@@ -1,0 +1,224 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "yonga"
+version = "0.1.0"
+description = "Linux-first local AI model manager for Intel AI PCs (OpenVINO, Optimum Intel, Hugging Face Hub)"
+readme = { file = "README.md", content-type = "text/markdown" }
+requires-python = ">=3.11,<3.15"
+license = "AGPL-3.0-or-later"
+keywords = [
+    "openvino",
+    "intel",
+    "npu",
+    "gpu",
+    "llm",
+    "vlm",
+    "quantization",
+    "huggingface",
+    "model-manager",
+    "ai-pc",
+]
+authors = [{ name = "yonga contributors" }]
+maintainers = [{ name = "yonga contributors" }]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: System :: Hardware",
+    "Topic :: Utilities",
+    "Typing :: Typed",
+]
+dependencies = [
+    "typer>=0.15",
+    "rich>=13.7",
+    "prompt-toolkit>=3.0.43",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.2",
+    "packaging>=23.2",
+    "huggingface_hub>=1.0,<2",
+    "psutil>=5.9",
+    "PyYAML>=6",
+]
+
+[project.optional-dependencies]
+openvino = [
+    "openvino>=2026.2",
+    "openvino-genai>=2026.2",
+    "openvino-tokenizers>=2026.2",
+]
+export = [
+    "optimum-intel[openvino]>=2.1",
+    "nncf>=2.19",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "pytest-mock>=3.12",
+    "pytest-timeout>=2.3",
+    "ruff>=0.6",
+    "mypy>=1.10",
+]
+all = [
+    "yonga[openvino]",
+    "yonga[export]",
+    "yonga[dev]",
+]
+
+[project.scripts]
+yonga = "yonga.cli:app"
+
+[project.urls]
+Homepage = "https://github.com/yonga-project/yonga"
+Documentation = "https://github.com/yonga-project/yonga/tree/main/docs"
+Repository = "https://github.com/yonga-project/yonga"
+Issues = "https://github.com/yonga-project/yonga/issues"
+Changelog = "https://github.com/yonga-project/yonga/blob/main/CHANGELOG.md"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+yonga = [
+    "py.typed",
+    "registry/builtin/*.yaml",
+    "registry/builtin/*.yml",
+    "data/*.json",
+    "data/*.yaml",
+    "data/*.yml",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+# Specification documents are the project's source of truth and are owned by the
+# maintainers, not by the formatter. Ruff formats Python code blocks inside Markdown,
+# which would silently rewrite them, so keep documentation out of scope entirely.
+extend-exclude = [".venv", "build", "dist", "*.md", "docs", "registry"]
+
+[tool.ruff.lint]
+select = [
+    "E",
+    "F",
+    "I",
+    "UP",
+    "B",
+    "SIM",
+    "RUF",
+    "ANN",
+    "PTH",
+    "C4",
+    "RET",
+    "ARG",
+    "TID",
+]
+ignore = [
+    # Typer/Rich helpers legitimately accept Any.
+    "ANN401",
+    # Typer declares option defaults with function calls.
+    "B008",
+    # The internal contract mandates `class X(str, Enum)` rather than StrEnum.
+    "UP042",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["ANN", "ARG"]
+"src/yonga/cli.py" = ["ARG"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["yonga"]
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "all"
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "auto"
+docstring-code-format = true
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unreachable = true
+warn_no_return = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+no_implicit_reexport = true
+show_error_codes = true
+plugins = []
+mypy_path = "src"
+files = ["src", "tests"]
+
+[[tool.mypy.overrides]]
+module = [
+    "openvino.*",
+    "openvino_genai.*",
+    "openvino_tokenizers.*",
+    "optimum.*",
+    "nncf.*",
+    "transformers.*",
+    "torch.*",
+    "psutil.*",
+    "yaml.*",
+]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["tests.*"]
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+disallow_untyped_decorators = false
+check_untyped_defs = true
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+pythonpath = ["src"]
+markers = [
+    "network: test needs outbound network access (Hugging Face Hub, etc.)",
+    "openvino: test needs the OpenVINO runtime to be importable",
+    "intel_gpu: test needs a working Intel GPU exposed through OpenVINO",
+    "intel_npu: test needs a working Intel NPU exposed through OpenVINO",
+    "slow: test takes a long time to run",
+    "large_model: test downloads or converts a multi-gigabyte model",
+]
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--strict-config",
+    "-m",
+    "not network and not intel_gpu and not intel_npu and not large_model and not slow",
+]
+filterwarnings = [
+    "default",
+    "error::DeprecationWarning:yonga",
+    "error::PendingDeprecationWarning:yonga",
+]
+timeout = 300
+
+[tool.coverage.run]
+source = ["yonga"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+]
