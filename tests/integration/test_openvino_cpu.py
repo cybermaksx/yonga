@@ -258,6 +258,62 @@ def test_generation_produces_text_and_metrics(artifact, settings):
     assert any(settings.paths.compile_cache_dir.iterdir())
 
 
+def test_repeated_runs_of_one_prompt_are_independent(artifact, settings):
+    """The benchmark loop, against the real runtime: same prompt, three times.
+
+    Each run builds a fresh one-message history holding the identical fixture and
+    declares a conversation boundary first, exactly as ``BenchmarkService`` does.
+    Every run must answer, and — the point of the boundary — every run must be
+    measured against the same prompt length. A run that silently continued the
+    previous conversation would report a growing ``input_tokens`` and its TTFT
+    would not be comparable with the others (SPEC.md section 6.5).
+    """
+    runtime = open_runtime(
+        artifact,
+        device="CPU",
+        pipeline=PipelineKind.LLM,
+        settings=settings,
+    )
+    try:
+        measured = []
+        for _ in range(3):
+            runtime.begin_conversation()
+            history = ChatHistory()
+            history.add_user("Explain gravity in one sentence.")
+            measured.append(runtime.generate(history, GenerationSettings(max_new_tokens=8)))
+
+        assert [result.output_tokens for result in measured] == [8, 8, 8]
+        input_tokens = [result.input_tokens for result in measured]
+        assert all(count is not None and count > 0 for count in input_tokens)
+        assert len(set(input_tokens)) == 1, f"the context grew between runs: {input_tokens}"
+        assert all(result.ttft_ms is not None and result.ttft_ms > 0.0 for result in measured)
+    finally:
+        runtime.close()
+
+
+def test_begin_conversation_does_not_disturb_the_llm_path(artifact, settings):
+    """The stateless path re-supplies its history, so the boundary costs it nothing."""
+    runtime = open_runtime(artifact, device="CPU", pipeline=PipelineKind.LLM, settings=settings)
+    try:
+        runtime.begin_conversation()
+        runtime.begin_conversation()
+
+        history = ChatHistory()
+        history.add_user("Hello")
+        first = runtime.generate(history, GenerationSettings(max_new_tokens=8))
+
+        history.add_assistant(first.text)
+        history.add_user("And again")
+        second = runtime.generate(history, GenerationSettings(max_new_tokens=8))
+
+        assert first.input_tokens is not None
+        assert second.input_tokens is not None
+        assert second.input_tokens > first.input_tokens
+    finally:
+        runtime.close()
+    runtime.begin_conversation()  # idempotent after close
+
+
 def test_generation_on_a_broken_artifact_raises_a_typed_error(broken_artifact, settings):
     from yonga.domain.diagnostics import CompileError
 

@@ -617,6 +617,13 @@ class BenchmarkService:
         history.add_user(fixture.text)
         started = time.perf_counter()
         try:
+            # Every run — warmups included — is its own conversation. A stateful
+            # runtime that carried the previous run's turns into this one would
+            # be measuring a longer context than the fixture describes, so its
+            # TTFT and token counts would not be comparable with the other runs
+            # (SPEC.md section 6.5). Independence is declared here rather than
+            # inferred from the history, which repeats the same prompt verbatim.
+            runtime.begin_conversation()
             generated = runtime.generate(history, settings)
         except Exception as exc:
             return RunMetrics(

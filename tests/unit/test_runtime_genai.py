@@ -591,6 +591,22 @@ def test_vlm_restarts_the_session_when_the_history_is_reset(artifact, settings, 
     runtime.close()
 
 
+def test_the_conversation_boundary_is_part_of_the_domain_interface(artifact, settings, genai):
+    """``begin_conversation`` reaches callers through ``ChatRuntime``, not through GenAI.
+
+    ``start_chat``/``finish_chat`` are deprecated and stay inside the adapter
+    (SPEC.md section 6.4); what the domain gets is a statement that the next
+    history opens a new conversation. Conversation-boundary behaviour itself is
+    covered in ``test_vlm_conversation.py``.
+    """
+    runtime = open_runtime(artifact, settings=settings, pipeline=PipelineKind.VLM)
+    assert isinstance(runtime, ChatRuntime)
+    assert not hasattr(runtime, "start_chat")
+    assert not hasattr(runtime, "finish_chat")
+    runtime.begin_conversation()
+    runtime.close()
+
+
 def test_vlm_without_a_new_user_turn_is_rejected(artifact, settings, genai):
     runtime = make_runtime(artifact, settings, pipeline=PipelineKind.VLM)
     history = ChatHistory()

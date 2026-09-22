@@ -14,7 +14,11 @@ Two upstream details are hidden here on purpose:
   domain interface. The LLM path does not use them at all: multi-turn state
   travels as an ``openvino_genai.ChatHistory`` passed to ``generate``. The VLM
   path has no such overload in this build, so the adapter drives the deprecated
-  lifecycle internally and feeds the pipeline only the newest user turn.
+  lifecycle internally and feeds the pipeline only the newest user turn. Because
+  that makes the VLM runtime stateful, the domain interface carries
+  :meth:`ChatRuntime.begin_conversation` — a caller's explicit statement that the
+  next history opens a new conversation. The adapter cannot infer that on its
+  own: two conversations may open with identical words.
 * Reasoning ("thinking") is switched off through the chat template variable via
   ``ChatHistory.set_extra_context``. The source repository's chat template is
   never rewritten. *Which* variable to send is decided from evidence: unless the
@@ -405,6 +409,30 @@ def thinking_extra_context(
 class ChatRuntime(Protocol):
     """A loaded model that can answer turns. Deliberately free of GenAI types."""
 
+    def begin_conversation(self) -> None:
+        """Declare that the next turn starts a brand-new conversation.
+
+        Only the caller knows where one conversation ends and the next begins.
+        A benchmark run, each of its warmups, and a ``/reset`` in chat each start
+        one; a history that merely *looks* like the previous one — the same
+        prompt fixture sent twice — is not a continuation of it.
+
+        A **stateless** implementation may ignore this entirely: the LLM path
+        re-supplies the whole history on every turn, so there is nothing stale to
+        throw away, and the default below is exactly that no-op. A **stateful**
+        implementation (the VLM path, which keeps a hidden pipeline-side session)
+        **must** discard its session here, so the next turn is measured against an
+        empty context rather than against whatever the last conversation left
+        behind (``SPEC.md`` section 6.5).
+
+        Must be idempotent, safe to call before the first turn, and must not raise.
+
+        The body below is the stateless default — doing nothing is the correct
+        behaviour for a runtime that holds no session — and is inherited by
+        anything that subclasses the protocol explicitly.
+        """
+        return
+
     def generate(self, history: ChatHistory, config: GenerationSettings) -> GenerationResult:
         """Generate one assistant turn for ``history``."""
         ...
@@ -573,10 +601,40 @@ def _finish_reason(raw: object) -> str | None:
 
 
 def _is_prefix(prefix: Sequence[ChatMessage], messages: Sequence[ChatMessage]) -> bool:
-    """Return whether ``prefix`` is the leading run of ``messages``."""
+    """Return whether ``prefix`` is the leading run of ``messages``.
+
+    This answers a question about *text*, not about identity: two different
+    conversations that open with the same words are prefixes of one another.
+    Callers must not read it as "this is a continuation" on its own — see
+    :meth:`GenAIChatRuntime._continues_conversation`.
+    """
     if len(prefix) > len(messages):
         return False
     return all(left == right for left, right in zip(prefix, messages, strict=False))
+
+
+def _user_turn_text(messages: Sequence[ChatMessage]) -> str:
+    """Join the non-empty user turns of ``messages`` into one prompt."""
+    return "\n\n".join(
+        message.content.strip()
+        for message in messages
+        if message.role == "user" and message.content.strip()
+    )
+
+
+def _leading_system(messages: Sequence[ChatMessage]) -> list[ChatMessage]:
+    """Return the run of system turns at the head of ``messages``.
+
+    Only the leading run counts: what is recorded as already delivered has to be
+    a genuine prefix of the conversation, or the next turn's "everything after
+    what I sent" slice would skip real messages.
+    """
+    leading: list[ChatMessage] = []
+    for message in messages:
+        if message.role != "system":
+            break
+        leading.append(message)
+    return leading
 
 
 # --- the runtime ----------------------------------------------------------------------
@@ -744,6 +802,24 @@ class GenAIChatRuntime:
 
     # --- generation ------------------------------------------------------
 
+    def begin_conversation(self) -> None:
+        """Discard any conversation the pipeline is still holding.
+
+        The LLM path is stateless — its whole history travels with every
+        ``generate`` call — so there is nothing to do for it. The VLM path keeps
+        a hidden ``start_chat()`` session, and this is the only signal that the
+        next history is a *new* conversation rather than a continuation that
+        happens to begin with the same words.
+
+        Idempotent, safe before the first turn and after :meth:`close`, and it
+        never raises: refusing to start a conversation is not a failure mode a
+        caller could do anything about.
+        """
+        if self._closed or self._pipeline is None:
+            return
+        if self._pipeline_kind is PipelineKind.VLM:
+            self._end_vlm_chat()
+
     def generate(self, history: ChatHistory, config: GenerationSettings) -> GenerationResult:
         """Generate one assistant turn and collect its metrics.
 
@@ -827,17 +903,34 @@ class GenAIChatRuntime:
         return self._pipeline.generate(prompt, generation_config=generation_config)
 
     def _vlm_turn_prompt(self, history: ChatHistory) -> str:
-        """Return the text to send to the VLM pipeline for this turn."""
+        """Return the text to send to the VLM pipeline for this turn.
+
+        The pipeline remembers the conversation, so only the turns it has not
+        seen are handed over. Deciding *what it has not seen* is the whole
+        difficulty: the adapter sees histories, not conversation identities.
+
+        Three guards, outermost first:
+
+        1. :meth:`_continues_conversation` — a continuation must extend what was
+           already delivered, not merely match it. A history equal to the last
+           one is a second conversation that happens to start with the same
+           words, which is exactly what a benchmark's repeated prompt fixture and
+           a ``/reset`` followed by retyping the same line both look like.
+        2. A pending slice with no user content, in a history that *does* carry
+           one, means the bookkeeping has lost track. Restart and resend rather
+           than tell the caller there is nothing to answer.
+        3. Only a history with no user turn at all — a system-only conversation —
+           still raises, because that is a genuine caller bug.
+        """
         messages = list(history.messages)
-        if not self._chat_started or not _is_prefix(self._sent, messages):
+        if not self._continues_conversation(messages):
             self._restart_vlm_chat(messages)
         pending = messages[len(self._sent) :]
-        prompt = "\n\n".join(
-            message.content.strip()
-            for message in pending
-            if message.role == "user" and message.content.strip()
-        )
-        self._sent = messages
+        prompt = _user_turn_text(pending)
+        if not prompt and _user_turn_text(messages):
+            self._restart_vlm_chat(messages)
+            pending = messages[len(self._sent) :]
+            prompt = _user_turn_text(pending)
         if not prompt:
             raise GenerationError(
                 diagnostic(
@@ -847,15 +940,26 @@ class GenAIChatRuntime:
                     "Add a user message to the conversation before generating.",
                 )
             )
+        self._sent = messages
         return prompt
+
+    def _continues_conversation(self, messages: Sequence[ChatMessage]) -> bool:
+        """Whether ``messages`` continues the conversation the pipeline is holding.
+
+        Equality of content is not identity of conversation, so a history that is
+        exactly what was already delivered is *not* a continuation: it is a new
+        conversation whose opening happens to repeat. A continuation has to
+        extend the delivered turns, which means being strictly longer than them.
+        """
+        if not self._chat_started:
+            return False
+        if not _is_prefix(self._sent, messages):
+            return False
+        return len(messages) > len(self._sent)
 
     def _restart_vlm_chat(self, messages: Sequence[ChatMessage]) -> None:
         """(Re)start the hidden VLM chat session, seeding it with the system turn."""
-        if self._chat_started:
-            with suppress(Exception):
-                self._pipeline.finish_chat()
-            self._chat_started = False
-        self._sent = []
+        self._end_vlm_chat()
         system = next((m.content for m in messages if m.role == "system"), "")
         try:
             if system:
@@ -865,7 +969,16 @@ class GenAIChatRuntime:
         except Exception as exc:
             raise GenerationError(self._generation_failed_diagnostic(exc), cause=exc) from exc
         self._chat_started = True
-        self._sent = [message for message in messages if message.role == "system"]
+        # start_chat has consumed the system turn; everything after it is pending.
+        self._sent = _leading_system(messages)
+
+    def _end_vlm_chat(self) -> None:
+        """Close the hidden VLM session, if one is open, and forget what was sent."""
+        if self._chat_started:
+            with suppress(Exception):
+                self._pipeline.finish_chat()
+            self._chat_started = False
+        self._sent = []
 
     def _generation_failed_diagnostic(self, error: BaseException) -> Diagnostic:
         """Build the generation failure diagnostic, keeping the raw runtime text."""
@@ -894,12 +1007,8 @@ class GenAIChatRuntime:
         if self._closed:
             return
         self._closed = True
-        if self._chat_started:
-            with suppress(Exception):
-                self._pipeline.finish_chat()
-            self._chat_started = False
+        self._end_vlm_chat()
         self._pipeline = None
-        self._sent = []
 
     def __enter__(self) -> GenAIChatRuntime:
         """Return the runtime so it can be used as a context manager."""

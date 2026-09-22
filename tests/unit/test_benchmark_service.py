@@ -71,12 +71,17 @@ class ScriptedRuntime:
         self.default = default or make_generation(ttft_ms=100.0, throughput_tps=20.0)
         self.load_seconds = load_seconds
         self.calls: list[str] = []
+        self.events: list[str] = []
         self.closed = False
+
+    def begin_conversation(self) -> None:
+        self.events.append("begin")
 
     def generate(self, history: ChatHistory, config: GenerationSettings) -> GenerationResult:
         prompt = history.messages[-1].content
         key = _prompt_key(prompt)
         self.calls.append(key)
+        self.events.append(f"generate:{key}")
         queue = self.script.get(key)
         if not queue:
             return self.default
@@ -534,6 +539,72 @@ def test_peak_rss_is_read_on_this_host() -> None:
 
 
 # --- errors ---------------------------------------------------------------------------
+
+
+def test_every_run_and_warmup_opens_its_own_conversation(
+    tmp_path: Path,
+    job_ctx: tuple[JobContext, CollectingSink],
+) -> None:
+    """Runs are independent by construction, not by luck.
+
+    A run that silently continued the previous one would be measuring a longer
+    context, so its TTFT and token counts would not be comparable (SPEC.md
+    section 6.5). The boundary is declared, because the histories themselves are
+    identical — the same fixture, every run.
+    """
+    ctx, _ = job_ctx
+    runtime = ScriptedRuntime()
+    service, _ = make_service(tmp_path, runtime)
+
+    service.run(make_artifact(tmp_path), device="CPU", suite="quick", runs=2, warmups=1, ctx=ctx)
+
+    assert runtime.events == [
+        "begin",
+        "generate:short-instruction",
+        "begin",
+        "generate:short-instruction",
+        "begin",
+        "generate:short-instruction",
+    ]
+
+
+def test_a_stateful_runtime_completes_every_run(
+    tmp_path: Path,
+    job_ctx: tuple[JobContext, CollectingSink],
+) -> None:
+    """The reproduced bench failure, at the service seam.
+
+    This double behaves like the VLM adapter did: it only accepts turns it has
+    not seen, so without an explicit conversation boundary the second and third
+    runs of the same prompt fixture raise.
+    """
+    ctx, _ = job_ctx
+
+    class StatefulRuntime(ScriptedRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.seen: list[str] = []
+
+        def begin_conversation(self) -> None:
+            super().begin_conversation()
+            self.seen = []
+
+        def generate(self, history: ChatHistory, config: GenerationSettings) -> GenerationResult:
+            pending = [m.content for m in history.messages][len(self.seen) :]
+            self.seen = [m.content for m in history.messages]
+            if not pending:
+                raise RuntimeError("Add a user message to the conversation before generating.")
+            return super().generate(history, config)
+
+    runtime = StatefulRuntime()
+    service, _ = make_service(tmp_path, runtime)
+
+    result = service.run(
+        make_artifact(tmp_path), device="CPU", suite="quick", runs=2, warmups=1, ctx=ctx
+    )
+
+    assert result.errors == []
+    assert [run.error for run in result.run_metrics] == [None, None, None]
 
 
 def test_a_run_that_raises_is_an_error_entry_and_the_others_still_complete(

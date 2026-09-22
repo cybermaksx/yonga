@@ -140,7 +140,12 @@ class FakeChatRuntime:
     def __init__(self, reply: str = "Hello from the fake model.") -> None:
         self.reply = reply
         self.turns: list[int] = []
+        self.conversations = 0
         self.closed = False
+
+    def begin_conversation(self) -> None:
+        """Start a new conversation; nothing to discard in a stateless fake."""
+        self.conversations += 1
 
     def generate(self, history: ChatHistory, config: GenerationSettings) -> GenerationResult:
         """Answer one turn with a canned reply and plausible metrics."""

@@ -9,6 +9,23 @@ manifest may change in any minor release.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A VLM artifact can be benchmarked with more than one run, and `/reset` really
+  resets it.** `VLMPipeline` has no chat-history overload in this build, so the
+  runtime adapter keeps a hidden session and hands the pipeline only the turns it
+  has not seen. It decided what was new by comparing histories, and two
+  conversations that open with the same words are indistinguishable that way:
+  `yonga bench ARTIFACT --runs 2` re-sent the identical prompt fixture and every
+  run after the first failed with "Add a user message to the conversation before
+  generating", as did retyping the same first message after `/reset`. The domain
+  interface now carries an explicit conversation boundary, which `bench` declares
+  before every warmup and every measured run and `/reset` declares in chat, and
+  the adapter additionally treats a history that only repeats what it already
+  delivered as a new conversation. Multi-turn chat is unchanged: a history that
+  genuinely extends the delivered turns is still continued incrementally. The LLM
+  path is stateless and is not affected.
+
 ### Known issues
 
 - `bench` does not classify a failed compile. When loading the artifact fails it

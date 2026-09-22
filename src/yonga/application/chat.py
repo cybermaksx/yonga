@@ -1124,11 +1124,18 @@ class ChatSession:
     def reset(self) -> None:
         """Forget the conversation, keeping the session's system prompt.
 
-        The pipeline is deliberately untouched: for the LLM path the whole
-        conversation is re-supplied on every turn, so there is nothing stale to
-        discard and nothing to reload.
+        The pipeline is deliberately not reloaded — that would pay the compile
+        cost again — but it is *told* that a new conversation starts here. For
+        the LLM path that changes nothing, since the whole conversation is
+        re-supplied on every turn. For a stateful path it is the only way the
+        runtime can know that retyping the first message is a fresh start rather
+        than a repeat with nothing new in it.
         """
         self.history.reset(keep_system=True)
+        runtime = self._runtime
+        if runtime is not None:
+            with suppress(Exception):
+                runtime.begin_conversation()
 
     # --- settings --------------------------------------------------------
 

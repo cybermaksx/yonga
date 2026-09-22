@@ -74,9 +74,16 @@ class FakeRuntime:
         self.answers = list(answers)
         self.histories: list[list[tuple[str, str]]] = []
         self.configs: list[GenerationSettings] = []
+        self.conversations = 0
+        self.events: list[str] = []
         self.closed = False
 
+    def begin_conversation(self) -> None:
+        self.conversations += 1
+        self.events.append("begin")
+
     def generate(self, history: ChatHistory, config: GenerationSettings) -> GenerationResult:
+        self.events.append("generate")
         self.histories.append([(m.role, m.content) for m in history.messages])
         self.configs.append(config.model_copy(deep=True))
         answer = self.answers.pop(0) if self.answers else ""
@@ -532,6 +539,33 @@ def test_the_whole_conversation_is_resupplied_each_turn(tmp_path):
         ("assistant", "one"),
         ("user", "second"),
     ]
+
+
+def test_reset_tells_the_runtime_a_new_conversation_starts(tmp_path):
+    """A stateful runtime cannot see /reset in the history: it has to be told.
+
+    Retyping the same first message after /reset produces a history identical to
+    the one that was just answered, which is indistinguishable from a repeat.
+    """
+    service, _factory, runtime = build_service(tmp_path, answers=["one", "two"])
+    artifact = write_artifact(tmp_path, make_manifest())
+    session = service.open_artifact(artifact)
+    session.send("hello")
+    session.reset()
+    session.send("hello")
+
+    assert runtime.events == ["generate", "begin", "generate"]
+    assert runtime.histories[-1] == [("user", "hello")]
+
+
+def test_reset_before_the_model_is_loaded_does_not_load_it(tmp_path):
+    """Nothing is holding a conversation yet, so there is nothing to tell."""
+    service, factory, runtime = build_service(tmp_path)
+    artifact = write_artifact(tmp_path, make_manifest())
+    session = service.open_artifact(artifact)
+    session.reset()
+    assert factory.calls == 0
+    assert runtime.conversations == 0
 
 
 def test_reset_keeps_the_system_prompt(tmp_path):
