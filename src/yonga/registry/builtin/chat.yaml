@@ -1,0 +1,57 @@
+# Chat profiles: how a model family expects a conversation to be driven.
+#
+# Thinking mode is requested through the chat template variable named here,
+# which openvino_genai passes with ChatHistory.set_extra_context(); the source
+# repository's template is never modified.
+schema_version: 1
+
+chat:
+  - id: chat-qwen3_5
+    schema_version: 1
+    status: active
+    priority: 100
+    summary: Qwen3.5 chat defaults, thinking disabled unless asked for
+    match:
+      model_types:
+        - qwen3_5
+      architectures:
+        - Qwen3_5ForConditionalGeneration
+        - Qwen3_5ForCausalLM
+    supports_thinking_flag: true
+    thinking_template_variable: enable_thinking
+    default_thinking: false
+    reasoning_wrappers:
+      - ["<think>", "</think>"]
+    defaults:
+      temperature: 0.7
+      top_p: 0.8
+      top_k: 20
+      max_new_tokens: 4096
+    thinking_defaults:
+      temperature: 0.6
+      top_p: 0.95
+      top_k: 20
+    sources:
+      - kind: model_card
+        url: https://huggingface.co/nDimensional/Qwen3.5-9B-Uncensored-Safetensors
+      - kind: community
+        note: >-
+          Qwen chat templates expose enable_thinking, and the family documents
+          different sampling defaults for thinking and non-thinking modes.
+
+  - id: chat-default
+    schema_version: 1
+    status: active
+    priority: 10
+    summary: Conservative chat defaults for models with no family-specific profile
+    supports_thinking_flag: false
+    default_thinking: false
+    reasoning_wrappers:
+      - ["<think>", "</think>"]
+    defaults:
+      max_new_tokens: 4096
+    sources:
+      - kind: community
+        note: >-
+          The <think> wrapper is stripped defensively even when the family is
+          unknown, so hidden reasoning never reaches the screen by accident.

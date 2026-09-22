@@ -1,0 +1,36 @@
+# Repair rules.
+#
+# `implementation` is a key into the built-in Python repair registry. Registry
+# data never carries find/replace instructions: remote or user-supplied YAML
+# must not be able to describe an edit that is then executed.
+schema_version: 1
+
+repairs:
+  - id: ov-tokenizer-precision-string-casing
+    schema_version: 1
+    status: active
+    priority: 100
+    summary: Fix the mixed-case STRiNG port precision in exported tokenizer IR
+    match:
+      files:
+        - openvino_tokenizer.xml
+        - openvino_detokenizer.xml
+      contains: 'precision="STRiNG"'
+    constraints:
+      openvino: ">=2026.2,<2027"
+    repair:
+      implementation: tokenizer_string_precision
+      safety: automatic
+    validation:
+      requires_tokenizer_read: true
+      postconditions:
+        - no_precision_str_ing
+        - tokenizer_readable
+        - detokenizer_readable
+    sources:
+      - kind: tested
+        note: >-
+          Reproduced with openvino 2026.4.0 and openvino-tokenizers 2026.4.0.0:
+          save_model writes port precision="STRiNG" while the layer's
+          element_type="string" is correct. Rewriting only the port precision
+          makes read_model and compile_model succeed.

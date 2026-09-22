@@ -1,0 +1,245 @@
+# Known failure signatures.
+#
+# Prefer exact strings over regexes. A rule that names a model family beats a
+# rule that only names a device, so a family-specific diagnosis wins where it
+# applies and the generic one still covers everything else.
+schema_version: 1
+
+issues:
+  - id: qwen35-npu-fp16-bufferize
+    schema_version: 1
+    status: active
+    priority: 100
+    summary: The current NPU compiler rejects part of the Qwen3.5 graph
+    match:
+      model_types:
+        - qwen3_5
+      device: npu
+      case_sensitive: true
+      exception_contains:
+        - "OneShotBufferizeVPU2VPUIP failed : Only supports FP16"
+    classification:
+      code: npu.compiler.unsupported_graph.qwen35
+      category: compiler_unsupported_graph
+      environment_broken: false
+      retry_same_device: false
+    recommendation:
+      title: Qwen3.5 cannot be compiled for the NPU
+      message: >-
+        The NPU compiler ran and refused this Qwen3.5 graph: one of its
+        operations is only implemented for FP16 on the NPU. The driver and the
+        compiler are working; the graph is what this NPU release cannot take.
+      fallback_devices:
+        - gpu
+        - cpu
+      remediation:
+        - "Prepare this model for the GPU: yonga prepare MODEL --device gpu"
+        - Keep the NPU for architectures the registry marks as supported.
+    sources:
+      - kind: tested
+        note: >-
+          Reproduced on a Lunar Lake host with OpenVINO 2026.4 and
+          compiler-in-plugin while preparing a Qwen3.5-9B derivative.
+
+  - id: npu-compiler-dynamic-shape
+    schema_version: 1
+    status: active
+    priority: 70
+    summary: The NPU compiler cannot compile a dynamically shaped graph
+    match:
+      device: npu
+      case_sensitive: true
+      exception_contains:
+        - "to_shape was called on a dynamic shape"
+    classification:
+      code: npu.compiler.dynamic_shape
+      category: compiler_unsupported_graph
+      environment_broken: false
+      retry_same_device: false
+    recommendation:
+      title: The NPU needs a statically shaped graph
+      message: >-
+        The NPU compiler requires every tensor shape to be known at compile
+        time, and this IR still has dynamic dimensions. OpenVINO GenAI reshapes
+        a model for the NPU through the MAX_PROMPT_LEN and MIN_RESPONSE_LEN
+        pipeline properties; a raw IR compiled directly keeps its dynamic
+        shapes and is rejected. The NPU itself is healthy: the driver answered
+        and the compiler returned a message.
+      fallback_devices:
+        - gpu
+        - cpu
+      remediation:
+        - >-
+          Load the artifact through OpenVINO GenAI with MAX_PROMPT_LEN and
+          MIN_RESPONSE_LEN set, rather than compiling the IR directly.
+        - "Or run this model on the GPU: yonga prepare MODEL --device gpu"
+    sources:
+      - kind: tested
+        note: >-
+          Reproduced on this reference host by compiling a text-generation IR
+          for the NPU with OpenVINO 2026.4; the compiler returned
+          "Exception from src/core/src/partial_shape.cpp:261: to_shape was
+          called on a dynamic shape."
+
+  - id: npu-compiler-unsupported-graph-generic
+    schema_version: 1
+    status: active
+    priority: 50
+    summary: The NPU compiler rejected this graph
+    match:
+      device: npu
+      case_sensitive: true
+      exception_contains:
+        - "OneShotBufferizeVPU2VPUIP failed"
+    classification:
+      code: npu.compiler.unsupported_graph
+      category: compiler_unsupported_graph
+      environment_broken: false
+      retry_same_device: false
+    recommendation:
+      title: This graph cannot be compiled for the NPU
+      message: >-
+        The NPU compiler ran and refused the graph. This is a model/compiler
+        limitation, not a broken driver or a missing package.
+      fallback_devices:
+        - gpu
+        - cpu
+      remediation:
+        - "Prepare this model for the GPU or the CPU instead."
+        - Re-check after an OpenVINO and NPU compiler update.
+    sources:
+      - kind: tested
+        note: >-
+          Generic form of the Qwen3.5 bufferization failure, kept less specific
+          so a family-scoped rule always wins where one exists.
+
+  - id: tokenizer-string-precision-read
+    schema_version: 1
+    status: active
+    priority: 100
+    summary: The tokenizer IR declares a mixed-case string precision OpenVINO cannot read
+    match:
+      case_sensitive: true
+      exception_contains:
+        - "Unsupported element type: STRiNG"
+    classification:
+      code: tokenizer.ir.string_precision
+      category: tokenizer_ir_incompatible
+      environment_broken: false
+      retry_same_device: false
+    recommendation:
+      title: The exported tokenizer IR cannot be read back
+      message: >-
+        The exported tokenizer XML writes the port precision as "STRiNG" while
+        the same layer's element type is the correct lower-case "string".
+        OpenVINO rejects the mixed-case spelling, so the tokenizer and the
+        detokenizer cannot be loaded. This is an export defect in the artifact,
+        not a problem with the model or the device.
+      repair: ov-tokenizer-precision-string-casing
+      remediation:
+        - "Run: yonga repair ARTIFACT"
+        - Only the port precision attribute is rewritten; element_type is left alone.
+    sources:
+      - kind: tested
+        note: >-
+          Reproduced on this reference host with openvino 2026.4.0 and
+          openvino-tokenizers 2026.4.0.0; every fresh export contains the defect.
+
+  - id: npu-permission-denied
+    schema_version: 1
+    status: active
+    priority: 90
+    summary: The NPU device node cannot be opened by this user
+    match:
+      device: npu
+      exception_contains:
+        - "Permission denied"
+        - "EACCES"
+        - "Operation not permitted"
+    classification:
+      code: npu.device.permission_denied
+      category: permission_denied
+      environment_broken: true
+      retry_same_device: false
+    recommendation:
+      title: No permission to use the NPU device node
+      message: >-
+        The kernel refused access to the NPU accelerator node. This is a host
+        permission problem, so yonga will not quietly move the job to another
+        device: fixing the permission is what you actually want, and a silent
+        fallback would hide a broken environment.
+      remediation:
+        - "Check the device node: ls -l /dev/accel/accel0"
+        - "Add your user to the owning group (usually render), then log out and back in."
+        - "Run: yonga doctor"
+      fallback_devices: []
+    sources:
+      - kind: community
+        note: >-
+          Generic POSIX permission wording; the exact plugin message was not
+          reproduced on the reference host, where the user is already in the
+          render group.
+
+  - id: runtime-out-of-memory
+    schema_version: 1
+    status: active
+    priority: 60
+    summary: The host or the accelerator ran out of memory
+    match:
+      exception_contains:
+        - "std::bad_alloc"
+        - "Out of memory"
+        - "Cannot allocate memory"
+        - "CL_OUT_OF_RESOURCES"
+        - "ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY"
+        - "ZE_RESULT_ERROR_OUT_OF_HOST_MEMORY"
+    classification:
+      code: runtime.out_of_memory
+      category: out_of_memory
+      environment_broken: false
+      retry_same_device: false
+    recommendation:
+      title: Out of memory
+      message: >-
+        The step ran out of memory. Conversion and the first compile are the
+        most memory-hungry parts of a preparation.
+      remediation:
+        - Close other applications and retry.
+        - Choose a profile with stronger weight compression, or a smaller group size.
+        - "Check the reported memory: yonga doctor"
+    sources:
+      - kind: community
+        note: Standard allocator and Level Zero out-of-memory wordings.
+
+  - id: storage-no-space-left
+    schema_version: 1
+    status: active
+    priority: 65
+    summary: A write failed because the filesystem is full
+    match:
+      exception_contains:
+        - "No space left on device"
+        - "basic_ios::clear: iostream error"
+        - "Disk quota exceeded"
+    classification:
+      code: storage.insufficient_disk
+      category: insufficient_disk
+      environment_broken: false
+      retry_same_device: false
+    recommendation:
+      title: Not enough free disk space
+      message: >-
+        A file could not be written because the filesystem ran out of space.
+        OpenVINO reports this as an iostream error when it fails to save an IR,
+        which looks like a serialisation bug but is a full disk.
+      remediation:
+        - Free space on the cache and data filesystems, then retry.
+        - >-
+          Point YONGA_CACHE_DIR at a disk-backed directory with room for several
+          times the model size; a tmpfs /tmp is usually far too small.
+        - "Run: yonga doctor"
+    sources:
+      - kind: community
+        note: >-
+          The iostream wording is what OpenVINO surfaces when serialisation
+          cannot write the .bin file.

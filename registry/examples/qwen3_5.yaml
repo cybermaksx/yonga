@@ -82,21 +82,51 @@ issues:
     recommendation:
       fallback_devices: [gpu, cpu]
 
-  - id: tokenizer-string-precision-casing
+  - id: tokenizer-string-precision-read
     status: active
     summary: OpenVINO tokenizer XML contains invalid mixed-case legacy precision
     match:
-      file_names:
+      exception_contains:
+        - "Unsupported element type: STRiNG"
+      case_sensitive: true
+    classification:
+      code: tokenizer.ir.string_precision
+      category: tokenizer_ir_incompatible
+      environment_broken: false
+      retry_same_device: false
+    recommendation:
+      title: The exported tokenizer IR cannot be read back
+      # An issue names a repair by id; it never carries the edit itself. Keeping
+      # one definition per repair is what lets `validate_registry` catch a
+      # dangling reference, and it keeps executable instructions out of data
+      # that a user or a remote override may supply.
+      repair: ov-tokenizer-precision-string-casing
+      remediation:
+        - "Run: yonga repair ARTIFACT"
+
+repairs:
+  - id: ov-tokenizer-precision-string-casing
+    status: active
+    summary: Fix the mixed-case STRiNG port precision in exported tokenizer IR
+    match:
+      files:
         - openvino_tokenizer.xml
         - openvino_detokenizer.xml
       contains: 'precision="STRiNG"'
+    constraints:
+      openvino: ">=2026.2,<2027"
     repair:
+      # A key into the built-in Python repair registry, never a find/replace
+      # instruction: registry data must not be able to describe an edit that is
+      # then executed.
       implementation: tokenizer_string_precision
       safety: automatic
-    postconditions:
-      - no_precision_str_ing
-      - tokenizer_readable
-      - detokenizer_readable
+    validation:
+      requires_tokenizer_read: true
+      postconditions:
+        - no_precision_str_ing
+        - tokenizer_readable
+        - detokenizer_readable
 
 derivatives:
   - id: hauhaucs-qwen35-safetensors

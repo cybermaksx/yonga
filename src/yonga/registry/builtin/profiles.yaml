@@ -1,0 +1,95 @@
+# Conversion profiles: quantization plus runtime properties, per device class.
+#
+# Profiles are data, not branches. The exporter turns `quantization` into
+# optimum-cli flags; `runtime` holds OpenVINO GenAI pipeline properties.
+schema_version: 1
+
+profiles:
+  - id: npu-int4-sym-cw
+    schema_version: 1
+    status: active
+    priority: 100
+    summary: NPU channel-wise INT4 profile for larger supported LLMs
+    device: npu
+    format: openvino_ir
+    quantization:
+      weight_format: int4
+      symmetric: true
+      ratio: 1.0
+      group_size: -1
+    constraints:
+      openvino: ">=2026.2,<2027"
+    rationale: >-
+      The NPU documentation recommends symmetric channel-wise INT4 weights for
+      models above roughly 4-5B parameters; group-wise quantization costs more
+      than it gains at that size.
+    sources:
+      - kind: official_docs
+        url: https://docs.openvino.ai/2026/openvino-workflow-generative/inference-with-genai/inference-with-genai-on-npu.html
+
+  - id: npu-int4-sym-g128
+    schema_version: 1
+    status: active
+    priority: 90
+    summary: NPU group-wise INT4 profile for smaller supported LLMs
+    device: npu
+    format: openvino_ir
+    quantization:
+      weight_format: int4
+      symmetric: true
+      ratio: 1.0
+      group_size: 128
+    constraints:
+      openvino: ">=2026.2,<2027"
+    rationale: >-
+      Group-wise INT4 keeps more accuracy on smaller models, where the extra
+      scales are affordable on the NPU.
+    sources:
+      - kind: official_docs
+        url: https://docs.openvino.ai/2026/openvino-workflow-generative/inference-with-genai/inference-with-genai-on-npu.html
+
+  - id: gpu-int4-asym-g128
+    schema_version: 1
+    status: active
+    priority: 100
+    summary: GPU asymmetric group-wise INT4 profile
+    device: gpu
+    format: openvino_ir
+    quantization:
+      weight_format: int4
+      symmetric: false
+      ratio: 1.0
+      group_size: 128
+    runtime:
+      ATTENTION_BACKEND: SDPA
+    constraints:
+      openvino: ">=2026.2,<2027"
+    rationale: >-
+      Matches the quantization published for the reference OpenVINO build of
+      Qwen3.5-9B. ATTENTION_BACKEND=SDPA is an openvino_genai pipeline property,
+      not a device property, and is applied when the pipeline is created.
+    sources:
+      - kind: model_card
+        url: https://huggingface.co/OpenVINO/Qwen3.5-9B-int4-ov
+
+  - id: cpu-int4-asym-g128
+    schema_version: 1
+    status: active
+    priority: 100
+    summary: CPU asymmetric group-wise INT4 profile
+    device: cpu
+    format: openvino_ir
+    quantization:
+      weight_format: int4
+      symmetric: false
+      ratio: 1.0
+      group_size: 128
+    constraints:
+      openvino: ">=2026.2,<2027"
+    rationale: >-
+      Same weight compression as the GPU profile so the two artifacts stay
+      comparable, but without the SDPA attention backend property, which is a
+      GPU pipeline setting.
+    sources:
+      - kind: model_card
+        url: https://huggingface.co/OpenVINO/Qwen3.5-9B-int4-ov

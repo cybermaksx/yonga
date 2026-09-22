@@ -1,0 +1,61 @@
+<?xml version="1.0"?>
+<net name="tiny_tokenizer" version="11">
+	<layers>
+		<layer id="0" name="string_input" type="Parameter" version="opset1">
+			<data shape="?" element_type="string" />
+			<output>
+				<port id="0" precision="STRiNG" names="string_input">
+					<dim>-1</dim>
+				</port>
+			</output>
+		</layer>
+		<layer id="1" name="StringTensorUnpack_2" type="StringTensorUnpack" version="opset15">
+			<input>
+				<port id="0" precision="STRiNG">
+					<dim>-1</dim>
+				</port>
+			</input>
+			<output>
+				<port id="1" precision="i32" names="Result_3">
+					<dim>-1</dim>
+				</port>
+				<port id="2" precision="i32" names="Result_4">
+					<dim>-1</dim>
+				</port>
+				<port id="3" precision="U8" names="Result_5">
+					<dim>-1</dim>
+				</port>
+			</output>
+		</layer>
+		<layer id="2" name="Result_3" type="Result" version="opset1" output_names="Result_3">
+			<input>
+				<port id="0" precision="i32">
+					<dim>-1</dim>
+				</port>
+			</input>
+		</layer>
+		<layer id="3" name="Result_4" type="Result" version="opset1" output_names="Result_4">
+			<input>
+				<port id="0" precision="i32">
+					<dim>-1</dim>
+				</port>
+			</input>
+		</layer>
+		<layer id="4" name="Result_5" type="Result" version="opset1" output_names="Result_5">
+			<input>
+				<port id="0" precision="U8">
+					<dim>-1</dim>
+				</port>
+			</input>
+		</layer>
+	</layers>
+	<edges>
+		<edge from-layer="0" from-port="0" to-layer="1" to-port="0" />
+		<edge from-layer="1" from-port="1" to-layer="2" to-port="0" />
+		<edge from-layer="1" from-port="2" to-layer="3" to-port="0" />
+		<edge from-layer="1" from-port="3" to-layer="4" to-port="0" />
+	</edges>
+	<rt_info>
+		<info name="OpenVINO Runtime" value="2026.4.0-22959-99c81491cc3-releases/2026/4" />
+	</rt_info>
+</net>

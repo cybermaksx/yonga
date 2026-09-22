@@ -108,7 +108,10 @@ src = ["src", "tests"]
 # Specification documents are the project's source of truth and are owned by the
 # maintainers, not by the formatter. Ruff formats Python code blocks inside Markdown,
 # which would silently rewrite them, so keep documentation out of scope entirely.
-extend-exclude = [".venv", "build", "dist", "*.md", "docs", "registry"]
+# The leading slash anchors a pattern at the project root: a bare "registry" also
+# matched the `src/yonga/registry/` package component and silently skipped the
+# whole registry source package.
+extend-exclude = [".venv", "build", "dist", "*.md", "/docs", "/registry"]
 
 [tool.ruff.lint]
 select = [
@@ -179,6 +182,10 @@ module = [
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
+# `tests/`, `tests/unit/` and `tests/integration/` each carry an `__init__.py`
+# purely so that mypy names these modules `tests.unit.test_x` and this
+# relaxation actually applies; without them mypy names them `test_x` and the
+# pattern silently matches nothing.
 module = ["tests.*"]
 disallow_untyped_defs = false
 disallow_incomplete_defs = false

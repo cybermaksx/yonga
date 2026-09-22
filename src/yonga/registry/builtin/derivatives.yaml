@@ -1,0 +1,32 @@
+# Declared alternative sources for repositories that cannot be converted directly.
+#
+# Never infer that a similarly named repository is equivalent. Every candidate
+# needs evidence, and a third-party derivative is only ever a suggestion the
+# user has to approve.
+schema_version: 1
+
+derivatives:
+  - id: hauhaucs-qwen35-safetensors
+    schema_version: 1
+    status: active
+    priority: 100
+    summary: Safetensors conversion of a GGUF-only Qwen3.5 derivative
+    requested_repo: HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive
+    candidates:
+      - repo_id: nDimensional/Qwen3.5-9B-Uncensored-Safetensors
+        relationship: lossless_conversion
+        trust: suggest
+        note: >-
+          The requested repository publishes GGUF weights only, which the
+          OpenVINO exporter cannot read. This repository is declared as a
+          lossless conversion of the same weights.
+        evidence:
+          - kind: model_card
+            url: https://huggingface.co/nDimensional/Qwen3.5-9B-Uncensored-Safetensors
+    sources:
+      - kind: model_card
+        url: https://huggingface.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive
+      - kind: community
+        note: >-
+          Third-party lineage. Trust policy is "suggest", so the user always
+          confirms before the substitution happens.

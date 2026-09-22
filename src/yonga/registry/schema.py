@@ -1,0 +1,1066 @@
+"""Typed records for the compatibility registry.
+
+The registry turns fast-moving knowledge — which architecture runs on which
+device, which exporter version it needs, what a known failure looks like, which
+repair fixes it — into *data* instead of conditionals scattered through the
+codebase. This module defines the shape of that data and nothing else: it reads
+no files, performs no resolution and imports nothing heavier than Pydantic.
+
+Two policies are baked into the types themselves:
+
+* Registry data never carries executable instructions. A repair rule names a
+  built-in Python implementation by key (:data:`KNOWN_REPAIR_IMPLEMENTATIONS`);
+  it can never describe a find/replace to run.
+* Every rule can be traced. Each rule carries ``sources``, and matching is
+  explainable through :class:`MatchOutcome`, which records *why* a rule matched
+  or was rejected.
+
+Matching semantics (shared by every rule kind, see :class:`RuleMatch`):
+
+* Inside one criterion the entries are alternatives (OR).
+* ``model_types`` and ``architectures`` form a single *identity* criterion that
+  is satisfied when either side matches, because a repository may expose only
+  one of the two.
+* Different criteria are combined with AND.
+* An empty criterion imposes no constraint.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterable, Mapping, Sequence
+from enum import Enum
+from typing import Any, ClassVar
+
+from packaging.specifiers import InvalidSpecifier, SpecifierSet
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    field_validator,
+    model_validator,
+)
+
+from yonga.domain.compatibility import DeviceStatus, EvidenceLevel
+from yonga.domain.hardware import normalise_device
+from yonga.domain.models import ModelFormat, PipelineKind, SourceEvidence, SourceRelationship
+from yonga.domain.plans import ConversionProfile, QuantizationSettings
+
+#: Schema version understood by this build of the loader.
+SCHEMA_VERSION: int = 1
+
+#: Specificity of a rule that names an exact repository id.
+SPECIFICITY_REPO_ID: int = 100
+#: Specificity of an architecture rule that also constrains device or host family.
+SPECIFICITY_ARCHITECTURE_FAMILY: int = 80
+#: Specificity of a plain architecture (model type / architecture class) rule.
+SPECIFICITY_ARCHITECTURE: int = 60
+#: Specificity of a task-scoped rule.
+SPECIFICITY_TASK: int = 40
+#: Specificity of a generic device or profile rule.
+SPECIFICITY_GENERIC: int = 20
+
+#: Built-in repair implementations a registry rule is allowed to select.
+#:
+#: The name is a key into the Python repair registry; YAML must never describe
+#: the transformation itself. ``validate_registry`` rejects unknown names.
+KNOWN_REPAIR_IMPLEMENTATIONS: frozenset[str] = frozenset({"tokenizer_string_precision"})
+
+#: Distribution names whose versions may appear in a ``constraints`` block.
+KNOWN_CONSTRAINT_KEYS: frozenset[str] = frozenset(
+    {
+        "openvino",
+        "openvino_genai",
+        "openvino_tokenizers",
+        "optimum",
+        "optimum_intel",
+        "nncf",
+        "transformers",
+        "torch",
+        "huggingface_hub",
+        "python",
+    }
+)
+
+_STRICT = ConfigDict(extra="forbid")
+_STRICT_ALIASED = ConfigDict(extra="forbid", populate_by_name=True)
+
+
+def _normalise_key(value: str) -> str:
+    """Canonicalise a package/constraint key (``optimum-intel`` -> ``optimum_intel``)."""
+    return value.strip().lower().replace("-", "_")
+
+
+def _casefold_all(values: Iterable[str]) -> list[str]:
+    """Casefold and de-duplicate a list of match tokens, preserving order."""
+    seen: list[str] = []
+    for value in values:
+        cleaned = value.strip().casefold()
+        if cleaned and cleaned not in seen:
+            seen.append(cleaned)
+    return seen
+
+
+class RuleStatus(str, Enum):
+    """Lifecycle status of a registry rule."""
+
+    ACTIVE = "active"
+    DEPRECATED = "deprecated"
+    EXPERIMENTAL = "experimental"
+
+    @property
+    def is_usable(self) -> bool:
+        """True when the rule may take part in resolution."""
+        return self is not RuleStatus.DEPRECATED
+
+
+class SourceKind(str, Enum):
+    """Kind of provenance backing a registry claim."""
+
+    OFFICIAL_DOCS = "official_docs"
+    UPSTREAM_ISSUE = "upstream_issue"
+    TESTED = "tested"
+    MODEL_CARD = "model_card"
+    COMMUNITY = "community"
+
+
+class TrustPolicy(str, Enum):
+    """How far a declared derivative source may be used without asking."""
+
+    SUGGEST = "suggest"
+    AUTO_IF_TRUSTED = "auto_if_trusted"
+    NEVER_AUTO = "never_auto"
+
+    @property
+    def requires_confirmation(self) -> bool:
+        """True when the user must approve before this source is used."""
+        return self is not TrustPolicy.AUTO_IF_TRUSTED
+
+
+class RepairSafety(str, Enum):
+    """How much approval a repair needs before it may touch artifact files."""
+
+    AUTOMATIC = "automatic"
+    CONFIRM = "confirm"
+    MANUAL = "manual"
+
+
+class SourceRef(BaseModel):
+    """One provenance entry backing a registry claim."""
+
+    model_config = _STRICT
+
+    kind: SourceKind
+    url: str | None = None
+    note: str | None = None
+
+    def as_mapping(self) -> dict[str, str]:
+        """Render as a flat string mapping for embedding in domain models."""
+        data: dict[str, str] = {"kind": self.kind.value}
+        if self.url is not None:
+            data["url"] = self.url
+        if self.note is not None:
+            data["note"] = self.note
+        return data
+
+    def as_evidence(self) -> SourceEvidence:
+        """Render as a :class:`~yonga.domain.models.SourceEvidence` entry."""
+        return SourceEvidence(kind=self.kind.value, url=self.url, note=self.note)
+
+
+class MatchOutcome(BaseModel):
+    """Result of evaluating one rule's match block against a subject."""
+
+    model_config = _STRICT
+
+    matched: bool
+    specificity: int = SPECIFICITY_GENERIC
+    reasons: list[str] = Field(default_factory=list)
+
+
+class MatchSubject(BaseModel):
+    """The facts a rule is matched against."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    repo_id: str | None = None
+    model_type: str | None = None
+    architectures: tuple[str, ...] = ()
+    task: str | None = None
+    device: str | None = None
+    host_tags: tuple[str, ...] = ()
+
+    @field_validator("device")
+    @classmethod
+    def _normalise_device_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return normalise_device(value) or None
+
+
+class RuleMatch(BaseModel):
+    """Criteria selecting the subjects a rule applies to.
+
+    See the module docstring for the OR/AND semantics. ``model_types`` and
+    ``architectures`` together form the single *identity* criterion.
+    """
+
+    model_config = _STRICT_ALIASED
+
+    repo_ids: list[str] = Field(default_factory=list)
+    model_types: list[str] = Field(default_factory=list)
+    architectures: list[str] = Field(default_factory=list)
+    tasks: list[str] = Field(default_factory=list)
+    devices: list[str] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("devices", "device"),
+    )
+    host_tags: list[str] = Field(default_factory=list)
+
+    @field_validator("devices", mode="before")
+    @classmethod
+    def _accept_single_device(cls, value: object) -> object:
+        """Allow ``device: npu`` as shorthand for ``devices: [npu]``."""
+        if isinstance(value, str):
+            return [value]
+        return value
+
+    @field_validator("devices")
+    @classmethod
+    def _normalise_devices(cls, value: list[str]) -> list[str]:
+        names: list[str] = []
+        for raw in value:
+            name = normalise_device(raw)
+            if name and name not in names:
+                names.append(name)
+        return names
+
+    @property
+    def identity_tokens(self) -> list[str]:
+        """Casefolded model types and architecture class names, combined."""
+        return _casefold_all([*self.model_types, *self.architectures])
+
+    @property
+    def is_generic(self) -> bool:
+        """True when the rule constrains nothing at all."""
+        return not (
+            self.repo_ids or self.model_types or self.architectures or self.tasks or self.host_tags
+        )
+
+    def static_specificity(self) -> int:
+        """Specificity this rule would score if it matched, ignoring the subject."""
+        if self.repo_ids:
+            return SPECIFICITY_REPO_ID
+        if self.model_types or self.architectures:
+            if self.devices or self.host_tags:
+                return SPECIFICITY_ARCHITECTURE_FAMILY
+            return SPECIFICITY_ARCHITECTURE
+        if self.tasks:
+            return SPECIFICITY_TASK
+        return SPECIFICITY_GENERIC
+
+    def evaluate(self, subject: MatchSubject) -> MatchOutcome:
+        """Evaluate this match block against ``subject``.
+
+        Returns a :class:`MatchOutcome` whose ``reasons`` explain the decision in
+        user-facing English, so ``registry explain`` can print it verbatim.
+        """
+        reasons: list[str] = []
+
+        if self.repo_ids:
+            wanted = _casefold_all(self.repo_ids)
+            actual = (subject.repo_id or "").strip().casefold()
+            if actual not in wanted:
+                return MatchOutcome(
+                    matched=False,
+                    specificity=self.static_specificity(),
+                    reasons=[f"repository {subject.repo_id or '<unknown>'} is not listed"],
+                )
+            reasons.append(f"repository {subject.repo_id} matches exactly")
+
+        identity = self.identity_tokens
+        if identity:
+            candidates = _casefold_all([subject.model_type or "", *subject.architectures])
+            hit = next((token for token in candidates if token in identity), None)
+            if hit is None:
+                described = subject.model_type or ", ".join(subject.architectures) or "<unknown>"
+                return MatchOutcome(
+                    matched=False,
+                    specificity=self.static_specificity(),
+                    reasons=[f"architecture/model type {described} is not listed"],
+                )
+            reasons.append(f"model identity {hit} is listed")
+
+        if self.tasks:
+            wanted_tasks = _casefold_all(self.tasks)
+            actual_task = (subject.task or "").strip().casefold()
+            if actual_task not in wanted_tasks:
+                return MatchOutcome(
+                    matched=False,
+                    specificity=self.static_specificity(),
+                    reasons=[f"task {subject.task or '<unknown>'} is not listed"],
+                )
+            reasons.append(f"task {subject.task} is listed")
+
+        if self.devices:
+            if subject.device is None or subject.device not in self.devices:
+                return MatchOutcome(
+                    matched=False,
+                    specificity=self.static_specificity(),
+                    reasons=[f"device {subject.device or '<unspecified>'} is not listed"],
+                )
+            reasons.append(f"device {subject.device} is listed")
+
+        if self.host_tags:
+            wanted_tags = set(_casefold_all(self.host_tags))
+            actual_tags = set(_casefold_all(subject.host_tags))
+            overlap = sorted(wanted_tags & actual_tags)
+            if not overlap:
+                return MatchOutcome(
+                    matched=False,
+                    specificity=self.static_specificity(),
+                    reasons=["host does not carry any of the required device tags"],
+                )
+            reasons.append(f"host tag {overlap[0]} is present")
+
+        if not reasons:
+            reasons.append("generic rule, no constraints")
+        return MatchOutcome(matched=True, specificity=self.static_specificity(), reasons=reasons)
+
+    def overlaps(self, other: RuleMatch) -> bool:
+        """True when both blocks could select the same subject.
+
+        Used by registry validation to detect genuinely ambiguous rule pairs
+        without having to enumerate every possible subject.
+        """
+        return (
+            _tokens_overlap(_casefold_all(self.repo_ids), _casefold_all(other.repo_ids))
+            and _tokens_overlap(self.identity_tokens, other.identity_tokens)
+            and _tokens_overlap(_casefold_all(self.tasks), _casefold_all(other.tasks))
+            and _tokens_overlap(self.devices, other.devices)
+            and _tokens_overlap(_casefold_all(self.host_tags), _casefold_all(other.host_tags))
+        )
+
+
+def _tokens_overlap(left: Sequence[str], right: Sequence[str]) -> bool:
+    """True when two criterion lists could both be satisfied by one subject."""
+    if not left or not right:
+        return True
+    return bool(set(left) & set(right))
+
+
+class DeviceSupport(BaseModel):
+    """What is known about running one architecture on one device class."""
+
+    model_config = _STRICT
+
+    status: DeviceStatus = DeviceStatus.UNKNOWN
+    evidence: EvidenceLevel = EvidenceLevel.UNKNOWN
+    constraints: dict[str, str] = Field(default_factory=dict)
+    reason: str | None = None
+    notes: list[str] = Field(default_factory=list)
+
+    @field_validator("constraints")
+    @classmethod
+    def _normalise_constraints(cls, value: dict[str, str]) -> dict[str, str]:
+        return {_normalise_key(key): str(spec).strip() for key, spec in value.items()}
+
+
+class ExportSpec(BaseModel):
+    """Exporter requirements and pipeline hints for an architecture."""
+
+    model_config = _STRICT
+
+    transformers: str | None = None
+    optimum_intel: str | None = None
+    openvino: str | None = None
+    nncf: str | None = None
+    task: str | None = None
+    pipeline: PipelineKind = PipelineKind.UNKNOWN
+    trust_remote_code: bool = False
+    extra_args: list[str] = Field(default_factory=list)
+
+    def specifiers(self) -> dict[str, str]:
+        """Return the non-empty version specifiers keyed by distribution name."""
+        pairs = (
+            ("transformers", self.transformers),
+            ("optimum_intel", self.optimum_intel),
+            ("openvino", self.openvino),
+            ("nncf", self.nncf),
+        )
+        return {name: spec for name, spec in pairs if spec}
+
+
+class BaseRule(BaseModel):
+    """Fields shared by every registry rule."""
+
+    model_config = _STRICT
+
+    #: Rule family, used in explanations and in :class:`Registry` indexes.
+    kind: ClassVar[str] = "rule"
+
+    id: str
+    schema_version: int = SCHEMA_VERSION
+    status: RuleStatus = RuleStatus.ACTIVE
+    summary: str = ""
+    sources: list[SourceRef] = Field(default_factory=list)
+    priority: int = 100
+    constraints: dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("id")
+    @classmethod
+    def _check_id(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("rule id must not be empty")
+        return cleaned
+
+    @field_validator("constraints")
+    @classmethod
+    def _normalise_constraints(cls, value: dict[str, str]) -> dict[str, str]:
+        return {_normalise_key(key): str(spec).strip() for key, spec in value.items()}
+
+    @property
+    def match_block(self) -> RuleMatch:
+        """The rule's match criteria; generic when the rule has none."""
+        return RuleMatch()
+
+    def source_mappings(self) -> list[dict[str, str]]:
+        """Provenance entries as flat string mappings."""
+        return [source.as_mapping() for source in self.sources]
+
+
+class ArchitectureRule(BaseRule):
+    """Device support, exporter requirements and defaults for an architecture."""
+
+    kind: ClassVar[str] = "architecture"
+
+    match: RuleMatch = Field(default_factory=RuleMatch)
+    export: ExportSpec = Field(default_factory=ExportSpec)
+    devices: dict[str, DeviceSupport] = Field(default_factory=dict)
+    recommended_device: str | None = None
+    profiles: dict[str, str] = Field(default_factory=dict)
+    chat_profile: str | None = None
+    known_limitations: list[str] = Field(default_factory=list)
+
+    @field_validator("devices")
+    @classmethod
+    def _normalise_device_keys(cls, value: dict[str, DeviceSupport]) -> dict[str, DeviceSupport]:
+        return {normalise_device(key): support for key, support in value.items()}
+
+    @field_validator("profiles")
+    @classmethod
+    def _normalise_profile_keys(cls, value: dict[str, str]) -> dict[str, str]:
+        return {normalise_device(key): profile_id.strip() for key, profile_id in value.items()}
+
+    @field_validator("recommended_device")
+    @classmethod
+    def _normalise_recommended(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return normalise_device(value) or None
+
+    @property
+    def match_block(self) -> RuleMatch:
+        """The rule's match criteria."""
+        return self.match
+
+    def device_support(self, device: str) -> DeviceSupport | None:
+        """Return the declared support entry for ``device``, if any."""
+        return self.devices.get(normalise_device(device))
+
+    def profile_id_for(self, device: str) -> str | None:
+        """Return the preferred profile id for ``device``, if the rule names one."""
+        return self.profiles.get(normalise_device(device))
+
+
+class ProfileRule(BaseRule):
+    """A conversion profile: quantization plus runtime properties for a device."""
+
+    kind: ClassVar[str] = "profile"
+
+    device: str
+    format: ModelFormat = ModelFormat.OPENVINO_IR
+    quantization: QuantizationSettings = Field(default_factory=QuantizationSettings)
+    runtime: dict[str, str] = Field(default_factory=dict)
+    export_extra_args: list[str] = Field(default_factory=list)
+    applies_to: RuleMatch = Field(default_factory=RuleMatch)
+    rationale: str | None = None
+
+    @field_validator("device")
+    @classmethod
+    def _normalise_device_name(cls, value: str) -> str:
+        name = normalise_device(value)
+        if not name:
+            raise ValueError("profile device must not be empty")
+        return name
+
+    @field_validator("runtime")
+    @classmethod
+    def _normalise_runtime(cls, value: dict[str, str]) -> dict[str, str]:
+        """Runtime property names are upper case in OpenVINO GenAI."""
+        return {key.strip().upper(): str(item) for key, item in value.items()}
+
+    @property
+    def match_block(self) -> RuleMatch:
+        """The rule's match criteria."""
+        return self.applies_to
+
+    def to_conversion_profile(self) -> ConversionProfile:
+        """Convert to the domain :class:`~yonga.domain.plans.ConversionProfile`."""
+        return ConversionProfile(
+            id=self.id,
+            device=self.device,
+            summary=self.summary,
+            quantization=self.quantization.model_copy(deep=True),
+            runtime_properties=dict(self.runtime),
+            export_extra_args=list(self.export_extra_args),
+            constraints=dict(self.constraints),
+            priority=self.priority,
+            rationale=self.rationale,
+            sources=self.source_mappings(),
+        )
+
+
+class IssueMatch(RuleMatch):
+    """Match criteria for a known failure signature."""
+
+    stages: list[str] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("stages", "stage"),
+    )
+    exception_contains: list[str] = Field(default_factory=list)
+    file_names: list[str] = Field(default_factory=list)
+    contains: str | None = None
+    case_sensitive: bool = False
+
+    @field_validator("stages", mode="before")
+    @classmethod
+    def _accept_single_stage(cls, value: object) -> object:
+        if isinstance(value, str):
+            return [value]
+        return value
+
+    @field_validator("stages")
+    @classmethod
+    def _normalise_stages(cls, value: list[str]) -> list[str]:
+        return _casefold_all(value)
+
+    def signature_hit(self, text: str) -> str | None:
+        """Return the longest signature found in ``text``, or ``None``."""
+        if not self.exception_contains:
+            return None
+        haystack = text if self.case_sensitive else text.casefold()
+        hits = [
+            needle
+            for needle in self.exception_contains
+            if (needle if self.case_sensitive else needle.casefold()) in haystack
+        ]
+        if not hits:
+            return None
+        return max(hits, key=len)
+
+    def stage_matches(self, stage: str | None) -> bool:
+        """True when this rule applies to ``stage`` (no ``stages`` means any)."""
+        if not self.stages:
+            return True
+        if stage is None:
+            return False
+        return stage.strip().casefold() in self.stages
+
+
+class IssueClassification(BaseModel):
+    """The diagnostic an issue rule produces."""
+
+    model_config = _STRICT
+
+    code: str
+    category: str
+    environment_broken: bool = False
+    retry_same_device: bool = False
+
+    @field_validator("code")
+    @classmethod
+    def _check_code(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("classification code must not be empty")
+        return cleaned
+
+    @field_validator("category")
+    @classmethod
+    def _check_category(cls, value: str) -> str:
+        return value.strip().lower()
+
+
+class IssueRecommendation(BaseModel):
+    """What the user should do about a classified failure."""
+
+    model_config = _STRICT
+
+    message: str | None = None
+    title: str | None = None
+    fallback_devices: list[str] = Field(default_factory=list)
+    remediation: list[str] = Field(default_factory=list)
+    repair: str | None = None
+
+    @field_validator("fallback_devices")
+    @classmethod
+    def _normalise_devices(cls, value: list[str]) -> list[str]:
+        names: list[str] = []
+        for raw in value:
+            name = normalise_device(raw)
+            if name and name not in names:
+                names.append(name)
+        return names
+
+
+class IssueRule(BaseRule):
+    """A known failure signature and its classification."""
+
+    kind: ClassVar[str] = "issue"
+
+    match: IssueMatch = Field(default_factory=IssueMatch)
+    classification: IssueClassification
+    recommendation: IssueRecommendation = Field(default_factory=IssueRecommendation)
+
+    @property
+    def match_block(self) -> RuleMatch:
+        """The rule's match criteria."""
+        return self.match
+
+
+class RepairMatch(BaseModel):
+    """File-level criteria selecting artifacts a repair applies to."""
+
+    model_config = _STRICT_ALIASED
+
+    files: list[str] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("files", "file_names"),
+    )
+    contains: str | None = None
+
+    def file_candidates(self, names: Iterable[str]) -> list[str]:
+        """Return the entries of ``names`` this repair would inspect."""
+        wanted = {name.strip() for name in self.files if name.strip()}
+        if not wanted:
+            return list(names)
+        return [name for name in names if name in wanted]
+
+
+class RepairAction(BaseModel):
+    """The built-in implementation a repair rule selects."""
+
+    model_config = _STRICT
+
+    implementation: str
+    safety: RepairSafety = RepairSafety.CONFIRM
+
+    @field_validator("implementation")
+    @classmethod
+    def _check_implementation(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("repair implementation must not be empty")
+        return cleaned
+
+
+class RepairValidation(BaseModel):
+    """Post-conditions that must hold once a repair has been applied."""
+
+    model_config = _STRICT
+
+    requires_tokenizer_read: bool = False
+    postconditions: list[str] = Field(default_factory=list)
+
+
+class RepairRule(BaseRule):
+    """A detectable artifact defect and the built-in repair that fixes it."""
+
+    kind: ClassVar[str] = "repair"
+
+    match: RepairMatch = Field(default_factory=RepairMatch)
+    repair: RepairAction
+    validation: RepairValidation = Field(default_factory=RepairValidation)
+
+    @property
+    def implementation(self) -> str:
+        """Key of the built-in Python repair implementation."""
+        return self.repair.implementation
+
+    @property
+    def safety(self) -> RepairSafety:
+        """How much approval this repair needs."""
+        return self.repair.safety
+
+
+class DerivativeCandidate(BaseModel):
+    """One alternative repository that can stand in for a requested model."""
+
+    model_config = _STRICT_ALIASED
+
+    repo_id: str
+    relationship: SourceRelationship = SourceRelationship.CONVERTED
+    trust: TrustPolicy = TrustPolicy.SUGGEST
+    revision: str | None = None
+    note: str | None = None
+    evidence: list[SourceRef] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("evidence", "sources"),
+    )
+
+    @property
+    def requires_confirmation(self) -> bool:
+        """True when the user must approve before this source may be used."""
+        return self.trust.requires_confirmation
+
+    def source_evidence(self) -> list[SourceEvidence]:
+        """Provenance as domain :class:`~yonga.domain.models.SourceEvidence` entries."""
+        return [item.as_evidence() for item in self.evidence]
+
+
+class DerivativeRule(BaseRule):
+    """Declared alternative sources for one requested repository."""
+
+    kind: ClassVar[str] = "derivative"
+
+    requested_repo: str
+    candidates: list[DerivativeCandidate] = Field(default_factory=list)
+
+    @field_validator("requested_repo")
+    @classmethod
+    def _check_requested_repo(cls, value: str) -> str:
+        cleaned = value.strip().strip("/")
+        if not cleaned:
+            raise ValueError("requested_repo must not be empty")
+        return cleaned
+
+    @property
+    def match_block(self) -> RuleMatch:
+        """Derivative rules are keyed by the requested repository id."""
+        return RuleMatch(repo_ids=[self.requested_repo])
+
+    def matches_repo(self, repo_id: str) -> bool:
+        """True when this rule declares sources for ``repo_id``."""
+        return repo_id.strip().casefold() == self.requested_repo.casefold()
+
+
+class ArtifactSpec(BaseModel):
+    """What a specific repository already contains."""
+
+    model_config = _STRICT
+
+    format: ModelFormat = ModelFormat.UNKNOWN
+    already_prepared: bool = False
+
+
+class ModelRule(BaseRule):
+    """Behaviour that genuinely differs from the model's architecture."""
+
+    kind: ClassVar[str] = "model"
+
+    match: RuleMatch = Field(default_factory=RuleMatch)
+    artifact: ArtifactSpec = Field(default_factory=ArtifactSpec)
+    devices: dict[str, DeviceSupport] = Field(default_factory=dict)
+    profiles: dict[str, str] = Field(default_factory=dict)
+    chat_profile: str | None = None
+    export: ExportSpec | None = None
+    notes: list[str] = Field(default_factory=list)
+
+    @field_validator("devices")
+    @classmethod
+    def _normalise_device_keys(cls, value: dict[str, DeviceSupport]) -> dict[str, DeviceSupport]:
+        return {normalise_device(key): support for key, support in value.items()}
+
+    @field_validator("profiles")
+    @classmethod
+    def _normalise_profile_keys(cls, value: dict[str, str]) -> dict[str, str]:
+        return {normalise_device(key): profile_id.strip() for key, profile_id in value.items()}
+
+    @property
+    def match_block(self) -> RuleMatch:
+        """The rule's match criteria."""
+        return self.match
+
+    def device_support(self, device: str) -> DeviceSupport | None:
+        """Return the declared support entry for ``device``, if any."""
+        return self.devices.get(normalise_device(device))
+
+    def profile_id_for(self, device: str) -> str | None:
+        """Return the preferred profile id for ``device``, if the rule names one."""
+        return self.profiles.get(normalise_device(device))
+
+
+class GenerationDefaults(BaseModel):
+    """Sampling defaults suggested for a model family."""
+
+    model_config = _STRICT
+
+    temperature: float | None = None
+    top_p: float | None = None
+    top_k: int | None = None
+    max_new_tokens: int | None = None
+    repetition_penalty: float | None = None
+    do_sample: bool | None = None
+
+    def merged(self, other: GenerationDefaults) -> GenerationDefaults:
+        """Return a copy where every field explicitly set on ``other`` wins."""
+        data = self.model_dump()
+        for name in other.model_fields_set:
+            data[name] = getattr(other, name)
+        return GenerationDefaults.model_validate(data)
+
+    def as_mapping(self) -> dict[str, float | int | bool]:
+        """Return only the fields that carry a value."""
+        data: dict[str, float | int | bool] = {}
+        for name, value in self.model_dump().items():
+            if value is not None:
+                data[name] = value
+        return data
+
+
+class ChatProfileRule(BaseRule):
+    """Chat-template and generation policy for a model family."""
+
+    kind: ClassVar[str] = "chat"
+
+    match: RuleMatch = Field(default_factory=RuleMatch)
+    supports_thinking_flag: bool = False
+    thinking_template_variable: str | None = None
+    default_thinking: bool = False
+    reasoning_wrappers: list[tuple[str, str]] = Field(default_factory=list)
+    defaults: GenerationDefaults = Field(default_factory=GenerationDefaults)
+    thinking_defaults: GenerationDefaults = Field(default_factory=GenerationDefaults)
+    stop_strings: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _check_thinking_variable(self) -> ChatProfileRule:
+        """A thinking flag is useless without the template variable that drives it."""
+        if self.supports_thinking_flag and not self.thinking_template_variable:
+            raise ValueError("supports_thinking_flag requires thinking_template_variable")
+        return self
+
+    @property
+    def match_block(self) -> RuleMatch:
+        """The rule's match criteria."""
+        return self.match
+
+    def defaults_for(self, *, thinking: bool) -> GenerationDefaults:
+        """Return the generation defaults for thinking or non-thinking mode."""
+        if thinking:
+            return self.defaults.merged(self.thinking_defaults)
+        return self.defaults.model_copy(deep=True)
+
+    def template_context(self, *, thinking: bool | None = None) -> dict[str, bool]:
+        """Chat-template variables that drive thinking mode, if this family has one."""
+        if not self.supports_thinking_flag or self.thinking_template_variable is None:
+            return {}
+        enabled = self.default_thinking if thinking is None else thinking
+        return {self.thinking_template_variable: enabled}
+
+
+#: Any concrete registry rule.
+AnyRule = (
+    ArchitectureRule
+    | ProfileRule
+    | IssueRule
+    | RepairRule
+    | DerivativeRule
+    | ModelRule
+    | ChatProfileRule
+)
+
+
+class RegistryDocument(BaseModel):
+    """One parsed registry YAML file, before merging."""
+
+    model_config = _STRICT_ALIASED
+
+    schema_version: int = SCHEMA_VERSION
+    origin: str = "<memory>"
+    architectures: list[ArchitectureRule] = Field(default_factory=list)
+    profiles: list[ProfileRule] = Field(default_factory=list)
+    issues: list[IssueRule] = Field(default_factory=list)
+    repairs: list[RepairRule] = Field(default_factory=list)
+    derivatives: list[DerivativeRule] = Field(default_factory=list)
+    models: list[ModelRule] = Field(default_factory=list)
+    chat: list[ChatProfileRule] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("chat", "chat_profiles"),
+    )
+
+    def rules(self) -> list[AnyRule]:
+        """Every rule in this document, in section order."""
+        collected: list[AnyRule] = []
+        collected.extend(self.architectures)
+        collected.extend(self.profiles)
+        collected.extend(self.issues)
+        collected.extend(self.repairs)
+        collected.extend(self.derivatives)
+        collected.extend(self.models)
+        collected.extend(self.chat)
+        return collected
+
+
+class Registry(BaseModel):
+    """The merged, indexed registry used by the resolver."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: int = SCHEMA_VERSION
+    architectures: list[ArchitectureRule] = Field(default_factory=list)
+    profiles: list[ProfileRule] = Field(default_factory=list)
+    issues: list[IssueRule] = Field(default_factory=list)
+    repairs: list[RepairRule] = Field(default_factory=list)
+    derivatives: list[DerivativeRule] = Field(default_factory=list)
+    models: list[ModelRule] = Field(default_factory=list)
+    chat: list[ChatProfileRule] = Field(default_factory=list)
+    #: Rule id -> human readable origin of the layer that supplied it.
+    origins: dict[str, str] = Field(default_factory=dict)
+    #: Human readable origins of every layer that was merged, in order.
+    layers: list[str] = Field(default_factory=list)
+
+    _index: dict[str, AnyRule] = PrivateAttr(default_factory=dict)
+
+    def model_post_init(self, _context: Any, /) -> None:
+        """Build the by-id index once the model is constructed."""
+        index: dict[str, AnyRule] = {}
+        for rule in self.all_rules():
+            index[rule.id] = rule
+        self._index = index
+
+    def all_rules(self) -> list[AnyRule]:
+        """Every rule of every kind, grouped by kind in a stable order."""
+        collected: list[AnyRule] = []
+        collected.extend(self.architectures)
+        collected.extend(self.profiles)
+        collected.extend(self.issues)
+        collected.extend(self.repairs)
+        collected.extend(self.derivatives)
+        collected.extend(self.models)
+        collected.extend(self.chat)
+        return collected
+
+    @property
+    def rule_ids(self) -> list[str]:
+        """Ids of every rule, in registry order."""
+        return [rule.id for rule in self.all_rules()]
+
+    def rule(self, rule_id: str) -> AnyRule | None:
+        """Look up any rule by id."""
+        return self._index.get(rule_id)
+
+    def origin_of(self, rule_id: str) -> str | None:
+        """Return the layer a rule came from, for explanations and debugging."""
+        return self.origins.get(rule_id)
+
+    def architecture(self, rule_id: str) -> ArchitectureRule | None:
+        """Look up an architecture rule by id."""
+        found = self._index.get(rule_id)
+        return found if isinstance(found, ArchitectureRule) else None
+
+    def profile(self, rule_id: str) -> ProfileRule | None:
+        """Look up a profile rule by id."""
+        found = self._index.get(rule_id)
+        return found if isinstance(found, ProfileRule) else None
+
+    def issue(self, rule_id: str) -> IssueRule | None:
+        """Look up an issue rule by id."""
+        found = self._index.get(rule_id)
+        return found if isinstance(found, IssueRule) else None
+
+    def repair(self, rule_id: str) -> RepairRule | None:
+        """Look up a repair rule by id."""
+        found = self._index.get(rule_id)
+        return found if isinstance(found, RepairRule) else None
+
+    def derivative(self, rule_id: str) -> DerivativeRule | None:
+        """Look up a derivative rule by id."""
+        found = self._index.get(rule_id)
+        return found if isinstance(found, DerivativeRule) else None
+
+    def model_rule(self, rule_id: str) -> ModelRule | None:
+        """Look up an exact-model rule by id."""
+        found = self._index.get(rule_id)
+        return found if isinstance(found, ModelRule) else None
+
+    def chat_profile(self, rule_id: str) -> ChatProfileRule | None:
+        """Look up a chat profile rule by id."""
+        found = self._index.get(rule_id)
+        return found if isinstance(found, ChatProfileRule) else None
+
+    def profiles_for_device(self, device: str) -> list[ProfileRule]:
+        """Return every profile rule targeting ``device``."""
+        wanted = normalise_device(device)
+        return [rule for rule in self.profiles if rule.device == wanted]
+
+    def derivatives_for(self, repo_id: str) -> list[DerivativeRule]:
+        """Return every derivative rule declared for ``repo_id``."""
+        return [rule for rule in self.derivatives if rule.matches_repo(repo_id)]
+
+    def counts(self) -> dict[str, int]:
+        """Number of rules per kind, for ``yonga registry validate`` output."""
+        return {
+            "architectures": len(self.architectures),
+            "profiles": len(self.profiles),
+            "issues": len(self.issues),
+            "repairs": len(self.repairs),
+            "derivatives": len(self.derivatives),
+            "models": len(self.models),
+            "chat": len(self.chat),
+        }
+
+
+def subject_from_metadata(
+    metadata: object,
+    *,
+    device: str | None = None,
+    host_tags: Sequence[str] = (),
+) -> MatchSubject:
+    """Build a :class:`MatchSubject` from a ``ModelMetadata``-like object.
+
+    Accepts anything exposing ``identity``/``model_type``/``architectures``/
+    ``task`` attributes, and tolerates ``None`` so classification still works
+    when no metadata was gathered.
+    """
+    repo_id: str | None = None
+    model_type: str | None = None
+    architectures: tuple[str, ...] = ()
+    task: str | None = None
+    if metadata is not None:
+        identity = getattr(metadata, "identity", None)
+        raw_repo = getattr(identity, "repo_id", None)
+        if isinstance(raw_repo, str):
+            repo_id = raw_repo
+        raw_type = getattr(metadata, "model_type", None)
+        if isinstance(raw_type, str):
+            model_type = raw_type
+        raw_architectures = getattr(metadata, "architectures", None)
+        if isinstance(raw_architectures, Sequence) and not isinstance(raw_architectures, str):
+            architectures = tuple(item for item in raw_architectures if isinstance(item, str))
+        raw_task = getattr(metadata, "task", None)
+        if isinstance(raw_task, str):
+            task = raw_task
+    return MatchSubject(
+        repo_id=repo_id,
+        model_type=model_type,
+        architectures=architectures,
+        task=task,
+        device=device,
+        host_tags=tuple(host_tags),
+    )
+
+
+def constraint_problems(constraints: Mapping[str, str]) -> list[str]:
+    """Return human-readable problems with a ``constraints`` block."""
+    problems: list[str] = []
+    for key, specifier in constraints.items():
+        if key not in KNOWN_CONSTRAINT_KEYS:
+            problems.append(f"unknown constraint key {key!r}")
+        try:
+            SpecifierSet(specifier.strip())
+        except InvalidSpecifier:
+            problems.append(f"unparsable version specifier {specifier!r} for {key!r}")
+    return problems
