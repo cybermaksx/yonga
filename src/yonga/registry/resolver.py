@@ -5,8 +5,14 @@ Every decision this module makes is reproducible and auditable:
 * Version constraints are applied as a *filter before* scoring, and a rule they
   reject is still reported as a rejected candidate carrying its reason.
 * Surviving rules are ranked on the specificity ladder (exact repository id 100,
-  architecture plus host/device family 80, architecture 60, task 40, generic 20);
-  a tie is broken by the rule's ``priority``.
+  architecture plus host/device family 80, architecture 60, architecture reached
+  through an identity alias 50, task 40, generic 20); a tie is broken by the
+  rule's ``priority``. The alias rung sits below every declared-identity rung so
+  a rule that recognises the model type a repository actually declares always
+  beats one identified from a hint found outside ``config.json``. A hint is
+  consulted only when the repository declares no identity at all: a declaration
+  a rule does not list is a rejection, so a contradicting GGUF header resolves
+  to "unknown" rather than to another architecture's rule.
 * A tie that ``priority`` cannot break is a registry authoring bug and raises
   :class:`~yonga.domain.diagnostics.RegistryError` rather than silently picking
   by load order.
@@ -43,6 +49,7 @@ from yonga.domain.diagnostics import (
 from yonga.domain.hardware import normalise_device
 from yonga.domain.plans import ConversionProfile
 from yonga.registry.schema import (
+    IDENTITY_HINT_SOURCE,
     AnyRule,
     ArchitectureRule,
     BaseRule,
@@ -479,6 +486,7 @@ class RegistryResolver:
             explanation.notes.append("No architecture rule matched; runtime probing decides.")
         else:
             explanation.winner_id = winner.id
+            _note_identity_hint(winner, subject, explanation)
         return winner, explanation
 
     def resolve_model_rule(
@@ -1176,6 +1184,31 @@ class RegistryResolver:
             recommended_device=recommended,
             notes=notes,
         )
+
+
+def _note_identity_hint(
+    rule: ArchitectureRule,
+    subject: MatchSubject,
+    explanation: ResolutionExplanation,
+) -> None:
+    """Say so when the winning rule was reached through an identity hint.
+
+    A hint only ever identifies a repository that declares nothing of its own,
+    so the note can state that: it never reports a header overriding a
+    ``config.json``, because that never happens.
+
+    The rule's match block is re-evaluated rather than threaded back out of
+    :meth:`RegistryResolver._evaluate`, which keeps that helper's signature
+    shared by every rule kind. Evaluation is pure and deterministic, and only
+    the winner is re-checked, so this cannot disagree with the ranking.
+    """
+    outcome = rule.match_block.evaluate(subject)
+    if outcome.alias_hint is None:
+        return
+    explanation.notes.append(
+        f"Architecture identified from {IDENTITY_HINT_SOURCE} "
+        f"(alias {outcome.alias_hint!r}); this repository has no config.json."
+    )
 
 
 def _contents_match(

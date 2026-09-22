@@ -48,6 +48,7 @@ schema_version: 1
 match:
   architectures: [Qwen3_5ForConditionalGeneration, Qwen3_5ForCausalLM]
   model_types: [qwen3_5]
+  aliases: [qwen35]
 export:
   transformers: "==5.2.*"
   pipeline: vlm
@@ -74,6 +75,14 @@ Status values:
 - `unsupported` — known incompatible;
 - `experimental` — works under restricted conditions;
 - `unknown` — no reliable knowledge.
+
+`aliases` lists spellings the architecture is known by outside `config.json`. It exists for repositories that declare no identity of their own: a GGUF-only repository ships no `config.json`, so `model_types` and `architectures` can never match it, and without an alias every device is reported `unknown`.
+
+An alias is compared only against *identity hints*, and the only hint is the `architecture` string in the GGUF header the Hub reports — a value read out of the weight file itself. It is never compared against `model_types` or `architectures`, so an alias cannot widen what a declared identity matches. Hints are consulted only when the repository declares no identity at all — an empty `model_type` and an empty `architectures` list. A header is evidence in the *absence* of a `config.json`, never a correction of one, so a repository that declares an identity no rule lists resolves to nothing rather than to whatever its header names.
+
+Repository tags are deliberately never used as hints. A tag such as `qwen3.5` or `qwen` is free-form text an uploader typed; identifying a model from it would be exactly the "do not infer that a similarly named repository is equivalent" inference `SPEC.md` section 8.1 forbids. A tag may well be true, but it is not evidence.
+
+A rule reached through an alias scores below every rule that matched a declared identity; see section 11.
 
 ## 5. Profile rule
 
@@ -200,8 +209,11 @@ Specificity score order:
 1. exact repo ID;
 2. architecture + host family;
 3. architecture;
-4. task + host family;
-5. generic device profile.
+4. architecture reached through an identity alias (section 4);
+5. task + host family;
+6. generic device profile.
+
+Rung 4 sits below every declared-identity rung on purpose: a rule that recognises the `model_type` a repository actually publishes must always beat one that had to fall back on a hint found outside `config.json`, whatever the two rules' priorities say.
 
 Then apply version constraints and explicit `priority`.
 

@@ -22,7 +22,12 @@ import pytest
 
 from tests.support import find_broken_artifact
 from yonga.adapters.openvino_probe import OpenVINOProbe, openvino_available
-from yonga.adapters.runtime_genai import ChatHistory, ChatProfile, open_runtime
+from yonga.adapters.runtime_genai import (
+    ChatHistory,
+    ChatProfile,
+    GenAIChatRuntime,
+    open_runtime,
+)
 from yonga.config.settings import Settings
 from yonga.domain.artifacts import ProbeStatus, SubmodelRole
 from yonga.domain.benchmarks import GenerationSettings
@@ -204,7 +209,7 @@ def test_unrepaired_tokenizer_fails_with_the_string_precision_defect(broken_arti
     assert STRING_PRECISION_SIGNATURE in (result.message or "")
     # The source fixture must still be exactly as the exporter wrote it.
     assert 'precision="STRiNG"' in (
-        (UNREPAIRED_FIXTURE / "openvino_tokenizer.xml").read_text(encoding="utf-8")
+        (_require(UNREPAIRED_FIXTURE) / "openvino_tokenizer.xml").read_text(encoding="utf-8")
     )
 
 
@@ -219,6 +224,7 @@ def test_generation_produces_text_and_metrics(artifact, settings):
         chat_profile=ChatProfile(supports_thinking_flag=True, default_thinking=False),
         settings=settings,
     )
+    assert isinstance(runtime, GenAIChatRuntime)
     try:
         assert runtime.properties["CACHE_DIR"].startswith(str(settings.paths.compile_cache_dir))
 

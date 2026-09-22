@@ -727,3 +727,44 @@ def test_generic_profile_rules_keep_the_generic_specificity():
     _profile, explanation = resolver.resolve_profile(device="gpu")
     specificities = {candidate.specificity for candidate in explanation.candidates}
     assert specificities == {SPECIFICITY_GENERIC}
+
+
+def test_a_gguf_only_repository_is_identified_through_its_alias():
+    """The reference repository has no config.json; the GGUF header identifies it."""
+    resolver = builtin_resolver()
+    metadata = ModelMetadata(
+        identity=ModelIdentity(repo_id="HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive"),
+        tags=["gguf", "qwen3.5", "qwen"],
+        gguf_metadata={"architecture": "qwen35", "context_length": 262144},
+    )
+    rule, explanation = resolver.resolve_architecture(metadata)
+    assert rule is not None
+    assert rule.id == "arch-qwen3_5"
+    assert any("GGUF metadata" in note for note in explanation.notes)
+
+
+def test_an_alias_match_scores_below_a_declared_model_type():
+    """A rule that recognises the declared identity always outranks an alias match."""
+    resolver = resolver_for(
+        """
+        architectures:
+          - id: arch-declared
+            priority: 1
+            match:
+              model_types: [qwen3_5]
+          - id: arch-aliased
+            priority: 100
+            match:
+              aliases: [qwen35]
+        """
+    )
+    metadata = ModelMetadata(
+        identity=ModelIdentity(repo_id="owner/model"),
+        model_type="qwen3_5",
+        gguf_metadata={"architecture": "qwen35"},
+    )
+    rule, explanation = resolver.resolve_architecture(metadata)
+    assert rule is not None
+    assert rule.id == "arch-declared"
+    scored = {candidate.rule_id: candidate for candidate in explanation.candidates}
+    assert scored["arch-aliased"].specificity < scored["arch-declared"].specificity

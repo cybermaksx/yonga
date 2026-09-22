@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import math
 import types
+from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -37,7 +39,7 @@ from yonga.domain.models import PipelineKind
 class MeanStd:
     """Stand-in for ``openvino_genai.MeanStdPair``."""
 
-    def __init__(self, mean, std=0.0):
+    def __init__(self, mean: Any, std: Any = 0.0) -> None:
         self.mean = mean
         self.std = std
 
@@ -66,12 +68,17 @@ class FakePerfMetrics:
 
 
 class FakeFinishReason:
-    def __init__(self, name):
+    def __init__(self, name: str) -> None:
         self.name = name
 
 
 class FakeResults:
-    def __init__(self, text="hello there", reason="LENGTH", perf_metrics=None):
+    def __init__(
+        self,
+        text: str = "hello there",
+        reason: str = "LENGTH",
+        perf_metrics: Any = None,
+    ) -> None:
         self.texts = [text]
         self.finish_reasons = [FakeFinishReason(reason)]
         self.perf_metrics = perf_metrics
@@ -108,14 +115,14 @@ class FakeChatHistory:
 
 
 class FakePipeline:
-    def __init__(self, module, kind, path, device, properties):
+    def __init__(self, module: Any, kind: Any, path: Any, device: Any, properties: Any) -> None:
         self.module = module
         self.kind = kind
         self.path = path
         self.device = device
         self.properties = properties
-        self.generate_calls = []
-        self.chat_events = []
+        self.generate_calls: list[tuple[Any, ...]] = []
+        self.chat_events: list[tuple[str, Any]] = []
 
     def generate(self, *args, **kwargs):
         self.generate_calls.append((args, kwargs))
@@ -133,15 +140,15 @@ class FakePipeline:
 class FakeGenAI:
     """A scriptable ``openvino_genai`` module."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.ChatHistory = FakeChatHistory
         self.GenerationConfig = FakeGenerationConfig
-        self.pipelines = []
-        self.load_error = None
-        self.generate_error = None
+        self.pipelines: list[FakePipeline] = []
+        self.load_error: BaseException | None = None
+        self.generate_error: BaseException | None = None
         self.result = FakeResults(perf_metrics=FakePerfMetrics())
 
-    def _make(self, kind, path, device, properties):
+    def _make(self, kind: Any, path: Any, device: Any, properties: Any) -> FakePipeline:
         if self.load_error is not None:
             raise self.load_error
         pipeline = FakePipeline(self, kind, path, device, properties)
@@ -191,7 +198,7 @@ def artifact(tmp_path):
     return directory
 
 
-def make_runtime(artifact, settings, **kwargs):
+def make_runtime(artifact: Path, settings: Settings, **kwargs: Any) -> GenAIChatRuntime:
     runtime = open_runtime(artifact, settings=settings, **kwargs)
     assert isinstance(runtime, GenAIChatRuntime)
     return runtime
@@ -217,7 +224,7 @@ def test_chat_history_helpers():
 
 def test_chat_message_rejects_an_unknown_role():
     with pytest.raises(ValueError, match="role"):
-        ChatMessage(role="tool", content="x")
+        ChatMessage(role=cast(Any, "tool"), content="x")
 
 
 # --- chat profile ---------------------------------------------------------------------

@@ -9,6 +9,7 @@ import pytest
 
 from yonga.config.paths import Paths
 from yonga.domain.diagnostics import FailureCategory, RegistryError
+from yonga.domain.models import ModelIdentity, ModelMetadata
 from yonga.registry.loader import (
     BUILTIN_FILENAMES,
     KNOWN_REPAIR_IMPLEMENTATIONS,
@@ -21,6 +22,7 @@ from yonga.registry.loader import (
     registry_override_dirs,
     validate_registry,
 )
+from yonga.registry.resolver import RegistryResolver
 from yonga.registry.schema import Registry
 
 PROFILE_DOCUMENT = textwrap.dedent(
@@ -532,4 +534,82 @@ def test_validate_ignores_deprecated_rules_in_conflict_detection():
             summary: replaced by gpu-a
         """
     )
+    assert validate_registry(registry) == []
+
+
+def test_validate_detects_a_conflict_only_reachable_through_the_alias_rung():
+    """A rule pair that ties only after the alias demotion is still ambiguous.
+
+    ``arch-qwen3_5`` statically scores 60 but resolves at the alias rung (50)
+    whenever a GGUF header identified it, which is exactly where
+    ``arch-alias-only`` also scores. Validation has to compare every rung a rule
+    can resolve at, or ``yonga registry validate`` certifies a registry that
+    raises ``registry.ambiguous_rules`` during ``yonga inspect``.
+    """
+    registry = registry_from(
+        """
+        architectures:
+          - id: arch-qwen3_5
+            priority: 100
+            match:
+              model_types: [qwen3_5]
+              aliases: [qwen35]
+          - id: arch-alias-only
+            priority: 100
+            match:
+              aliases: [qwen35]
+        """
+    )
+
+    problems = validate_registry(registry)
+
+    assert any("'arch-qwen3_5' and 'arch-alias-only'" in item for item in problems)
+    assert any("resolution would be ambiguous" in item for item in problems)
+
+
+def test_the_alias_rung_conflict_really_does_raise_at_resolution_time():
+    """The pair validation now flags is exactly the pair that blows up in ``inspect``."""
+    registry = registry_from(
+        """
+        architectures:
+          - id: arch-qwen3_5
+            priority: 100
+            match:
+              model_types: [qwen3_5]
+              aliases: [qwen35]
+          - id: arch-alias-only
+            priority: 100
+            match:
+              aliases: [qwen35]
+        """
+    )
+    metadata = ModelMetadata(
+        identity=ModelIdentity(repo_id="owner/gguf-only"),
+        gguf_metadata={"architecture": "qwen35"},
+    )
+
+    assert validate_registry(registry) != []
+    with pytest.raises(RegistryError) as excinfo:
+        RegistryResolver(registry).resolve_architecture(metadata)
+    assert excinfo.value.diagnostic.code == "registry.ambiguous_rules"
+
+
+def test_validate_accepts_alias_rules_for_different_architectures():
+    """Two alias-bearing rules at one priority are fine when no subject fits both."""
+    registry = registry_from(
+        """
+        architectures:
+          - id: arch-llama
+            priority: 100
+            match:
+              model_types: [llama]
+              aliases: [llamacpp]
+          - id: arch-gemma3
+            priority: 100
+            match:
+              model_types: [gemma3]
+              aliases: [gemma]
+        """
+    )
+
     assert validate_registry(registry) == []

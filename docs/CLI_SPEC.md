@@ -94,9 +94,10 @@ License     apache-2.0
 Task        image-text-to-text
 Architecture qwen3_5
 Formats     GGUF
-Size        ~18.8 GiB total weights
+Size        ~16.7 GiB (one model; 38.5 GiB across 5 files in the repository)
 
 Compatibility on this host
+  Architecture identified from GGUF metadata; this repository has no config.json.
   NPU   known unsupported / current compiler rule
   GPU   supported/test candidate
   CPU   supported/test candidate
@@ -106,6 +107,10 @@ Preparation
   Safetensors source: no
   Known derivative: nDimensional/... (approval required)
 ```
+
+`Size` states one model first, because a GGUF repository publishes several interchangeable quantizations of the same weights and summing them overstates the download several-fold; the repository total follows, qualified by how many files it spans.
+
+When the architecture was identified from an identity hint instead of from `config.json` (`REGISTRY_SPEC.md` section 4), the default output says so beside the compatibility block, because every claim in that block rests on that identification. Which alias matched is a `--verbose` detail.
 
 No multi-GB download.
 

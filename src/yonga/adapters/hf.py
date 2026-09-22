@@ -101,6 +101,25 @@ MAX_METADATA_FILE_BYTES: Final[int] = 8 * 1024 * 1024
 GGUF_METADATA_MAX_VALUE_CHARS: Final[int] = 512
 """GGUF metadata values longer than this (chat templates) are recorded as elided."""
 
+GGUF_TOTAL_FILE_SIZE_KEY: Final[str] = "totalFileSize"
+"""Hub GGUF metadata key holding the byte size of the repository's primary model file.
+
+The Hub parses the repository's GGUF headers itself and reports the size of the
+one model it considers the repository's subject, which is exactly the
+``primary_bytes`` question. It is preferred over any local guess.
+"""
+
+GGUF_COMPANION_PREFIXES: Final[tuple[str, ...]] = ("mmproj",)
+"""Filename prefixes marking a ``.gguf`` side-car that is not a runnable model.
+
+HEURISTIC: this is a filename convention, not a fact carried in the file
+listing. ``llama.cpp`` tooling names the multimodal projector that accompanies a
+vision model ``mmproj-<model>.gguf``, and nothing in the Hub's file inventory
+distinguishes it from a model file without downloading and parsing the header.
+Getting this wrong only degrades a fallback estimate, never the figure the Hub
+itself reported through :data:`GGUF_TOTAL_FILE_SIZE_KEY`.
+"""
+
 PROGRESS_MIN_INTERVAL_SECONDS: Final[float] = 0.2
 """Minimum wall-clock gap between two download progress events."""
 
@@ -453,6 +472,48 @@ def _total_bytes(files: Sequence[RepoFile]) -> tuple[int, int]:
     return total, unknown
 
 
+def _is_gguf_companion(entry: RepoFile) -> bool:
+    """True when a ``.gguf`` file is a side-car rather than a runnable model.
+
+    A filename-convention heuristic, never a format guarantee: see
+    :data:`GGUF_COMPANION_PREFIXES`. Two details of the comparison are
+    deliberate and are pinned by tests.
+
+    * It case-folds and reads the *base name*, so neither ``MMPROJ-x.gguf`` nor
+      ``sub/mmproj-x.gguf`` can slip past it.
+    * Only a **prefix** counts. ``model-mmproj-ish.gguf`` is treated as a
+      runnable model, because ``llama.cpp`` puts the marker first and a
+      substring test would quietly swallow legitimately named models.
+    """
+    name = entry.name.casefold()
+    return any(name.startswith(prefix.casefold()) for prefix in GGUF_COMPANION_PREFIXES)
+
+
+def _gguf_primary_bytes(files: Sequence[RepoFile], declared_total: int | None) -> int:
+    """Return the bytes of the single GGUF model a user would actually run.
+
+    A GGUF repository conventionally publishes one file per quantization of the
+    *same* model, so summing them answers the wrong question. Preference order:
+
+    1. the size the Hub derived from the repository's GGUF headers
+       (:data:`GGUF_TOTAL_FILE_SIZE_KEY`), when it is a positive integer;
+    2. otherwise the largest single ``.gguf`` file that is not a companion — the
+       unquantized copy is the largest, and picking the largest keeps the
+       estimate conservative rather than optimistic.
+
+    ``0`` means "unknown" and is returned whenever no non-companion file has a
+    known size. That covers the repository holding nothing but companions: it
+    publishes no runnable model, so answering with a companion's size would
+    hand callers the size of the one file this module just classified as not
+    runnable. Callers treat ``0`` as unknown and fall back to their own floor
+    (the temp estimate reserves ``temp_min_bytes`` regardless).
+    """
+    if declared_total is not None and declared_total > 0:
+        return declared_total
+    models = [entry for entry in files if not _is_gguf_companion(entry)]
+    return max((entry.size or 0 for entry in models), default=0)
+
+
 def _size_note(unknown: int) -> list[str]:
     """Return a note when the Hub did not report every file size."""
     if unknown <= 0:
@@ -530,6 +591,7 @@ def detect_formats(
     files: Sequence[RepoFile],
     *,
     shard_indexes: Mapping[str, Sequence[str]] | None = None,
+    gguf_total_file_size: int | None = None,
 ) -> list[FormatObservation]:
     """Classify a repository's file inventory into weight-format observations.
 
@@ -549,8 +611,17 @@ def detect_formats(
     stays pure and unit-testable.
 
     Index documents are listed in the observation's notes but excluded from
-    ``files``/``total_bytes``, so ``total_bytes`` is exactly the weight payload a
-    conversion would read.
+    ``files``/``total_bytes``, so ``total_bytes`` is exactly the weight payload
+    the repository publishes in that format.
+
+    Each observation also carries ``primary_bytes``: the size of *one* usable
+    model. For OpenVINO IR, safetensors and PyTorch checkpoints every listed
+    file belongs to that one model — a four-shard safetensors model genuinely
+    needs all four shards — so the two counters are equal. Only GGUF, which
+    conventionally publishes one file per quantization of the same model,
+    distinguishes them; ``gguf_total_file_size`` carries the Hub's own figure
+    for that repository's primary model file when it reported one (see
+    :func:`_gguf_primary_bytes`).
     """
     observations: list[FormatObservation] = []
     by_path = {entry.path: entry for entry in files}
@@ -584,6 +655,8 @@ def detect_formats(
                 format=ModelFormat.OPENVINO_IR,
                 files=sorted(entry.path for entry in ir_files),
                 total_bytes=total,
+                # Every submodel XML/BIN pair belongs to the one exported model.
+                primary_bytes=total,
                 complete=not missing,
                 notes=notes,
             )
@@ -606,6 +679,8 @@ def detect_formats(
                 format=ModelFormat.SAFETENSORS,
                 files=sorted(entry.path for entry in safetensors),
                 total_bytes=total,
+                # Sharded weights are one model: every shard must be downloaded.
+                primary_bytes=total,
                 complete=complete,
                 notes=notes,
             )
@@ -630,6 +705,8 @@ def detect_formats(
                 format=ModelFormat.PYTORCH_BIN,
                 files=sorted(entry.path for entry in torch_bins),
                 total_bytes=total,
+                # As with safetensors, a sharded checkpoint is a single model.
+                primary_bytes=total,
                 complete=complete,
                 notes=notes,
             )
@@ -639,11 +716,24 @@ def detect_formats(
     ggufs = [entry for entry in files if entry.suffix == GGUF_SUFFIX]
     if ggufs:
         total, unknown = _total_bytes(ggufs)
+        primary = _gguf_primary_bytes(ggufs, gguf_total_file_size)
         notes = [
             f"{len(ggufs)} self-contained GGUF file(s); the byte total covers every "
             "quantization published in this repository, not one runnable variant."
         ]
-        projectors = sorted(entry.name for entry in ggufs if entry.name.startswith("mmproj"))
+        if gguf_total_file_size is not None and gguf_total_file_size > 0:
+            notes.append(f"One runnable model is {primary} byte(s), per the Hub's GGUF metadata.")
+        elif primary <= 0 < total:
+            notes.append(
+                "The size of one runnable model is unknown: no GGUF file here is "
+                "both a model (rather than a companion) and sized by the Hub."
+            )
+        elif primary < total:
+            notes.append(
+                f"One runnable model is estimated at {primary} byte(s): "
+                "the largest non-companion GGUF file."
+            )
+        projectors = sorted(entry.name for entry in ggufs if _is_gguf_companion(entry))
         if projectors:
             notes.append(f"Multimodal projector file(s) present: {', '.join(projectors)}.")
         notes.extend(_size_note(unknown))
@@ -652,6 +742,7 @@ def detect_formats(
                 format=ModelFormat.GGUF,
                 files=sorted(entry.path for entry in ggufs),
                 total_bytes=total,
+                primary_bytes=primary,
                 complete=True,
                 notes=notes,
             )
@@ -1079,11 +1170,17 @@ class HuggingFaceAdapter:
         if resolved is not None:
             shard_indexes = self._fetch_shard_indexes(model.repo_id, resolved, files, notes)
 
-        formats = detect_formats(files, shard_indexes=shard_indexes)
+        # Read before detection: the Hub's GGUF metadata is what tells a
+        # multi-quantization repository apart from a single-model one.
+        gguf_metadata = _compact_gguf_metadata(getattr(info, "gguf", None))
+        formats = detect_formats(
+            files,
+            shard_indexes=shard_indexes,
+            gguf_total_file_size=_optional_int(gguf_metadata.get(GGUF_TOTAL_FILE_SIZE_KEY)),
+        )
         _attach_notes(formats, notes)
 
         requires_remote_code, remote_code_files = detect_remote_code(config, files)
-        gguf_metadata = _compact_gguf_metadata(getattr(info, "gguf", None))
 
         return ModelMetadata(
             identity=model,

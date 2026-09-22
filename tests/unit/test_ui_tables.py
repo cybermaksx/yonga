@@ -171,6 +171,27 @@ def metadata() -> ModelMetadata:
     )
 
 
+def hint_identified_metadata() -> ModelMetadata:
+    """Metadata for a GGUF-only repository that declares no identity of its own.
+
+    No ``config.json``, so no ``model_type`` and no architecture class: whatever
+    the registry knows about this model, it did not learn it here.
+    """
+    return ModelMetadata(
+        identity=ModelIdentity(repo_id="HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive"),
+        resolved_revision=SHA,
+        exists=True,
+        license="apache-2.0",
+        files=[RepoFile(path="model.gguf", size=16 * 1024**3, lfs=True)],
+        formats=[
+            FormatObservation(
+                format=ModelFormat.GGUF, files=["model.gguf"], total_bytes=16 * 1024**3
+            )
+        ],
+        gguf_metadata={"architecture": "qwen35"},
+    )
+
+
 def compatibility() -> CompatibilityDecision:
     """A decision that rules the NPU out and picks the GPU."""
     return CompatibilityDecision(
@@ -398,6 +419,41 @@ def test_inspect_report_survives_empty_metadata():
     text = render(inspect_report(bare, CompatibilityDecision(), []))
     assert "a/b" in text
     assert "No registry claim" in text
+
+
+def test_inspect_report_discloses_an_architecture_identified_from_a_hint():
+    """Default output, no ``--verbose``: the device claims name their weakest link.
+
+    Every row of the compatibility block descends from this identification, so a
+    run that had to read the architecture out of a GGUF header says so beside
+    the claims instead of burying it in a verbose-only note.
+    """
+    text = render(
+        inspect_report(
+            hint_identified_metadata(),
+            compatibility(),
+            identified_from="GGUF metadata",
+        )
+    )
+
+    disclosure = "Architecture identified from GGUF metadata; this repository has no config.json."
+    assert disclosure in text
+    assert text.index("Compatibility on this host") < text.index(disclosure) < text.index("NPU")
+
+
+def test_inspect_report_says_where_a_hint_disagreed_with_config_json():
+    """When the repository does declare an identity, the caveat says that instead."""
+    text = render(inspect_report(metadata(), compatibility(), identified_from="GGUF metadata"))
+
+    assert (
+        "Architecture identified from GGUF metadata; the repository's config.json declares a "
+        "different identity." in text
+    )
+
+
+def test_inspect_report_stays_silent_when_config_json_declared_the_identity():
+    """No caveat is invented for the ordinary case."""
+    assert "identified from" not in render(inspect_report(metadata(), compatibility()))
 
 
 # ----------------------------------------------------------------------

@@ -6,6 +6,7 @@ import io
 import json
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -27,7 +28,7 @@ RAW_TRACEBACK = (
 )
 
 
-def make_console(**kwargs):
+def make_console(**kwargs: Any) -> tuple[YongaConsole, io.StringIO, io.StringIO]:
     """Build a console pair writing into in-memory buffers."""
     out = io.StringIO()
     err = io.StringIO()
@@ -132,6 +133,7 @@ def test_json_ready_handles_paths_datetimes_and_models():
             "items": {3, 1, 2},
         }
     )
+    assert isinstance(payload, dict)
     assert payload["path"] == "/tmp/x"
     assert payload["when"].startswith("2026-09-22T10:00")
     assert payload["severity"] == "warning"
@@ -303,7 +305,7 @@ def test_diagnostic_prefers_explicit_fallback_command():
 class RecordingConsole(YongaConsole):
     """Console that records prompts instead of blocking on a terminal."""
 
-    def __init__(self, answer: bool = True, **kwargs):
+    def __init__(self, answer: bool = True, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self.asked: list[str] = []
         self.answer = answer
@@ -313,7 +315,7 @@ class RecordingConsole(YongaConsole):
         return self.answer
 
 
-def recording(answer=True, *, interactive, **kwargs):
+def recording(answer: bool = True, *, interactive: bool | None, **kwargs: Any) -> RecordingConsole:
     """Build a RecordingConsole writing into in-memory buffers."""
     return RecordingConsole(
         answer,
@@ -436,11 +438,11 @@ def test_progress_sink_log_events_need_verbose():
 def test_progress_sink_never_raises():
     class Exploding(YongaConsole):
         @property
-        def json_mode(self):  # type: ignore[override]
+        def json_mode(self) -> bool:
             raise RuntimeError("boom")
 
         @json_mode.setter
-        def json_mode(self, value):
+        def json_mode(self, value: bool) -> None:
             pass
 
     console = Exploding(

@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "notice": "The prompt TEXT is the benchmark fixture. Editing any 'text' below changes its sha256, which makes every benchmark result recorded with the old text incomparable with the new one. To change a prompt, add a new id instead of editing an existing one.",
+  "default_suite": "standard",
+  "prompts": [
+    {
+      "id": "short-instruction",
+      "category": "instruction",
+      "text": "Explain what a neural processing unit is and why a laptop would ship with one. Answer in exactly two sentences."
+    },
+    {
+      "id": "medium-explanation",
+      "category": "explanation",
+      "text": "A colleague has a laptop with an integrated GPU and a separate NPU, and wants to run a large language model locally. Explain, in about two hundred words and in plain language, what int4 weight quantization does to a model, why it reduces the memory the model needs, what it costs in output quality, and why the group size used during quantization matters. Finish with one concrete sentence of advice about when int4 is a reasonable choice and when it is not."
+    },
+    {
+      "id": "long-context",
+      "category": "long_context",
+      "text": "Read the following incident report and then answer the question at the end.\n\nIncident report: intermittent ingestion stalls in the telemetry pipeline.\n\nThe telemetry pipeline collects structured events from about four thousand edge agents. Each agent batches events locally and ships them over HTTPS to a regional collector. The collector validates every batch against a schema registry, stamps it with a receive timestamp, and appends it to a durable log. A pool of eight indexer processes reads from that log and writes into the query store. A separate compaction job rewrites the query store's segment files every six hours.\n\nOn the fourteenth of the month, on-call received the first alert at 02:14. The alert was raised by the ingestion lag monitor, which compares the newest receive timestamp in the durable log with the newest timestamp visible in the query store. The lag had grown from its usual two seconds to just over four minutes. It recovered on its own at 02:31 without anyone touching the system. The same pattern repeated at 08:47, at 14:52 and at 20:55, each time lasting between twelve and twenty minutes.\n\nThe first hypothesis was network loss between the agents and the collector. This was rejected: the collector's own receive timestamps stayed smooth throughout each stall, and no agent reported a retry storm. Whatever was happening, it was happening after the batches had already been accepted.\n\nThe second hypothesis was indexer starvation. The indexers were each pinned to a single core, and their CPU utilisation did sit at one hundred percent during the stalls. However, it also sat at one hundred percent for long stretches when the lag was perfectly normal, so high utilisation alone did not distinguish a stall from a healthy period.\n\nA third engineer noticed that the four stall start times were spaced roughly six hours and thirty-three minutes apart, and that the compaction job was configured to start every six hours. The offset grew by about thirty-three minutes each time, which matched the compaction job's own runtime drifting later as the dataset grew. Correlating the compaction logs with the stall windows showed that every stall began within ninety seconds of a compaction pass starting, and ended within ninety seconds of it finishing.\n\nCompaction and indexing share the same local NVMe device. Compaction reads whole segment files and writes replacements, saturating the device's write bandwidth. The indexers issue small synchronous writes and wait for each one to be acknowledged. Under compaction load, the acknowledgement latency for those small writes rose from under one millisecond to roughly eighty milliseconds, which is almost exactly the factor by which indexing throughput fell.\n\nThe team applied an I/O weight to the compaction job so that it yields device bandwidth to the indexers, and set the compaction schedule to a fixed wall-clock time rather than a fixed interval. Lag has stayed under three seconds since.\n\nQuestion: summarise the root cause in no more than three sentences, and state clearly which two hypotheses were ruled out and what specific evidence ruled each of them out."
+    },
+    {
+      "id": "long-context-analysis",
+      "category": "long_context",
+      "text": "Read the following design note and then answer the questions at the end.\n\nDesign note: choosing a storage layout for a local model catalogue.\n\nA desktop tool manages converted machine learning models on a single machine. Each converted model is a directory containing several weight files, a handful of small configuration files, and a manifest written by the tool itself. The tool must list the catalogue quickly, must be able to tell whether a directory was fully written or was interrupted halfway, must survive the machine losing power at any moment, and must never corrupt a directory that a user placed there by hand.\n\nThree layouts were considered.\n\nThe first layout writes every converted model directly into the catalogue directory, under a name derived from the source repository and the conversion profile. The manifest is written last, so a directory without a manifest is treated as incomplete. This is simple and needs no extra state. Its weakness is that an interrupted conversion leaves a partial directory in the catalogue, where a later listing must skip it, and where a user browsing the folder sees something that looks like a model but is not one. It also cannot distinguish a directory the tool abandoned from a directory a user created by hand and has not finished copying into.\n\nThe second layout writes into a hidden staging directory and moves the finished directory into place with a single rename. On the same filesystem a rename is atomic, so the catalogue only ever contains complete directories. The cost is that the staging directory and the catalogue must live on the same filesystem, which is not guaranteed when a user points the catalogue at an external disk. When they are on different filesystems the rename degrades to a copy, which doubles the write volume and reintroduces the partial-directory problem during the copy.\n\nThe third layout keeps a separate index file listing every complete model, written atomically after each conversion. The catalogue directory may contain anything; only entries named in the index are considered real. Listing is fast because it reads one small file. The weakness is that the index is a second source of truth: if it is lost, deleted or edited, the catalogue appears empty even though the models are present, and a rebuild has to scan every directory anyway.\n\nThe team chose the second layout, with two additions. Staging is placed inside the catalogue root rather than in the system temporary directory, so it is always on the same filesystem as the destination. A marker file is written into any directory the tool is currently building, and only directories carrying that marker are ever deleted automatically, so a directory a user created by hand is never removed by the tool.\n\nQuestions: first, explain in two or three sentences why placing the staging directory inside the catalogue root solves the cross-filesystem problem. Second, describe one failure mode that the chosen layout still does not handle, and say what evidence would appear on disk when it happened."
+    }
+  ],
+  "suites": {
+    "quick": [
+      "short-instruction"
+    ],
+    "standard": [
+      "short-instruction",
+      "medium-explanation",
+      "long-context"
+    ],
+    "long": [
+      "short-instruction",
+      "medium-explanation",
+      "long-context",
+      "long-context-analysis"
+    ]
+  }
+}

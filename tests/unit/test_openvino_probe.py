@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import json
 import types
+from collections.abc import Sequence
 from enum import Enum
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -50,7 +52,15 @@ class FakeCompilerType(Enum):
 class FakePort:
     """A model port that can be made to misbehave the way real ones do."""
 
-    def __init__(self, name, element_type, shape, *, raise_any_name=False, names=None):
+    def __init__(
+        self,
+        name: str,
+        element_type: Any,
+        shape: Any,
+        *,
+        raise_any_name: bool = False,
+        names: set[str] | None = None,
+    ) -> None:
         self._name = name
         self._element_type = element_type
         self._shape = shape
@@ -75,7 +85,12 @@ class FakePort:
 class FakeModel:
     """A minimal ``openvino.Model`` stand-in."""
 
-    def __init__(self, friendly_name="Model0", inputs=(), outputs=()):
+    def __init__(
+        self,
+        friendly_name: str = "Model0",
+        inputs: Sequence[Any] = (),
+        outputs: Sequence[Any] = (),
+    ) -> None:
         self._friendly_name = friendly_name
         self.inputs = list(inputs)
         self.outputs = list(outputs)
@@ -87,12 +102,19 @@ class FakeModel:
 class FakeCore:
     """A scriptable ``openvino.Core``."""
 
-    def __init__(self, *, devices=("CPU",), properties=None, models=None, compile_errors=None):
+    def __init__(
+        self,
+        *,
+        devices: Sequence[str] = ("CPU",),
+        properties: dict[str, dict[str, Any]] | None = None,
+        models: dict[str, Any] | None = None,
+        compile_errors: dict[str, BaseException] | None = None,
+    ) -> None:
         self.available_devices = list(devices)
         self._properties = properties or {}
         self._models = models or {}
         self._compile_errors = compile_errors or {}
-        self.compiled: list[tuple[str, dict]] = []
+        self.compiled: list[tuple[str, dict[str, Any]]] = []
 
     def get_property(self, device, name):
         table = self._properties.get(device, {})
@@ -119,7 +141,12 @@ class FakeCore:
         return object()
 
 
-def install_openvino(monkeypatch, core, *, version="2026.4.0-22959-releases/2026/4"):
+def install_openvino(
+    monkeypatch: pytest.MonkeyPatch,
+    core: Any,
+    *,
+    version: str = "2026.4.0-22959-releases/2026/4",
+) -> types.SimpleNamespace:
     """Install a fake ``openvino`` module and return it."""
     module = types.SimpleNamespace(
         Core=lambda: core,
@@ -130,7 +157,12 @@ def install_openvino(monkeypatch, core, *, version="2026.4.0-22959-releases/2026
     return module
 
 
-def install_tokenizers(monkeypatch, *, version="2026.4.0.0-736", compatible=True):
+def install_tokenizers(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    version: str = "2026.4.0.0-736",
+    compatible: bool = True,
+) -> types.SimpleNamespace:
     """Install a fake ``openvino_tokenizers`` module and return it."""
     module = types.SimpleNamespace(
         __version__=version,
@@ -140,7 +172,9 @@ def install_tokenizers(monkeypatch, *, version="2026.4.0.0-736", compatible=True
     return module
 
 
-def break_openvino(monkeypatch, message="No module named 'openvino'"):
+def break_openvino(
+    monkeypatch: pytest.MonkeyPatch, message: str = "No module named 'openvino'"
+) -> None:
     """Make every OpenVINO import fail, as on a host without the runtime."""
 
     def _raise():

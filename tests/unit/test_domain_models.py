@@ -196,6 +196,167 @@ class TestWeightBytes:
         assert not metadata.has_format(ModelFormat.SAFETENSORS)
 
 
+class TestPrimaryVersusRepositoryBytes:
+    """``weight_bytes`` sizes one model; ``repo_weight_bytes`` sizes the repository.
+
+    The two diverge whenever a repository publishes several interchangeable
+    copies of the same model — the GGUF one-file-per-quantization convention —
+    and preflight must never be handed the larger of the two.
+    """
+
+    def test_an_unset_primary_defaults_to_the_total(self) -> None:
+        """One file set, one model: the honest default for every non-GGUF format."""
+        observation = FormatObservation(
+            format=ModelFormat.SAFETENSORS, total_bytes=18 * GIB, complete=True
+        )
+        assert observation.primary_bytes == 18 * GIB
+
+    def test_an_explicit_zero_primary_means_unknown_not_the_total(self) -> None:
+        """A detector that computed 0 is believed; the convenience must not fire.
+
+        The inventory behind this: a GGUF repository where the Hub sized only
+        the multimodal projector. Every candidate *model* file is sizeless, so
+        the primary is genuinely unknown — and copying ``total_bytes`` over it
+        would announce the projector, the one file classified as not runnable,
+        as "the size of one usable model".
+        """
+        observation = FormatObservation(
+            format=ModelFormat.GGUF,
+            files=["demo-Q4_K_M.gguf", "mmproj-demo-BF16.gguf"],
+            total_bytes=900,
+            primary_bytes=0,
+            complete=True,
+        )
+        assert observation.primary_bytes == 0
+        assert observation.total_bytes == 900
+
+    def test_an_unknown_primary_is_never_read_as_a_weight_figure(self) -> None:
+        """An observation that cannot size one model answers "unknown" everywhere."""
+        metadata = _metadata(
+            formats=[
+                FormatObservation(
+                    format=ModelFormat.GGUF,
+                    files=["demo-Q4_K_M.gguf", "mmproj-demo-BF16.gguf"],
+                    total_bytes=900,
+                    primary_bytes=0,
+                    complete=True,
+                )
+            ]
+        )
+        assert metadata.weight_bytes == 0
+        assert metadata.primary_observation is None
+        # The format is still known: only its size is not.
+        assert metadata.primary_format is ModelFormat.GGUF
+
+    def test_an_unknown_primary_survives_a_serialisation_round_trip(self) -> None:
+        """Dump and reload must not resurrect the fallback and invent a size."""
+        observation = FormatObservation(
+            format=ModelFormat.GGUF,
+            files=["mmproj-demo-BF16.gguf"],
+            total_bytes=900,
+            primary_bytes=0,
+            complete=True,
+        )
+        assert FormatObservation.model_validate(observation.model_dump()).primary_bytes == 0
+
+    def test_an_explicit_primary_is_left_alone(self) -> None:
+        observation = FormatObservation(
+            format=ModelFormat.GGUF,
+            files=["a.gguf", "b.gguf"],
+            total_bytes=38 * GIB,
+            primary_bytes=16 * GIB,
+            complete=True,
+        )
+        assert observation.primary_bytes == 16 * GIB
+        assert observation.total_bytes == 38 * GIB
+
+    def test_unknown_sizes_stay_unknown_on_both_counters(self) -> None:
+        observation = FormatObservation(format=ModelFormat.GGUF, files=["a.gguf"])
+        assert observation.primary_bytes == 0
+        assert observation.total_bytes == 0
+
+    def test_weight_bytes_reports_one_model_and_repo_bytes_the_whole_format(self) -> None:
+        metadata = _metadata(
+            formats=[
+                FormatObservation(
+                    format=ModelFormat.GGUF,
+                    files=["bf16.gguf", "q4.gguf", "q8.gguf"],
+                    total_bytes=38 * GIB,
+                    primary_bytes=16 * GIB,
+                    complete=True,
+                )
+            ]
+        )
+        assert metadata.weight_bytes == 16 * GIB
+        assert metadata.repo_weight_bytes == 38 * GIB
+        assert metadata.primary_format is ModelFormat.GGUF
+
+    def test_the_two_agree_when_every_file_is_part_of_one_model(self) -> None:
+        metadata = _metadata(
+            formats=[
+                FormatObservation(
+                    format=ModelFormat.SAFETENSORS,
+                    files=[f"shard-{index}.safetensors" for index in range(4)],
+                    total_bytes=18_819_721_040,
+                    complete=True,
+                )
+            ]
+        )
+        assert metadata.weight_bytes == metadata.repo_weight_bytes == 18_819_721_040
+
+    def test_a_format_preference_still_decides_which_observation_is_read(self) -> None:
+        """Adding the second counter did not move the preference order."""
+        metadata = _metadata(
+            formats=[
+                FormatObservation(
+                    format=ModelFormat.GGUF,
+                    total_bytes=38 * GIB,
+                    primary_bytes=16 * GIB,
+                    complete=True,
+                ),
+                FormatObservation(
+                    format=ModelFormat.SAFETENSORS, total_bytes=18 * GIB, complete=True
+                ),
+            ]
+        )
+        assert metadata.primary_format is ModelFormat.SAFETENSORS
+        assert metadata.weight_bytes == 18 * GIB
+        assert metadata.repo_weight_bytes == 18 * GIB
+
+    def test_a_known_primary_survives_an_unknown_repository_total(self) -> None:
+        """``inspect --no-sizes`` on a GGUF repo the Hub has already measured."""
+        metadata = _metadata(
+            formats=[
+                FormatObservation(
+                    format=ModelFormat.GGUF,
+                    files=["bf16.gguf", "q4.gguf"],
+                    total_bytes=0,
+                    primary_bytes=17_920_696_704,
+                    complete=True,
+                )
+            ]
+        )
+        assert metadata.weight_bytes == 17_920_696_704
+        assert metadata.repo_weight_bytes == 0
+
+    def test_no_observations_report_zero_on_both_counters(self) -> None:
+        metadata = _metadata()
+        assert metadata.weight_bytes == 0
+        assert metadata.repo_weight_bytes == 0
+        assert metadata.primary_observation is None
+
+    def test_primary_observation_is_the_one_the_numbers_came_from(self) -> None:
+        gguf = FormatObservation(
+            format=ModelFormat.GGUF,
+            files=["bf16.gguf"],
+            total_bytes=38 * GIB,
+            primary_bytes=16 * GIB,
+            complete=True,
+        )
+        metadata = _metadata(formats=[gguf])
+        assert metadata.primary_observation is gguf
+
+
 class TestPipelineKind:
     @pytest.mark.parametrize(
         "tag", ["image-text-to-text", "visual-question-answering", "image-to-text"]

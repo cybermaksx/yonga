@@ -132,9 +132,15 @@ def test_mount_for_picks_the_longest_match(tmp_path):
         "/dev/root / ext4 rw 0 0\ntmpfs /tmp tmpfs rw 0 0\n/dev/sdb /tmp/deep xfs rw 0 0\n",
     )
     adapter = FilesystemAdapter(mounts_files=[mounts])
-    assert adapter.mount_for(Path("/tmp/deep/inner/file")).fstype == "xfs"
-    assert adapter.mount_for(Path("/tmp/other")).fstype == "tmpfs"
-    assert adapter.mount_for(Path("/var/lib")).fstype == "ext4"
+
+    def fstype_for(path: str) -> str:
+        entry = adapter.mount_for(Path(path))
+        assert entry is not None
+        return entry.fstype
+
+    assert fstype_for("/tmp/deep/inner/file") == "xfs"
+    assert fstype_for("/tmp/other") == "tmpfs"
+    assert fstype_for("/var/lib") == "ext4"
 
 
 def test_mounts_falls_back_to_the_second_file(tmp_path):

@@ -7,12 +7,14 @@ import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
 from yonga.config.paths import Paths
 from yonga.ui.chat_tui import (
     CHAT_COMMANDS,
+    ChatCommand,
     ChatCommandKind,
     ChatSessionInfo,
     ChatView,
@@ -28,7 +30,7 @@ from yonga.ui.console import YongaConsole, build_console
 SHA = "0123456789abcdef0123456789abcdef01234567"
 
 
-def render(renderable, *, width: int = 100) -> str:
+def render(renderable: Any, *, width: int = 100) -> str:
     """Render a renderable to plain text the way a non-TTY terminal would."""
     from rich.console import Console
 
@@ -37,9 +39,9 @@ def render(renderable, *, width: int = 100) -> str:
     return buffer.getvalue()
 
 
-def session_info(**overrides) -> ChatSessionInfo:
+def session_info(**overrides: Any) -> ChatSessionInfo:
     """A fully populated chat session description."""
-    payload = {
+    payload: dict[str, Any] = {
         "display_name": "Qwen3.5-9B",
         "artifact_id": "qwen35-gpu",
         "repo_id": "Qwen/Qwen3.5-9B",
@@ -56,9 +58,9 @@ def session_info(**overrides) -> ChatSessionInfo:
     return ChatSessionInfo(**payload)
 
 
-def metrics(**overrides):
+def metrics(**overrides: Any) -> SimpleNamespace:
     """A generation result stand-in carrying whichever metrics the test needs."""
-    payload = {
+    payload: dict[str, Any] = {
         "input_tokens": 512,
         "output_tokens": 380,
         "ttft_ms": 180.0,
@@ -69,7 +71,7 @@ def metrics(**overrides):
     return SimpleNamespace(**payload)
 
 
-def console_pair(**kwargs):
+def console_pair(**kwargs: Any) -> tuple[YongaConsole, io.StringIO, io.StringIO]:
     """A console writing into in-memory buffers."""
     out = io.StringIO()
     err = io.StringIO()
@@ -83,6 +85,13 @@ def console_pair(**kwargs):
         out,
         err,
     )
+
+
+def parsed(line: str) -> ChatCommand:
+    """Parse a line that must be a command, narrowing away the ``None``."""
+    command = parse_command(line)
+    assert command is not None
+    return command
 
 
 # ----------------------------------------------------------------------
@@ -109,25 +118,25 @@ def test_plain_text_is_not_a_command():
     ],
 )
 def test_bare_commands_parse(line, kind):
-    command = parse_command(line)
+    command = parsed(line)
     assert command is not None
     assert command.kind is kind
     assert command.ok
 
 
 def test_bare_command_rejects_an_argument():
-    command = parse_command("/reset everything")
+    command = parsed("/reset everything")
     assert command.kind is ChatCommandKind.RESET
     assert not command.ok
-    assert "does not take an argument" in command.error
+    assert command.error is not None and "does not take an argument" in command.error
 
 
 def test_unknown_command_is_reported_with_help_hint():
-    command = parse_command("/nope 3")
+    command = parsed("/nope 3")
     assert command.kind is ChatCommandKind.UNKNOWN
     assert not command.ok
-    assert "Unknown command '/nope'" in command.error
-    assert "/help" in command.error
+    assert command.error is not None and "Unknown command '/nope'" in command.error
+    assert command.error is not None and "/help" in command.error
 
 
 @pytest.mark.parametrize(
@@ -135,7 +144,7 @@ def test_unknown_command_is_reported_with_help_hint():
     [("/tokens 512", 512), ("/tokens 1", 1), ("/tokens   2048  ", 2048)],
 )
 def test_tokens_accepts_whole_numbers(line, expected):
-    command = parse_command(line)
+    command = parsed(line)
     assert command.kind is ChatCommandKind.TOKENS
     assert command.ok
     assert command.int_value == expected
@@ -143,7 +152,7 @@ def test_tokens_accepts_whole_numbers(line, expected):
 
 @pytest.mark.parametrize("line", ["/tokens abc", "/tokens 1.5", "/tokens 0", "/tokens -4"])
 def test_tokens_rejects_bad_arguments(line):
-    command = parse_command(line)
+    command = parsed(line)
     assert command.kind is ChatCommandKind.TOKENS
     assert not command.ok
     assert command.error
@@ -151,22 +160,22 @@ def test_tokens_rejects_bad_arguments(line):
 
 
 def test_tokens_without_argument_shows_usage():
-    command = parse_command("/tokens")
+    command = parsed("/tokens")
     assert not command.ok
     assert command.error == "Usage: /tokens N"
 
 
 def test_tokens_rejects_an_absurd_value():
-    command = parse_command("/tokens 999999999")
+    command = parsed("/tokens 999999999")
     assert not command.ok
-    assert "between 1 and" in command.error
+    assert command.error is not None and "between 1 and" in command.error
 
 
 @pytest.mark.parametrize(
     ("line", "expected"), [("/temp 0.7", 0.7), ("/temp 0", 0.0), ("/temperature 2", 2.0)]
 )
 def test_temperature_accepts_valid_values(line, expected):
-    command = parse_command(line)
+    command = parsed(line)
     assert command.kind is ChatCommandKind.TEMPERATURE
     assert command.ok
     assert command.float_value == pytest.approx(expected)
@@ -174,7 +183,7 @@ def test_temperature_accepts_valid_values(line, expected):
 
 @pytest.mark.parametrize("line", ["/temp 5", "/temp -1", "/temp hot", "/temp nan", "/temp inf"])
 def test_temperature_rejects_out_of_range_and_junk(line):
-    command = parse_command(line)
+    command = parsed(line)
     assert command.kind is ChatCommandKind.TEMPERATURE
     assert not command.ok
     assert command.error
@@ -182,12 +191,14 @@ def test_temperature_rejects_out_of_range_and_junk(line):
 
 
 def test_temperature_error_names_the_bounds():
-    assert "between 0 and 2" in parse_command("/temp 5").error
+    error = parsed("/temp 5").error
+    assert error is not None
+    assert "between 0 and 2" in error
 
 
 @pytest.mark.parametrize(("line", "expected"), [("/top-p 0.8", 0.8), ("/top_p 1", 1.0)])
 def test_top_p_accepts_valid_values(line, expected):
-    command = parse_command(line)
+    command = parsed(line)
     assert command.kind is ChatCommandKind.TOP_P
     assert command.ok
     assert command.float_value == pytest.approx(expected)
@@ -195,12 +206,12 @@ def test_top_p_accepts_valid_values(line, expected):
 
 @pytest.mark.parametrize("line", ["/top-p 1.5", "/top-p -0.1", "/top-p most"])
 def test_top_p_rejects_bad_values(line):
-    assert not parse_command(line).ok
+    assert not parsed(line).ok
 
 
 @pytest.mark.parametrize(("line", "expected"), [("/top-k 20", 20), ("/top-k 0", 0)])
 def test_top_k_accepts_valid_values(line, expected):
-    command = parse_command(line)
+    command = parsed(line)
     assert command.kind is ChatCommandKind.TOP_K
     assert command.ok
     assert command.int_value == expected
@@ -208,7 +219,7 @@ def test_top_k_accepts_valid_values(line, expected):
 
 @pytest.mark.parametrize("line", ["/top-k -1", "/top-k many", "/top-k 1.5"])
 def test_top_k_rejects_bad_values(line):
-    assert not parse_command(line).ok
+    assert not parsed(line).ok
 
 
 @pytest.mark.parametrize(
@@ -221,7 +232,7 @@ def test_top_k_rejects_bad_values(line):
     ],
 )
 def test_switch_commands_parse(line, kind, expected):
-    command = parse_command(line)
+    command = parsed(line)
     assert command.kind is kind
     assert command.ok
     assert command.bool_value is expected
@@ -229,7 +240,7 @@ def test_switch_commands_parse(line, kind, expected):
 
 @pytest.mark.parametrize("line", ["/reasoning maybe", "/stats 7", "/reasoning"])
 def test_switch_commands_reject_other_words(line):
-    command = parse_command(line)
+    command = parsed(line)
     assert not command.ok
     assert command.bool_value is None
     assert command.error
@@ -238,13 +249,13 @@ def test_switch_commands_reject_other_words(line):
 def test_every_documented_command_is_parseable():
     for spec in CHAT_COMMANDS:
         name = spec.usage.split(" ")[0]
-        command = parse_command(name)
+        command = parsed(name)
         assert command is not None
         assert command.kind is spec.kind
 
 
 def test_parsed_commands_are_immutable():
-    command = parse_command("/tokens 64")
+    command = parsed("/tokens 64")
     with pytest.raises(ValueError):
         command.int_value = 1
 

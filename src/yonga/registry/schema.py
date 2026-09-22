@@ -21,8 +21,48 @@ Matching semantics (shared by every rule kind, see :class:`RuleMatch`):
 * ``model_types`` and ``architectures`` form a single *identity* criterion that
   is satisfied when either side matches, because a repository may expose only
   one of the two.
+* ``aliases`` extends that same identity criterion to :attr:`identity hints
+  <MatchSubject.identity_hints>`: identifiers a repository carries somewhere
+  other than ``config.json``. A hint is compared *only* against ``aliases`` and
+  never against ``model_types`` or ``architectures``, so teaching yonga a new
+  spelling of an architecture is always a deliberate, reviewable registry edit
+  rather than a fuzzy string match that happens to fire.
 * Different criteria are combined with AND.
 * An empty criterion imposes no constraint.
+
+Identity hints are evidence, not resemblance
+--------------------------------------------
+
+:func:`subject_from_metadata` fills :attr:`MatchSubject.identity_hints` from the
+GGUF file metadata the Hub reports (``gguf_metadata["architecture"]``) and from
+nothing else. That value is read out of the weight file itself, so it is a
+statement the artifact makes about what it is.
+
+Repository *tags* are deliberately excluded. They are free-form text any
+uploader can write, and matching a tag such as ``qwen`` or ``qwen3.5`` would be
+exactly the "infer that a similarly named repository is equivalent" mistake
+``SPEC.md`` section 8.1 forbids. A tag may well be true; it is not evidence.
+
+A hint is consulted *only* when the repository declares no identity of its own:
+an empty ``model_type`` and an empty ``architectures`` list. A GGUF header is
+evidence in the *absence* of a declaration, never a correction of one. When the
+repository declares something, the declaration wins, so an identity no rule
+recognises resolves to *nothing* rather than to whatever rule the header
+happens to name — a conflict between a declaration and a header means
+"unknown", never "pick the other one". Substituting the header's architecture
+for a declared one would hand the user another model's exporter pins, pipeline
+and device verdict, which ``SPEC.md`` section 3 forbids ("silently substitute a
+semantically different model") and section 8.1 forbids inferring.
+
+Specificity ladder
+------------------
+
+Exact repository id (100) > architecture plus device/host family (80) >
+architecture (60) > architecture reached through an alias
+(:data:`SPECIFICITY_ARCHITECTURE_ALIAS`, 50) > task (40) > generic (20). The
+alias rung sits below every declared-identity rung on purpose: a rule that
+recognises the model type a repository actually declares must always beat one
+that had to fall back on a hint found outside ``config.json``.
 """
 
 from __future__ import annotations
@@ -56,10 +96,22 @@ SPECIFICITY_REPO_ID: int = 100
 SPECIFICITY_ARCHITECTURE_FAMILY: int = 80
 #: Specificity of a plain architecture (model type / architecture class) rule.
 SPECIFICITY_ARCHITECTURE: int = 60
+#: Specificity of an architecture rule reached only through an identity *alias*.
+#:
+#: Below :data:`SPECIFICITY_ARCHITECTURE` on purpose: an alias match means the
+#: repository never declared the model type, so any rule that did recognise a
+#: declared identity is the better answer.
+SPECIFICITY_ARCHITECTURE_ALIAS: int = 50
 #: Specificity of a task-scoped rule.
 SPECIFICITY_TASK: int = 40
 #: Specificity of a generic device or profile rule.
 SPECIFICITY_GENERIC: int = 20
+
+#: Human-readable name of the source :func:`subject_from_metadata` reads hints from.
+#:
+#: Kept beside the reader so the sentence ``yonga registry explain`` prints and
+#: the code that fills :attr:`MatchSubject.identity_hints` cannot drift apart.
+IDENTITY_HINT_SOURCE: str = "GGUF metadata"
 
 #: Built-in repair implementations a registry rule is allowed to select.
 #:
@@ -178,6 +230,14 @@ class MatchOutcome(BaseModel):
     specificity: int = SPECIFICITY_GENERIC
     reasons: list[str] = Field(default_factory=list)
 
+    alias_hint: str | None = None
+    """The identity hint that satisfied identity through :attr:`RuleMatch.aliases`.
+
+    ``None`` whenever identity was settled by a declared ``model_type`` or
+    architecture class, so a caller can tell a hint-based identification apart
+    from a ``config.json`` one without parsing :attr:`reasons`.
+    """
+
 
 class MatchSubject(BaseModel):
     """The facts a rule is matched against."""
@@ -191,6 +251,15 @@ class MatchSubject(BaseModel):
     device: str | None = None
     host_tags: tuple[str, ...] = ()
 
+    identity_hints: tuple[str, ...] = ()
+    """Identifiers discovered somewhere other than ``config.json``.
+
+    Weaker than a declared ``model_type`` but still authoritative, because they
+    are read out of the weight file rather than typed into a repository card.
+    They are only ever compared against :attr:`RuleMatch.aliases`; see the
+    module docstring for why repository tags are not hints.
+    """
+
     @field_validator("device")
     @classmethod
     def _normalise_device_name(cls, value: str | None) -> str | None:
@@ -202,8 +271,9 @@ class MatchSubject(BaseModel):
 class RuleMatch(BaseModel):
     """Criteria selecting the subjects a rule applies to.
 
-    See the module docstring for the OR/AND semantics. ``model_types`` and
-    ``architectures`` together form the single *identity* criterion.
+    See the module docstring for the OR/AND semantics. ``model_types``,
+    ``architectures`` and ``aliases`` together form the single *identity*
+    criterion, with ``aliases`` matched only against identity hints.
     """
 
     model_config = _STRICT_ALIASED
@@ -211,6 +281,14 @@ class RuleMatch(BaseModel):
     repo_ids: list[str] = Field(default_factory=list)
     model_types: list[str] = Field(default_factory=list)
     architectures: list[str] = Field(default_factory=list)
+
+    aliases: list[str] = Field(default_factory=list)
+    """Alternative spellings this architecture is known by in other metadata sources.
+
+    Only :attr:`MatchSubject.identity_hints` are compared against this list, so
+    an alias can never widen what a declared ``model_type`` matches.
+    """
+
     tasks: list[str] = Field(default_factory=list)
     devices: list[str] = Field(
         default_factory=list,
@@ -242,20 +320,40 @@ class RuleMatch(BaseModel):
         return _casefold_all([*self.model_types, *self.architectures])
 
     @property
+    def alias_tokens(self) -> list[str]:
+        """Casefolded identity aliases, compared only against identity hints."""
+        return _casefold_all(self.aliases)
+
+    @property
     def is_generic(self) -> bool:
         """True when the rule constrains nothing at all."""
         return not (
-            self.repo_ids or self.model_types or self.architectures or self.tasks or self.host_tags
+            self.repo_ids
+            or self.model_types
+            or self.architectures
+            or self.aliases
+            or self.tasks
+            or self.host_tags
         )
 
     def static_specificity(self) -> int:
-        """Specificity this rule would score if it matched, ignoring the subject."""
+        """Best specificity this rule could score, ignoring the subject.
+
+        A rule carrying both declared identities and aliases reports the
+        declared rung: that is the strongest outcome it can reach, and
+        :meth:`evaluate` lowers it to :data:`SPECIFICITY_ARCHITECTURE_ALIAS`
+        for the runs that actually had to fall back on an alias. Callers that
+        need every rung a rule can compete on — registry validation above all —
+        want :meth:`resolvable_specificities` instead.
+        """
         if self.repo_ids:
             return SPECIFICITY_REPO_ID
         if self.model_types or self.architectures:
             if self.devices or self.host_tags:
                 return SPECIFICITY_ARCHITECTURE_FAMILY
             return SPECIFICITY_ARCHITECTURE
+        if self.aliases:
+            return SPECIFICITY_ARCHITECTURE_ALIAS
         if self.tasks:
             return SPECIFICITY_TASK
         return SPECIFICITY_GENERIC
@@ -280,17 +378,38 @@ class RuleMatch(BaseModel):
             reasons.append(f"repository {subject.repo_id} matches exactly")
 
         identity = self.identity_tokens
-        if identity:
-            candidates = _casefold_all([subject.model_type or "", *subject.architectures])
-            hit = next((token for token in candidates if token in identity), None)
-            if hit is None:
-                described = subject.model_type or ", ".join(subject.architectures) or "<unknown>"
+        aliases = self.alias_tokens
+        alias_hint: str | None = None
+        if identity or aliases:
+            declared = _casefold_all([subject.model_type or "", *subject.architectures])
+            hit = next((token for token in declared if token in identity), None)
+            if hit is not None:
+                reasons.append(f"model identity {hit} is listed")
+            elif declared:
+                # The repository declared an identity this rule does not list.
+                # The alias path stops here: a GGUF header is evidence only in
+                # the ABSENCE of a declaration. Consulting it now would let a
+                # header override a contradicting config.json and report the
+                # repository as a different architecture entirely, with that
+                # architecture's exporter pins, pipeline and device verdict.
+                # The declaration wins, and a conflict means "unknown".
                 return MatchOutcome(
                     matched=False,
                     specificity=self.static_specificity(),
-                    reasons=[f"architecture/model type {described} is not listed"],
+                    reasons=self._identity_rejection(subject, hints_considered=False),
                 )
-            reasons.append(f"model identity {hit} is listed")
+            else:
+                alias_hint = next(
+                    (token for token in _casefold_all(subject.identity_hints) if token in aliases),
+                    None,
+                )
+                if alias_hint is None:
+                    return MatchOutcome(
+                        matched=False,
+                        specificity=self.static_specificity(),
+                        reasons=self._identity_rejection(subject, hints_considered=bool(aliases)),
+                    )
+                reasons.append(_alias_reason(alias_hint))
 
         if self.tasks:
             wanted_tasks = _casefold_all(self.tasks)
@@ -326,7 +445,53 @@ class RuleMatch(BaseModel):
 
         if not reasons:
             reasons.append("generic rule, no constraints")
-        return MatchOutcome(matched=True, specificity=self.static_specificity(), reasons=reasons)
+        return MatchOutcome(
+            matched=True,
+            specificity=self._matched_specificity(alias_hint=alias_hint),
+            reasons=reasons,
+            alias_hint=alias_hint,
+        )
+
+    def _identity_rejection(self, subject: MatchSubject, *, hints_considered: bool) -> list[str]:
+        """Explain why neither the declared identity nor a hint satisfied this rule."""
+        described = subject.model_type or ", ".join(subject.architectures) or "<unknown>"
+        reasons = [f"architecture/model type {described} is not listed"]
+        if hints_considered:
+            hints = ", ".join(subject.identity_hints) or "<none>"
+            reasons.append(f"identity hints ({hints}) match no alias of this rule")
+        elif self.alias_tokens and subject.identity_hints:
+            hints = ", ".join(subject.identity_hints)
+            reasons.append(
+                f"identity hints ({hints}) were not consulted because the repository "
+                f"declares an identity of its own"
+            )
+        return reasons
+
+    def _matched_specificity(self, *, alias_hint: str | None) -> int:
+        """Score a successful match, demoting one that only an alias rescued."""
+        specificity = self.static_specificity()
+        if alias_hint is None:
+            return specificity
+        return _alias_demoted(specificity)
+
+    def resolvable_specificities(self) -> tuple[int, ...]:
+        """Every specificity :meth:`evaluate` can actually score this block at.
+
+        :meth:`static_specificity` reports only the best rung. A block that also
+        carries ``aliases`` resolves at the demoted
+        :data:`SPECIFICITY_ARCHITECTURE_ALIAS` rung whenever an alias rescued
+        the match, so it competes with other rules on two rungs, not one.
+        Registry validation compares every rung two rules share: a pair that
+        ties only on the demoted rung would otherwise pass validation and then
+        raise ``registry.ambiguous_rules`` at resolution time.
+        """
+        static = self.static_specificity()
+        if not self.alias_tokens:
+            return (static,)
+        demoted = _alias_demoted(static)
+        if demoted == static:
+            return (static,)
+        return (static, demoted)
 
     def overlaps(self, other: RuleMatch) -> bool:
         """True when both blocks could select the same subject.
@@ -336,11 +501,55 @@ class RuleMatch(BaseModel):
         """
         return (
             _tokens_overlap(_casefold_all(self.repo_ids), _casefold_all(other.repo_ids))
-            and _tokens_overlap(self.identity_tokens, other.identity_tokens)
+            and self._identity_overlaps(other)
             and _tokens_overlap(_casefold_all(self.tasks), _casefold_all(other.tasks))
             and _tokens_overlap(self.devices, other.devices)
             and _tokens_overlap(_casefold_all(self.host_tags), _casefold_all(other.host_tags))
         )
+
+    def _identity_overlaps(self, other: RuleMatch) -> bool:
+        """True when one subject could satisfy both blocks' identity criterion.
+
+        A block that lists neither identities nor aliases constrains identity
+        not at all and therefore overlaps everything. Otherwise the question is
+        whether the two blocks name a token in common — comparing aliases with
+        aliases (one hint could satisfy both) and each side's aliases with the
+        other side's declared identities (the same name written as a hint on one
+        side and as a declaration on the other). Two alias-bearing blocks naming
+        *different* architectures are not overlapping: no subject carries two
+        identities, and a subject carries at most one hint, so nothing could
+        satisfy both. Reporting them would cap the registry at one alias rule
+        per priority and make every further alias a hand-tuned priority.
+        """
+        mine_identity, mine_aliases = self.identity_tokens, self.alias_tokens
+        their_identity, their_aliases = other.identity_tokens, other.alias_tokens
+        if not (mine_identity or mine_aliases) or not (their_identity or their_aliases):
+            return True
+        pairs = (
+            (mine_identity, their_identity),
+            (mine_aliases, their_aliases),
+            (mine_aliases, their_identity),
+            (mine_identity, their_aliases),
+        )
+        return any(set(left) & set(right) for left, right in pairs)
+
+
+def _alias_demoted(specificity: int) -> int:
+    """Lower an architecture rung to the alias rung; other rungs are unchanged."""
+    if specificity in (SPECIFICITY_ARCHITECTURE, SPECIFICITY_ARCHITECTURE_FAMILY):
+        return SPECIFICITY_ARCHITECTURE_ALIAS
+    return specificity
+
+
+def _alias_reason(alias_hint: str) -> str:
+    """Word an alias-only identity match the way ``registry explain`` prints it.
+
+    The sentence names the alias and where the hint came from, so the audit
+    trail never lets an alias match pass for a ``config.json`` identification.
+    An alias only ever matches a subject that declares no identity, so the
+    sentence can state that unconditionally.
+    """
+    return f"matched alias {alias_hint!r} from {IDENTITY_HINT_SOURCE} (no config.json)"
 
 
 def _tokens_overlap(left: Sequence[str], right: Sequence[str]) -> bool:
@@ -1022,13 +1231,19 @@ def subject_from_metadata(
     """Build a :class:`MatchSubject` from a ``ModelMetadata``-like object.
 
     Accepts anything exposing ``identity``/``model_type``/``architectures``/
-    ``task`` attributes, and tolerates ``None`` so classification still works
-    when no metadata was gathered.
+    ``task``/``gguf_metadata`` attributes, and tolerates ``None`` so
+    classification still works when no metadata was gathered.
+
+    :attr:`MatchSubject.identity_hints` is filled from
+    ``gguf_metadata["architecture"]`` — the identifier stored inside the weight
+    file — and from nothing else. ``tags`` are read by no branch here on
+    purpose: see the module docstring.
     """
     repo_id: str | None = None
     model_type: str | None = None
     architectures: tuple[str, ...] = ()
     task: str | None = None
+    identity_hints: tuple[str, ...] = ()
     if metadata is not None:
         identity = getattr(metadata, "identity", None)
         raw_repo = getattr(identity, "repo_id", None)
@@ -1043,6 +1258,11 @@ def subject_from_metadata(
         raw_task = getattr(metadata, "task", None)
         if isinstance(raw_task, str):
             task = raw_task
+        raw_gguf = getattr(metadata, "gguf_metadata", None)
+        if isinstance(raw_gguf, Mapping):
+            raw_hint = raw_gguf.get("architecture")
+            if isinstance(raw_hint, str) and raw_hint.strip():
+                identity_hints = (raw_hint.strip(),)
     return MatchSubject(
         repo_id=repo_id,
         model_type=model_type,
@@ -1050,6 +1270,7 @@ def subject_from_metadata(
         task=task,
         device=device,
         host_tags=tuple(host_tags),
+        identity_hints=identity_hints,
     )
 
 

@@ -175,8 +175,22 @@ def inspect_report(
     source_options: Sequence[SourceOption] = (),
     *,
     show_files: bool = False,
+    architecture: str | None = None,
+    identified_from: str | None = None,
 ) -> RenderableType:
-    """Render the ``yonga inspect`` report (``docs/CLI_SPEC.md`` section 4)."""
+    """Render the ``yonga inspect`` report (``docs/CLI_SPEC.md`` section 4).
+
+    ``architecture`` is the identity the registry resolved, which can be known
+    even when the repository declares none — a GGUF-only repo has no
+    ``config.json``, so the architecture comes from the GGUF header instead.
+    Passing it keeps the human table and ``--json`` telling the same story.
+
+    ``identified_from`` names that weaker source when one was used. It is
+    disclosed beside the compatibility block at default verbosity rather than
+    in a ``--verbose`` note, because every device claim in that block rests on
+    the identification and ``SPEC.md`` section 3 does not allow support to be
+    presented as better established than it is.
+    """
     facts = _grid()
     facts.add_row(Text("Model"), _text(metadata.identity.repo_id))
     facts.add_row(
@@ -185,19 +199,17 @@ def inspect_report(
     )
     facts.add_row(Text("License"), _text(metadata.license))
     facts.add_row(Text("Task"), _text(metadata.pipeline_tag or metadata.task))
-    facts.add_row(Text("Architecture"), _text(", ".join(metadata.architectures) or None))
-    facts.add_row(Text("Model type"), _text(metadata.model_type))
+    facts.add_row(
+        Text("Architecture"),
+        _text(", ".join(metadata.architectures) or architecture),
+    )
+    facts.add_row(Text("Model type"), _text(metadata.model_type or architecture))
     facts.add_row(Text("Pipeline"), _text(metadata.pipeline_kind.value))
     formats = ", ".join(
         observation.format.value for observation in metadata.formats if observation.files
     )
     facts.add_row(Text("Formats"), _text(formats or None))
-    facts.add_row(
-        Text("Size"),
-        _text(f"~{human_bytes(metadata.weight_bytes, precision=1)} total weights")
-        if metadata.weight_bytes
-        else _text(None),
-    )
+    facts.add_row(Text("Size"), _size_row(metadata))
     if metadata.parameter_count:
         facts.add_row(Text("Parameters"), _text(f"{metadata.parameter_count:,}"))
     if metadata.gated or metadata.private:
@@ -215,6 +227,8 @@ def inspect_report(
 
     if compatibility is not None:
         blocks.extend((Text(""), Text("Compatibility on this host", style="bold")))
+        if identified_from is not None:
+            blocks.append(_identity_provenance(metadata, identified_from))
         blocks.append(_compatibility_table(compatibility))
 
     if source_options:
@@ -249,6 +263,48 @@ def inspect_report(
         blocks.append(files)
 
     return Group(*blocks)
+
+
+def _size_row(metadata: ModelMetadata) -> Text:
+    """Render the inspect "Size" row: usable weights, plus the repository total.
+
+    ``weight_bytes`` is the number that matters to the user — what one model
+    costs to download and what preflight reserves working space for. For most
+    repositories it is also the whole story, and the row stays the short form.
+
+    A repository that publishes several interchangeable copies of one model (the
+    GGUF one-file-per-quantization convention) makes the two figures diverge,
+    and hiding either would mislead: the total alone overstates the download
+    several-fold, the primary alone contradicts the file listing right below it.
+    So both are shown, on one line, with the repository figure qualified by how
+    many files it spans.
+    """
+    usable = metadata.weight_bytes
+    if not usable:
+        return _text(None)
+    repository = metadata.repo_weight_bytes
+    if repository <= usable:
+        return _text(f"~{human_bytes(usable, precision=1)} total weights")
+    observation = metadata.primary_observation
+    file_count = len(observation.files) if observation is not None else 0
+    return _text(
+        f"~{human_bytes(usable, precision=1)} (one model; "
+        f"{human_bytes(repository, precision=1)} across {file_count} files in the repository)"
+    )
+
+
+def _identity_provenance(metadata: ModelMetadata, identified_from: str) -> Text:
+    """State that the claims below rest on a hint rather than on ``config.json``.
+
+    One line, because ``docs/CLI_SPEC.md`` section 1 asks the default output to
+    stay concise; the alias that actually matched is left to the ``--verbose``
+    note the registry already writes.
+    """
+    if metadata.architectures or metadata.model_type:
+        tail = "the repository's config.json declares a different identity"
+    else:
+        tail = "this repository has no config.json"
+    return Text(f"Architecture identified from {identified_from}; {tail}.", style="yellow")
 
 
 def _compatibility_table(decision: CompatibilityDecision) -> RenderableType:

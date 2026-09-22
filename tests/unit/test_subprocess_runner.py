@@ -10,10 +10,10 @@ import textwrap
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
-from yonga.adapters import subprocess as runner_module
 from yonga.adapters.subprocess import (
     DEFAULT_TAIL_LINES,
     CompletedCommand,
@@ -76,16 +76,15 @@ def read_log(path: Path) -> list[dict[str, object]]:
 
 
 def test_popen_is_called_with_an_argv_list_and_no_shell(monkeypatch, tmp_path):
-    captured: dict[str, object] = {}
-    real_popen = stdlib_subprocess.Popen
+    captured: dict[str, Any] = {}
 
-    class Spy(real_popen):  # type: ignore[misc]
-        def __init__(self, args, **kwargs):
+    class Spy(stdlib_subprocess.Popen[bytes]):
+        def __init__(self, args: Any, **kwargs: Any) -> None:
             captured["args"] = args
             captured["kwargs"] = dict(kwargs)
             super().__init__(args, **kwargs)
 
-    monkeypatch.setattr(runner_module.subprocess, "Popen", Spy)
+    monkeypatch.setattr("yonga.adapters.subprocess.subprocess.Popen", Spy)
 
     argv = [sys.executable, "-c", "print('ok')"]
     result = SubprocessRunner().run(argv, cwd=tmp_path)

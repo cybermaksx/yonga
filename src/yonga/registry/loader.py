@@ -482,19 +482,26 @@ def _validate_conflicts(registry: Registry, problems: list[str]) -> None:
     for kind, rules in groups:
         active = [rule for rule in rules if rule.status.is_usable]
         for index, first in enumerate(active):
-            first_specificity = first.match_block.static_specificity()
+            first_rungs = set(first.match_block.resolvable_specificities())
             for second in active[index + 1 :]:
                 if first.priority != second.priority:
                     continue
-                if first_specificity != second.match_block.static_specificity():
+                # Every rung a rule can *resolve* at, not just its best one: a
+                # rule carrying aliases scores at the demoted alias rung
+                # whenever a hint rescued the match, so two rules can tie there
+                # while their static specificities differ. Comparing only the
+                # static rung certifies a registry that then raises
+                # ``registry.ambiguous_rules`` during resolution.
+                shared = first_rungs & set(second.match_block.resolvable_specificities())
+                if not shared:
                     continue
                 if not first.match_block.overlaps(second.match_block):
                     continue
                 if not _same_scope(kind, first, second):
                     continue
                 problems.append(
-                    f"{kind} rules {first.id!r} and {second.id!r} have the same specificity "
-                    f"({first_specificity}) and the same priority ({first.priority}); "
+                    f"{kind} rules {first.id!r} and {second.id!r} can both resolve at "
+                    f"specificity {max(shared)} with the same priority ({first.priority}); "
                     f"resolution would be ambiguous"
                 )
 
@@ -509,8 +516,11 @@ def validate_registry(
     This powers ``yonga registry validate``. It reports unknown repair
     implementation names, unparsable version specifiers, dangling profile,
     chat-profile and repair references, unknown failure categories, and rule
-    pairs whose specificity and priority are both equal (which would make
-    resolution ambiguous). An empty list means the registry is sound.
+    pairs that share a priority and a specificity they can both resolve at
+    (which would make resolution ambiguous). Specificity is compared over every
+    rung a rule can reach, including the demoted alias rung, so a registry that
+    passes validation never raises ``registry.ambiguous_rules`` while
+    resolving. An empty list means the registry is sound.
     """
     implementations = (
         KNOWN_REPAIR_IMPLEMENTATIONS

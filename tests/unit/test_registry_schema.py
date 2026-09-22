@@ -10,6 +10,7 @@ from yonga.domain.models import ModelFormat, ModelIdentity, ModelMetadata, Sourc
 from yonga.domain.plans import ConversionProfile, QuantizationSettings
 from yonga.registry.schema import (
     SPECIFICITY_ARCHITECTURE,
+    SPECIFICITY_ARCHITECTURE_ALIAS,
     SPECIFICITY_ARCHITECTURE_FAMILY,
     SPECIFICITY_GENERIC,
     SPECIFICITY_REPO_ID,
@@ -322,3 +323,47 @@ def test_registry_document_accepts_chat_profiles_alias():
 def test_model_format_default_on_profile_rule():
     rule = ProfileRule(id="p", device="cpu")
     assert rule.format is ModelFormat.OPENVINO_IR
+
+
+def test_aliases_are_matched_only_against_identity_hints():
+    match = RuleMatch(model_types=["qwen3_5"], aliases=["qwen35"])
+    assert match.evaluate(MatchSubject(model_type="qwen3_5")).matched
+    assert match.evaluate(MatchSubject(identity_hints=("qwen35",))).matched
+    assert not match.evaluate(MatchSubject(model_type="qwen35")).matched
+    assert (
+        not RuleMatch(model_types=["qwen35"])
+        .evaluate(MatchSubject(identity_hints=("qwen35",)))
+        .matched
+    )
+
+
+def test_an_alias_match_is_recorded_and_demoted():
+    match = RuleMatch(model_types=["qwen3_5"], aliases=["qwen35"])
+    by_alias = match.evaluate(MatchSubject(identity_hints=("qwen35",)))
+    by_model_type = match.evaluate(MatchSubject(model_type="qwen3_5"))
+    assert by_alias.alias_hint == "qwen35"
+    assert by_model_type.alias_hint is None
+    assert by_alias.specificity == SPECIFICITY_ARCHITECTURE_ALIAS
+    assert by_model_type.specificity == SPECIFICITY_ARCHITECTURE
+    assert any("matched alias 'qwen35'" in reason for reason in by_alias.reasons)
+
+
+def test_alias_only_rules_report_the_alias_specificity():
+    assert RuleMatch(aliases=["qwen35"]).static_specificity() == SPECIFICITY_ARCHITECTURE_ALIAS
+    assert not RuleMatch(aliases=["qwen35"]).is_generic
+
+
+def test_subject_from_metadata_reads_hints_from_gguf_metadata_only():
+    metadata = ModelMetadata(
+        identity=ModelIdentity(repo_id="owner/gguf-only"),
+        tags=["gguf", "qwen3.5", "qwen"],
+        gguf_metadata={"architecture": "qwen35", "context_length": 262144},
+    )
+    subject = subject_from_metadata(metadata)
+    assert subject.model_type is None
+    assert subject.identity_hints == ("qwen35",)
+    tagged_only = ModelMetadata(
+        identity=ModelIdentity(repo_id="owner/tagged"),
+        tags=["gguf", "qwen3.5", "qwen"],
+    )
+    assert subject_from_metadata(tagged_only).identity_hints == ()

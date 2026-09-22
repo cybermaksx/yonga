@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -278,6 +279,9 @@ GGUF_SIBLINGS = [
     ),
 ]
 GGUF_TOTAL_BYTES = 17920696704 + 5627044224 + 7359259008 + 9527501184 + 921704448
+# What the live Hub reports as gguf["totalFileSize"]: the BF16 model alone, not
+# the sum of the four quantizations and the projector beside it.
+GGUF_PRIMARY_BYTES = 17920696704
 
 SAFETENSORS_SHARDS = {
     "model.safetensors-00001-of-00004.safetensors": 5278251472,
@@ -328,6 +332,7 @@ def gguf_info() -> FakeModelInfo:
         card_data=FakeCardData(license="apache-2.0"),
         gguf={
             "total": 8953803264,
+            "totalFileSize": GGUF_PRIMARY_BYTES,
             "architecture": "qwen35",
             "context_length": 262144,
             "chat_template": "x" * 20000,
@@ -362,7 +367,22 @@ def safetensors_adapter(tmp_path: Path) -> tuple[HuggingFaceAdapter, FakeApi]:
         },
         root=tmp_path / "hub",
     )
-    return HuggingFaceAdapter(Settings(), api=api), api
+    return adapter_for(api), api
+
+
+def adapter_for(api: FakeApi, settings: Settings | None = None) -> HuggingFaceAdapter:
+    """Build the adapter around a :class:`FakeApi`.
+
+    ``FakeApi`` is a structural stand-in that implements only the handful of
+    ``HfApi`` methods the adapter actually calls, so the substitution is recorded
+    here once instead of at every construction site.
+    """
+    return HuggingFaceAdapter(Settings() if settings is None else settings, api=cast(Any, api))
+
+
+def hub_response(status_code: int) -> Any:
+    """A structural ``httpx.Response`` stand-in for building Hub errors."""
+    return FakeResponse(status_code)
 
 
 # --------------------------------------------------------------------------- #
@@ -371,7 +391,7 @@ def safetensors_adapter(tmp_path: Path) -> tuple[HuggingFaceAdapter, FakeApi]:
 
 
 def test_adapter_satisfies_hub_client_protocol():
-    assert isinstance(HuggingFaceAdapter(Settings(), api=FakeApi()), HubClient)
+    assert isinstance(adapter_for(FakeApi()), HubClient)
 
 
 @pytest.mark.parametrize(
@@ -392,7 +412,7 @@ def test_is_commit_sha(value, expected):
 
 def test_resolve_revision_returns_immutable_sha():
     api = FakeApi(info=gguf_info())
-    adapter = HuggingFaceAdapter(Settings(), api=api)
+    adapter = adapter_for(api)
 
     sha = adapter.resolve_revision(ModelIdentity(repo_id="HauhauCS/x", revision="main"))
 
@@ -401,7 +421,7 @@ def test_resolve_revision_returns_immutable_sha():
 
 
 def test_resolve_revision_without_sha_is_a_typed_failure():
-    adapter = HuggingFaceAdapter(Settings(), api=FakeApi(info=FakeModelInfo(sha=None)))
+    adapter = adapter_for(FakeApi(info=FakeModelInfo(sha=None)))
 
     with pytest.raises(SourceResolutionError) as excinfo:
         adapter.resolve_revision(ModelIdentity(repo_id="acme/model"))
@@ -567,6 +587,60 @@ def test_unknown_file_sizes_are_flagged_not_guessed():
     assert any("no size for 1 file" in note for note in observation.notes)
 
 
+def test_a_repository_of_quantizations_is_not_one_giant_model(tmp_path):
+    """``inspect`` hands the Hub's totalFileSize through to the observation.
+
+    The repository publishes 38.5 GiB of GGUF across five files, but one model
+    is 16.7 GiB. Sizing preflight from the sum would reserve scratch space for
+    a model that does not exist.
+    """
+    api = FakeApi(info=gguf_info(), json_files={}, root=tmp_path / "hub")
+
+    metadata = adapter_for(api).inspect(ModelIdentity(repo_id="HauhauCS/x"))
+
+    assert metadata.weight_bytes == GGUF_PRIMARY_BYTES
+    assert metadata.repo_weight_bytes == GGUF_TOTAL_BYTES
+    observation = next(o for o in metadata.formats if o.format is ModelFormat.GGUF)
+    assert any("Hub's GGUF metadata" in note for note in observation.notes)
+
+
+def test_a_repository_without_gguf_metadata_estimates_from_the_file_listing(tmp_path):
+    """No totalFileSize: the largest non-companion .gguf file is the model."""
+    info = gguf_info()
+    info.gguf = {"architecture": "qwen35"}
+    api = FakeApi(info=info, json_files={}, root=tmp_path / "hub")
+
+    metadata = adapter_for(api).inspect(ModelIdentity(repo_id="HauhauCS/x"))
+
+    assert metadata.weight_bytes == GGUF_PRIMARY_BYTES
+    assert metadata.repo_weight_bytes == GGUF_TOTAL_BYTES
+    observation = next(o for o in metadata.formats if o.format is ModelFormat.GGUF)
+    assert any("largest non-companion" in note for note in observation.notes)
+
+
+def test_a_non_numeric_total_file_size_is_ignored(tmp_path):
+    """A string where the Hub should have sent an int must not become a size."""
+    info = gguf_info()
+    info.gguf = {"architecture": "qwen35", "totalFileSize": "17920696704"}
+    api = FakeApi(info=info, json_files={}, root=tmp_path / "hub")
+
+    metadata = adapter_for(api).inspect(ModelIdentity(repo_id="HauhauCS/x"))
+
+    # Falls back to the file listing rather than trusting an unusable value.
+    assert metadata.weight_bytes == GGUF_PRIMARY_BYTES
+
+
+def test_safetensors_shards_are_all_part_of_the_one_model(tmp_path):
+    """Every shard is required, so primary and repository bytes agree."""
+    adapter, _ = safetensors_adapter(tmp_path)
+
+    metadata = adapter.inspect(ModelIdentity(repo_id="nDimensional/x"))
+    observation = next(o for o in metadata.formats if o.format is ModelFormat.SAFETENSORS)
+
+    assert observation.primary_bytes == observation.total_bytes == SAFETENSORS_WEIGHT_BYTES
+    assert metadata.weight_bytes == metadata.repo_weight_bytes == SAFETENSORS_WEIGHT_BYTES
+
+
 # --------------------------------------------------------------------------- #
 # The GGUF-only repository with no config.json
 # --------------------------------------------------------------------------- #
@@ -574,7 +648,7 @@ def test_unknown_file_sizes_are_flagged_not_guessed():
 
 def test_gguf_only_repo_without_config_json_does_not_crash(tmp_path):
     api = FakeApi(info=gguf_info(), json_files={}, root=tmp_path / "hub")
-    adapter = HuggingFaceAdapter(Settings(), api=api)
+    adapter = adapter_for(api)
 
     metadata = adapter.inspect(ModelIdentity(repo_id="HauhauCS/Qwen3.5-9B-Uncensored"))
 
@@ -588,13 +662,14 @@ def test_gguf_only_repo_without_config_json_does_not_crash(tmp_path):
 
     observation = next(o for o in metadata.formats if o.format is ModelFormat.GGUF)
     assert observation.total_bytes == GGUF_TOTAL_BYTES
+    assert observation.primary_bytes == GGUF_PRIMARY_BYTES
     assert any("no config.json" in note for note in observation.notes)
     assert any("qwen3.5" in note for note in observation.notes)
 
 
 def test_gguf_metadata_is_recorded_without_downloading_the_weights(tmp_path):
     api = FakeApi(info=gguf_info(), json_files={}, root=tmp_path / "hub")
-    adapter = HuggingFaceAdapter(Settings(), api=api)
+    adapter = adapter_for(api)
 
     metadata = adapter.inspect(ModelIdentity(repo_id="HauhauCS/x"))
 
@@ -609,7 +684,7 @@ def test_gguf_metadata_is_recorded_without_downloading_the_weights(tmp_path):
 def test_repository_tags_and_licence_survive_a_missing_config(tmp_path):
     api = FakeApi(info=gguf_info(), json_files={}, root=tmp_path / "hub")
 
-    metadata = HuggingFaceAdapter(Settings(), api=api).inspect(ModelIdentity(repo_id="HauhauCS/x"))
+    metadata = adapter_for(api).inspect(ModelIdentity(repo_id="HauhauCS/x"))
 
     assert "qwen3.5" in metadata.tags
     assert metadata.license == "apache-2.0"
@@ -622,7 +697,7 @@ def test_licence_falls_back_to_a_license_tag(tmp_path):
     info.card_data = None
     api = FakeApi(info=info, json_files={}, root=tmp_path / "hub")
 
-    metadata = HuggingFaceAdapter(Settings(), api=api).inspect(ModelIdentity(repo_id="HauhauCS/x"))
+    metadata = adapter_for(api).inspect(ModelIdentity(repo_id="HauhauCS/x"))
 
     assert metadata.license == "apache-2.0"
 
@@ -656,9 +731,7 @@ def test_prepared_openvino_repository_is_recognised(tmp_path):
         root=tmp_path / "hub",
     )
 
-    metadata = HuggingFaceAdapter(Settings(), api=api).inspect(
-        ModelIdentity(repo_id="OpenVINO/Qwen3.5-9B-int4-ov")
-    )
+    metadata = adapter_for(api).inspect(ModelIdentity(repo_id="OpenVINO/Qwen3.5-9B-int4-ov"))
 
     assert metadata.resolved_revision == OPENVINO_SHA
     assert metadata.primary_format is ModelFormat.OPENVINO_IR
@@ -711,7 +784,7 @@ def test_auto_map_sets_requires_remote_code(tmp_path):
         root=tmp_path / "hub",
     )
 
-    metadata = HuggingFaceAdapter(Settings(), api=api).inspect(ModelIdentity(repo_id="acme/x"))
+    metadata = adapter_for(api).inspect(ModelIdentity(repo_id="acme/x"))
 
     assert metadata.requires_remote_code is True
     assert metadata.remote_code_files == ["configuration_custom.py", "modeling_custom.py"]
@@ -753,7 +826,7 @@ def test_detect_remote_code_survives_a_missing_config():
 # --------------------------------------------------------------------------- #
 
 
-def hub_errors():
+def hub_errors() -> list[Any]:
     """Every upstream error shape, paired with its expected classification."""
     from huggingface_hub.errors import (
         DisabledRepoError,
@@ -770,7 +843,7 @@ def hub_errors():
     message = f"denied (token {FAKE_TOKEN})"
     return [
         pytest.param(
-            GatedRepoError(message, response=FakeResponse(403)),
+            GatedRepoError(message, response=hub_response(403)),
             CODE_GATED,
             FailureCategory.GATED_MODEL_AUTH_REQUIRED,
             ExitCode.AUTH_REQUIRED,
@@ -778,7 +851,7 @@ def hub_errors():
             id="gated",
         ),
         pytest.param(
-            HfHubHTTPError(message, response=FakeResponse(401)),
+            HfHubHTTPError(message, response=hub_response(401)),
             CODE_AUTH_REQUIRED,
             FailureCategory.GATED_MODEL_AUTH_REQUIRED,
             ExitCode.AUTH_REQUIRED,
@@ -786,7 +859,7 @@ def hub_errors():
             id="http-401",
         ),
         pytest.param(
-            HfHubHTTPError(message, response=FakeResponse(403)),
+            HfHubHTTPError(message, response=hub_response(403)),
             CODE_AUTH_REQUIRED,
             FailureCategory.GATED_MODEL_AUTH_REQUIRED,
             ExitCode.AUTH_REQUIRED,
@@ -794,7 +867,7 @@ def hub_errors():
             id="http-403",
         ),
         pytest.param(
-            RepositoryNotFoundError(message, response=FakeResponse(404)),
+            RepositoryNotFoundError(message, response=hub_response(404)),
             CODE_REPO_NOT_FOUND,
             FailureCategory.DOWNLOAD_FAILURE,
             ExitCode.SOURCE_RESOLUTION,
@@ -804,7 +877,7 @@ def hub_errors():
         pytest.param(
             # VERIFIED against the live Hub: an anonymous request for a missing
             # repository is answered with 401, not 404.
-            RepositoryNotFoundError(message, response=FakeResponse(401)),
+            RepositoryNotFoundError(message, response=hub_response(401)),
             CODE_REPO_NOT_FOUND,
             FailureCategory.DOWNLOAD_FAILURE,
             ExitCode.SOURCE_RESOLUTION,
@@ -812,7 +885,7 @@ def hub_errors():
             id="repo-missing-401-anonymous",
         ),
         pytest.param(
-            DisabledRepoError(message, response=FakeResponse(403)),
+            DisabledRepoError(message, response=hub_response(403)),
             CODE_REPO_NOT_FOUND,
             FailureCategory.DOWNLOAD_FAILURE,
             ExitCode.SOURCE_RESOLUTION,
@@ -820,7 +893,7 @@ def hub_errors():
             id="disabled-repo-403",
         ),
         pytest.param(
-            RevisionNotFoundError(message, response=FakeResponse(404)),
+            RevisionNotFoundError(message, response=hub_response(404)),
             CODE_REVISION_NOT_FOUND,
             FailureCategory.DOWNLOAD_FAILURE,
             ExitCode.SOURCE_RESOLUTION,
@@ -852,7 +925,7 @@ def hub_errors():
             id="entry-missing",
         ),
         pytest.param(
-            HfHubHTTPError(message, response=FakeResponse(503)),
+            HfHubHTTPError(message, response=hub_response(503)),
             CODE_HTTP_ERROR,
             FailureCategory.DOWNLOAD_FAILURE,
             ExitCode.SOURCE_RESOLUTION,
@@ -914,7 +987,7 @@ def test_gated_remediation_mentions_hf_auth_login():
     from huggingface_hub.errors import GatedRepoError
 
     translated = translate_hub_error(
-        GatedRepoError("gated", response=FakeResponse(403)),
+        GatedRepoError("gated", response=hub_response(403)),
         model=ModelIdentity(repo_id="acme/model"),
     )
 
@@ -926,7 +999,7 @@ def test_repo_not_found_remediation_covers_the_login_case():
     from huggingface_hub.errors import RepositoryNotFoundError
 
     translated = translate_hub_error(
-        RepositoryNotFoundError("gone", response=FakeResponse(401)),
+        RepositoryNotFoundError("gone", response=hub_response(401)),
         model=ModelIdentity(repo_id="acme/model"),
     )
 
@@ -940,7 +1013,7 @@ def test_a_bare_401_without_a_repository_error_is_an_auth_failure():
     from huggingface_hub.errors import HfHubHTTPError
 
     translated = translate_hub_error(
-        HfHubHTTPError("nope", response=FakeResponse(401)),
+        HfHubHTTPError("nope", response=hub_response(401)),
         model=ModelIdentity(repo_id="acme/model"),
     )
 
@@ -969,8 +1042,8 @@ def test_offline_turns_a_missing_entry_into_an_offline_diagnostic():
 def test_inspect_translates_a_hub_failure():
     from huggingface_hub.errors import GatedRepoError
 
-    api = FakeApi(model_info_error=GatedRepoError("gated", response=FakeResponse(403)))
-    adapter = HuggingFaceAdapter(Settings(), api=api)
+    api = FakeApi(model_info_error=GatedRepoError("gated", response=hub_response(403)))
+    adapter = adapter_for(api)
 
     with pytest.raises(HubAuthError) as excinfo:
         adapter.inspect(ModelIdentity(repo_id="acme/model"))
@@ -986,12 +1059,13 @@ def test_inspect_degrades_instead_of_failing_when_config_json_is_unreadable(tmp_
         json_files={"model.safetensors.index.json": SAFETENSORS_INDEX},
         root=tmp_path / "hub",
     )
+    assert api.info is not None
     api.info.config = {
         "architectures": ["Qwen3_5ForConditionalGeneration"],
         "model_type": "qwen3_5",
     }
 
-    metadata = HuggingFaceAdapter(Settings(), api=api).inspect(ModelIdentity(repo_id="acme/x"))
+    metadata = adapter_for(api).inspect(ModelIdentity(repo_id="acme/x"))
 
     assert metadata.model_type == "qwen3_5"
     assert metadata.config == {}
@@ -1008,7 +1082,7 @@ def test_download_uses_the_resolved_sha_not_the_branch_name(tmp_path):
     snapshot = tmp_path / "snapshot"
     snapshot.mkdir()
     api = FakeApi(info=safetensors_info(), snapshot=snapshot)
-    adapter = HuggingFaceAdapter(Settings(), api=api)
+    adapter = adapter_for(api)
 
     result = adapter.download(ModelIdentity(repo_id="nDimensional/x", revision="main"))
 
@@ -1023,7 +1097,7 @@ def test_download_skips_resolution_when_already_pinned(tmp_path):
     snapshot = tmp_path / "snapshot"
     snapshot.mkdir()
     api = FakeApi(snapshot=snapshot)
-    adapter = HuggingFaceAdapter(Settings(), api=api)
+    adapter = adapter_for(api)
 
     adapter.download(ModelIdentity(repo_id="nDimensional/x", revision=SAFETENSORS_SHA))
 
@@ -1035,7 +1109,7 @@ def test_download_forwards_patterns(tmp_path):
     snapshot = tmp_path / "snapshot"
     snapshot.mkdir()
     api = FakeApi(snapshot=snapshot)
-    adapter = HuggingFaceAdapter(Settings(), api=api)
+    adapter = adapter_for(api)
 
     adapter.download(
         ModelIdentity(repo_id="acme/x", revision=SAFETENSORS_SHA),
@@ -1051,7 +1125,7 @@ def test_offline_mode_passes_local_files_only(tmp_path):
     snapshot = tmp_path / "snapshot"
     snapshot.mkdir()
     api = FakeApi(snapshot=snapshot)
-    adapter = HuggingFaceAdapter(Settings(offline=True), api=api)
+    adapter = adapter_for(api, Settings(offline=True))
 
     adapter.download(ModelIdentity(repo_id="acme/x", revision="main"))
 
@@ -1065,7 +1139,7 @@ def test_offline_miss_is_reported_as_hub_offline_missing(tmp_path):
     from huggingface_hub.errors import LocalEntryNotFoundError
 
     api = FakeApi(snapshot_error=LocalEntryNotFoundError("not cached"))
-    adapter = HuggingFaceAdapter(Settings(offline=True), api=api)
+    adapter = adapter_for(api, Settings(offline=True))
 
     with pytest.raises(SourceResolutionError) as excinfo:
         adapter.download(ModelIdentity(repo_id="acme/x", revision=SAFETENSORS_SHA))
@@ -1078,7 +1152,7 @@ def test_download_honours_a_configured_hf_home(tmp_path):
     snapshot = tmp_path / "snapshot"
     snapshot.mkdir()
     api = FakeApi(snapshot=snapshot)
-    adapter = HuggingFaceAdapter(Settings(hf_home=tmp_path / "hf"), api=api)
+    adapter = adapter_for(api, Settings(hf_home=tmp_path / "hf"))
 
     adapter.download(ModelIdentity(repo_id="acme/x", revision=SAFETENSORS_SHA))
 
@@ -1093,9 +1167,7 @@ def test_download_emits_progress_events(tmp_path):
     sink = ctx.progress
     assert isinstance(sink, CollectingSink)
 
-    HuggingFaceAdapter(Settings(), api=api).download(
-        ModelIdentity(repo_id="acme/x", revision=SAFETENSORS_SHA), ctx=ctx
-    )
+    adapter_for(api).download(ModelIdentity(repo_id="acme/x", revision=SAFETENSORS_SHA), ctx=ctx)
 
     events = sink.of_kind(ProgressKind.DOWNLOAD)
     statuses = [event.status for event in events]
@@ -1113,9 +1185,7 @@ def test_download_without_a_context_passes_no_tqdm_class(tmp_path):
     snapshot.mkdir()
     api = FakeApi(snapshot=snapshot)
 
-    HuggingFaceAdapter(Settings(), api=api).download(
-        ModelIdentity(repo_id="acme/x", revision=SAFETENSORS_SHA)
-    )
+    adapter_for(api).download(ModelIdentity(repo_id="acme/x", revision=SAFETENSORS_SHA))
 
     assert api.snapshot_calls[0]["tqdm_class"] is None
 
@@ -1128,7 +1198,7 @@ def test_download_stops_when_the_job_is_cancelled(tmp_path):
     ctx.cancelled.set()
 
     with pytest.raises(CancelledError) as excinfo:
-        HuggingFaceAdapter(Settings(), api=api).download(
+        adapter_for(api).download(
             ModelIdentity(repo_id="acme/x", revision=SAFETENSORS_SHA), ctx=ctx
         )
 
@@ -1141,9 +1211,7 @@ def test_download_never_copies_the_snapshot(tmp_path):
     (snapshot / "config.json").write_text("{}", encoding="utf-8")
     api = FakeApi(snapshot=snapshot)
 
-    result = HuggingFaceAdapter(Settings(), api=api).download(
-        ModelIdentity(repo_id="acme/x", revision=SAFETENSORS_SHA)
-    )
+    result = adapter_for(api).download(ModelIdentity(repo_id="acme/x", revision=SAFETENSORS_SHA))
 
     assert result == snapshot
     assert list(tmp_path.iterdir()) == [snapshot]
@@ -1156,7 +1224,7 @@ def test_download_never_copies_the_snapshot(tmp_path):
 
 def test_auth_info_without_a_token(monkeypatch):
     monkeypatch.setattr("yonga.adapters.hf.get_token", lambda: None)
-    adapter = HuggingFaceAdapter(Settings(), api=FakeApi())
+    adapter = adapter_for(FakeApi())
 
     info = adapter.auth_info()
 
@@ -1169,8 +1237,8 @@ def test_auth_info_without_a_token(monkeypatch):
 def test_auth_info_with_a_token_reports_the_user_not_the_token(monkeypatch, tmp_path):
     monkeypatch.setattr("yonga.adapters.hf.get_token", lambda: FAKE_TOKEN)
     monkeypatch.setenv("HF_TOKEN", FAKE_TOKEN)
-    adapter = HuggingFaceAdapter(
-        Settings(hf_home=tmp_path / "hf"), api=FakeApi(whoami_result={"name": "octocat"})
+    adapter = adapter_for(
+        FakeApi(whoami_result={"name": "octocat"}), Settings(hf_home=tmp_path / "hf")
     )
 
     info = adapter.auth_info()
@@ -1186,9 +1254,9 @@ def test_auth_info_reports_a_rejected_token_as_logged_out(monkeypatch):
     from huggingface_hub.errors import HfHubHTTPError
 
     monkeypatch.setattr("yonga.adapters.hf.get_token", lambda: FAKE_TOKEN)
-    api = FakeApi(whoami_error=HfHubHTTPError("bad token", response=FakeResponse(401)))
+    api = FakeApi(whoami_error=HfHubHTTPError("bad token", response=hub_response(401)))
 
-    info = HuggingFaceAdapter(Settings(), api=api).auth_info()
+    info = adapter_for(api).auth_info()
 
     assert info.logged_in is False
     assert info.user is None
@@ -1198,7 +1266,7 @@ def test_auth_info_keeps_the_token_when_the_network_is_down(monkeypatch):
     monkeypatch.setattr("yonga.adapters.hf.get_token", lambda: FAKE_TOKEN)
     api = FakeApi(whoami_error=ConnectionError("no route to host"))
 
-    info = HuggingFaceAdapter(Settings(), api=api).auth_info()
+    info = adapter_for(api).auth_info()
 
     assert info.logged_in is True
     assert info.user is None
@@ -1208,7 +1276,7 @@ def test_auth_info_offline_does_not_call_whoami(monkeypatch):
     monkeypatch.setattr("yonga.adapters.hf.get_token", lambda: FAKE_TOKEN)
     api = FakeApi(whoami_error=AssertionError("whoami must not run offline"))
 
-    info = HuggingFaceAdapter(Settings(offline=True), api=api).auth_info()
+    info = adapter_for(api, Settings(offline=True)).auth_info()
 
     assert info.offline is True
     assert info.logged_in is True

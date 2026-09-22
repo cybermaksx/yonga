@@ -191,15 +191,65 @@ class RepoFile(BaseModel):
 
 
 class FormatObservation(BaseModel):
-    """Evidence that a repository contains weights in a particular format."""
+    """Evidence that a repository contains weights in a particular format.
+
+    The two byte counters answer different questions and must not be confused:
+    ``total_bytes`` describes the *repository*, ``primary_bytes`` describes the
+    *model a user ends up running*. They are equal whenever every file of the
+    format belongs to one model, and they differ when a repository publishes
+    several interchangeable copies of the same model — the GGUF convention of
+    shipping one file per quantization being the case that matters today.
+    """
 
     model_config = ConfigDict(extra="ignore")
 
     format: ModelFormat
     files: list[str] = Field(default_factory=list)
     total_bytes: int = 0
+    """Honest sum of every file of this format listed in the repository.
+
+    This is a download-side number: it is what a full snapshot of the format
+    costs, and it is the right input to a "how much will I fetch" estimate. It
+    is *not* a statement about how much of that payload a single conversion
+    reads, because a repository may carry several alternative copies of one
+    model. ``0`` means the sizes were unknown, never "empty".
+    """
+
+    primary_bytes: int = 0
+    """Size of ONE usable model in this format — the conversion-side number.
+
+    A conversion reads exactly one model, so this is what preflight, temp-space
+    and artifact-size estimates must be derived from. For sharded safetensors
+    and PyTorch checkpoints every shard is part of that one model, so this
+    equals ``total_bytes``. For a GGUF repository publishing BF16, Q4_K_M, Q6_K
+    and Q8_0 copies plus a projector side-car, it is the size of the single
+    file a user actually runs. ``0`` means unknown, never "empty".
+    """
+
     complete: bool = False
     notes: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _default_primary_to_total(self) -> FormatObservation:
+        """Treat an *unmentioned* ``primary_bytes`` as "one file set, one model".
+
+        That is the truth for every format except GGUF, and it keeps callers
+        that predate this field — and the many fixtures that construct an
+        observation by hand — describing exactly what they meant.
+
+        A caller that did name the field is believed, ``0`` included. ``0`` is
+        the documented way to say "unknown", and a detector reaches it on a real
+        inventory: a GGUF repository whose only *sized* file is the multimodal
+        projector has no measurable runnable model. Copying ``total_bytes`` over
+        that answer would promote the one file the detector explicitly
+        classified as not runnable to "the size of one usable model", which is
+        both wrong and unrecoverable downstream.
+        """
+        if "primary_bytes" in self.model_fields_set:
+            return self
+        if self.primary_bytes <= 0 and self.total_bytes > 0:
+            self.primary_bytes = self.total_bytes
+        return self
 
 
 class ModelMetadata(BaseModel):
@@ -266,13 +316,14 @@ class ModelMetadata(BaseModel):
         """Pick the observation that best represents this repository's weights.
 
         Complete observations win over incomplete ones; within each pass the
-        :data:`WEIGHT_FORMAT_PREFERENCE` order decides. Observations without a
-        known byte total are skipped because they cannot answer "how big is it".
+        :data:`WEIGHT_FORMAT_PREFERENCE` order decides. Observations that cannot
+        size a single model are skipped because they cannot answer "how big is
+        it".
         """
         for require_complete in (True, False):
             for fmt in WEIGHT_FORMAT_PREFERENCE:
                 observation = self._observation(fmt)
-                if observation is None or observation.total_bytes <= 0:
+                if observation is None or observation.primary_bytes <= 0:
                     continue
                 if require_complete and not observation.complete:
                     continue
@@ -280,8 +331,30 @@ class ModelMetadata(BaseModel):
         return None
 
     @property
+    def primary_observation(self) -> FormatObservation | None:
+        """The observation :attr:`weight_bytes` and :attr:`primary_format` read from."""
+        return self._weight_observation()
+
+    @property
     def weight_bytes(self) -> int:
-        """Total size of the most complete weight-bearing format, or 0 if unknown."""
+        """Size of one usable model in the preferred format, or 0 if unknown.
+
+        This is the conversion-side figure that drives preflight: a GGUF
+        repository shipping five quantizations of the same model still only
+        needs one of them. Use :attr:`repo_weight_bytes` when the question is
+        how large the repository is rather than how large the model is.
+        """
+        observation = self._weight_observation()
+        return observation.primary_bytes if observation is not None else 0
+
+    @property
+    def repo_weight_bytes(self) -> int:
+        """Sum of every file of the preferred format in the repository, or 0.
+
+        The display counterpart of :attr:`weight_bytes`, and the honest input to
+        a full-snapshot download estimate. It is never smaller than
+        :attr:`weight_bytes` once the Hub has reported file sizes.
+        """
         observation = self._weight_observation()
         return observation.total_bytes if observation is not None else 0
 

@@ -16,6 +16,15 @@ architectures:
       architectures:
         - Qwen3_5ForConditionalGeneration
         - Qwen3_5ForCausalLM
+      # Spellings this architecture is known by outside config.json. `qwen35` is
+      # the identifier GGUF files carry in their own header, so a GGUF-only
+      # repository that publishes no config.json is still identified here
+      # instead of falling through to "unknown". Aliases are compared only
+      # against identifiers read out of a weight file, never against repository
+      # tags, so listing one stays a deliberate registry decision.
+      aliases:
+        - qwen35
+        - qwen3_5
     export:
       transformers: "==5.2.*"
       pipeline: vlm
@@ -54,6 +63,14 @@ architectures:
         note: >-
           A Qwen3.5-9B derivative failed NPU compilation on a Lunar Lake host with
           OpenVINO 2026.4 and compiler-in-plugin, while GPU compilation succeeded.
+      - kind: tested
+        url: https://huggingface.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive
+        note: >-
+          GGUF files for this architecture carry `qwen35` in their header, which is
+          the provenance for the `match.aliases` entry. Verified against
+          HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive, a GGUF-only repository
+          with no config.json, whose Hub `gguf_metadata` reports
+          `{"architecture": "qwen35"}`.
 
   - id: arch-generic-text-generation
     schema_version: 1
