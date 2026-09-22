@@ -25,6 +25,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.support import find_broken_artifact
 from yonga.adapters import (
     CommandRunner,
     Exporter,
@@ -62,7 +63,7 @@ from yonga.repairs import (
 from yonga.util.jsonlog import null_logger
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-BROKEN_ARTIFACT = REPO_ROOT / "tests" / "fixtures" / "artifacts" / "tinyllm"
+BROKEN_ARTIFACT = find_broken_artifact()
 EXAMPLE_REGISTRY = REPO_ROOT / "registry" / "examples" / "qwen3_5.yaml"
 
 #: Every third-party package the CLI must not pull in at import time.
@@ -212,6 +213,11 @@ def test_a_rule_the_resolver_selects_is_a_rule_the_repair_layer_runs(resolver, t
     """The whole registry -> repairs path, on the real defective artifact."""
     if installed_repair_versions()["openvino"] is None:
         pytest.skip("the built-in repair rule is gated on an installed OpenVINO")
+    if BROKEN_ARTIFACT is None:
+        pytest.skip(
+            "the tiny OpenVINO test artifact is not present; "
+            "generate it with: python tools/make_test_artifact.py"
+        )
 
     artifact = tmp_path / "artifact"
     artifact.mkdir()
@@ -247,7 +253,7 @@ def test_a_rule_the_resolver_selects_is_a_rule_the_repair_layer_runs(resolver, t
     assert records[0].rule_id == "ov-tokenizer-precision-string-casing"
     for name in ("openvino_tokenizer.xml", "openvino_detokenizer.xml"):
         assert 'precision="STRiNG"' not in (artifact / name).read_text(encoding="utf-8")
-    # The vendored fixture is the evidence; it must never be written to.
+    # The generated fixture is the evidence; it must never be written to.
     assert 'precision="STRiNG"' in (BROKEN_ARTIFACT / "openvino_tokenizer.xml").read_text(
         encoding="utf-8"
     )

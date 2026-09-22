@@ -13,3 +13,6 @@ coverage.xml
 htmlcov/
 .tox/
 *.log
+
+# Generated test artifacts (see tools/make_test_artifact.py)
+tests/fixtures/.cache/

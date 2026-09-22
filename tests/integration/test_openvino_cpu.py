@@ -20,6 +20,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.support import find_broken_artifact
 from yonga.adapters.openvino_probe import OpenVINOProbe, openvino_available
 from yonga.adapters.runtime_genai import ChatHistory, ChatProfile, open_runtime
 from yonga.config.settings import Settings
@@ -33,8 +34,11 @@ pytestmark = pytest.mark.openvino
 #: ``optimum-cli export openvino`` run, kept byte-for-byte as the exporter
 #: produced it -- including the ``precision="STRiNG"`` defect in the tokenizer
 #: pair. ``YONGA_TEST_BROKEN_ARTIFACT`` points the suite at a larger export.
-_VENDORED_ARTIFACT = Path(__file__).resolve().parents[1] / "fixtures" / "artifacts" / "tinyllm"
-UNREPAIRED_FIXTURE = Path(os.environ.get("YONGA_TEST_BROKEN_ARTIFACT", _VENDORED_ARTIFACT))
+#: Resolved by ``tests/conftest.py``: the ``YONGA_TEST_BROKEN_ARTIFACT`` override,
+#: then the generated cache (``python tools/make_test_artifact.py``). ``None``
+#: when the artifact has not been generated on this host, in which case the
+#: tests below skip.
+UNREPAIRED_FIXTURE = find_broken_artifact()
 
 #: A complete, working artifact. When it is not supplied, the ``artifact``
 #: fixture derives one from the vendored export, because the two differ by
@@ -63,9 +67,12 @@ def _repair_in_place(directory: Path) -> None:
         path.write_text(text.replace(_BAD_PRECISION, _GOOD_PRECISION), encoding="utf-8")
 
 
-def _require(fixture: Path) -> Path:
-    if not fixture.is_dir():
-        pytest.skip(f"test artifact {fixture} is not present on this host")
+def _require(fixture: Path | None) -> Path:
+    if fixture is None or not fixture.is_dir():
+        pytest.skip(
+            "the tiny OpenVINO test artifact is not present; "
+            "generate it with: python tools/make_test_artifact.py"
+        )
     return fixture
 
 
