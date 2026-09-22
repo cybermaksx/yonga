@@ -1073,7 +1073,7 @@ def _space_check(
             remediation=[
                 f"Less than {format_bytes(CRITICAL_FREE_BYTES)} is free on {info.path}; "
                 "free space or point cache_dir/data_dir at a larger filesystem.",
-                "Remove artifacts you no longer need with: yonga rm MODEL",
+                "Remove artifacts you no longer need with: yonga remove ARTIFACT",
             ],
         )
     if free < floor:

@@ -224,6 +224,16 @@ class PreparationPlan(BaseModel):
     requested_revision: str | None = None
     resolved_source: ResolvedSource
     architecture: str | None = None
+    """What this model *is* — ``llama``, ``qwen3_5`` — never a registry rule id.
+
+    Same meaning as ``ArtifactManifest.architecture``, so the pre-flight panel
+    and the manifest it becomes cannot disagree. The id of the rule that matched
+    is ``architecture_rule_id``.
+    """
+
+    architecture_rule_id: str | None = None
+    """The registry architecture rule that matched, when one did."""
+
     task: str | None = None
     pipeline: PipelineKind = PipelineKind.UNKNOWN
     hardware: HardwareInventory
@@ -261,6 +271,19 @@ class PreparationPlan(BaseModel):
     def blocked(self) -> bool:
         """True when the plan cannot run as-is (remote code needed but not enabled)."""
         return self.trust_remote_code_required and not self.trust_remote_code_enabled
+
+    @property
+    def exporter_requirements_block(self) -> bool:
+        """True when an unmet exporter pin really will stop this job at preflight.
+
+        Unmet pins are not always fatal. A repository that already publishes
+        OpenVINO IR is copied and validated, never converted, so the exporter is
+        not on that job's path at all and its version pins decide nothing.
+
+        The preflight gate and the plan panel both read this one property, so
+        the panel cannot announce a block the service will not perform.
+        """
+        return bool(self.exporter.problems) and not self.resolved_source.already_openvino
 
     def to_json(self) -> dict[str, object]:
         """Return a fully JSON-serialisable representation of the plan."""

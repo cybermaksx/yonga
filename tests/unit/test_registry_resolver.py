@@ -575,10 +575,43 @@ def test_generic_chat_profile_is_used_for_unknown_families():
     rule = resolver.chat_profile(meta=metadata)
     assert rule is not None
     assert rule.id == "chat-default"
-    assert rule.supports_thinking_flag is False
+    # No stance: the runtime decides from the artifact's own chat template, so an
+    # unknown family still gets its reasoning suppressed when its template
+    # supports it.
+    assert rule.supports_thinking_flag is None
+    assert rule.thinking_candidates == ("enable_thinking",)
     assert rule.reasoning_wrappers == [("<think>", "</think>")]
     assert rule.defaults_for(thinking=False).max_new_tokens == 4096
     assert rule.template_context() == {}
+
+
+def test_a_catch_all_architecture_rule_does_not_hide_the_family_chat_profile():
+    """`registry explain` and `yonga chat` must name the same winner.
+
+    ``arch-generic-text-generation`` names ``chat-default``. Returning on that
+    name alone made ``explain`` print ``chat-default`` for a Qwen3 model while
+    ``yonga chat`` used ``chat-qwen3``, which is the one command whose whole job
+    is saying which rule won.
+    """
+    resolver = builtin_resolver()
+    metadata = ModelMetadata(
+        identity=ModelIdentity(repo_id="Qwen/Qwen3-0.6B"),
+        model_type="qwen3",
+        architectures=["Qwen3ForCausalLM"],
+    )
+    arch, _ = resolver.resolve_architecture(metadata)
+    assert arch is not None
+    assert arch.id == "arch-generic-text-generation"
+    assert arch.chat_profile == "chat-default"
+
+    rule, explanation = resolver.resolve_chat_profile(arch_rule=arch, meta=metadata)
+
+    assert rule is not None
+    assert rule.id == "chat-qwen3"
+    assert explanation.winner_id == "chat-qwen3"
+    # The named profile is still in the trail, with the reason it was considered.
+    named = next(c for c in explanation.candidates if c.rule_id == "chat-default")
+    assert any("named by architecture rule" in reason for reason in named.reasons)
 
 
 def test_chat_profile_resolution_is_explained():

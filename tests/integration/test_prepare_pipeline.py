@@ -261,8 +261,10 @@ def test_full_pipeline_through_a_real_subprocess(settings: Settings, hub: FakeHu
     assert summaries[0].repo_id == REPO_ID
     assert store.find(REPO_ID) == published
 
+    # The counter lives in current/total; the message is the bare label.
+    converting = sink.of_kind(ProgressKind.STAGE)[4]
+    assert (converting.message, converting.current, converting.total) == ("Converting", 5, 7)
     stages = [event.message for event in sink.of_kind(ProgressKind.STAGE)]
-    assert stages[4] == "5/7 Converting"
     assert stages[-1].startswith("Artifact ready at ")
 
 

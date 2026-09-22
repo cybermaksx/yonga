@@ -16,7 +16,11 @@ from typing import Any
 
 import pytest
 
-from yonga.application.chat import DEFAULT_REASONING_WRAPPERS, sanitize_reasoning
+from yonga.application.chat import (
+    DEFAULT_REASONING_WRAPPERS,
+    sanitize_answer,
+    sanitize_reasoning,
+)
 from yonga.registry.loader import load_builtin_registry
 
 THINK = [("<think>", "</think>")]
@@ -321,3 +325,72 @@ def test_an_identical_opening_and_closing_wrapper_pairs_up():
     assert SECRET not in display
     assert display == "ab"
     assert reasoning == SECRET
+
+
+# --- the typed signals the UI renders from --------------------------------------------
+#
+# The renderer must be able to tell "said nothing" from "never finished thinking"
+# without looking at the text again, so the sanitiser reports the *shape* of what
+# it removed. These flags travel to the screen; the reasoning itself does not.
+
+
+def test_a_clean_answer_reports_no_hidden_reasoning():
+    answer = sanitize_answer("just an answer", THINK, show=False)
+    assert answer.display_text == "just an answer"
+    assert answer.reasoning_hidden is False
+    assert answer.reasoning_unterminated is False
+    assert answer.is_empty is False
+
+
+def test_a_closed_block_reports_hidden_but_terminated_reasoning():
+    answer = sanitize_answer(f"<think>{SECRET}</think>", THINK, show=False)
+    assert SECRET not in answer.display_text
+    assert answer.is_empty is True
+    assert answer.reasoning_hidden is True
+    assert answer.reasoning_unterminated is False
+
+
+def test_an_unclosed_block_reports_unterminated_reasoning():
+    answer = sanitize_answer(f"<think>{SECRET}", THINK, show=False)
+    assert SECRET not in answer.display_text
+    assert answer.is_empty is True
+    assert answer.reasoning_hidden is True
+    assert answer.reasoning_unterminated is True
+
+
+def test_a_nested_block_left_open_is_still_unterminated():
+    answer = sanitize_answer(f"<think>a<think>{SECRET}</think>", THINK, show=False)
+    assert SECRET not in answer.display_text
+    assert answer.reasoning_unterminated is True
+
+
+def test_a_closing_wrapper_with_no_opener_is_not_unterminated():
+    """The template can emit the opener, so generated text may start inside the block."""
+    answer = sanitize_answer(f"{SECRET}</think>the answer", THINK, show=False)
+    assert SECRET not in answer.display_text
+    assert answer.display_text == "the answer"
+    assert answer.reasoning_hidden is True
+    assert answer.reasoning_unterminated is False
+
+
+def test_showing_reasoning_hides_nothing_so_nothing_is_flagged_hidden():
+    answer = sanitize_answer(f"<think>{SECRET}", THINK, show=True)
+    assert SECRET in answer.display_text
+    assert answer.reasoning_hidden is False
+    assert answer.reasoning_unterminated is True
+
+
+def test_the_two_value_form_still_agrees_with_the_typed_one():
+    raw = f"<think>{SECRET}</think>answer"
+    display, reasoning = sanitize_reasoning(raw, THINK, show=False)
+    answer = sanitize_answer(raw, THINK, show=False)
+    assert (display, reasoning) == (answer.display_text, answer.reasoning_text)
+
+
+@pytest.mark.parametrize("show", [True, False])
+def test_the_typed_sanitiser_is_total(show):
+    for text in ("", "<think>", "</think>", "<think>" * 200, "\x00<think>\x00"):
+        answer = sanitize_answer(text, THINK, show=show)
+        assert isinstance(answer.display_text, str)
+        assert isinstance(answer.reasoning_hidden, bool)
+        assert isinstance(answer.reasoning_unterminated, bool)

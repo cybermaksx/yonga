@@ -11,12 +11,14 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 from pydantic import BaseModel, ConfigDict
 from rich.box import ROUNDED, SIMPLE
-from rich.console import Group, RenderableType
+from rich.console import Console, ConsoleOptions, Group, RenderableType, RenderResult
+from rich.measure import Measurement
 from rich.panel import Panel
+from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 
@@ -48,6 +50,13 @@ __all__ = [
 ]
 
 _DASH = "—"
+
+#: The flag that lets a user proceed past an unmet exporter requirement. Spelled
+#: here rather than imported so this pure render module keeps its domain-only
+#: dependencies; it must stay equal to
+#: ``yonga.application.prepare.IGNORE_EXPORTER_REQUIREMENTS_FLAG``, which a unit
+#: test asserts.
+_IGNORE_EXPORTER_REQUIREMENTS_FLAG = "--ignore-exporter-requirements"
 
 #: Severity shown for each device compatibility status.
 _DEVICE_STATUS_SEVERITY: dict[DeviceStatus, Severity] = {
@@ -91,6 +100,20 @@ def _grid(*, padding: tuple[int, int] = (0, 2)) -> Table:
     return table
 
 
+def _architecture_line(plan: PreparationPlan) -> Text:
+    """Render the architecture as the identity, with the matched rule id behind it.
+
+    ``plan.architecture`` is what the model *is* (``llama``). The registry rule
+    that matched covers a whole family, so its id answers a different question
+    and is shown as provenance rather than as the answer.
+    """
+    identity = _text(plan.architecture)
+    rule_id = (plan.architecture_rule_id or "").strip()
+    if not rule_id or rule_id == str(plan.architecture or "").strip():
+        return identity
+    return Text.assemble(identity, ("  ", ""), (f"rule {rule_id}", "dim"))
+
+
 def _text(value: object, *, style: str = "") -> Text:
     """Render any value as text, using an em dash for ``None`` and blanks."""
     if value is None:
@@ -116,11 +139,11 @@ def _short_revision(revision: str | None, *, length: int = 12) -> str | None:
     return cleaned
 
 
-def _timestamp(moment: datetime | None) -> str:
-    """Render a timestamp in local minutes precision."""
+def _timestamp(moment: datetime | None, *, minutes: bool = True) -> str:
+    """Render a timestamp in local time, to the minute or, when narrow, to the day."""
     if moment is None:
         return _DASH
-    return moment.astimezone().strftime("%Y-%m-%d %H:%M")
+    return moment.astimezone().strftime("%Y-%m-%d %H:%M" if minutes else "%Y-%m-%d")
 
 
 def _status_text(severity: Severity, label: str) -> Text:
@@ -362,7 +385,7 @@ def preparation_plan(plan: PreparationPlan) -> RenderableType:
     )
     body.add_row(Text("Relationship"), _text(source.relationship.value))
     body.add_row(Text("Source format"), _text(source.format.value))
-    body.add_row(Text("Architecture"), _text(plan.architecture))
+    body.add_row(Text("Architecture"), _architecture_line(plan))
     body.add_row(Text("Task"), _text(plan.task or plan.pipeline.value))
 
     device_line = Text(plan.target_device, style="bold")
@@ -446,8 +469,7 @@ def preparation_plan(plan: PreparationPlan) -> RenderableType:
             )
         blocks.append(reasons)
 
-    if plan.exporter.problems:
-        blocks.extend(_bullet_block("Exporter problems", plan.exporter.problems, style="red"))
+    blocks.extend(_exporter_block(plan))
 
     return Panel(
         Group(*blocks),
@@ -457,6 +479,42 @@ def preparation_plan(plan: PreparationPlan) -> RenderableType:
         box=ROUNDED,
         padding=(1, 2),
     )
+
+
+def _exporter_block(plan: PreparationPlan) -> list[RenderableType]:
+    """Render unmet exporter requirements as a *blocking* section.
+
+    This is not an advisory list. Everything above it in the panel describes
+    work that is about to happen and, at most, asks for approval; this section
+    says the work will not happen at all. It therefore gets its own rule, an
+    explicit ``BLOCKED`` heading and a red ``x`` marker per problem rather than
+    the ``!``/``·`` bullets of ``Confirmation required``, and it names the one
+    flag that overrides it — ``--yes`` deliberately does not.
+
+    Rendered only when the pin really will stop the job: the section is keyed on
+    :attr:`PreparationPlan.exporter_requirements_block`, the same property the
+    preflight gate blocks on, so the panel cannot announce a block that will not
+    happen (an already-OpenVINO source is copied, never converted).
+    """
+    if not plan.exporter_requirements_block:
+        return []
+    problems = Table.grid(padding=(0, 2))
+    problems.add_column(no_wrap=True, width=1)
+    problems.add_column(overflow="fold")
+    for problem in plan.exporter.problems:
+        problems.add_row(Text("x", style="bold red"), Text(problem, style="red"))
+    return [
+        Text(""),
+        Rule(style="red"),
+        Text("BLOCKED — exporter requirements not satisfied", style="bold red"),
+        problems,
+        Text(
+            "Preparation stops at preflight, before the download and the conversion. "
+            f"Override with {_IGNORE_EXPORTER_REQUIREMENTS_FLAG} if you know the pin is stale; "
+            "--yes does not.",
+            style="dim",
+        ),
+    ]
 
 
 def _bullet_block(title: str, items: Sequence[str], *, style: str) -> list[RenderableType]:
@@ -474,38 +532,155 @@ def _bullet_block(title: str, items: Sequence[str], *, style: str) -> list[Rende
 # ----------------------------------------------------------------------
 # list
 # ----------------------------------------------------------------------
+#: Every column ``yonga list`` can show, in display order, with its header.
+_LIST_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("artifact", "Artifact"),
+    ("model", "Model"),
+    ("revision", "Revision"),
+    ("profile", "Profile"),
+    ("device", "Dev"),
+    ("size", "Size"),
+    ("created", "Created"),
+    ("benchmark", "Benchmark"),
+    ("ready", "Ready"),
+)
+
+#: Order in which columns are given up when the terminal cannot fit them all.
+#: ``docs/CLI_SPEC.md`` section 7 asks for the artifact, its source revision,
+#: profile, recommended device, size and last benchmark, so the columns it does
+#: not ask for go first and the ones it does go last.
+_LIST_DROP_ORDER: tuple[str, ...] = (
+    "created",
+    "model",
+    "revision",
+    "benchmark",
+    "size",
+    "ready",
+)
+
+#: Columns whose values are right-aligned.
+_LIST_NUMERIC: frozenset[str] = frozenset({"size"})
+
+#: Widest repository id printed before it is elided; long ids must not be able
+#: to push the columns beside them out of the table.
+_LIST_MODEL_MAX_WIDTH = 32
+
+#: Commit sha length in the list. The full sha is one ``--json`` away.
+_LIST_REVISION_LENGTH = 8
+
+#: A width no real table reaches, used to measure a layout's natural size.
+_LIST_MEASURE_WIDTH = 10_000
+
+
+class _ListVariant(NamedTuple):
+    """One rung of the ``yonga list`` layout ladder."""
+
+    dropped: frozenset[str]
+    long_timestamps: bool
+
+
+def _list_variants() -> tuple[_ListVariant, ...]:
+    """Build the layout ladder, widest first, narrowest last."""
+    variants = [_ListVariant(frozenset(), True), _ListVariant(frozenset(), False)]
+    dropped: set[str] = set()
+    for key in _LIST_DROP_ORDER:
+        dropped.add(key)
+        variants.append(_ListVariant(frozenset(dropped), False))
+    return tuple(variants)
+
+
+#: The layout ladder, from every column with to-the-minute timestamps down to
+#: the artifact id, its profile and its device.
+_LIST_VARIANTS: tuple[_ListVariant, ...] = _list_variants()
+
+
+def _list_cells(summary: ArtifactSummary, *, long_timestamps: bool) -> dict[str, Text]:
+    """Render one artifact as a cell per column key."""
+    severity = Severity.OK if summary.ready else Severity.WARNING
+    ready = _status_text(severity, "yes" if summary.ready else "no")
+    revision = _short_revision(summary.resolved_revision, length=_LIST_REVISION_LENGTH)
+    return {
+        "artifact": _text(summary.artifact_id),
+        "model": _text(summary.repo_id),
+        "revision": _text(revision),
+        "profile": _text(summary.profile),
+        "device": _text(summary.recommended_device),
+        "size": _text(human_bytes(summary.size_bytes)),
+        "created": _text(_timestamp(summary.created_at, minutes=long_timestamps)),
+        "benchmark": _text(_timestamp(summary.last_benchmark, minutes=long_timestamps)),
+        "ready": ready,
+    }
+
+
+def _artifact_table(summaries: Sequence[ArtifactSummary], variant: _ListVariant) -> Table:
+    """Build the ``yonga list`` table for one rung of the ladder."""
+    table = Table(
+        box=SIMPLE,
+        show_edge=False,
+        pad_edge=False,
+        header_style="bold",
+        # One space between columns instead of two: the extra column that the
+        # box rule occupies already separates them, and nine columns cannot
+        # afford a second space each on an 80-column terminal.
+        padding=(0, 1, 0, 0),
+    )
+    keys = [key for key, _ in _LIST_COLUMNS if key not in variant.dropped]
+    headers = dict(_LIST_COLUMNS)
+    for key in keys:
+        table.add_column(
+            headers[key],
+            no_wrap=True,
+            overflow="ellipsis",
+            justify="right" if key in _LIST_NUMERIC else "left",
+            max_width=_LIST_MODEL_MAX_WIDTH if key == "model" else None,
+        )
+    for summary in summaries:
+        cells = _list_cells(summary, long_timestamps=variant.long_timestamps)
+        table.add_row(*(cells[key] for key in keys))
+    return table
+
+
+class _ArtifactList:
+    """The ``yonga list`` catalogue, laid out for the terminal it is printed on.
+
+    Nine columns do not fit an 80-column terminal, and Rich's answer to that is
+    to shrink every column until each one is an ellipsis. This renderable
+    answers differently: it drops whole columns, in a fixed order, until the
+    rest fit at their natural width. The artifact id, the profile and the
+    device are never truncated, and the detail ``docs/CLI_SPEC.md`` section 7
+    asks for survives down to 80 columns.
+    """
+
+    def __init__(self, summaries: Sequence[ArtifactSummary]) -> None:
+        """Keep the summaries; the layout is chosen at render time."""
+        self._summaries = tuple(summaries)
+
+    def table_for(self, console: Console, options: ConsoleOptions) -> Table:
+        """Return the widest layout whose natural width fits ``options``."""
+        wide = options.update_width(_LIST_MEASURE_WIDTH)
+        narrowest = _artifact_table(self._summaries, _LIST_VARIANTS[-1])
+        for variant in _LIST_VARIANTS[:-1]:
+            candidate = _artifact_table(self._summaries, variant)
+            if Measurement.get(console, wide, candidate).maximum <= options.max_width:
+                return candidate
+        return narrowest
+
+    def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
+        """Render the chosen layout."""
+        yield self.table_for(console, options)
+
+    def __rich_measure__(self, console: Console, options: ConsoleOptions) -> Measurement:
+        """Measure the layout that would be chosen for ``options``."""
+        return Measurement.get(console, options, self.table_for(console, options))
+
+
 def artifact_list(summaries: Sequence[ArtifactSummary]) -> RenderableType:
     """Render ``yonga list`` (``docs/CLI_SPEC.md`` section 7)."""
     if not summaries:
         return Text(
             "No prepared artifacts yet. Run 'yonga prepare MODEL' to make one.", style="dim"
         )
-
-    table = Table(box=SIMPLE, show_edge=False, pad_edge=False, header_style="bold")
-    table.add_column("Artifact", no_wrap=True)
-    table.add_column("Model", overflow="fold")
-    table.add_column("Revision", no_wrap=True)
-    table.add_column("Profile", no_wrap=True)
-    table.add_column("Device", no_wrap=True)
-    table.add_column("Size", justify="right", no_wrap=True)
-    table.add_column("Created", no_wrap=True)
-    table.add_column("Benchmark", no_wrap=True)
-    table.add_column("State", no_wrap=True)
-
-    for summary in summaries:
-        severity = Severity.OK if summary.ready else Severity.WARNING
-        table.add_row(
-            summary.artifact_id,
-            summary.repo_id,
-            _short_revision(summary.resolved_revision) or _DASH,
-            summary.profile or _DASH,
-            summary.recommended_device or _DASH,
-            human_bytes(summary.size_bytes),
-            _timestamp(summary.created_at),
-            _timestamp(summary.last_benchmark),
-            _status_text(severity, "ready" if summary.ready else "incomplete"),
-        )
-    return table
+    return _ArtifactList(summaries)
 
 
 # ----------------------------------------------------------------------

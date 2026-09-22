@@ -21,8 +21,12 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import pytest
-from click.testing import Result
-from typer.testing import CliRunner
+
+# ``Result`` comes from typer, not click: typer 0.27 vendored click and returns
+# its own ``typer.testing.Result`` from ``CliRunner.invoke``, while typer 0.25
+# re-exports click's. Importing it from typer is correct under both, so the
+# annotation tracks whichever version is installed.
+from typer.testing import CliRunner, Result
 
 from tests.unit.test_prepare_planning import (
     GGUF_REPO,

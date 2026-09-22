@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 from rich.console import Console
+from rich.text import Text
 
 from yonga.domain.artifacts import (
     ArtifactSummary,
@@ -508,18 +509,24 @@ def test_preparation_plan_without_optional_sections():
 # ----------------------------------------------------------------------
 # list
 # ----------------------------------------------------------------------
-def test_artifact_list_renders_rows():
-    summaries = [
+ARTIFACT_ID = "7bd72baf64957953"
+PROFILE = "cpu-int4-asym-g128"
+
+
+def list_summaries() -> list[ArtifactSummary]:
+    """One ready artifact and one incomplete one, with real-world field widths."""
+    return [
         ArtifactSummary(
-            artifact_id="qwen35-gpu",
-            path=Path("/artifacts/qwen35-gpu"),
-            repo_id="Qwen/Qwen3.5-9B",
+            artifact_id=ARTIFACT_ID,
+            path=Path("/artifacts/qwen3"),
+            repo_id="Qwen/Qwen3-0.6B",
             resolved_revision=SHA,
-            profile="gpu-int4-asym-g128",
-            recommended_device="GPU",
+            profile=PROFILE,
+            recommended_device="CPU",
             size_bytes=6 * 1024**3,
             created_at=NOW,
             ready=True,
+            last_benchmark=NOW,
         ),
         ArtifactSummary(
             artifact_id="broken",
@@ -528,16 +535,71 @@ def test_artifact_list_renders_rows():
             created_at=NOW,
         ),
     ]
-    text = render(artifact_list(summaries))
-    assert "qwen35-gpu" in text
-    assert "0123456789ab" in text
+
+
+def widest_line(text: str) -> int:
+    """Width of the longest rendered line, as the terminal would count it."""
+    return max(Text(line).cell_len for line in text.splitlines())
+
+
+def test_artifact_list_renders_rows():
+    text = render(artifact_list(list_summaries()))
+    assert ARTIFACT_ID in text
+    assert "01234567" in text
     assert "6.0 GiB" in text
-    assert "ready" in text
-    assert "incomplete" in text
+    assert "✓ yes" in text
+    assert "! no" in text
 
 
 def test_artifact_list_handles_empty_input():
     assert "No prepared artifacts" in render(artifact_list([]))
+
+
+@pytest.mark.parametrize("width", [80, 100, 120])
+def test_artifact_list_keeps_the_spec_columns_legible(width: int):
+    """``docs/CLI_SPEC.md`` section 7: id, revision, profile, device, size, benchmark."""
+    text = render(artifact_list(list_summaries()), width=width)
+
+    assert widest_line(text) <= width
+    # Nothing that identifies the artifact is abbreviated away.
+    assert ARTIFACT_ID in text
+    assert PROFILE in text
+    assert "01234567" in text
+    assert "CPU" in text
+    assert "6.0 GiB" in text
+    assert "2026-09-22" in text
+    assert "…" not in text
+
+
+def test_artifact_list_drops_columns_rather_than_truncating_them():
+    """A narrow terminal loses whole columns; a wide one gets every column."""
+    summaries = list_summaries()
+
+    narrow = render(artifact_list(summaries), width=80)
+    wide = render(artifact_list(summaries), width=140)
+
+    assert "Model" not in narrow
+    assert "Created" not in narrow
+    assert "Model" in wide
+    assert "Qwen/Qwen3-0.6B" in wide
+    assert "Created" in wide
+    # The widest layout keeps the time of day; the narrower ones keep the date.
+    assert NOW.astimezone().strftime("%Y-%m-%d %H:%M") in wide
+
+
+def test_artifact_list_elides_only_an_over_long_repository_id():
+    """One 50-character repo id must not push the columns beside it out of view."""
+    summaries = list_summaries()
+    summaries[0] = summaries[0].model_copy(
+        update={"repo_id": "HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive"}
+    )
+
+    text = render(artifact_list(summaries), width=120)
+
+    assert widest_line(text) <= 120
+    assert ARTIFACT_ID in text
+    assert PROFILE in text
+    assert "HauhauCS/Qwen3.5" in text
 
 
 # ----------------------------------------------------------------------

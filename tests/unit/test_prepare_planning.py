@@ -12,6 +12,7 @@ decision test asserts against them exactly rather than against round numbers.
 
 from __future__ import annotations
 
+import re
 import shutil
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -37,7 +38,13 @@ from yonga.application.prepare import (
 )
 from yonga.application.progress import CollectingSink, ProgressKind
 from yonga.config.settings import Settings
-from yonga.domain.artifacts import IRDescription, ProbeResult, ProbeStatus, SubmodelRole
+from yonga.domain.artifacts import (
+    ArtifactManifest,
+    IRDescription,
+    ProbeResult,
+    ProbeStatus,
+    SubmodelRole,
+)
 from yonga.domain.diagnostics import (
     CancelledError,
     ExitCode,
@@ -120,14 +127,29 @@ REGISTRY_VERSIONS: dict[str, str | None] = {
     "python": "3.11.0",
 }
 
-#: Installed versions as the exporter adapter reports them on the reference host.
+#: Installed versions as the exporter adapter reports them on a host that can
+#: actually run the Qwen3.5 export: ``transformers`` satisfies the registry's
+#: ``==5.2.*`` pin, matching the ``transformers 5.2.1`` the CLI tests' healthy
+#: inventory reports. This is :class:`FakeExporter`'s default because an unmet
+#: pin now *stops* preparation at preflight, so every test that is about
+#: something else must start from an exporter that is allowed to run.
 INSTALLED_EXPORT_VERSIONS: dict[str, str | None] = {
     "openvino": "2026.4.0",
     "optimum": "2.3.0",
     "optimum-intel": "2.2.0",
     "nncf": "3.4.0",
-    "transformers": "5.5.4",
+    "transformers": "5.2.1",
     "torch": "2.14.0",
+}
+
+#: The mismatch the reference host really has: ``transformers 5.5.4`` against the
+#: registry's ``==5.2.*``. Verified by hand — 5.5.4 loads ``Qwen3_5Config`` and
+#: reports ``model_type: qwen3_5``, so the architecture looks supported, but
+#: optimum-intel 2.2.0's export patcher imports ``Qwen3_5DynamicCache``, which
+#: 5.5.4 no longer exposes, and the conversion dies minutes into the job.
+MISMATCHED_EXPORT_VERSIONS: dict[str, str | None] = {
+    **INSTALLED_EXPORT_VERSIONS,
+    "transformers": "5.5.4",
 }
 
 #: The authentic mixed-case defect every current export writes.
@@ -673,8 +695,14 @@ def run_prepare(
     confirm: ConfirmCallback = approve_all,
     allow_repairs: bool = True,
     sink: CollectingSink | None = None,
+    ignore_exporter_requirements: bool = False,
 ) -> PreparationOutcome:
-    """Run a plan inside a real job context, reusing the plan's job id."""
+    """Run a plan inside a real job context, reusing the plan's job id.
+
+    ``ignore_exporter_requirements`` defaults to ``False``, exactly as the CLI
+    does: a test that wants to convert past an unmet pin has to say so, the same
+    way a user has to.
+    """
     events = sink if sink is not None else CollectingSink()
     with open_job(
         settings=settings,
@@ -682,7 +710,13 @@ def run_prepare(
         job_id=plan.job_id,
         progress=events,
     ) as ctx:
-        return service.prepare(plan, confirm=confirm, ctx=ctx, allow_repairs=allow_repairs)
+        return service.prepare(
+            plan,
+            confirm=confirm,
+            ctx=ctx,
+            allow_repairs=allow_repairs,
+            ignore_exporter_requirements=ignore_exporter_requirements,
+        )
 
 
 # --- fixtures ------------------------------------------------------------------------
@@ -920,7 +954,8 @@ def test_exporter_version_mismatch_is_reported_not_papered_over(
     settings: Settings, hub: FakeHub
 ) -> None:
     """Transformers 5.5.4 against the registry's ``==5.2.*`` must show up in the plan."""
-    service = build_service(settings=settings, hub=hub)
+    exporter = FakeExporter(versions=dict(MISMATCHED_EXPORT_VERSIONS))
+    service = build_service(settings=settings, hub=hub, exporter=exporter)
 
     plan = service.plan(SAFETENSORS_REPO, device="gpu")
 
@@ -934,13 +969,51 @@ def test_exporter_version_mismatch_is_reported_not_papered_over(
 
 def test_exporter_requirements_pass_when_versions_match(settings: Settings, hub: FakeHub) -> None:
     """A host with the required Transformers reports a satisfied requirement set."""
-    exporter = FakeExporter(versions={**INSTALLED_EXPORT_VERSIONS, "transformers": "5.2.1"})
-    service = build_service(settings=settings, hub=hub, exporter=exporter)
+    service = build_service(settings=settings, hub=hub)
 
     plan = service.plan(SAFETENSORS_REPO, device="gpu")
 
     assert plan.exporter.satisfied is True
     assert plan.exporter.problems == []
+
+
+def test_an_absent_exporter_package_reads_differently_from_a_wrong_one(
+    settings: Settings, hub: FakeHub
+) -> None:
+    """ "Not installed" and "the wrong version" are different problems, so they say so."""
+    exporter = FakeExporter(versions={**INSTALLED_EXPORT_VERSIONS, "transformers": None})
+    service = build_service(settings=settings, hub=hub, exporter=exporter)
+
+    plan = service.plan(SAFETENSORS_REPO, device="gpu")
+
+    assert plan.exporter.satisfied is False
+    assert plan.exporter.problems == [
+        "transformers ==5.2.* is required, but transformers is not installed"
+    ]
+
+
+def test_an_unparsable_installed_version_is_unknown_rather_than_unsatisfied(
+    settings: Settings, hub: FakeHub
+) -> None:
+    """``satisfies`` says ``False`` for a version it cannot read; that is not a verdict.
+
+    Treating it as one would refuse to convert on any host whose package
+    metadata yonga happens not to understand, so the plan records what it could
+    not check as a known limitation and leaves ``problems`` empty.
+    """
+    exporter = FakeExporter(
+        versions={**INSTALLED_EXPORT_VERSIONS, "transformers": "unreleased-nightly"}
+    )
+    service = build_service(settings=settings, hub=hub, exporter=exporter)
+
+    plan = service.plan(SAFETENSORS_REPO, device="gpu")
+
+    assert plan.exporter.problems == []
+    assert plan.exporter.satisfied is True
+    assert any(
+        "could not be checked" in note and "unreleased-nightly" in note
+        for note in plan.known_limitations
+    )
 
 
 # --- reuse ---------------------------------------------------------------------------
@@ -988,23 +1061,40 @@ def test_artifact_directory_layout_matches_architecture_spec(
 
 
 def test_stage_events_are_numbered_one_to_seven(settings: Settings, hub: FakeHub) -> None:
-    """The UI stream carries ``"4/7 Downloading"`` style stage events in order."""
+    """The stage stream carries the seven stages of ``docs/CLI_SPEC.md`` section 6, in order."""
     service = build_service(settings=settings, hub=hub)
     plan = service.plan(SAFETENSORS_REPO, device="gpu")
     sink = CollectingSink()
 
     run_prepare(service, plan, settings, sink=sink)
 
-    messages = [event.message for event in sink.of_kind(ProgressKind.STAGE)]
-    assert messages[:7] == [
-        "1/7 Inspecting source",
-        "2/7 Resolving compatibility",
-        "3/7 Preflight",
-        "4/7 Downloading",
-        "5/7 Converting",
-        "6/7 Validating / repairing",
-        "7/7 Probing runtime",
+    stages = sink.of_kind(ProgressKind.STAGE)[:7]
+    assert [(event.current, event.total) for event in stages] == [(n, 7) for n in range(1, 8)]
+    assert [event.message for event in stages] == [
+        "Inspecting source",
+        "Resolving compatibility",
+        "Preflight",
+        "Downloading",
+        "Converting",
+        "Validating / repairing",
+        "Probing runtime",
     ]
+
+
+def test_a_stage_message_never_carries_its_own_counter(settings: Settings, hub: FakeHub) -> None:
+    """The position travels in ``current``/``total``; the renderer prints it once.
+
+    A message beginning with its own ``"4/7"`` printed the counter twice, because
+    the renderer adds one from the same event's position.
+    """
+    service = build_service(settings=settings, hub=hub)
+    plan = service.plan(SAFETENSORS_REPO, device="gpu")
+    sink = CollectingSink()
+
+    run_prepare(service, plan, settings, sink=sink)
+
+    for event in sink.of_kind(ProgressKind.STAGE):
+        assert not re.match(r"^\d+\s*/\s*\d+", event.message), event.message
 
 
 def test_hash_events_are_emitted_during_finalization(settings: Settings, hub: FakeHub) -> None:
@@ -1053,11 +1143,49 @@ def test_manifest_records_requested_and_resolved_revisions(
     assert manifest.resolved_source.relationship is SourceRelationship.LOSSLESS_CONVERSION
     assert manifest.tool_version
     assert manifest.source_license == "apache-2.0"
-    assert manifest.architecture == "arch-qwen3_5"
+    assert manifest.architecture == "qwen3_5"
+    assert manifest.architecture_rule_id == "arch-qwen3_5"
     assert manifest.task == "image-text-to-text"
     assert manifest.pipeline is PipelineKind.VLM
     assert manifest.host["devices"] == "CPU,GPU,NPU"
     assert manifest.ready is True
+
+
+def test_manifest_architecture_is_the_identity_not_the_matched_rule_id(
+    settings: Settings, hub: FakeHub
+) -> None:
+    """``SPEC.md`` section 14 wants ``"architecture": "qwen3_5"``, not a rule id.
+
+    An architecture rule covers a family, so its id answers a different question
+    than "what is this model". Both are recorded, in separate fields.
+    """
+    service = build_service(settings=settings, hub=hub)
+
+    manifest = run_prepare(service, service.plan(SAFETENSORS_REPO, device="gpu"), settings).manifest
+
+    assert manifest.architecture == "qwen3_5"
+    assert manifest.architecture_rule_id == "arch-qwen3_5"
+    payload = manifest.to_json()
+    assert payload["architecture"] == "qwen3_5"
+    assert payload["architecture_rule_id"] == "arch-qwen3_5"
+    assert not str(payload["architecture"]).startswith("arch-")
+
+
+def test_manifest_written_before_the_rule_id_field_existed_still_validates(
+    settings: Settings, hub: FakeHub
+) -> None:
+    """Artifacts prepared by an older build must keep loading, field or no field."""
+    service = build_service(settings=settings, hub=hub)
+    manifest = run_prepare(service, service.plan(SAFETENSORS_REPO, device="gpu"), settings).manifest
+
+    payload = manifest.to_json()
+    del payload["architecture_rule_id"]
+    payload["architecture"] = "arch-generic-text-generation"
+
+    restored = ArtifactManifest.model_validate(payload)
+
+    assert restored.architecture_rule_id is None
+    assert restored.architecture == "arch-generic-text-generation"
 
 
 def test_manifest_holds_no_user_paths_or_secrets(settings: Settings, hub: FakeHub) -> None:

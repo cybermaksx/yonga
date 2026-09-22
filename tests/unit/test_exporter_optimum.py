@@ -395,6 +395,24 @@ def test_env_overrides_record_only_the_differences(job: JobContext) -> None:
     assert set(result.env_overrides) <= {"TMPDIR", "TMP", "TEMP", "HF_HUB_OFFLINE"}
 
 
+def test_the_runner_is_never_handed_the_whole_environment(job: JobContext) -> None:
+    """What reaches ``run(env=...)`` is recorded in the job log, so it must be small.
+
+    The exporter used to pass ``ctx.child_env()`` — a complete environment —
+    which the runner wrote into ``subprocess.start`` verbatim. The child still
+    sees the inherited environment, because the runner merges the overrides onto
+    ``ctx.child_env()`` itself.
+    """
+    runner = FakeRunner()
+    request = make_request(job, extra_env={"OV_CACHE": "on"})
+    OptimumExporter(runner, launcher=LAUNCHER).export(request, job)
+    passed = dict(runner.calls[0].env)
+    assert set(passed) <= {"TMPDIR", "TMP", "TEMP", "HF_HUB_OFFLINE", "OV_CACHE"}
+    assert "PATH" not in passed
+    assert "HOME" not in passed
+    assert passed["TMPDIR"] == str(job.temp_dir)
+
+
 def test_offline_setting_reaches_the_subprocess(tmp_path: Path) -> None:
     settings = load_settings(
         env={},
@@ -565,18 +583,27 @@ def test_requirements_returns_every_export_package() -> None:
     assert versions["transformers"] is not None
 
 
-def test_check_requirements_flags_the_real_transformers_mismatch() -> None:
-    """transformers 5.5.4 is installed here while the Qwen3.5 rule wants ``==5.2.*``."""
+def test_check_requirements_flags_a_mismatch_against_the_really_installed_version() -> None:
+    """A pin the installed transformers cannot satisfy is reported, naming both versions.
+
+    The specifier is derived from whatever is installed rather than hard-coded, so
+    this exercises the real ``requirements()`` reading without asserting anything
+    about which transformers release happens to be on the host. Pinning a literal
+    here would make the test fail on exactly the version the Qwen3.5 rule asks for.
+    """
     exporter = OptimumExporter(FakeRunner(), launcher=LAUNCHER)
     installed = exporter.requirements()["transformers"]
     assert installed is not None
 
-    checked = exporter.check_requirements(ExporterRequirements(transformers="==5.2.*"))
+    major = int(installed.split(".")[0])
+    impossible = f"=={major + 1}.0.*"
+
+    checked = exporter.check_requirements(ExporterRequirements(transformers=impossible))
 
     assert checked.satisfied is False
     assert len(checked.problems) == 1
     problem = checked.problems[0]
-    assert "==5.2.*" in problem
+    assert impossible in problem
     assert installed in problem
     assert "transformers" in problem
 

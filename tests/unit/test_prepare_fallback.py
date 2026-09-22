@@ -25,6 +25,7 @@ import pytest
 
 from tests.unit.test_prepare_planning import (
     BAD_PRECISION,
+    MISMATCHED_EXPORT_VERSIONS,
     SAFETENSORS_REPO,
     FakeExporter,
     FakeFilesystemProbe,
@@ -46,6 +47,8 @@ from yonga.domain.diagnostics import (
     DeviceUnsupportedError,
     ExitCode,
     ExportError,
+    FailureCategory,
+    PreflightError,
     RepairError,
     ValidationError,
 )
@@ -68,6 +71,18 @@ NPU_PERMISSION_DENIED = (
 
 #: What a full filesystem looks like coming out of the exporter.
 DISK_FULL = "RuntimeError: Failed to save model: No space left on device"
+
+#: How the Qwen3.5 export really dies on ``transformers 5.5.4``: optimum-intel
+#: 2.2.0's model patcher imports a symbol that release no longer exposes. The
+#: architecture looks supported right up to this line — 5.5.4 loads
+#: ``Qwen3_5Config`` and reports ``model_type: qwen3_5`` — which is exactly why
+#: only the declared version pin can predict the failure.
+QWEN35_CACHE_IMPORT_ERROR = (
+    'File ".../optimum/exporters/openvino/model_patcher.py", line 10049, in __init__\n'
+    "    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DynamicCache\n"
+    "ImportError: cannot import name 'Qwen3_5DynamicCache' from "
+    "'transformers.models.qwen3_5.modeling_qwen3_5'"
+)
 
 #: A registry document that makes the NPU the recommended device for one exact
 #: repository, so auto-selection tries it first and the fallback path is reached.
@@ -448,6 +463,36 @@ def test_export_failure_is_classified_and_kept_raw(settings: Settings, hub: Fake
     assert "No space left on device" in log_text
 
 
+def test_an_unmet_exporter_pin_stops_the_job_before_the_export_can_fail(
+    settings: Settings, hub: FakeHub
+) -> None:
+    """The export that cannot succeed is never launched.
+
+    This is the observed defect in miniature: the exporter double here reports
+    the reference host's real ``transformers 5.5.4`` *and* would fail with the
+    authentic ``Qwen3_5DynamicCache`` import error. Preflight refuses first, so
+    the user gets the package diagnostic instead of a generic conversion failure
+    minutes and 17.5 GiB later.
+    """
+    exporter = FakeExporter(
+        versions=dict(MISMATCHED_EXPORT_VERSIONS),
+        succeed=False,
+        stderr_tail=[QWEN35_CACHE_IMPORT_ERROR],
+    )
+    service = build_service(settings=settings, hub=hub, exporter=exporter)
+    plan = service.plan(SAFETENSORS_REPO, device="gpu")
+
+    with pytest.raises(PreflightError) as caught:
+        run_prepare(service, plan, settings)
+
+    failure = caught.value.diagnostic
+    assert failure.category is FailureCategory.PACKAGE_ABI_MISMATCH
+    assert caught.value.exit_code() is ExitCode.ENVIRONMENT_UNUSABLE
+    assert exporter.requests == []
+    assert hub.downloaded == []
+    assert not plan.artifact_dir.exists()
+
+
 def test_export_argv_is_recorded_in_the_manifest(settings: Settings, hub: FakeHub) -> None:
     """Reproducibility: the exact command line lands in the manifest, redacted."""
     service = build_service(settings=settings, hub=hub)
@@ -463,7 +508,7 @@ def test_export_argv_is_recorded_in_the_manifest(settings: Settings, hub: FakeHu
     assert export.arguments["weight_format"] == "int4"
     assert export.arguments["group_size"] == 128
     assert export.arguments["symmetric"] is False
-    assert export.package_versions["transformers"] == "5.5.4"
+    assert export.package_versions["transformers"] == "5.2.1"
     assert export.duration_seconds is not None
 
 

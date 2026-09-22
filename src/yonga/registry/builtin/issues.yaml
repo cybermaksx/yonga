@@ -113,6 +113,62 @@ issues:
           Generic form of the Qwen3.5 bufferization failure, kept less specific
           so a family-scoped rule always wins where one exists.
 
+  # Lower priority than every rule above it, so a named compiler pass failure is
+  # only ever the answer when nothing more specific recognised the text. It exists
+  # because the "generic" rule above is not generic: it matches one bufferization
+  # message, and every other compiler pass that refuses a graph fell through to
+  # the built-in signatures, which suggested checking the driver. The driver is
+  # exactly what is *not* wrong here, and TROUBLESHOOTING section 5.1 tells users
+  # so; the classifier should not tell them the opposite.
+  - id: npu-compiler-pass-failed
+    schema_version: 1
+    status: active
+    priority: 40
+    summary: A named NPU compiler pass refused this graph
+    match:
+      device: npu
+      case_sensitive: true
+      exception_contains:
+        # The compiler answered. A missing or broken driver does not get this far:
+        # it reports ZE_RESULT_ERROR_UNINITIALIZED, or the NPU is absent from
+        # available_devices, and `device.driver_missing` covers those.
+        - "[NPU_VCL] Compiler returned msg:"
+        - "[vpux-compiler] Failed Pass"
+    classification:
+      code: npu.compiler.pass_failed
+      category: compiler_unsupported_graph
+      environment_broken: false
+      retry_same_device: false
+    recommendation:
+      title: The NPU compiler refused this graph
+      message: >-
+        One of the NPU compiler's passes could not compile this graph. The
+        driver answered and the compiler ran and returned a message, so nothing
+        is wrong with the NPU, its driver or the installation: this graph is
+        what this compiler release cannot take. Reinstalling the driver will not
+        change it.
+      fallback_devices:
+        - gpu
+        - cpu
+      remediation:
+        - "Run this model on the GPU instead: yonga prepare MODEL --device gpu"
+        - >-
+          The failing pass and the shape it rejected are in the job log:
+          yonga logs JOB_ID --raw
+        - Re-check after an OpenVINO and NPU compiler update.
+    sources:
+      - kind: tested
+        note: >-
+          Reproduced on this reference host with OpenVINO 2026.4 and
+          compiler-in-plugin by loading a Qwen3-0.6B artifact on the NPU:
+          "[vpux-compiler] MultiClusterStrategyAssignment Pass failed : Cannot
+          get per cluster memory shapes. Shape [1, 1, 8, 1], Unsupported
+          distribution", then "Compilation failed. Level0 pfnCreate2 result:
+          ZE_RESULT_ERROR_INVALID_ARGUMENT ... [NPU_VCL] Compiler returned msg:".
+          Before this rule the failure fell through to a generic message whose
+          remediation was "Run `yonga doctor` to check the device and driver
+          state".
+
   - id: tokenizer-string-precision-read
     schema_version: 1
     status: active
@@ -137,7 +193,10 @@ issues:
         not a problem with the model or the device.
       repair: ov-tokenizer-precision-string-casing
       remediation:
-        - "Run: yonga repair ARTIFACT"
+        - >-
+          Re-prepare the artifact: yonga applies this repair itself during
+          validation, so `yonga prepare MODEL --force` produces a readable
+          tokenizer. (`--no-repair` is what turns that off.)
         - Only the port precision attribute is rewritten; element_type is left alone.
     sources:
       - kind: tested
@@ -243,3 +302,195 @@ issues:
         note: >-
           The iostream wording is what OpenVINO surfaces when serialisation
           cannot write the .bin file.
+
+  # Category choice, deliberately: `configuration_error`, not
+  # `source_format_unsupported`. The source is a perfectly convertible
+  # safetensors checkpoint and converts on the very next attempt once the
+  # profile changes, so nothing about its *format* is unsupported; what is
+  # wrong is the conversion setting yonga asked for (group size 128) against
+  # this model's channel sizes. `configuration_error` carries exit code 70
+  # ("registry/configuration error", CLI_SPEC section 15), which points at the
+  # profile that has to change rather than at the model that has to be
+  # replaced. Without this rule the failure surfaces as the generic
+  # `export.failed` / exit 40.
+  - id: nncf-group-size-not-divisible
+    schema_version: 1
+    status: active
+    priority: 80
+    summary: The profile's group size does not divide this model's channel sizes
+    match:
+      case_sensitive: true
+      exception_contains:
+        - "InvalidGroupSizeError"
+        - "Failed to apply group-wise quantization with group size value"
+    classification:
+      code: export.quantization.group_size_mismatch
+      category: configuration_error
+      environment_broken: false
+      retry_same_device: false
+    recommendation:
+      title: This model cannot be quantized with the profile's group size
+      message: >-
+        Group-wise INT4 quantization splits every weight row into groups of a
+        fixed size, so the group size has to divide each layer's channel size.
+        NNCF listed the layers where it does not: their channel size is smaller
+        than, or not a multiple of, the group size this profile asks for. The
+        installation, the devices and the source model are all fine; the
+        conversion setting is what does not fit this model. Nothing had been
+        compiled when this failed, so no device is implicated.
+      remediation:
+        - >-
+          Re-run with the channel-wise profile, which has no divisibility
+          requirement: yonga prepare MODEL --profile npu-int4-sym-cw
+          (group size -1, one scale per output channel).
+        - >-
+          Or pick a profile whose group size divides every channel size in the
+          error; the shipped group-wise profiles all use 128.
+        - >-
+          The failing nodes and their channel sizes are in the job log:
+          yonga logs JOB_ID --raw
+    sources:
+      - kind: tested
+        note: |-
+          Reproduced on this reference host with optimum-intel 2.2.0 and nncf
+          3.4.0. `yonga prepare hf-internal-testing/tiny-random-LlamaForCausalLM
+          --device cpu` (profile cpu-int4-asym-g128) exited 40 with the generic
+          exporter message, while the job log ended with:
+            nncf.errors.InvalidGroupSizeError: Failed to apply group-wise
+            quantization with group size value 128. Ensure that the group size
+            is divisible by the channel size ... Failed nodes:
+            "__module.model.layers.0.self_attn.v_proj/aten::linear/MatMul"
+            (channel size: 16)
+          Re-running the same model with --profile npu-int4-sym-cw (group size
+          -1) converts and publishes successfully.
+
+  # Category choice, deliberately: `package_abi_mismatch`. SPEC section 5.3 states
+  # the ABI rule as being about a compatible package *set*, and that is exactly
+  # what is wrong here: each package imports and works on its own, but
+  # optimum-intel's export patcher reaches into `transformers` internals, and the
+  # installed pair does not agree on what those internals are. The alternatives
+  # are worse. `configuration_error` carries exit 70 ("registry/configuration
+  # error"), which points at yonga's own settings; nothing yonga was asked to do
+  # is wrong. `unknown_runtime_error` carries exit 99 and says nothing.
+  # `package_abi_mismatch` carries exit 10 ("environment unusable"), and the
+  # environment is where the fix is: one `pip install` away.
+  #
+  # `environment_broken: false` all the same, and the two are not in conflict:
+  # the flag drives device fallback in `prepare` (a broken environment stops the
+  # job instead of trying another device), and this installation is not broken.
+  # Every package imports, every device works, and the very same environment
+  # exports other architectures. What is wrong is the *combination* of two
+  # versions for this one architecture, so there is nothing to fall back to and
+  # nothing to declare dead. `retry_same_device: false` for the same reason: the
+  # device was never reached, and retrying changes nothing until a package does.
+  - id: qwen35-exporter-transformers-symbol-mismatch
+    schema_version: 1
+    status: active
+    priority: 100
+    summary: The installed Transformers does not expose the Qwen3.5 symbol the exporter patches
+    match:
+      model_types:
+        - qwen3_5
+      case_sensitive: true
+      exception_contains:
+        - "Qwen3_5DynamicCache"
+    classification:
+      code: export.transformers.symbol_missing.qwen35
+      category: package_abi_mismatch
+      environment_broken: false
+      retry_same_device: false
+    recommendation:
+      title: This Transformers release cannot export Qwen3.5
+      message: >-
+        The exporter's Qwen3.5 patcher imports `Qwen3_5DynamicCache` from the
+        installed `transformers`, and this release does not define it. Nothing
+        is broken: `transformers` and `optimum-intel` are each healthy, and the
+        architecture is supported. The two versions simply do not agree on the
+        Qwen3.5 modelling code, and the export needs the version the registry
+        pins. Loading the config is not evidence that the export will work: a
+        newer `transformers` still reads `Qwen3_5Config` and still reports
+        `model_type: qwen3_5`, and only fails once the patcher runs.
+      fallback_devices: []
+      remediation:
+        - >-
+          Install the Transformers release this architecture requires, then
+          re-run: pip install "transformers==5.2.*"
+        - >-
+          The requirement and the installed version are both printed by:
+          yonga inspect MODEL
+        - >-
+          yonga will not install it for you: changing the Transformers version
+          in your environment affects everything else that uses it, so that
+          choice stays yours.
+    sources:
+      - kind: tested
+        note: >-
+          Reproduced on this reference host with optimum-intel 2.2.0 and
+          transformers 5.5.4 while preparing a Qwen3.5-9B derivative for the GPU:
+          optimum/exporters/openvino/model_patcher.py raised "ImportError: cannot
+          import name 'Qwen3_5DynamicCache' from
+          transformers.models.qwen3_5.modeling_qwen3_5". With transformers 5.2.0
+          the symbol imports and the export proceeds.
+
+  # The generic tier of the rule above, and the same two-tier shape the NPU
+  # compiler rules use: the family-scoped rule wins where it applies, and this one
+  # still recognises the failure for every other architecture, because the pin is
+  # per-architecture (SPEC section 5.2) and every architecture can reach it.
+  #
+  # Each signature has to stand on its own, because `exception_contains` is a
+  # disjunction — there is no way to require two strings at once — so each entry
+  # below is chosen to be conclusive by itself rather than merely suggestive.
+  - id: exporter-transformers-symbol-mismatch
+    schema_version: 1
+    status: active
+    priority: 75
+    summary: The exporter cannot patch the installed Transformers modelling code
+    match:
+      case_sensitive: true
+      exception_contains:
+        # The patcher's own file. It exists only to rewrite `transformers`
+        # modelling internals for export, so a failure raised inside it is a
+        # statement about which `transformers` is installed, whatever the
+        # exception class.
+        - "optimum/exporters/openvino/model_patcher.py"
+        # "cannot import name 'X' from 'transformers.models.<a>.modeling_<a>'":
+        # the quoted module path is contiguous with the word before it, so this
+        # one substring pins the whole shape for any architecture.
+        - "from 'transformers.models."
+        # The attribute form of the same mismatch: "module
+        # 'transformers.models.<a>.modeling_<a>' has no attribute 'X'".
+        - "module 'transformers.models."
+    classification:
+      code: export.transformers.symbol_missing
+      category: package_abi_mismatch
+      environment_broken: false
+      retry_same_device: false
+    recommendation:
+      title: The installed Transformers does not match what the exporter expects
+      message: >-
+        Converting a model runs that architecture's modelling code from
+        `transformers`, and `optimum-intel` patches that code before tracing it.
+        The patcher looked for something the installed release does not provide,
+        so the two versions do not agree on this architecture. The installation
+        is not broken and the device was never reached: this is a version
+        pairing, and the registry records which Transformers release each
+        architecture needs.
+      fallback_devices: []
+      remediation:
+        - >-
+          Install the Transformers release this architecture requires, then
+          re-run. yonga will not change your environment for you.
+        - >-
+          The required version and the installed one are both printed by:
+          yonga inspect MODEL
+        - >-
+          The failing import and the module it came from are in the job log:
+          yonga logs JOB_ID --raw
+    sources:
+      - kind: tested
+        note: >-
+          Generic form of the Qwen3.5 symbol mismatch above, kept less specific
+          so a family-scoped rule always wins where one exists. Verified on this
+          reference host against the Qwen3.5 traceback; the same shape is what
+          optimum-intel raises for any architecture whose patcher outruns the
+          installed transformers.

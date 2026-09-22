@@ -34,6 +34,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "CHAT_COMMANDS",
+    "ChatAnswer",
     "ChatCommand",
     "ChatCommandKind",
     "ChatMetrics",
@@ -432,21 +433,124 @@ def startup_panel(info: ChatSessionInfo) -> RenderableType:
     )
 
 
-def render_answer(markdown_text: str) -> RenderableType:
+@runtime_checkable
+class ChatAnswer(Protocol):
+    """One sanitised reply, as ``yonga.application.chat`` reports it.
+
+    ``GenerationResult`` and ``ChatTurn`` both satisfy this structurally, which
+    is what keeps this module free of application imports. Every field describes
+    the *shape* of the reply; the hidden reasoning itself is deliberately absent
+    from this protocol, so nothing rendered from it can leak a word of it.
+    """
+
+    @property
+    def display_text(self) -> str:
+        """The text that may be shown."""
+
+    @property
+    def reasoning_hidden(self) -> bool:
+        """True when a reasoning block was removed from ``display_text``."""
+
+    @property
+    def reasoning_unterminated(self) -> bool:
+        """True when a reasoning block was opened and never closed."""
+
+    @property
+    def output_tokens(self) -> int | None:
+        """How many tokens the model generated, when the runtime reported it."""
+
+
+#: Smallest output limit worth suggesting when a reply ran out of tokens mid-thought.
+MIN_SUGGESTED_TOKENS = 1024
+
+
+def render_answer(answer: str | ChatAnswer) -> RenderableType:
     """Render an already-sanitised answer as a Markdown panel.
 
     The text handed in must already have had any hidden reasoning removed by
-    ``yonga.application.chat``; this function trusts and renders it.
+    ``yonga.application.chat``; this function trusts and renders it. A plain
+    string is accepted for callers that have nothing else, and then an empty
+    answer can only be reported as an empty answer.
+
+    An empty answer is not one situation but three, and saying "the model
+    returned no text" for all of them is a lie when the model in fact produced
+    nothing but reasoning. They are told apart from the typed flags on
+    ``answer`` — never by looking at the text again — and each gets its own
+    explanation:
+
+    * nothing at all was generated;
+    * only reasoning was generated and the block never closed, which means the
+      token limit arrived before the answer did;
+    * only reasoning was generated inside a closed block, which means the model
+      finished thinking and chose to say nothing.
+
+    The second and third mention how much was hidden and never what was in it.
     """
-    body = markdown_text.strip()
-    if not body:
+    body = _answer_text(answer).strip()
+    if body:
+        return Panel(Markdown(body), border_style="green", box=ROUNDED, padding=(1, 2))
+    if isinstance(answer, str) or not answer.reasoning_hidden:
         return Panel(
             Text("(the model returned no text)", style="dim"),
             border_style="dim",
             box=ROUNDED,
             padding=(1, 2),
         )
-    return Panel(Markdown(body), border_style="green", box=ROUNDED, padding=(1, 2))
+    return Panel(
+        _reasoning_only_notice(answer),
+        border_style="yellow",
+        box=ROUNDED,
+        padding=(1, 2),
+    )
+
+
+def _answer_text(answer: str | ChatAnswer) -> str:
+    """Return the displayable text of a string or a sanitised answer."""
+    if isinstance(answer, str):
+        return answer
+    text = _attribute(answer, "display_text")
+    return text if isinstance(text, str) else ""
+
+
+def _reasoning_only_notice(answer: ChatAnswer) -> Text:
+    """Explain a reply that was entirely hidden reasoning, and how to get past it.
+
+    Reports the token count and whether the block closed. It never reads
+    ``reasoning_text``, so no part of the hidden block can reach the screen
+    through this path.
+    """
+    tokens = _whole(_attribute(answer, "output_tokens"))
+    produced = f"{tokens} tokens of reasoning" if tokens is not None else "only reasoning"
+    if _attribute(answer, "reasoning_unterminated") is True:
+        limit = _suggested_token_limit(tokens)
+        return Text.assemble(
+            (
+                f"The model produced {produced} and did not reach an answer before "
+                "the output limit.\n",
+                "",
+            ),
+            (
+                f"Raise the limit with /tokens {limit}, or show the reasoning with /reasoning on.",
+                "dim",
+            ),
+        )
+    return Text.assemble(
+        (f"The model produced {produced} and then ended its turn without an answer.\n", ""),
+        ("Ask again, or show the reasoning with /reasoning on.", "dim"),
+    )
+
+
+def _suggested_token_limit(tokens: int | None) -> int:
+    """Suggest a new ``/tokens`` limit that gives the model real room to answer.
+
+    Enough headroom to finish the thought and still write the answer, rounded to
+    a whole number of 1024-token steps so the advice reads like advice.
+    """
+    if tokens is None or tokens <= 0:
+        return MIN_SUGGESTED_TOKENS
+    wanted = max(MIN_SUGGESTED_TOKENS, tokens * 2)
+    steps = -(-wanted // MIN_SUGGESTED_TOKENS)
+    return steps * MIN_SUGGESTED_TOKENS
 
 
 def render_metrics(result: ChatMetrics | None) -> Text:
@@ -583,13 +687,17 @@ class ChatView:
         """Print the session description again, as ``/model`` does."""
         self.console.print(self.startup_panel())
 
-    def render_answer(self, markdown_text: str) -> RenderableType:
+    def render_answer(self, answer: str | ChatAnswer) -> RenderableType:
         """Return the model's answer as a Markdown panel."""
-        return render_answer(markdown_text)
+        return render_answer(answer)
 
-    def show_answer(self, markdown_text: str) -> None:
-        """Print the model's answer."""
-        self.console.print(self.render_answer(markdown_text))
+    def show_answer(self, answer: str | ChatAnswer) -> None:
+        """Print the model's answer.
+
+        Pass the turn's result rather than only its text: an answer that came
+        back empty can then say *why* it is empty.
+        """
+        self.console.print(self.render_answer(answer))
 
     def render_metrics(self, result: ChatMetrics | None) -> Text:
         """Return the dim metrics footer for ``result``."""

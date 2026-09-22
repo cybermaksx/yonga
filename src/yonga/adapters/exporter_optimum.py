@@ -338,8 +338,12 @@ class OptimumExporter:
                 error.diagnostic, package_versions=package_versions, ctx=ctx, argv=[]
             )
 
-        env = self._build_env(request, ctx)
-        overrides = redact_env(_environment_overrides(env))
+        # Only the differences are handed to the runner. The runner merges them
+        # onto ``ctx.child_env()`` itself, so the child sees exactly the same
+        # environment either way — but nothing inherited from this process is
+        # passed along to be written into the job log.
+        env = _environment_overrides(self._build_env(request, ctx))
+        overrides = redact_env(env)
 
         ctx.logger.argv(
             "export.command",

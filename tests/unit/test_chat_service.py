@@ -41,8 +41,14 @@ from yonga.domain.artifacts import (
     manifest_path,
 )
 from yonga.domain.benchmarks import GenerationSettings
+from yonga.domain.diagnostics import (
+    CompileError,
+    GenerationError,
+    Severity,
+    YongaError,
+    diagnostic,
+)
 from yonga.domain.diagnostics import FailureCategory as Category
-from yonga.domain.diagnostics import GenerationError, Severity, diagnostic
 from yonga.domain.models import PipelineKind
 from yonga.registry.loader import load_builtin_registry
 from yonga.registry.resolver import RegistryResolver
@@ -710,7 +716,9 @@ def test_the_description_renders_as_a_ui_session_info(session_parts):
     assert info.show_reasoning is False
     assert info.source_label == f"{QWEN_REPO}@{'b' * 12}"
     assert description.extra["Chat profile"] == "chat-qwen3_5"
-    assert description.extra["Thinking mode"] == "off"
+    # The panel names the variable as well as the state, so a user looking at a
+    # suppressed answer can see exactly what was sent to the chat template.
+    assert description.extra["Thinking mode"] == "off (enable_thinking=false)"
 
 
 def test_the_history_path_follows_the_xdg_data_policy(tmp_path):
@@ -773,3 +781,148 @@ def test_open_session_asks_the_artifact_store(tmp_path):
     assert store.asked == [QWEN_REPO]
     assert session.artifact_dir == artifact
     assert isinstance(session, ChatSession)
+
+
+# --- the sanitiser's typed signals reach the turn --------------------------------------
+#
+# The UI renders an empty answer from these flags rather than by re-reading the
+# text, so they have to survive the trip from the sanitiser to the turn.
+
+
+def test_a_turn_reports_an_unterminated_reasoning_block(tmp_path):
+    service, _factory, _runtime = build_service(tmp_path, answers=[f"<think>{SECRET}"])
+    artifact = write_artifact(tmp_path, make_manifest())
+    session = service.open_artifact(artifact)
+
+    turn = session.send("hello")
+    assert turn.ok
+    assert turn.display_text == ""
+    assert SECRET not in turn.display_text
+    assert turn.reasoning_hidden is True
+    assert turn.reasoning_unterminated is True
+    assert turn.output_tokens == 34
+
+
+def test_a_turn_reports_a_closed_reasoning_block(tmp_path):
+    service, _factory, _runtime = build_service(tmp_path, answers=[f"<think>{SECRET}</think>"])
+    artifact = write_artifact(tmp_path, make_manifest())
+    session = service.open_artifact(artifact)
+
+    turn = session.send("hello")
+    assert turn.display_text == ""
+    assert turn.reasoning_hidden is True
+    assert turn.reasoning_unterminated is False
+
+
+def test_a_turn_with_a_real_answer_flags_nothing(tmp_path):
+    service, _factory, _runtime = build_service(tmp_path, answers=["a plain answer"])
+    artifact = write_artifact(tmp_path, make_manifest())
+    session = service.open_artifact(artifact)
+
+    turn = session.send("hello")
+    assert turn.display_text == "a plain answer"
+    assert turn.reasoning_hidden is False
+    assert turn.reasoning_unterminated is False
+
+
+def test_a_failed_turn_reports_no_reasoning_signals(tmp_path):
+    failure = GenerationError(
+        diagnostic("x.y", Category.UNKNOWN_RUNTIME_ERROR, "Nope", "It failed.")
+    )
+    service, _factory, _runtime = build_service(tmp_path, answers=[failure])
+    artifact = write_artifact(tmp_path, make_manifest())
+    session = service.open_artifact(artifact)
+
+    turn = session.send("hello")
+    assert not turn.ok
+    assert turn.reasoning_hidden is False
+    assert turn.reasoning_unterminated is False
+    assert turn.output_tokens is None
+
+
+# --- a failed load is explained by the registry, not by the runtime -------------------
+
+#: Verbatim tail of a real `yonga chat ARTIFACT --device npu` failure on the
+#: reference host. The NPU compiler ran and refused a graph.
+NPU_COMPILER_PASS_TAIL = (
+    "[ERROR] [vpux-compiler] Failed Pass MultiClusterStrategyAssignment on Operation\n"
+    "Exception from src/plugins/intel_npu/src/compiler_adapter/src/ze_graph_ext_wrappers.cpp:425:\n"
+    "Compilation failed. Level0 pfnCreate2 result: ZE_RESULT_ERROR_INVALID_ARGUMENT\n"
+    "[NPU_VCL] Compiler returned msg:\nCompilation failed"
+)
+
+
+class FailingFactory:
+    """A runtime factory that fails to load, the way a refused compile does."""
+
+    def __init__(self, raw: str) -> None:
+        self.raw = raw
+
+    def __call__(self, artifact_dir: Path, **kwargs: Any) -> ChatRuntime:
+        raise CompileError(
+            diagnostic(
+                "runtime.genai.load_failed",
+                Category.UNKNOWN_RUNTIME_ERROR,
+                "Could not load the model on NPU",
+                self.raw,
+                remediation=[
+                    "Run `yonga doctor` to check the device and driver state.",
+                    "Try another device, for example --device cpu.",
+                ],
+                raw_excerpt=self.raw,
+            )
+        )
+
+
+def failing_service(tmp_path: Path, raw: str) -> tuple[ChatService, Path]:
+    """A service whose runtime always fails to load with ``raw``."""
+    service = ChatService(
+        FailingFactory(raw),
+        FakeStore({}),
+        RegistryResolver(load_builtin_registry()),
+        make_settings(tmp_path),
+    )
+    return service, write_artifact(tmp_path, make_manifest())
+
+
+def test_a_refused_compile_is_explained_by_the_registry(tmp_path: Path) -> None:
+    """The adapter cannot reach the registry, so the session classifies for it.
+
+    Without this the user was told to check the driver and the device state — the
+    one thing that is not wrong when the compiler ran and returned a message.
+    """
+    service, artifact = failing_service(tmp_path, NPU_COMPILER_PASS_TAIL)
+    session = service.open_artifact(artifact, options=ChatOptions(device="npu"))
+
+    with pytest.raises(YongaError) as caught:
+        session.load()
+
+    report = caught.value.diagnostic
+    assert report.code == "npu.compiler.pass_failed"
+    assert report.matched_rule_id == "npu-compiler-pass-failed"
+    assert report.fallback_devices == ["GPU", "CPU"]
+    assert not any("doctor" in step for step in report.remediation)
+
+
+def test_an_unrecognised_load_failure_keeps_the_runtime_report(tmp_path: Path) -> None:
+    """Classification adds; it never replaces a report with a vaguer one."""
+    service, artifact = failing_service(tmp_path, "something nobody has ever seen before")
+    session = service.open_artifact(artifact, options=ChatOptions(device="npu"))
+
+    with pytest.raises(YongaError) as caught:
+        session.load()
+
+    report = caught.value.diagnostic
+    assert report.code == "runtime.genai.load_failed"
+    assert report.title == "Could not load the model on NPU"
+
+
+def test_classifying_a_failed_load_never_starts_a_fallback(tmp_path: Path) -> None:
+    """A recommended fallback is advice in the diagnostic, not an action."""
+    service, artifact = failing_service(tmp_path, NPU_COMPILER_PASS_TAIL)
+    session = service.open_artifact(artifact, options=ChatOptions(device="npu"))
+
+    with pytest.raises(YongaError):
+        session.load()
+
+    assert session.device == "NPU"

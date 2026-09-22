@@ -276,9 +276,35 @@ GENERIC_SIGNATURES: tuple[_GenericSignature, ...] = (
         title="OpenVINO IR uses an unsupported element type",
         message="The IR declares an element type this OpenVINO build cannot read.",
         needles=("unsupported element type", "is_valid_type_idx"),
-        remediation=("Run 'yonga validate ARTIFACT' to see which file is affected.",),
+        # There is no `yonga validate`: validation runs inside `prepare`, and the
+        # per-submodel view of an already-prepared artifact comes from `probe`.
+        remediation=(
+            "Run 'yonga probe ARTIFACT --all-submodels' to see which submodel is affected.",
+            "Then re-convert it with 'yonga prepare MODEL --force'.",
+        ),
     ),
 )
+
+
+def more_specific_chat_rule(
+    named: ChatProfileRule | None,
+    matched: ChatProfileRule | None,
+) -> ChatProfileRule | None:
+    """Return whichever of two chat rules constrains more, preferring ``named`` on a tie.
+
+    ``named`` is the profile an architecture rule points at; ``matched`` is the
+    profile whose own match block fits this model. A catch-all architecture rule
+    naming a catch-all chat profile must not beat a rule written for the family.
+    """
+    if matched is None:
+        return named
+    if named is None:
+        return matched
+    if named.id == matched.id:
+        return named
+    if matched.match_block.static_specificity() > named.match_block.static_specificity():
+        return matched
+    return named
 
 
 class RegistryExplanation(BaseModel):
@@ -974,34 +1000,37 @@ class RegistryResolver:
         repo_id: str | None = None,
         meta: ModelMetadata | None = None,
     ) -> tuple[ChatProfileRule | None, ResolutionExplanation]:
-        """Resolve the chat profile and return the candidate trail with it."""
+        """Resolve the chat profile and return the candidate trail with it.
+
+        Two answers are compared rather than one preferred outright. The
+        architecture rule may *name* a chat profile, and a chat rule may match the
+        model's own identity; the more specific of the two wins, with the named
+        one breaking a tie because naming it was deliberate.
+
+        Returning on the named profile alone is what used to make a catch-all
+        architecture rule hide a family's own chat profile: every model covered by
+        ``arch-generic-text-generation`` inherited ``chat-default`` even when the
+        registry held a rule matching its exact ``model_type``.
+        """
         explanation = ResolutionExplanation(subject="chat profile")
+        named: ChatProfileRule | None = None
         if arch_rule is not None and arch_rule.chat_profile is not None:
             named = self.registry.chat_profile(arch_rule.chat_profile)
-            if named is not None:
-                explanation.candidates.append(
-                    RuleCandidate(
-                        rule_id=named.id,
-                        kind=named.kind,
-                        specificity=named.match_block.static_specificity(),
-                        priority=named.priority,
-                        matched=True,
-                        reasons=[f"named by architecture rule {arch_rule.id}"],
-                    )
+            if named is None:
+                explanation.notes.append(
+                    f"Architecture rule {arch_rule.id} names unknown chat profile "
+                    f"{arch_rule.chat_profile!r}."
                 )
-                explanation.winner_id = named.id
-                return named, explanation
-            explanation.notes.append(
-                f"Architecture rule {arch_rule.id} names unknown chat profile "
-                f"{arch_rule.chat_profile!r}."
-            )
         subject = self._chat_subject(arch_rule, repo_id, meta)
         scored: list[tuple[ChatProfileRule, RuleCandidate]] = []
         for rule in self.registry.chat:
             candidate, _matched = self._evaluate(rule, subject)
+            if named is not None and rule.id == named.id and arch_rule is not None:
+                candidate.reasons.append(f"named by architecture rule {arch_rule.id}")
             explanation.candidates.append(candidate)
             scored.append((rule, candidate))
-        winner = self._rank(scored, subject="chat profile")
+        matched = self._rank(scored, subject="chat profile")
+        winner = more_specific_chat_rule(named, matched)
         if winner is not None:
             explanation.winner_id = winner.id
         return winner, explanation

@@ -71,6 +71,18 @@ architectures:
           HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive, a GGUF-only repository
           with no config.json, whose Hub `gguf_metadata` reports
           `{"architecture": "qwen35"}`.
+      - kind: tested
+        note: >-
+          Direct evidence for the `export.transformers` pin, from this reference
+          host (2026-09-22). With optimum-intel 2.2.0 and transformers 5.5.4 the
+          export fails in optimum/exporters/openvino/model_patcher.py with
+          "ImportError: cannot import name 'Qwen3_5DynamicCache' from
+          transformers.models.qwen3_5.modeling_qwen3_5"; with transformers 5.2.0
+          the same symbol imports and the export proceeds. The trap: 5.5.4 still
+          loads `Qwen3_5Config` and still reports `model_type: qwen3_5`, so the
+          architecture looks supported. Config loading is therefore not evidence
+          that the export will work, and this requirement must not be relaxed on
+          the strength of it.
 
   - id: arch-generic-text-generation
     schema_version: 1

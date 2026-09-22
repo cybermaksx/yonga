@@ -182,6 +182,15 @@ module = [
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
+# ``typer.testing.Result`` is the type ``CliRunner.invoke`` returns, and which
+# class that is depends on the installed typer: 0.27 defines its own (it
+# vendored click), 0.25 re-exports click's without an explicit re-export. Only
+# importing it from ``typer.testing`` is correct under both, so the one module
+# that provides it is exempted from the repository-wide re-export rule.
+module = ["typer.testing"]
+implicit_reexport = true
+
+[[tool.mypy.overrides]]
 # `tests/`, `tests/unit/` and `tests/integration/` each carry an `__init__.py`
 # purely so that mypy names these modules `tests.unit.test_x` and this
 # relaxation actually applies; without them mypy names them `test_x` and the

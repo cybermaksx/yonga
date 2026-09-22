@@ -1030,23 +1030,73 @@ class GenerationDefaults(BaseModel):
         return data
 
 
+#: Thinking variables tried against an artifact's own chat template when a chat
+#: profile names none of its own. One entry, because ``enable_thinking`` is the
+#: spelling the Jinja templates in the wild actually use; a family that spells it
+#: differently says so in its registry rule instead of being added here.
+DEFAULT_THINKING_VARIABLE_CANDIDATES: tuple[str, ...] = ("enable_thinking",)
+
+
 class ChatProfileRule(BaseRule):
-    """Chat-template and generation policy for a model family."""
+    """Chat-template and generation policy for a model family.
+
+    Thinking mode is requested through a chat-template variable, and this rule
+    describes *how sure* the registry is about which variable that is:
+
+    ``supports_thinking_flag: true``
+        The family is known to honour :attr:`thinking_template_variable`; it is
+        applied without asking the artifact. The validator makes the variable
+        mandatory in this case, because a declared flag with no name drives
+        nothing.
+    ``supports_thinking_flag: false``
+        An authoritative veto. No thinking variable is ever sent for this
+        family, whatever its chat template happens to mention.
+    *unset* (the default)
+        The registry has no opinion, so the decision is made from evidence: the
+        runtime applies the first of :attr:`thinking_variable_candidates` that
+        the artifact's **own** chat template actually references. That is what
+        makes a model nobody has written a rule for behave correctly, and it is
+        why enumerating architectures here is not required.
+
+    The source repository's template is never rewritten; the variable travels as
+    chat-history extra context (``SPEC.md`` section 18.4, ``MODEL_PIPELINE.md``
+    section 13).
+    """
 
     kind: ClassVar[str] = "chat"
 
     match: RuleMatch = Field(default_factory=RuleMatch)
-    supports_thinking_flag: bool = False
+    supports_thinking_flag: bool | None = None
     thinking_template_variable: str | None = None
+    thinking_variable_candidates: list[str] = Field(
+        default_factory=lambda: [*DEFAULT_THINKING_VARIABLE_CANDIDATES]
+    )
+    """Variable names to look for in the artifact's chat template, in order.
+
+    An empty list is a second way to switch detection off, for a family whose
+    template mentions a thinking variable it does not honour.
+    """
+
     default_thinking: bool = False
     reasoning_wrappers: list[tuple[str, str]] = Field(default_factory=list)
     defaults: GenerationDefaults = Field(default_factory=GenerationDefaults)
     thinking_defaults: GenerationDefaults = Field(default_factory=GenerationDefaults)
     stop_strings: list[str] = Field(default_factory=list)
 
+    @field_validator("thinking_variable_candidates", mode="after")
+    @classmethod
+    def _clean_candidates(cls, value: list[str]) -> list[str]:
+        """Drop blank and duplicate candidate names, preserving the declared order."""
+        cleaned: list[str] = []
+        for name in value:
+            token = name.strip()
+            if token and token not in cleaned:
+                cleaned.append(token)
+        return cleaned
+
     @model_validator(mode="after")
     def _check_thinking_variable(self) -> ChatProfileRule:
-        """A thinking flag is useless without the template variable that drives it."""
+        """A declared thinking flag is useless without the variable that drives it."""
         if self.supports_thinking_flag and not self.thinking_template_variable:
             raise ValueError("supports_thinking_flag requires thinking_template_variable")
         return self
@@ -1056,6 +1106,18 @@ class ChatProfileRule(BaseRule):
         """The rule's match criteria."""
         return self.match
 
+    @property
+    def thinking_candidates(self) -> tuple[str, ...]:
+        """Variables to try against an artifact template, most preferred first.
+
+        A named :attr:`thinking_template_variable` is the only candidate, because
+        naming one is the registry saying which variable this family uses.
+        """
+        named = (self.thinking_template_variable or "").strip()
+        if named:
+            return (named,)
+        return tuple(self.thinking_variable_candidates)
+
     def defaults_for(self, *, thinking: bool) -> GenerationDefaults:
         """Return the generation defaults for thinking or non-thinking mode."""
         if thinking:
@@ -1063,7 +1125,12 @@ class ChatProfileRule(BaseRule):
         return self.defaults.model_copy(deep=True)
 
     def template_context(self, *, thinking: bool | None = None) -> dict[str, bool]:
-        """Chat-template variables that drive thinking mode, if this family has one."""
+        """Chat-template variables this rule declares *without* consulting an artifact.
+
+        Only a rule that declares ``supports_thinking_flag: true`` produces one
+        here. Detection from a real chat template needs the artifact and lives in
+        ``yonga.adapters.runtime_genai``.
+        """
         if not self.supports_thinking_flag or self.thinking_template_variable is None:
             return {}
         enabled = self.default_thinking if thinking is None else thinking

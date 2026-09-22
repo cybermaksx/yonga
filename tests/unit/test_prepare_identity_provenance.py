@@ -116,8 +116,10 @@ def test_plan_carries_how_the_architecture_was_identified(settings: Settings, hu
 
     plan = service.plan(HEADER_ONLY_REPO, device="gpu")
 
-    # The whole plan descends from the alias match.
-    assert plan.architecture == "arch-qwen3_5"
+    # The whole plan descends from the alias match. ``architecture`` carries the
+    # identity the manifest will record — never the rule id, which is its own field.
+    assert plan.architecture == "qwen3_5"
+    assert plan.architecture_rule_id == "arch-qwen3_5"
     assert plan.pipeline is PipelineKind.VLM
     assert plan.exporter.transformers == "==5.2.*"
     assert DISCLOSURE in plan.known_limitations
@@ -135,6 +137,22 @@ def test_plan_panel_shows_how_the_architecture_was_identified(
     assert "no config.json" in text
 
 
+def test_the_plan_panel_names_the_model_not_the_rule(settings: Settings, hub: FakeHub) -> None:
+    """The pre-flight panel used to print ``arch-qwen3_5`` under "Architecture".
+
+    That is the id of a registry rule covering a family, not what this model is,
+    and the panel is the screen a user approves the job from.
+    """
+    service = build_service(settings=settings, hub=hub)
+
+    text = render(preparation_plan(service.plan(HEADER_ONLY_REPO, device="gpu")))
+
+    architecture_line = next(line for line in text.splitlines() if "Architecture " in line)
+    assert "qwen3_5" in architecture_line
+    assert "rule arch-qwen3_5" in architecture_line
+    assert not architecture_line.split("Architecture")[1].lstrip().startswith("arch-")
+
+
 def test_manifest_records_how_the_architecture_was_identified(
     settings: Settings, hub: FakeHub
 ) -> None:
@@ -144,7 +162,11 @@ def test_manifest_records_how_the_architecture_was_identified(
 
     manifest = run_prepare(service, plan, settings).manifest
 
-    assert manifest.architecture == "arch-qwen3_5"
+    # A repository with no config.json declares no identity of its own, so the
+    # rule that identified it supplies the canonical one — and the rule id is
+    # kept beside it rather than in place of it.
+    assert manifest.architecture == "qwen3_5"
+    assert manifest.architecture_rule_id == "arch-qwen3_5"
     assert DISCLOSURE in manifest.notes
 
 
@@ -165,5 +187,6 @@ def test_a_declared_architecture_adds_no_disclosure(settings: Settings, tmp_path
 
     plan = service.plan(HEADER_ONLY_REPO, device="gpu")
 
-    assert plan.architecture == "arch-qwen3_5"
+    assert plan.architecture == "qwen3_5"
+    assert plan.architecture_rule_id == "arch-qwen3_5"
     assert not any("identified from" in entry for entry in plan.known_limitations)

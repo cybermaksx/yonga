@@ -421,6 +421,7 @@ class ArtifactManifest(BaseModel):
     requested_model: ManifestModelRef
     resolved_source: ManifestModelRef
     architecture: str | None = None
+    architecture_rule_id: str | None = None
     model_type: str | None = None
     task: str | None = None
     pipeline: PipelineKind = PipelineKind.UNKNOWN

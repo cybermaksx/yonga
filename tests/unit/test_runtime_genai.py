@@ -8,6 +8,7 @@ accelerator. The real pipeline is exercised in
 
 from __future__ import annotations
 
+import json
 import math
 import types
 from pathlib import Path
@@ -621,3 +622,115 @@ def test_runtime_works_as_a_context_manager(artifact, settings, genai):
     with GenAIChatRuntime(artifact, settings=settings) as runtime:
         assert runtime.closed is False
     assert runtime.closed is True
+
+
+# --- the thinking variable is decided from the artifact's own chat template ------------
+#
+# The registry does not have to name the variable. Unless a profile states one,
+# the runtime reads the artifact's template and applies a candidate only when the
+# template actually references it — which is how a family nobody has written a
+# rule for still gets its reasoning suppressed.
+
+TEMPLATE_WITH_FLAG = (
+    "{%- if add_generation_prompt %}\n"
+    "    {%- if enable_thinking is defined and enable_thinking is false %}\n"
+    "        {{- '<think>\\n\\n</think>\\n\\n' }}\n"
+    "    {%- endif %}\n"
+    "{%- endif %}\n"
+)
+TEMPLATE_WITHOUT_FLAG = "{%- if add_generation_prompt %}{{- 'assistant' }}{%- endif %}\n"
+
+
+def write_template(artifact: Path, template: str, *, name: str = "chat_template.jinja") -> None:
+    """Give an artifact directory a chat template."""
+    (artifact / name).write_text(template, encoding="utf-8")
+
+
+def test_the_runtime_applies_the_variable_its_template_names(artifact, settings, genai):
+    write_template(artifact, TEMPLATE_WITH_FLAG)
+    runtime = make_runtime(artifact, settings, chat_profile=ChatProfile())
+    assert runtime.thinking_variable == "enable_thinking"
+
+    history = ChatHistory()
+    history.add_user("Hello")
+    runtime.generate(history, GenerationSettings())
+
+    (args, _kwargs) = genai.pipelines[0].generate_calls[0]
+    assert args[0].extra_context == {"enable_thinking": False}
+    assert runtime.extra_context_error is None
+    runtime.close()
+
+
+def test_the_runtime_applies_nothing_when_the_template_names_nothing(artifact, settings, genai):
+    write_template(artifact, TEMPLATE_WITHOUT_FLAG)
+    runtime = make_runtime(artifact, settings, chat_profile=ChatProfile())
+    assert runtime.thinking_variable is None
+
+    history = ChatHistory()
+    history.add_user("Hello")
+    runtime.generate(history, GenerationSettings())
+
+    (args, _kwargs) = genai.pipelines[0].generate_calls[0]
+    assert args[0].extra_context is None
+    runtime.close()
+
+
+def test_an_explicit_profile_vetoes_detection(artifact, settings, genai):
+    write_template(artifact, TEMPLATE_WITH_FLAG)
+    profile = ChatProfile(supports_thinking_flag=False)
+    runtime = make_runtime(artifact, settings, chat_profile=profile)
+    assert runtime.thinking_variable is None
+
+    history = ChatHistory()
+    history.add_user("Hello")
+    runtime.generate(history, GenerationSettings())
+    (args, _kwargs) = genai.pipelines[0].generate_calls[0]
+    assert args[0].extra_context is None
+    runtime.close()
+
+
+def test_an_explicit_profile_applies_without_template_evidence(artifact, settings, genai):
+    write_template(artifact, TEMPLATE_WITHOUT_FLAG)
+    profile = ChatProfile(supports_thinking_flag=True, thinking_template_variable="reasoning")
+    runtime = make_runtime(artifact, settings, chat_profile=profile, thinking=True)
+    assert runtime.thinking_variable == "reasoning"
+
+    history = ChatHistory()
+    history.add_user("Hello")
+    runtime.generate(history, GenerationSettings())
+    (args, _kwargs) = genai.pipelines[0].generate_calls[0]
+    assert args[0].extra_context == {"reasoning": True}
+    runtime.close()
+
+
+def test_the_template_is_read_but_never_written(artifact, settings, genai):
+    """SPEC 18.4: suppressing reasoning must not edit the model's own template."""
+    write_template(artifact, TEMPLATE_WITH_FLAG)
+    path = artifact / "chat_template.jinja"
+    before = path.read_bytes()
+    runtime = make_runtime(artifact, settings, chat_profile=ChatProfile())
+    history = ChatHistory()
+    history.add_user("Hello")
+    runtime.generate(history, GenerationSettings())
+    assert path.read_bytes() == before
+    runtime.close()
+
+
+def test_a_tokenizer_config_template_is_evidence_too(artifact, settings, genai):
+    (artifact / "tokenizer_config.json").write_text(
+        json.dumps({"chat_template": TEMPLATE_WITH_FLAG}), encoding="utf-8"
+    )
+    runtime = make_runtime(artifact, settings, chat_profile=ChatProfile())
+    assert runtime.thinking_variable == "enable_thinking"
+    runtime.close()
+
+
+def test_the_generation_result_defaults_report_nothing_hidden(artifact, settings, genai):
+    """The adapter does not sanitise; the flags start false and the service sets them."""
+    runtime = make_runtime(artifact, settings)
+    history = ChatHistory()
+    history.add_user("Hello")
+    result = runtime.generate(history, GenerationSettings())
+    assert result.reasoning_hidden is False
+    assert result.reasoning_unterminated is False
+    runtime.close()

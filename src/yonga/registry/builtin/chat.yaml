@@ -1,8 +1,17 @@
 # Chat profiles: how a model family expects a conversation to be driven.
 #
-# Thinking mode is requested through the chat template variable named here,
-# which openvino_genai passes with ChatHistory.set_extra_context(); the source
+# Thinking mode is requested through a chat-template variable, which
+# openvino_genai passes with ChatHistory.set_extra_context(); the source
 # repository's template is never modified.
+#
+# A profile does not have to know the variable. When it leaves
+# supports_thinking_flag unset, the runtime tries `thinking_variable_candidates`
+# against the artifact's OWN chat template and applies the first one the
+# template actually references. That is evidence rather than a guess, and it is
+# what makes a family nobody has written a rule for behave correctly. Setting
+# supports_thinking_flag explicitly overrides that decision in either direction:
+# `true` applies `thinking_template_variable` unconditionally, `false` vetoes
+# every variable.
 schema_version: 1
 
 chat:
@@ -39,12 +48,55 @@ chat:
           Qwen chat templates expose enable_thinking, and the family documents
           different sampling defaults for thinking and non-thinking modes.
 
+  - id: chat-qwen3
+    schema_version: 1
+    status: active
+    priority: 100
+    summary: Qwen3 sampling defaults; the thinking variable comes from the template
+    match:
+      model_types:
+        - qwen3
+        - qwen3_moe
+      architectures:
+        - Qwen3ForCausalLM
+        - Qwen3MoeForCausalLM
+    # supports_thinking_flag is deliberately unset: Qwen3 chat templates guard
+    # the reasoning prelude with `enable_thinking is defined and enable_thinking
+    # is false`, so the template itself is the evidence. A repackaged Qwen3 whose
+    # template dropped that guard must not be sent a variable it ignores.
+    default_thinking: false
+    reasoning_wrappers:
+      - ["<think>", "</think>"]
+    defaults:
+      temperature: 0.7
+      top_p: 0.8
+      top_k: 20
+      max_new_tokens: 4096
+    thinking_defaults:
+      temperature: 0.6
+      top_p: 0.95
+      top_k: 20
+    sources:
+      - kind: model_card
+        url: https://huggingface.co/Qwen/Qwen3-0.6B
+        note: >-
+          The Qwen3 model card documents temperature 0.7, top_p 0.8, top_k 20 for
+          non-thinking mode and temperature 0.6, top_p 0.95, top_k 20 for
+          thinking mode.
+      - kind: community
+        note: >-
+          Qwen3 chat_template.jinja emits an empty <think> block when
+          enable_thinking is false, which is why the wrapper is stripped as well
+          as suppressed.
+
   - id: chat-default
     schema_version: 1
     status: active
     priority: 10
     summary: Conservative chat defaults for models with no family-specific profile
-    supports_thinking_flag: false
+    # No stance on thinking: the runtime decides from the artifact's own chat
+    # template. A registry that has never heard of a family still suppresses its
+    # reasoning, which is the whole point of detecting rather than enumerating.
     default_thinking: false
     reasoning_wrappers:
       - ["<think>", "</think>"]

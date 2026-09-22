@@ -39,6 +39,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from yonga.adapters.runtime_genai import (
     DEFAULT_REASONING_WRAPPERS,
+    DEFAULT_THINKING_VARIABLES,
     ChatHistory,
     ChatMessage,
     ChatProfile,
@@ -46,6 +47,8 @@ from yonga.adapters.runtime_genai import (
     ChatRuntime,
     GenerationResult,
     Role,
+    read_chat_template,
+    resolve_thinking_variable,
 )
 from yonga.application.progress import ProgressEvent, ProgressKind, ProgressSink, null_sink
 from yonga.config.settings import DevicePolicy, Settings
@@ -86,10 +89,13 @@ __all__ = [
     "ChatTurn",
     "CommandOutcome",
     "GenerationResult",
+    "LoadClassifier",
     "ParsedCommand",
     "Role",
     "RuntimeFactory",
+    "SanitizedAnswer",
     "chat_history_filename",
+    "sanitize_answer",
     "sanitize_reasoning",
 ]
 
@@ -118,6 +124,7 @@ class _Scan(NamedTuple):
     segments: list[str]
     blocks: list[str]
     removed: bool
+    unterminated: bool
 
 
 def _normalise_wrappers(wrappers: object) -> list[tuple[str, str]]:
@@ -247,12 +254,18 @@ def _scan(text: str, pairs: Sequence[tuple[str, str]]) -> _Scan:
         index = best_position + len(best_token)
         run_start = index
 
+    unterminated = bool(stack)
     if stack:
         blocks.append(text[block_start:])
         removed = True
     else:
         segments.append(text[run_start:])
-    return _Scan(segments=segments, blocks=blocks, removed=removed)
+    return _Scan(
+        segments=segments,
+        blocks=blocks,
+        removed=removed,
+        unterminated=unterminated,
+    )
 
 
 def _separator(gap: str) -> str:
@@ -295,16 +308,45 @@ def _join_segments(segments: Sequence[str]) -> str:
     return "".join(parts)
 
 
-def sanitize_reasoning(
+class SanitizedAnswer(BaseModel):
+    """What one raw model reply looks like after the reasoning policy is applied.
+
+    The three flags describe the *shape* of what was hidden and never its
+    content, which is what lets the UI explain an empty answer without being able
+    to leak a word of the reasoning it is explaining.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    display_text: str
+    """The text that may be shown."""
+
+    reasoning_text: str | None = None
+    """The hidden reasoning, reported so ``--show-reasoning`` can render it."""
+
+    reasoning_hidden: bool = False
+    """True when a reasoning block was found and removed from ``display_text``."""
+
+    reasoning_unterminated: bool = False
+    """True when a reasoning block was opened and never closed.
+
+    The model ran out of tokens mid-thought, which is a different failure from
+    having decided to say nothing.
+    """
+
+    @property
+    def is_empty(self) -> bool:
+        """True when nothing at all survived for display."""
+        return not self.display_text.strip()
+
+
+def sanitize_answer(
     text: str,
     wrappers: Sequence[tuple[str, str]],
     *,
     show: bool,
-) -> tuple[str, str | None]:
+) -> SanitizedAnswer:
     """Split raw model output into what to display and what to keep hidden.
-
-    Returns ``(display_text, reasoning_text)``. ``reasoning_text`` is ``None``
-    when no reasoning block was found, or when every block was empty.
 
     ``wrappers`` are literal ``(opening, closing)`` pairs taken from the registry
     chat profile, never hard-coded here; matching is exact and case-sensitive, so
@@ -314,7 +356,8 @@ def sanitize_reasoning(
     was actually removed.
 
     With ``show=True`` the text is returned unchanged and the reasoning is still
-    reported, so ``--show-reasoning`` can render it separately.
+    reported, so ``--show-reasoning`` can render it separately. Nothing is
+    *hidden* in that mode, so ``reasoning_hidden`` stays false.
 
     The function is total. Any unexpected failure is treated as "we cannot prove
     this text is safe" and yields an empty display string rather than risking a
@@ -324,17 +367,43 @@ def sanitize_reasoning(
     try:
         pairs = _normalise_wrappers(wrappers)
         if not pairs:
-            return raw, None
+            return SanitizedAnswer(display_text=raw)
         scan = _scan(raw, pairs)
         reasoning_blocks = [block.strip() for block in scan.blocks]
         reasoning = "\n\n".join(block for block in reasoning_blocks if block) or None
         if show:
-            return raw, reasoning
-        if not scan.removed:
-            return raw, reasoning
-        return _join_segments(scan.segments), reasoning
+            return SanitizedAnswer(
+                display_text=raw,
+                reasoning_text=reasoning,
+                reasoning_unterminated=scan.unterminated,
+            )
+        display = raw if not scan.removed else _join_segments(scan.segments)
+        return SanitizedAnswer(
+            display_text=display,
+            reasoning_text=reasoning,
+            reasoning_hidden=scan.removed,
+            reasoning_unterminated=scan.unterminated,
+        )
     except Exception:  # pragma: no cover - defensive; the scan above is total
-        return (raw, None) if show else ("", None)
+        if show:
+            return SanitizedAnswer(display_text=raw)
+        return SanitizedAnswer(display_text="", reasoning_hidden=True)
+
+
+def sanitize_reasoning(
+    text: str,
+    wrappers: Sequence[tuple[str, str]],
+    *,
+    show: bool,
+) -> tuple[str, str | None]:
+    """Return just ``(display_text, reasoning_text)`` from :func:`sanitize_answer`.
+
+    The two-value form other components were written against; new callers that
+    need to tell "said nothing" from "never finished thinking" apart should use
+    :func:`sanitize_answer` instead.
+    """
+    answer = sanitize_answer(text, wrappers, show=show)
+    return answer.display_text, answer.reasoning_text
 
 
 # --------------------------------------------------------------------------------------
@@ -363,6 +432,19 @@ class RuntimeFactory(Protocol):
         thinking: bool | None,
     ) -> ChatRuntime:
         """Open a chat runtime for one prepared artifact."""
+        ...
+
+
+@runtime_checkable
+class LoadClassifier(Protocol):
+    """Turns raw runtime-load text into a registry diagnostic, or ``None``.
+
+    Keeps :class:`ChatSession` free of a registry import while still letting a
+    failed compile be explained by the same rules ``yonga probe`` uses.
+    """
+
+    def __call__(self, raw: str, device: str) -> Diagnostic | None:
+        """Classify ``raw`` for ``device``; ``None`` means "nothing to add"."""
         ...
 
 
@@ -441,8 +523,13 @@ class ChatProfileView(BaseModel):
 
     id: str | None = None
     summary: str = ""
-    supports_thinking_flag: bool = False
+    supports_thinking_flag: bool | None = None
+    """``True`` declares a thinking flag, ``False`` vetoes one, ``None`` means detect."""
+
     thinking_template_variable: str | None = None
+    thinking_variable_candidates: list[str] = Field(
+        default_factory=lambda: [*DEFAULT_THINKING_VARIABLES]
+    )
     default_thinking: bool = False
     reasoning_wrappers: list[tuple[str, str]] = Field(default_factory=_default_wrappers)
     defaults: GenerationDefaults = Field(default_factory=GenerationDefaults)
@@ -457,6 +544,7 @@ class ChatProfileView(BaseModel):
             summary=rule.summary,
             supports_thinking_flag=rule.supports_thinking_flag,
             thinking_template_variable=rule.thinking_template_variable,
+            thinking_variable_candidates=list(rule.thinking_variable_candidates),
             default_thinking=rule.default_thinking,
             reasoning_wrappers=list(rule.reasoning_wrappers) or _default_wrappers(),
             defaults=rule.defaults.model_copy(deep=True),
@@ -598,6 +686,21 @@ class ChatTurn(BaseModel):
         """The hidden reasoning, when the model emitted any."""
         return self.result.reasoning_text if self.result is not None else None
 
+    @property
+    def reasoning_hidden(self) -> bool:
+        """True when a reasoning block was removed from the answer."""
+        return self.result.reasoning_hidden if self.result is not None else False
+
+    @property
+    def reasoning_unterminated(self) -> bool:
+        """True when the model opened a reasoning block and never closed it."""
+        return self.result.reasoning_unterminated if self.result is not None else False
+
+    @property
+    def output_tokens(self) -> int | None:
+        """How many tokens the model generated, when the runtime reported it."""
+        return self.result.output_tokens if self.result is not None else None
+
 
 class ChatAction(str, Enum):
     """What the chat loop should do after a command was applied."""
@@ -732,11 +835,16 @@ class ChatSession:
         properties: Mapping[str, str] | None = None,
         options: ChatOptions | None = None,
         progress: ProgressSink | None = None,
+        classifier: LoadClassifier | None = None,
     ) -> None:
         """Bind a session to an artifact, a chat profile and a runtime factory.
 
         Nothing is loaded here: :meth:`load` (or the first :meth:`send`) builds
         the pipeline, so the caller can draw the startup panel first.
+
+        ``classifier`` turns raw runtime text into a registry diagnostic. It is
+        optional so a session can be built without a registry, and when it is
+        absent a load failure is reported exactly as the runtime described it.
         """
         chosen = options if options is not None else ChatOptions()
         self._artifact_dir = Path(artifact_dir)
@@ -749,8 +857,15 @@ class ChatSession:
         self._properties = dict(properties or {})
         self._options = chosen
         self._progress = progress if progress is not None else null_sink()
+        self._classifier = classifier
 
-        self._thinking = _resolve_thinking(profile, chosen)
+        self._chat_template = read_chat_template(self._artifact_dir)
+        self._thinking_variable = resolve_thinking_variable(profile, template=self._chat_template)
+        self._thinking = _resolve_thinking(
+            profile,
+            chosen,
+            thinking_available=self._thinking_variable is not None,
+        )
         self._show_reasoning = (
             chosen.show_reasoning if chosen.show_reasoning is not None else settings.show_reasoning
         )
@@ -831,6 +946,16 @@ class ChatSession:
         return self._thinking
 
     @property
+    def thinking_variable(self) -> str | None:
+        """The chat-template variable this session drives, when the artifact has one.
+
+        ``None`` means the artifact's own template references no variable this
+        profile knows about, so no template variable is sent and the reasoning
+        sanitiser is the only defence in play.
+        """
+        return self._thinking_variable
+
+    @property
     def stats(self) -> bool:
         """True when the metrics footer should be drawn."""
         return self._stats
@@ -889,18 +1014,42 @@ class ChatSession:
         runtime = self._runtime
         if runtime is None:
             self._emit(ProgressKind.STAGE, f"Loading the model on {self._device}...")
-            runtime = self._runtime_factory(
-                self._artifact_dir,
-                device=self._device,
-                pipeline=self._pipeline,
-                properties=dict(self._properties),
-                chat_profile=self._profile,
-                settings=self._settings,
-                thinking=self._thinking,
-            )
+            try:
+                runtime = self._runtime_factory(
+                    self._artifact_dir,
+                    device=self._device,
+                    pipeline=self._pipeline,
+                    properties=dict(self._properties),
+                    chat_profile=self._profile,
+                    settings=self._settings,
+                    thinking=self._thinking,
+                )
+            except YongaError as error:
+                raise self._classified(error) from error
             self._runtime = runtime
             self._runtime_loads += 1
         return runtime
+
+    def _classified(self, error: YongaError) -> YongaError:
+        """Re-report a load failure through the compatibility registry.
+
+        The runtime adapter cannot reach the registry, so on its own it can only
+        say "could not load the model" and suggest checking the driver — which is
+        the opposite of the truth when the NPU compiler ran and refused a graph.
+        Here the raw text goes through the same classifier ``probe`` uses, and the
+        registry's answer replaces the generic one whenever a rule recognised it.
+        An unrecognised failure keeps the runtime's own report, which at least
+        names the device.
+        """
+        if self._classifier is None:
+            return error
+        raw = error.diagnostic.raw_excerpt or error.diagnostic.message
+        if not raw.strip():
+            return error
+        classified = self._classifier(raw, self._device)
+        if classified is None or classified.matched_rule_id is None:
+            return error
+        return YongaError(classified)
 
     def close(self) -> None:
         """Release the runtime. Idempotent, and safe to call from a finally block."""
@@ -940,12 +1089,20 @@ class ChatSession:
             runtime = self.load()
             self._emit(ProgressKind.STAGE, "Generating a reply...")
             raw = runtime.generate(self.history, self._generation)
-            display, reasoning = sanitize_reasoning(
+            answer = sanitize_answer(
                 raw.text,
                 self._profile.reasoning_wrappers,
                 show=self._show_reasoning,
             )
-            result = raw.model_copy(update={"display_text": display, "reasoning_text": reasoning})
+            display = answer.display_text
+            result = raw.model_copy(
+                update={
+                    "display_text": display,
+                    "reasoning_text": answer.reasoning_text,
+                    "reasoning_hidden": answer.reasoning_hidden,
+                    "reasoning_unterminated": answer.reasoning_unterminated,
+                }
+            )
         except YongaError as error:
             self._rollback_user_turn()
             self._emit_diagnostic(error.diagnostic)
@@ -1087,7 +1244,7 @@ class ChatSession:
         self.set_reasoning(show)
         if not show:
             return CommandOutcome(message="Reasoning blocks are now hidden.")
-        if self._profile.supports_thinking_flag and not self._thinking:
+        if self._thinking_variable is not None and not self._thinking:
             return CommandOutcome(
                 message=(
                     "Reasoning blocks are now shown. Thinking mode is off for this session, "
@@ -1137,17 +1294,27 @@ class ChatSession:
         return self._settings.paths.compile_cache_dir
 
     def _description_extras(self) -> dict[str, str]:
-        """Extra startup-panel rows describing the generation policy in force."""
-        extras: dict[str, str] = {}
-        if self._profile.id:
-            extras["Chat profile"] = self._profile.id
-        if self._profile.supports_thinking_flag:
-            extras["Thinking mode"] = "on" if self._thinking else "off"
+        """Extra startup-panel rows describing the generation policy in force.
+
+        The chat profile and the thinking state are reported because they decide
+        whether reasoning is suppressed at all, and a user staring at a short or
+        empty answer needs to be able to see which rule produced it.
+        """
+        extras: dict[str, str] = {"Chat profile": self._profile.id or "built-in default"}
+        extras["Thinking mode"] = self._thinking_summary()
         sampling = _sampling_summary(self._generation)
         if sampling:
             extras["Sampling"] = sampling
         extras["Metrics footer"] = "on" if self._stats else "off"
         return extras
+
+    def _thinking_summary(self) -> str:
+        """Describe the thinking state, naming the template variable that drives it."""
+        variable = self._thinking_variable
+        if variable is None:
+            return "unavailable (this chat template has no thinking variable)"
+        state = "on" if self._thinking else "off"
+        return f"{state} ({variable}={str(self._thinking).lower()})"
 
     # --- progress --------------------------------------------------------
 
@@ -1184,17 +1351,22 @@ def _sampling_summary(settings: GenerationSettings) -> str:
     return " • ".join(parts)
 
 
-def _resolve_thinking(profile: ChatProfileView, options: ChatOptions) -> bool:
+def _resolve_thinking(
+    profile: ChatProfileView,
+    options: ChatOptions,
+    *,
+    thinking_available: bool,
+) -> bool:
     """Decide whether this session asks the chat template to enable thinking.
 
     An explicit ``--thinking``/``--no-thinking`` wins. Otherwise asking to *see*
-    reasoning on a family that has a thinking flag is taken as asking for it,
-    since the alternative is a flag that visibly does nothing. Everything else
-    follows the profile, which defaults to off.
+    reasoning on a model whose template actually has a thinking variable is taken
+    as asking for it, since the alternative is a flag that visibly does nothing.
+    Everything else follows the profile, which defaults to off.
     """
     if options.thinking is not None:
         return options.thinking
-    if options.show_reasoning and profile.supports_thinking_flag:
+    if options.show_reasoning and thinking_available:
         return True
     return profile.default_thinking
 
@@ -1313,7 +1485,22 @@ class ChatService:
             properties=self._runtime_properties(found, device),
             options=chosen,
             progress=self._progress,
+            classifier=self._load_classifier(found),
         )
+
+    def _load_classifier(self, manifest: ArtifactManifest | None) -> LoadClassifier:
+        """Return the callable a session uses to classify a runtime load failure."""
+        meta = _metadata_from_manifest(manifest)
+
+        def classify(raw: str, device: str) -> Diagnostic | None:
+            try:
+                return self._resolver.classify(
+                    raw_error=raw, device=device, meta=meta, stage="chat"
+                )
+            except Exception:  # pragma: no cover - classify is documented total
+                return None
+
+        return classify
 
     # --- resolution ------------------------------------------------------
 
@@ -1348,7 +1535,13 @@ class ChatService:
         return ChatProfileView()
 
     def _registry_chat_rule(self, manifest: ArtifactManifest | None) -> ChatProfileRule | None:
-        """Ask the resolver for this artifact's chat rule, tolerating a registry fault."""
+        """Ask the resolver for this artifact's chat rule, tolerating a registry fault.
+
+        The specificity preference — a family's own chat profile beating the one a
+        catch-all architecture rule names — lives in
+        :meth:`RegistryResolver.resolve_chat_profile`, so ``yonga chat`` and
+        ``yonga registry explain`` cannot disagree about which profile won.
+        """
         meta = _metadata_from_manifest(manifest)
         repo_id = meta.identity.repo_id if meta is not None else None
         try:

@@ -6,7 +6,7 @@ This is the service behind ``yonga prepare``. It owns the state machine in
 Protocols, so the whole pipeline is testable on a machine with no Intel
 accelerator and no network.
 
-Five rules are load-bearing and each one exists because the naive alternative
+Six rules are load-bearing and each one exists because the naive alternative
 fails on real hardware.
 
 **Plan first, then work.** :meth:`PrepareService.plan` performs no expensive side
@@ -34,6 +34,16 @@ stop the user from ever fixing it.
 **Security confirmations are not negotiable.** ``trust_remote_code`` is enabled
 only by the explicit flag. ``--yes`` can approve a large download or a repair; it
 can never approve executing repository code.
+
+**An export we already know cannot succeed never starts.** The registry declares
+which package versions an architecture's exporter needs
+(``AGENT_PROMPT.md`` section 13.2), preflight computes package compatibility
+(``docs/MODEL_PIPELINE.md`` section 5), and an unmet pin stops the job there —
+before the download, not several minutes into the quantization. Printing the
+problem and converting anyway is what this pipeline used to do, and it cost a
+17.5 GiB download per attempt. ``--ignore-exporter-requirements`` is the escape
+hatch for a stale pin; like ``--trust-remote-code`` it is its own deliberate
+flag and ``--yes`` does not reach it.
 """
 
 from __future__ import annotations
@@ -45,7 +55,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from itertools import pairwise
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -129,12 +139,13 @@ from yonga.registry.schema import ArchitectureRule, ChatProfileRule, ModelRule, 
 from yonga.repairs import Repair, RepairContext, RepairMatch, apply_repairs
 from yonga.util.hashing import sha256_text, short_hash
 from yonga.util.redaction import redact_argv, redact_text
-from yonga.util.versions import installed_version, satisfies
+from yonga.util.versions import installed_version, parse_version, satisfies
 
 __all__ = [
     "AUTO_DEVICE_PREFERENCE",
     "EXPECTED_EXPORT_FILES",
     "GENAI_ONLY_PROPERTIES",
+    "IGNORE_EXPORTER_REQUIREMENTS_FLAG",
     "SMOKE_MAX_NEW_TOKENS",
     "SMOKE_PROMPT",
     "STAGE_LABELS",
@@ -142,10 +153,14 @@ __all__ = [
     "ConfirmCallback",
     "PreparationOutcome",
     "PrepareService",
+    "RequirementState",
     "SmokeTester",
+    "requirement_state",
 ]
 
-#: Stage labels shown as ``"4/7 Downloading"`` (``docs/CLI_SPEC.md`` section 6).
+#: Stage labels. The renderer prefixes the counter, so an event carries the
+#: bare label here and its position in ``current``/``total``
+#: (``docs/CLI_SPEC.md`` section 6).
 STAGE_LABELS: tuple[str, ...] = (
     "Inspecting source",
     "Resolving compatibility",
@@ -224,6 +239,45 @@ _EXPORT_BACKEND: str = "optimum-intel"
 #: Distributions whose versions are reported in the validation record.
 _OPENVINO_DISTRIBUTION: str = "openvino"
 _TOKENIZERS_DISTRIBUTION: str = "openvino-tokenizers"
+
+#: Name of the flag that overrides an unmet exporter pin. Spelled once so the
+#: diagnostic, the plan panel's hint and the CLI option cannot drift apart.
+IGNORE_EXPORTER_REQUIREMENTS_FLAG: str = "--ignore-exporter-requirements"
+
+RequirementState = Literal["ok", "missing", "mismatch", "unverifiable"]
+"""How one declared exporter version pin compares to what is installed."""
+
+#: States that stop preparation. ``unverifiable`` is deliberately absent.
+_BLOCKING_REQUIREMENT_STATES: frozenset[RequirementState] = frozenset({"missing", "mismatch"})
+
+
+def requirement_state(installed: str | None, specifier: str) -> RequirementState:
+    """Classify one declared exporter pin against the installed version.
+
+    Four outcomes, kept distinct because only two of them may stop a job:
+
+    ``missing``
+        The distribution is not installed at all. The export cannot run.
+    ``mismatch``
+        A parseable version is installed and it contradicts the pin. This is the
+        Qwen3.5 case: ``optimum-intel`` 2.2.0 imports ``Qwen3_5DynamicCache``,
+        which ``transformers`` 5.5.4 no longer exposes, so the export dies deep
+        inside the patcher after the weights have already been fetched.
+    ``unverifiable``
+        Something is installed but its version cannot be parsed, so the pin
+        cannot be judged either way. :func:`~yonga.util.versions.satisfies`
+        answers ``False`` here exactly as it does for a real contradiction,
+        which is why a bare ``False`` must never be read as "wrong".
+    ``ok``
+        The installed version satisfies the pin, or there is no pin.
+    """
+    if installed is None:
+        return "missing"
+    if satisfies(installed, specifier):
+        return "ok"
+    if parse_version(installed) is None:
+        return "unverifiable"
+    return "mismatch"
 
 
 ConfirmCallback = Callable[[ConfirmationReason], bool]
@@ -433,7 +487,9 @@ class PrepareService:
             model_rule=model_rule,
             explicit_profile_id=profile_id,
         )
-        exporter_requirements = self._exporter_requirements(arch_rule, model_rule)
+        exporter_requirements, exporter_unverifiable = self._exporter_requirements(
+            arch_rule, model_rule
+        )
 
         source_sha = source_meta.resolved_revision or resolved_source.source.revision
         artifact_dir = self._artifacts.artifact_dir(
@@ -468,6 +524,9 @@ class PrepareService:
             f"Exporter requirement not satisfied: {problem}"
             for problem in exporter_requirements.problems
         )
+        known_limitations.extend(
+            f"Exporter requirement could not be checked: {note}" for note in exporter_unverifiable
+        )
 
         reuse = None if force else self._reusable_artifact(artifact_dir, source_sha, profile.id)
         confirmations = self._confirmations(
@@ -486,7 +545,8 @@ class PrepareService:
             requested=requested,
             requested_revision=requested_revision,
             resolved_source=resolved_source,
-            architecture=arch_rule.id if arch_rule is not None else source_meta.model_type,
+            architecture=self._architecture_identity(source_meta, arch_rule),
+            architecture_rule_id=arch_rule.id if arch_rule is not None else None,
             task=task,
             pipeline=pipeline,
             hardware=inventory,
@@ -675,11 +735,19 @@ class PrepareService:
         self,
         arch_rule: ArchitectureRule | None,
         model_rule: ModelRule | None,
-    ) -> ExporterRequirements:
+    ) -> tuple[ExporterRequirements, list[str]]:
         """Compare the registry's declared exporter constraints against this host.
 
         A mismatch is reported, never fixed: yonga does not install or downgrade
         packages in the user's environment (``AGENT_PROMPT.md`` section 13.2).
+
+        Returns the checked requirements plus the pins that could not be judged
+        at all. ``problems`` is reserved for the two states that really do stop
+        an export — an absent distribution and a contradicted version — because
+        :attr:`ExporterRequirements.satisfied` is derived from it and preflight
+        blocks on it. A version string nobody can parse is a gap in what yonga
+        knows, not evidence that the export will fail, so it travels separately
+        and lands in ``known_limitations`` where it informs without blocking.
         """
         spec = None
         if model_rule is not None and model_rule.export is not None:
@@ -693,12 +761,27 @@ class PrepareService:
             nncf=spec.nncf if spec is not None else None,
         )
         versions = self._exporter.requirements()
-        problems = [
-            (f"{name} {specifier} is required, but {versions.get(name) or 'nothing'} is installed")
-            for name, specifier in requirements.specifiers().items()
-            if not satisfies(versions.get(name), specifier)
-        ]
-        return requirements.model_copy(update={"problems": problems, "satisfied": not problems})
+        problems: list[str] = []
+        unverifiable: list[str] = []
+        for name, specifier in requirements.specifiers().items():
+            installed = versions.get(name)
+            state = requirement_state(installed, specifier)
+            if state == "ok":
+                continue
+            if state == "unverifiable":
+                unverifiable.append(
+                    f"{name} {specifier} is required, and the installed version "
+                    f"{installed!r} could not be parsed, so the requirement could not be checked"
+                )
+                continue
+            installed_text = (
+                f"{installed} is installed" if installed else f"{name} is not installed"
+            )
+            problems.append(f"{name} {specifier} is required, but {installed_text}")
+        return (
+            requirements.model_copy(update={"problems": problems, "satisfied": not problems}),
+            unverifiable,
+        )
 
     def _decide_device(
         self,
@@ -971,6 +1054,7 @@ class PrepareService:
         confirm: ConfirmCallback,
         ctx: JobContext,
         allow_repairs: bool = True,
+        ignore_exporter_requirements: bool = False,
     ) -> PreparationOutcome:
         """Execute a plan through the full preparation state machine.
 
@@ -978,11 +1062,25 @@ class PrepareService:
         per step. Any typed failure is recorded against the stage it happened in
         and re-raised, so the CLI can render the diagnostic and exit with its
         stable code.
+
+        Args:
+            plan: The plan to execute, as returned by :meth:`plan`.
+            confirm: Callback asked to approve each :class:`ConfirmationReason`.
+            ctx: The open job context this preparation runs inside.
+            allow_repairs: Whether known-defect repairs may modify the export.
+            ignore_exporter_requirements: Proceed even when the registry's
+                exporter version pins are unmet. Defaults to ``False``; the CLI
+                only sets it from its own explicit flag, never from ``--yes``.
         """
         tracker = _StageTracker()
         try:
             return self._execute(
-                plan, confirm=confirm, ctx=ctx, allow_repairs=allow_repairs, tracker=tracker
+                plan,
+                confirm=confirm,
+                ctx=ctx,
+                allow_repairs=allow_repairs,
+                tracker=tracker,
+                ignore_exporter_requirements=ignore_exporter_requirements,
             )
         except YongaError as error:
             ctx.fail(tracker.stage, error.diagnostic)
@@ -996,6 +1094,7 @@ class PrepareService:
         ctx: JobContext,
         allow_repairs: bool,
         tracker: _StageTracker,
+        ignore_exporter_requirements: bool = False,
     ) -> PreparationOutcome:
         """Run the state machine. See :meth:`prepare` for the caller contract."""
         started = time.perf_counter()
@@ -1020,7 +1119,9 @@ class PrepareService:
 
         self._stage(ctx, 3)
         tracker.stage = JobStage.PREFLIGHT_OK
-        warnings = self._preflight(plan, ctx)
+        warnings = self._preflight(
+            plan, ctx, ignore_exporter_requirements=ignore_exporter_requirements
+        )
         ctx.advance(JobStage.PREFLIGHT_OK)
 
         self._stage(ctx, 4)
@@ -1095,10 +1196,16 @@ class PrepareService:
 
     @staticmethod
     def _stage(ctx: JobContext, number: int) -> None:
-        """Emit the ``"N/7 Label"`` stage event for step ``number``."""
+        """Emit the stage event for step ``number``.
+
+        The message is the bare label. The ``current``/``total`` pair is what
+        carries the position, and the renderer turns it into the ``"4/7"``
+        prefix of ``docs/CLI_SPEC.md`` section 6 — putting the counter in the
+        message too printed it twice.
+        """
         ctx.emit(
             ProgressKind.STAGE,
-            f"{number}/{TOTAL_STAGES} {STAGE_LABELS[number - 1]}",
+            STAGE_LABELS[number - 1],
             current=number,
             total=TOTAL_STAGES,
         )
@@ -1206,12 +1313,19 @@ class PrepareService:
 
     # --- preflight --------------------------------------------------------
 
-    def _preflight(self, plan: PreparationPlan, ctx: JobContext) -> list[str]:
+    def _preflight(
+        self,
+        plan: PreparationPlan,
+        ctx: JobContext,
+        *,
+        ignore_exporter_requirements: bool = False,
+    ) -> list[str]:
         """Point every temp variable at managed storage and refuse to start if tight.
 
         Returns non-fatal warnings worth recording in the manifest. Raises
-        :class:`~yonga.domain.diagnostics.PreflightError` (exit code 30) when the
-        managed temp or the artifact filesystem clearly cannot hold the job, and
+        :class:`~yonga.domain.diagnostics.PreflightError` when the managed temp
+        or the artifact filesystem clearly cannot hold the job (exit code 30),
+        when the exporter's declared package pins are unmet (exit code 10), and
         :class:`~yonga.domain.diagnostics.DeviceUnsupportedError` when an
         explicitly requested device is not present at all.
         """
@@ -1268,16 +1382,137 @@ class PrepareService:
 
         self._require_space(plan.disk)
         self._require_device(plan)
+        warnings.extend(
+            self._require_exporter_requirements(plan, ctx, ignored=ignore_exporter_requirements)
+        )
+        return warnings
+
+    def _require_exporter_requirements(
+        self,
+        plan: PreparationPlan,
+        ctx: JobContext,
+        *,
+        ignored: bool,
+    ) -> list[str]:
+        """Refuse to convert when the exporter's declared package pins are unmet.
+
+        ``docs/MODEL_PIPELINE.md`` section 5 counts package compatibility among
+        the things preflight computes, and ``SPEC.md`` section 10 says preflight
+        exists to fail before expensive work. An unmet pin is knowledge that the
+        export cannot succeed, so spending the download and the quantization to
+        rediscover it several minutes later is exactly the waste this stage is
+        supposed to prevent.
+
+        The decision is keyed on :attr:`ExporterRequirements.problems` and never
+        on a bare :func:`~yonga.util.versions.satisfies` result: that function
+        also answers ``False`` for a version it cannot parse, and "unknown" must
+        not masquerade as "wrong" (see :func:`requirement_state`).
+
+        Returns the warnings to record when the block was explicitly overridden.
+        """
+        # Keyed on the plan's own property so the preflight gate and the plan
+        # panel cannot drift: an already-OpenVINO source is copied rather than
+        # converted (see :meth:`_convert`), and blocking it would refuse a job
+        # that has no export to fail.
+        if not plan.exporter_requirements_block:
+            return []
+
+        unmet = self._unmet_requirements(plan)
+        if ignored:
+            warnings: list[str] = []
+            for problem in plan.exporter.problems:
+                # The manifest is the artifact's lineage: an artifact built past a
+                # declared pin must say so, naming the requirement and the version
+                # that was actually installed, or nobody can explain it later.
+                note = (
+                    f"Exporter requirement overridden with "
+                    f"{IGNORE_EXPORTER_REQUIREMENTS_FLAG}: {problem}"
+                )
+                warnings.append(note)
+                ctx.emit(ProgressKind.LOG, note, severity=Severity.WARNING)
+                ctx.logger.warning("preflight.exporter_requirement_overridden", problem)
+            return warnings
 
         for problem in plan.exporter.problems:
-            warnings.append(f"Exporter requirement not satisfied: {problem}")
-            ctx.emit(
-                ProgressKind.LOG,
-                f"Exporter requirement not satisfied: {problem}",
-                severity=Severity.WARNING,
+            ctx.logger.error("preflight.exporter_requirement", problem)
+        commands = [f"pip install '{name}{specifier}'" for name, specifier, _ in unmet]
+        remediation = [
+            *(f"Install the required version yourself: {command}" for command in commands),
+            (
+                "yonga never installs, upgrades or removes packages in your environment; "
+                "a future managed-environment feature will handle this properly."
+            ),
+            (
+                f"If you know this pin is stale, re-run with {IGNORE_EXPORTER_REQUIREMENTS_FLAG}: "
+                f"yonga prepare {plan.requested.repo_id} {IGNORE_EXPORTER_REQUIREMENTS_FLAG}"
+            ),
+            (
+                "--yes does not and will not bypass this check, only "
+                f"{IGNORE_EXPORTER_REQUIREMENTS_FLAG} does."
+            ),
+        ]
+        # PACKAGE_ABI_MISMATCH is the honest category. Every package is present and
+        # importable; what is wrong is the combination of their versions — the
+        # Qwen3.5 export dies because optimum-intel 2.2.0 imports
+        # Qwen3_5DynamicCache, a symbol transformers 5.5.4 dropped although it
+        # still loads Qwen3_5Config and reports model_type qwen3_5. It is not
+        # INSUFFICIENT_DISK (no resource is short), not CONFIGURATION_ERROR or
+        # REGISTRY_ERROR (nothing the user or the registry wrote is wrong) and not
+        # SOURCE_FORMAT_UNSUPPORTED (the model is fine). That category maps to
+        # ExitCode.ENVIRONMENT_UNUSABLE (10) rather than PREFLIGHT (30): 10 is the
+        # right answer to *why* the job stopped even though it stopped *in*
+        # preflight, so neither the category nor the table is bent to match.
+        raise PreflightError(
+            diagnostic(
+                "preflight.exporter_requirement_unsatisfied",
+                FailureCategory.PACKAGE_ABI_MISMATCH,
+                "Exporter requirements are not satisfied",
+                (
+                    f"Converting {plan.resolved_source.source.repo_id} needs "
+                    f"{self._requirement_summary(plan, unmet)} yonga stops here, before the "
+                    f"{format_bytes(plan.disk.expected_download_bytes)} download and the "
+                    "conversion, because this export cannot succeed as the environment stands."
+                ),
+                remediation=remediation,
+                environment_broken=True,
+                context={
+                    "requirements": "; ".join(plan.exporter.problems)[:512],
+                    "profile": plan.profile.id,
+                },
             )
-            ctx.logger.warning("preflight.exporter_requirement", problem)
-        return warnings
+        )
+
+    def _unmet_requirements(self, plan: PreparationPlan) -> list[tuple[str, str, str | None]]:
+        """Return ``(distribution, specifier, installed)`` for every blocking pin."""
+        versions = self._exporter.requirements()
+        return [
+            (name, specifier, versions.get(name))
+            for name, specifier in plan.exporter.specifiers().items()
+            if requirement_state(versions.get(name), specifier) in _BLOCKING_REQUIREMENT_STATES
+        ]
+
+    @staticmethod
+    def _requirement_summary(
+        plan: PreparationPlan,
+        unmet: Sequence[tuple[str, str, str | None]],
+    ) -> str:
+        """Render one sentence naming each unmet pin and what is installed instead.
+
+        Falls back to the plan's recorded problem text when the live environment
+        no longer explains the plan — a plan is data and may outlive the versions
+        it was computed against, and a diagnostic must never invent a detail.
+        """
+        if not unmet:
+            return "; ".join(plan.exporter.problems) + "."
+        parts = [
+            (
+                f"{name} {specifier}, but {installed} is installed"
+                if installed
+                else f"{name} {specifier}, but {name} is not installed"
+            )
+            for name, specifier, installed in unmet
+        ]
+        return "; ".join(parts) + "."
 
     @staticmethod
     def _require_space(disk: DiskPlan) -> None:
@@ -2166,7 +2401,8 @@ class PrepareService:
                 resolved_revision=source_sha,
                 relationship=plan.resolved_source.relationship,
             ),
-            architecture=plan.architecture,
+            architecture=self._architecture_identity(source_meta, arch_rule),
+            architecture_rule_id=arch_rule.id if arch_rule is not None else None,
             model_type=source_meta.model_type if source_meta is not None else None,
             task=plan.task,
             pipeline=plan.pipeline,
@@ -2187,6 +2423,32 @@ class PrepareService:
             host=self._host_summary(plan.hardware, validation),
             notes=list(dict.fromkeys(manifest_notes)),
         )
+
+    @staticmethod
+    def _architecture_identity(
+        meta: ModelMetadata | None,
+        arch_rule: ArchitectureRule | None,
+    ) -> str | None:
+        """Return the architecture identity ``SPEC.md`` section 14 asks for.
+
+        That is what this model *is* — ``qwen3_5`` — and never the id of the
+        registry rule that happened to match it. A rule covers a family, so its
+        id answers a different question: it is recorded separately, in
+        ``architecture_rule_id``, so the lineage survives.
+
+        The declaration wins when there is one. A repository that declares
+        nothing — a GGUF-only repository has no ``config.json`` to declare in —
+        falls back to the canonical model type of the rule that identified it,
+        which is registry data rather than a guess made here.
+        """
+        if meta is not None:
+            if meta.model_type:
+                return meta.model_type
+            if meta.architectures:
+                return meta.architectures[0]
+        if arch_rule is not None and arch_rule.match.model_types:
+            return arch_rule.match.model_types[0]
+        return None
 
     @staticmethod
     def _artifact_id(repo_id: str, source_sha: str | None, profile_id: str) -> str:

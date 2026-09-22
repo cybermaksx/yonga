@@ -1,0 +1,123 @@
+# Continuous integration for yonga (docs/TESTING.md section 11).
+#
+# The runners have no Intel hardware and the tests must not reach the network.
+# Both are already handled by the default `addopts` in pyproject.toml, which
+# deselects `network`, `intel_gpu`, `intel_npu`, `large_model` and `slow`. No job
+# here passes `-m`: overriding that expression is how a CI run would start
+# depending on a device it does not have. Verified locally with every outbound
+# HTTP request blocked: 1608 passed, 1 skipped, 10 deselected.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  lint:
+    name: lint (ruff)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      # Ruff reads the source; it needs neither the OpenVINO runtime nor the
+      # conversion toolchain, and its result does not depend on the interpreter
+      # (pyproject pins `target-version = "py311"`), so this job runs once.
+      - name: Install lint tooling
+        run: python -m pip install -e ".[dev]"
+
+      # The whole tree, not just src and tests: `tools/` holds runnable Python
+      # too, and a lint gate that skips it is not the gate we run locally.
+      - name: ruff check
+        run: ruff check .
+
+      - name: ruff format --check
+        run: ruff format --check .
+
+  typing:
+    name: typing (mypy, py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      # No openvino/export extras on purpose. pyproject declares
+      # `ignore_missing_imports` for openvino, openvino_genai, optimum, nncf,
+      # transformers and torch, so mypy type-checks the whole tree without the
+      # heavy wheels. Verified in a clean venv holding only the base package and
+      # `[dev]` — which resolves typer 0.27.2 and click 8.5.0, not the typer
+      # 0.25.1 this repository's own .venv pins: clean, 108 source files.
+      - name: Install package and typing tooling
+        run: python -m pip install -e ".[dev]"
+
+      - name: mypy
+        run: mypy src tests
+
+  tests:
+    name: tests (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      # The openvino and export extras ARE required here, unlike in the two jobs
+      # above. Parts of the suite assert against the real installed stack rather
+      # than a fake: the exporter reports the versions of openvino/transformers it
+      # would run with, `doctor` enumerates OpenVINO devices, and the `openvino`
+      # marker is not in the deselected set. Verified: in an environment with only
+      # the base package and `[dev]`, five tests fail — two in
+      # tests/unit/test_exporter_optimum.py, one in
+      # tests/integration/test_exporter_fake.py and two in
+      # tests/integration/test_cli_commands.py.
+      #
+      # None of this needs Intel hardware: the OpenVINO CPU plugin runs anywhere,
+      # and the tests that need a real GPU or NPU carry the `intel_gpu`/`intel_npu`
+      # markers and stay deselected.
+      - name: Install package with the full toolchain
+        run: python -m pip install -e ".[openvino,export,dev]"
+
+      - name: Report the installed stack
+        run: python -m pip list
+
+      - name: Unit tests
+        run: pytest tests/unit
+
+      - name: Integration tests
+        run: pytest tests/integration

@@ -160,6 +160,32 @@ def test_only_overrides_are_recorded_never_the_whole_environment(tmp_path, monke
     assert "SOME_UNRELATED_HOST_VARIABLE" not in result.env_overrides
 
 
+def test_a_caller_that_passes_a_whole_environment_still_records_only_overrides(job, monkeypatch):
+    """The runner documents that it records overrides; it must enforce that.
+
+    ``ExporterOptimum`` used to hand ``run()`` a complete environment, which the
+    runner then wrote verbatim into the job log. Name-based redaction cannot
+    recognise a secret held under an unfamiliar name, so every inherited
+    variable ended up on disk in a world-readable file.
+    """
+    ctx, _sink, log_path = job
+    monkeypatch.setenv("SOME_UNRELATED_HOST_VARIABLE", "leaky")
+    monkeypatch.setenv("A_PRIVATE_VALUE_WITH_NO_SECRET_SOUNDING_NAME", "hunter2-hunter2")
+    whole = dict(os.environ)
+    whole["YONGA_MARKER"] = "1"
+
+    result = SubprocessRunner().run(python("print('x')"), env=whole, ctx=ctx)
+    ctx.logger.close()
+
+    assert result.returncode == 0
+    assert dict(result.env_overrides) == {**dict(ctx.temp_env), "YONGA_MARKER": "1"}
+    assert "SOME_UNRELATED_HOST_VARIABLE" not in result.env_overrides
+    recorded = json.dumps(dict(result.env_overrides))
+    assert "leaky" not in recorded
+    assert "hunter2-hunter2" not in recorded
+    assert "hunter2-hunter2" not in log_path.read_text(encoding="utf-8")
+
+
 def test_secret_environment_overrides_are_redacted(tmp_path):
     result = SubprocessRunner().run(python("print('x')"), env={"HF_TOKEN": SECRET})
     assert result.env_overrides["HF_TOKEN"] == REDACTED

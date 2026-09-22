@@ -61,6 +61,10 @@ _KIND_LABELS: dict[ProgressKind, str] = {
     ProgressKind.LOG: "",
 }
 
+#: Phase announcement for the per-submodel IR inventory, whose own messages are
+#: bare filenames.
+_INVENTORY_LABEL: str = "Inventorying OpenVINO IR"
+
 #: Event ``status`` values mapped onto a severity for icon/colour selection.
 _STATUS_SEVERITY: dict[str, Severity] = {
     "ok": Severity.OK,
@@ -194,21 +198,21 @@ class RichProgressSink:
 
     def _render_task(self, event: ProgressEvent) -> None:
         """Update (or create) the live task for this event's kind."""
-        description = event.message.strip() or _KIND_LABELS.get(event.kind, event.kind.value)
-        if event.kind is ProgressKind.DOWNLOAD and event.total:
-            moved = human_bytes(event.current)
-            expected = human_bytes(event.total)
-            description = f"{description} ({moved} / {expected})"
-
         if not self.console.animate:
-            # No terminal: a bar would be noise, so only announce the phase once.
+            # No terminal: a bar would be noise, so the phase is announced once
+            # and the per-event detail is kept for ``--verbose``.
+            announced: str | None = None
             if event.kind not in self._announced:
                 self._announced.add(event.kind)
-                self._write(Text(description, style="dim"))
-            elif self.console.verbose:
-                self.console.detail(description)
+                announced = self._describe(event, detail=False)
+                self._write(Text(announced, style="dim"))
+            if self.console.verbose:
+                detail = self._describe(event, detail=True)
+                if detail != announced:
+                    self.console.detail(detail)
             return
 
+        description = self._describe(event, detail=True)
         progress = self._ensure_progress()
         determinate = event.fraction is not None
         task_id = self._tasks.get(event.kind)
@@ -226,6 +230,49 @@ class RichProgressSink:
             total=float(event.total) if determinate and event.total else None,
             completed=float(event.current or 0),
         )
+
+    def _describe(self, event: ProgressEvent, *, detail: bool) -> str:
+        """Describe one task event as a phase announcement or as a detail line."""
+        if event.kind is ProgressKind.HASH:
+            return self._describe_hash(event, detail=detail)
+        if event.kind is ProgressKind.VALIDATE and "role" in event.data:
+            return self._describe_inventory(event, detail=detail)
+        description = event.message.strip() or _KIND_LABELS.get(event.kind, event.kind.value)
+        if event.kind is ProgressKind.DOWNLOAD and event.total:
+            moved = human_bytes(event.current)
+            expected = human_bytes(event.total)
+            description = f"{description} ({moved} / {expected})"
+        return description
+
+    def _describe_inventory(self, event: ProgressEvent, *, detail: bool) -> str:
+        """Describe one per-submodel IR inventory event without leading with a filename.
+
+        The message is ``openvino_detokenizer.xml: detokenizer`` — true, but it
+        was the first thing ``yonga probe`` printed, before anything had said
+        what was being done to it. The phase is announced as a phase, and the
+        per-file line is kept for ``--verbose``, exactly as file hashing is.
+        """
+        name = event.message.strip()
+        if detail and self.console.verbose and name:
+            return name
+        return _INVENTORY_LABEL
+
+    def _describe_hash(self, event: ProgressEvent, *, detail: bool) -> str:
+        """Describe a file-hashing event without leaking a bare filename.
+
+        The event's message is a relative path, and an artifact can hold
+        hundreds of files. Printing one of those paths on its own says nothing
+        about what is happening to it, so at default verbosity the step is
+        described as a whole — ``Hashing 12 files`` — and the per-file detail is
+        kept for ``--verbose``.
+        """
+        name = event.message.strip()
+        if detail and self.console.verbose and name:
+            return f"Hashing {name}"
+        total = event.total or 0
+        if total > 0:
+            return f"Hashing {total} file{'' if total == 1 else 's'}"
+        return _KIND_LABELS[ProgressKind.HASH]
 
     def _ensure_progress(self) -> Progress:
         """Start the live display on first use and return it."""

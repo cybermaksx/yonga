@@ -24,6 +24,15 @@ Relevant initial fact:
 
 - Qwen3.5 export requires `transformers==5.2` in current guidance.
 
+Checked on the reference host, 2026-09-22 (one host, one stack; not a general law):
+
+- With `optimum-intel` 2.2.0 and `transformers` 5.5.4 the OpenVINO export fails in
+  `optimum/exporters/openvino/model_patcher.py` with `ImportError: cannot import name
+  'Qwen3_5DynamicCache' from 'transformers.models.qwen3_5.modeling_qwen3_5'`. With
+  `transformers` 5.2.0 that symbol imports and the export proceeds.
+- `transformers` 5.5.4 still loads `Qwen3_5Config` and still reports `model_type: qwen3_5`, so a
+  successful config load says nothing about whether the export will work.
+
 ## OpenVINO GenAI API
 
 - VLMPipeline: https://docs.openvino.ai/2026/api/genai_api/_autosummary/openvino_genai.VLMPipeline.html

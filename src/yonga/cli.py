@@ -562,6 +562,14 @@ def prepare(
         "--trust-remote-code",
         help="Allow the conversion to execute Python published in the repository.",
     ),
+    ignore_exporter_requirements: bool = typer.Option(
+        False,
+        "--ignore-exporter-requirements",
+        help=(
+            "Convert even though a declared exporter package version is unmet. "
+            "Deliberate and separate: --yes never enables it."
+        ),
+    ),
     yes: bool = typer.Option(False, "--yes", "-y", help="Answer ordinary questions with yes."),
     force: bool = typer.Option(False, "--force", help="Re-prepare even if an artifact exists."),
     no_repair: bool = typer.Option(False, "--no-repair", help="Never modify the exported IR."),
@@ -579,6 +587,7 @@ def prepare(
             profile=profile,
             source=source,
             trust_remote_code=trust_remote_code,
+            ignore_exporter_requirements=ignore_exporter_requirements,
             yes=yes,
             force=force,
             no_repair=no_repair,
@@ -595,6 +604,7 @@ def _prepare(
     profile: str | None,
     source: str | None,
     trust_remote_code: bool,
+    ignore_exporter_requirements: bool,
     yes: bool,
     force: bool,
     no_repair: bool,
@@ -629,7 +639,13 @@ def _prepare(
         )
         console.print(tables.preparation_plan(plan))
         with _quiet_native_stdout(state.json_mode):
-            outcome = service.prepare(plan, confirm=confirm, ctx=job, allow_repairs=not no_repair)
+            outcome = service.prepare(
+                plan,
+                confirm=confirm,
+                ctx=job,
+                allow_repairs=not no_repair,
+                ignore_exporter_requirements=ignore_exporter_requirements,
+            )
 
     warnings = list(outcome.warnings)
     if outcome.fell_back:
@@ -921,7 +937,7 @@ def _chat_loop(state: CliState, session: ChatSession, view: ChatView) -> ExitCod
             if turn.diagnostic is not None:
                 console.diagnostic(turn.diagnostic)
             continue
-        view.show_answer(turn.display_text)
+        view.show_answer(turn.result or turn.display_text)
         if session.show_reasoning and turn.reasoning_text:
             console.print(turn.reasoning_text, style="dim")
         if session.stats:

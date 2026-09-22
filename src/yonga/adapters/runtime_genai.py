@@ -17,7 +17,10 @@ Two upstream details are hidden here on purpose:
   lifecycle internally and feeds the pipeline only the newest user turn.
 * Reasoning ("thinking") is switched off through the chat template variable via
   ``ChatHistory.set_extra_context``. The source repository's chat template is
-  never rewritten.
+  never rewritten. *Which* variable to send is decided from evidence: unless the
+  registry profile states the answer outright, the artifact's own chat template
+  is read and a candidate is applied only when that template actually references
+  it. See :func:`resolve_thinking_variable`.
 
 :class:`GenerationResult` carries the **raw** model text. ``display_text`` is set
 equal to ``text`` and ``reasoning_text`` to ``None`` here; hiding reasoning
@@ -27,7 +30,9 @@ show/hide policy and the unclosed-wrapper rule.
 
 from __future__ import annotations
 
+import json
 import math
+import re
 import time
 from collections.abc import Mapping, Sequence
 from contextlib import suppress
@@ -56,7 +61,9 @@ from yonga.domain.models import PipelineKind
 from yonga.util.redaction import redact_text
 
 __all__ = [
+    "CHAT_TEMPLATE_FILES",
     "DEFAULT_REASONING_WRAPPERS",
+    "DEFAULT_THINKING_VARIABLES",
     "ChatHistory",
     "ChatMessage",
     "ChatProfile",
@@ -69,11 +76,26 @@ __all__ = [
     "build_generation_config",
     "collect_metrics",
     "open_runtime",
+    "read_chat_template",
+    "resolve_thinking_variable",
+    "template_references",
     "thinking_extra_context",
 ]
 
 #: Reasoning wrappers understood by the default chat profile.
 DEFAULT_REASONING_WRAPPERS: tuple[tuple[str, str], ...] = (("<think>", "</think>"),)
+
+#: Thinking variables tried against an artifact's chat template when its chat
+#: profile names none. Mirrors the registry's default so a profile-less runtime
+#: behaves the same way as one driven by ``chat-default``.
+DEFAULT_THINKING_VARIABLES: tuple[str, ...] = ("enable_thinking",)
+
+#: Files an artifact may keep its chat template in, in the order they are read.
+CHAT_TEMPLATE_FILES: tuple[str, ...] = (
+    "chat_template.jinja",
+    "chat_template.json",
+    "tokenizer_config.json",
+)
 
 _DEFAULT_DEVICE = "CPU"
 _CACHE_DIR_PROPERTY = "CACHE_DIR"
@@ -164,10 +186,16 @@ class GenerationMetrics(BaseModel):
 class GenerationResult(BaseModel):
     """The outcome of one generation turn.
 
-    ``text`` is the raw model output. ``display_text`` and ``reasoning_text`` are
-    filled in by the chat service's sanitiser; this adapter sets
-    ``display_text = text`` and ``reasoning_text = None`` so a caller that does
-    not sanitise still shows something truthful.
+    ``text`` is the raw model output. ``display_text``, ``reasoning_text`` and the
+    two ``reasoning_*`` flags are filled in by the chat service's sanitiser; this
+    adapter sets ``display_text = text`` and leaves the rest at their defaults so
+    a caller that does not sanitise still shows something truthful.
+
+    ``reasoning_hidden`` and ``reasoning_unterminated`` exist so the UI can
+    explain an empty answer without looking at the text again. They describe the
+    *shape* of what was hidden, never its content: a renderer may say that 200
+    tokens of reasoning were suppressed and that the block never closed, and must
+    not be able to reconstruct a single word of it.
     """
 
     model_config = _LENIENT
@@ -175,6 +203,17 @@ class GenerationResult(BaseModel):
     text: str
     display_text: str
     reasoning_text: str | None = None
+    reasoning_hidden: bool = False
+    """True when a reasoning block was found and removed from ``display_text``."""
+
+    reasoning_unterminated: bool = False
+    """True when a reasoning block was opened and never closed before the text ended.
+
+    In practice this means the model ran into its token limit mid-thought, which
+    is the difference between "it had nothing to say" and "it never got to the
+    answer".
+    """
+
     input_tokens: int | None = None
     output_tokens: int | None = None
     ttft_ms: float | None = None
@@ -191,12 +230,15 @@ class GenerationResult(BaseModel):
 class ChatProfileLike(Protocol):
     """Structural type for a registry chat profile.
 
-    The registry's ``ChatProfileRule`` satisfies this by declaring the same three
+    The registry's ``ChatProfileRule`` satisfies this by declaring the same
     attribute names with the same types; the adapter reads nothing else.
+    ``supports_thinking_flag`` is tri-state — ``None`` means "no opinion, decide
+    from the artifact's chat template".
     """
 
-    supports_thinking_flag: bool
+    supports_thinking_flag: bool | None
     thinking_template_variable: str | None
+    thinking_variable_candidates: list[str]
     default_thinking: bool
 
 
@@ -209,29 +251,146 @@ class ChatProfile(BaseModel):
 
     model_config = _LENIENT
 
-    supports_thinking_flag: bool = False
+    supports_thinking_flag: bool | None = None
     thinking_template_variable: str | None = "enable_thinking"
+    thinking_variable_candidates: list[str] = Field(
+        default_factory=lambda: [*DEFAULT_THINKING_VARIABLES]
+    )
     default_thinking: bool = False
     reasoning_wrappers: list[tuple[str, str]] = Field(
         default_factory=lambda: [*DEFAULT_REASONING_WRAPPERS]
     )
 
 
+def read_chat_template(artifact_dir: Path) -> str | None:
+    """Return the chat-template source an artifact ships, or ``None``.
+
+    The template is read, never written: suppressing reasoning by editing the
+    model's own template is forbidden (``SPEC.md`` section 18.4,
+    ``MODEL_PIPELINE.md`` section 13), so this is evidence-gathering only.
+
+    Exporters put the template in one of three places, checked in that order: a
+    standalone ``chat_template.jinja``, a ``chat_template.json`` wrapper, or the
+    ``chat_template`` key of ``tokenizer_config.json``. Newer Transformers
+    releases may store a *list* of named templates there; every one of them is
+    returned joined together, because any of them could be the one that runs.
+
+    Never raises. An unreadable or malformed file is simply no evidence, and the
+    caller then leaves the template exactly as the model author wrote it.
+    """
+    directory = Path(artifact_dir)
+    for name in CHAT_TEMPLATE_FILES:
+        path = directory / name
+        try:
+            if not path.is_file():
+                continue
+            raw = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        template = raw if path.suffix == ".jinja" else _template_from_json(raw)
+        if template:
+            return template
+    return None
+
+
+def _template_from_json(raw: str) -> str | None:
+    """Pull the ``chat_template`` value out of a JSON config, whatever shape it has."""
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    value = payload.get("chat_template")
+    if isinstance(value, str):
+        return value or None
+    if isinstance(value, list):
+        parts = [
+            entry["template"]
+            for entry in value
+            if isinstance(entry, dict) and isinstance(entry.get("template"), str)
+        ]
+        return "\n".join(parts) or None
+    return None
+
+
+def template_references(template: str | None, variable: str) -> bool:
+    """True when ``template`` uses ``variable`` as a name of its own.
+
+    The match is on whole identifiers, so ``enable_thinking`` is not found inside
+    ``disable_enable_thinking2``. A name reached through an attribute, as in
+    ``message.enable_thinking``, does not count either: that is a property of a
+    message, not a variable the caller can set through extra context.
+    """
+    name = (variable or "").strip()
+    if not template or not name:
+        return False
+    pattern = rf"(?<![\w.]){re.escape(name)}(?![\w])"
+    return re.search(pattern, template) is not None
+
+
+def resolve_thinking_variable(
+    profile: ChatProfileLike | None,
+    *,
+    template: str | None = None,
+) -> str | None:
+    """Return the chat-template variable that drives thinking mode, or ``None``.
+
+    Three sources, in order of authority:
+
+    1. ``supports_thinking_flag: false`` is a veto. Nothing is sent, whatever the
+       template mentions.
+    2. ``supports_thinking_flag: true`` is a declaration. The profile's
+       ``thinking_template_variable`` is used as-is, because the registry author
+       has stated the family honours it.
+    3. Otherwise the candidates are tried against ``template`` and the first one
+       the template actually references wins. A profile that names a variable
+       makes that name the only candidate.
+
+    With no template (``None``) there is no evidence, so only an explicit
+    declaration can produce a variable. That is the safe direction to fail: a
+    template is left exactly as its author wrote it.
+    """
+    if profile is None:
+        return None
+    declared = getattr(profile, "supports_thinking_flag", None)
+    named = str(getattr(profile, "thinking_template_variable", "") or "").strip()
+    if declared is False:
+        return None
+    if declared is True and named:
+        return named
+    candidates = (named,) if named else _candidate_variables(profile)
+    return next((name for name in candidates if template_references(template, name)), None)
+
+
+def _candidate_variables(profile: ChatProfileLike) -> tuple[str, ...]:
+    """Return a profile's candidate variable names, tolerating an odd value."""
+    raw = getattr(profile, "thinking_variable_candidates", None)
+    if raw is None:
+        return DEFAULT_THINKING_VARIABLES
+    try:
+        items = list(raw)
+    except TypeError:
+        return DEFAULT_THINKING_VARIABLES
+    return tuple(item.strip() for item in items if isinstance(item, str) and item.strip())
+
+
 def thinking_extra_context(
     profile: ChatProfileLike | None,
     *,
     thinking: bool | None = None,
+    template: str | None = None,
 ) -> dict[str, bool]:
     """Return the chat-template variables to push through ``set_extra_context``.
 
-    Returns an empty mapping when the profile does not declare a thinking flag,
+    Returns an empty mapping when no thinking variable could be established,
     which is the safe default: an unknown template is left exactly as the model
-    author wrote it. ``thinking`` overrides the profile's ``default_thinking``.
+    author wrote it. ``thinking`` overrides the profile's ``default_thinking``,
+    and ``template`` is the artifact's own chat-template source, which is what
+    turns a candidate name into evidence.
     """
-    if profile is None or not bool(getattr(profile, "supports_thinking_flag", False)):
-        return {}
-    variable = str(getattr(profile, "thinking_template_variable", "") or "").strip()
-    if not variable:
+    variable = resolve_thinking_variable(profile, template=template)
+    if variable is None:
         return {}
     enabled = (
         bool(getattr(profile, "default_thinking", False)) if thinking is None else bool(thinking)
@@ -456,6 +615,10 @@ class GenAIChatRuntime:
         self._thinking = thinking
         self._settings = settings if settings is not None else Settings()
         self._properties = self._resolve_properties(properties)
+        self._chat_template = read_chat_template(self._artifact_dir)
+        self._thinking_variable = resolve_thinking_variable(
+            chat_profile, template=self._chat_template
+        )
         self._extra_context_error: str | None = None
         self._closed = False
         self._chat_started = False
@@ -561,6 +724,15 @@ class GenAIChatRuntime:
         return self._load_seconds
 
     @property
+    def thinking_variable(self) -> str | None:
+        """The chat-template variable this runtime drives, when one was established.
+
+        ``None`` means the artifact's template names no thinking variable this
+        profile knows about, so the template is left untouched.
+        """
+        return self._thinking_variable
+
+    @property
     def extra_context_error(self) -> str | None:
         """Why the chat-template variables could not be applied, when that failed."""
         return self._extra_context_error
@@ -631,7 +803,9 @@ class GenAIChatRuntime:
         genai_history = self._genai.ChatHistory()
         for message in history.messages:
             genai_history.append(message.as_payload())
-        extra = thinking_extra_context(self._chat_profile, thinking=self._thinking)
+        extra = thinking_extra_context(
+            self._chat_profile, thinking=self._thinking, template=self._chat_template
+        )
         if extra:
             try:
                 genai_history.set_extra_context(dict(extra))

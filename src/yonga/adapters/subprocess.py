@@ -94,6 +94,27 @@ def default_line_selector(line: str) -> ProgressKind | None:
     return None
 
 
+def _recorded_overrides(
+    candidates: Mapping[str, str],
+    *,
+    forced: Mapping[str, str],
+) -> dict[str, str]:
+    """Reduce a child environment to the variables that are genuinely overrides.
+
+    Anything whose value is identical to the inherited environment is not an
+    override and is dropped, so a caller that passes a complete environment
+    records nothing more than a caller that passes three variables. The managed
+    temp variables in ``forced`` are always kept: they are what makes a recorded
+    conversion reproducible.
+    """
+    inherited = os.environ
+    return {
+        key: value
+        for key, value in candidates.items()
+        if key in forced or inherited.get(key) != value
+    }
+
+
 @dataclass
 class CompletedCommand:
     """The outcome of one subprocess execution.
@@ -193,6 +214,14 @@ class SubprocessRunner:
         the managed temp directory). It is never the complete environment, and
         only these overrides are recorded on the result.
 
+        That last sentence is enforced here rather than trusted: a caller that
+        hands in a whole environment must not be able to dump every inherited
+        variable into the job log, where name-based redaction cannot recognise a
+        secret held under an unfamiliar name. Anything whose value merely repeats
+        the inherited environment is therefore dropped from the record, while the
+        managed temp variables are always kept because reproducing the run needs
+        them.
+
         A non-zero exit code is returned, not raised. A failure to *start* the
         process is also returned, with ``returncode`` 127 and ``error`` set, so
         that callers have exactly one code path to classify.
@@ -203,13 +232,10 @@ class SubprocessRunner:
             raise ValueError(message)
 
         overrides = dict(env or {})
-        if ctx is not None:
-            base = ctx.child_env()
-            recorded = {**dict(ctx.temp_env), **overrides}
-        else:
-            base = dict(os.environ)
-            recorded = dict(overrides)
+        forced = dict(ctx.temp_env) if ctx is not None else {}
+        base = ctx.child_env() if ctx is not None else dict(os.environ)
         child_env = {**base, **overrides}
+        recorded = _recorded_overrides({**forced, **overrides}, forced=forced)
 
         safe_argv = redact_argv(command)
         safe_overrides = redact_env(recorded)
