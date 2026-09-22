@@ -1,0 +1,111 @@
+schema_version: 1
+
+architectures:
+  - id: arch-qwen3_5
+    status: active
+    summary: Qwen3.5 hybrid architecture
+    match:
+      model_types:
+        - qwen3_5
+      architectures:
+        - Qwen3_5ForConditionalGeneration
+        - Qwen3_5ForCausalLM
+    export:
+      transformers: "==5.2.*"
+      pipeline: vlm
+    devices:
+      cpu:
+        status: supported
+        evidence: official
+      gpu:
+        status: supported
+        evidence: official
+      npu:
+        status: unsupported
+        evidence: tested
+        constraints:
+          openvino: ">=2026.2,<2027"
+        reason: current_npu_compiler_graph_limitation
+    recommended_device: gpu
+    sources:
+      - kind: official_docs
+        url: https://github.com/openvinotoolkit/openvino.genai/blob/master/site/docs/supported-models/index.mdx
+      - kind: tested
+        note: >-
+          Qwen3.5-9B derivative failed NPU compilation on a Lunar Lake host
+          with OpenVINO 2026.4 and compiler-in-plugin while GPU compilation
+          succeeded.
+
+profiles:
+  - id: gpu-int4-asym-g128
+    status: active
+    summary: Initial GPU profile for Qwen3.5-class large models
+    device: gpu
+    quantization:
+      weight_format: int4
+      symmetric: false
+      ratio: 1.0
+      group_size: 128
+    runtime:
+      attention_backend: SDPA
+    sources:
+      - kind: model_card
+        url: https://huggingface.co/OpenVINO/Qwen3.5-9B-int4-ov
+
+  - id: npu-int4-sym-cw
+    status: active
+    summary: NPU channel-wise profile for larger supported LLMs
+    device: npu
+    quantization:
+      weight_format: int4
+      symmetric: true
+      ratio: 1.0
+      group_size: -1
+    sources:
+      - kind: official_docs
+        url: https://docs.openvino.ai/2026/openvino-workflow-generative/inference-with-genai/inference-with-genai-on-npu.html
+
+issues:
+  - id: qwen35-npu-fp16-bufferize
+    status: active
+    summary: Current NPU compiler rejects part of Qwen3.5 graph
+    match:
+      model_types: [qwen3_5]
+      device: npu
+      exception_contains:
+        - "OneShotBufferizeVPU2VPUIP failed : Only supports FP16"
+    classification:
+      code: npu.compiler.unsupported_graph.qwen35
+      category: compiler_unsupported_graph
+      environment_broken: false
+      retry_same_device: false
+    recommendation:
+      fallback_devices: [gpu, cpu]
+
+  - id: tokenizer-string-precision-casing
+    status: active
+    summary: OpenVINO tokenizer XML contains invalid mixed-case legacy precision
+    match:
+      file_names:
+        - openvino_tokenizer.xml
+        - openvino_detokenizer.xml
+      contains: 'precision="STRiNG"'
+    repair:
+      implementation: tokenizer_string_precision
+      safety: automatic
+    postconditions:
+      - no_precision_str_ing
+      - tokenizer_readable
+      - detokenizer_readable
+
+derivatives:
+  - id: hauhaucs-qwen35-safetensors
+    status: active
+    requested_repo: HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive
+    candidates:
+      - repo_id: nDimensional/Qwen3.5-9B-Uncensored-Safetensors
+        relationship: lossless_conversion
+        trust: suggest
+        sources:
+          - kind: model_card
+            url: https://huggingface.co/nDimensional/Qwen3.5-9B-Uncensored-Safetensors
