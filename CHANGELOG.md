@@ -9,6 +9,16 @@ manifest may change in any minor release.
 
 ## [Unreleased]
 
+### Added
+
+- **`docs/PROFILE_COMPARISON.md`** — the same Qwen3.5-9B weights quantized twice
+  (`gpu-int4-asym-g128` and `npu-int4-sym-cw`), both converted and benchmarked on this
+  host's GPU, with artifact sizes, conversion duration, cold-compile and warm-load
+  times and per-prompt TTFT/tok/s/TPOT. It measures size and speed only and says so:
+  output quality was not evaluated, and the two profiles differ in pipeline properties
+  as well as in quantization, so the timings are not a clean comparison of the two
+  quantizations.
+
 ### Fixed
 
 - **A VLM artifact can be benchmarked with more than one run, and `/reset` really
@@ -54,7 +64,10 @@ printing compiler tracebacks. Linux x86_64 only.
   publish. The plan states the resolved source and revision, the device decision, the
   quantization profile, the disk estimate and the repairs it expects, and asks before
   spending time or bandwidth. Disk preflight refuses before downloading when the
-  managed temp cannot hold the conversion.
+  managed temp cannot hold the conversion, and so does an unmet exporter pin: an
+  architecture whose registry entry requires a Transformers release the environment
+  does not have stops at preflight with exit 10. `--ignore-exporter-requirements`
+  overrides that and is recorded in the manifest; `--yes` never implies it.
 - **`list`, `remove`** — the artifact catalogue, and deletion that also clears the
   artifact's compile-cache entries and refuses to touch anything outside the store.
 - **`probe ARTIFACT --device D`** — compiles an artifact's submodels on a device and
@@ -79,7 +92,9 @@ printing compiler tracebacks. Linux x86_64 only.
   Shipped signatures cover the Qwen3.5 NPU bufferization failure, dynamically shaped
   graphs the NPU compiler rejects, any other named NPU compiler pass that refuses a
   graph, the mixed-case `STRiNG` tokenizer IR, NPU node permissions, out-of-memory,
-  full disks, and NNCF's group-size-versus-channel-size refusal. `chat` classifies a
+  full disks, NNCF's group-size-versus-channel-size refusal, and the exporter patching
+  a Transformers release that does not define the symbol it wants — eleven rules in
+  all. `chat` classifies a
   failed compile through the same rules `probe` does, so a graph the NPU compiler
   refuses is never reported as a driver problem.
 - **Tokenizer IR repair** — `ov-tokenizer-precision-string-casing` rewrites only the
@@ -105,10 +120,12 @@ printing compiler tracebacks. Linux x86_64 only.
 - Linux only. Windows is an explicit future goal, not a current capability.
 - Verified on one machine: Intel Core Ultra 7 268V (Lunar Lake) with Arc iGPU and
   NPU, Ubuntu 26.04.1, Python 3.14.4, OpenVINO 2026.4.0, GenAI 2026.4.0.0,
-  Tokenizers 2026.4.0.0, optimum-intel 2.2.0, nncf 3.4.0, transformers 5.5.4,
+  Tokenizers 2026.4.0.0, optimum-intel 2.2.0, nncf 3.4.0, transformers 5.2.0,
   huggingface_hub 1.21.0. The full prepare/probe/chat/bench path was exercised on
-  CPU with `Qwen/Qwen3-0.6B` (INT4 asymmetric, group size 128); GPU and NPU were
-  exercised for enumeration, inspection and IR compilation.
+  CPU with `Qwen/Qwen3-0.6B` (INT4 asymmetric, group size 128) and on GPU with the
+  Qwen3.5-9B VLM of the reference case; the NPU was exercised for enumeration,
+  inspection and IR compilation, where it compiles a tokenizer submodel and has so
+  far refused every language submodel offered to it.
 - The registry knows a small number of architectures in detail; everything else
   resolves through generic rules and is reported as `inferred` rather than
   `official`.

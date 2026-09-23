@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from yonga.util.redaction import (
     REDACTED,
     SECRET_ENV_KEYS,
+    environment_secrets,
     is_secret_key,
     redact_argv,
     redact_env,
@@ -204,7 +207,84 @@ def test_redact_mapping_never_raises_on_odd_keys() -> None:
         ("output_tokens", False),
         ("tokenizer", False),
         ("bench_runs", False),
+        ("bos_token_id", False),
+        ("eos_token_id", False),
+        ("pad_token_id", False),
+        ("image_token_id", False),
+        ("tokenizer_class", False),
     ],
 )
 def test_is_secret_key(key: str, secret: bool) -> None:
     assert is_secret_key(key) is secret
+
+
+def test_model_config_token_ids_survive_redaction() -> None:
+    """Public model config fields are not secrets and must stay readable."""
+    config = {
+        "architectures": ["Qwen3ForCausalLM"],
+        "bos_token_id": 151643,
+        "eos_token_id": 151645,
+        "pad_token_id": 151643,
+        "hf_token": "hf_" + "a" * 32,
+    }
+
+    result = redact_mapping(config)
+
+    assert result["bos_token_id"] == 151643
+    assert result["eos_token_id"] == 151645
+    assert result["pad_token_id"] == 151643
+    assert result["hf_token"] == REDACTED
+
+
+# --- environment_secrets -------------------------------------------------------------
+
+
+def test_environment_secrets_collects_opaque_token_values() -> None:
+    """A secret that does not *look* like one is still collected as a literal."""
+    env = {
+        "HF_TOKEN": "an-opaque-self-hosted-token",
+        "MY_DB_PASSWORD": "correct-horse-battery",
+        "PATH": "/usr/bin",
+    }
+
+    secrets = environment_secrets(env)
+
+    assert "an-opaque-self-hosted-token" in secrets
+    assert "correct-horse-battery" in secrets
+    assert "/usr/bin" not in secrets
+
+
+def test_environment_secrets_masks_what_the_patterns_cannot() -> None:
+    """The collected literals are what make ``redact_text`` catch an opaque token."""
+    env = {"HF_TOKEN": "an-opaque-self-hosted-token"}
+
+    leaked = "the child printed an-opaque-self-hosted-token to stderr"
+
+    assert redact_text(leaked) == leaked  # patterns alone cannot see it
+    assert "an-opaque-self-hosted-token" not in redact_text(leaked, environment_secrets(env))
+
+
+def test_environment_secrets_never_masks_a_working_directory(tmp_path: Path) -> None:
+    """``PWD`` matches the ``pwd`` segment; masking it would corrupt every argv."""
+    env = {"PWD": str(tmp_path), "OLDPWD": str(tmp_path)}
+
+    assert environment_secrets(env) == ()
+
+
+def test_environment_secrets_skips_values_that_are_real_paths(tmp_path: Path) -> None:
+    """A secret-named variable holding an existing path is a false positive."""
+    env = {"SOME_TOKEN_DIR": str(tmp_path)}
+
+    assert str(tmp_path) not in environment_secrets(env)
+
+
+def test_environment_secrets_ignores_values_too_short_to_mask() -> None:
+    """Masking a short literal would blank out ordinary words."""
+    assert environment_secrets({"HF_TOKEN": "abc"}) == ()
+
+
+def test_environment_secrets_deduplicates_and_never_raises() -> None:
+    env = {"HF_TOKEN": "shared-secret-value", "GH_TOKEN": "shared-secret-value"}
+
+    assert environment_secrets(env) == ("shared-secret-value",)
+    assert environment_secrets({}) == ()

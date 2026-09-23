@@ -8,7 +8,11 @@ actually guarantees hidden reasoning never reaches the screen, so it is written
 defensively: an **unclosed** opening wrapper hides everything from the opener to
 the end of the text, a closing wrapper with no opener hides everything back to
 the last displayed boundary, and any internal failure hides the whole answer
-rather than risk leaking a hidden block.
+rather than risk leaking a hidden block. The one thing it cannot deduce is that
+the *prompt* opened a block, leaving a reply that contains no wrapper at all;
+that state arrives as ``starts_in_reasoning``, established by
+:func:`yonga.adapters.runtime_genai.resolve_starts_in_reasoning` from the
+artifact's own chat template.
 
 *The session.* :class:`ChatSession` owns one conversation: the pipeline is built
 once by the injected ``runtime_factory`` and reused for every turn (AGENT_PROMPT
@@ -48,6 +52,7 @@ from yonga.adapters.runtime_genai import (
     GenerationResult,
     Role,
     read_chat_template,
+    resolve_starts_in_reasoning,
     resolve_thinking_variable,
 )
 from yonga.application.progress import ProgressEvent, ProgressKind, ProgressSink, null_sink
@@ -162,19 +167,61 @@ def _normalise_wrappers(wrappers: object) -> list[tuple[str, str]]:
     return pairs
 
 
-def _scan(text: str, pairs: Sequence[tuple[str, str]]) -> _Scan:
+def _scan_from_inside(text: str, pairs: Sequence[tuple[str, str]]) -> _Scan:
+    """Scan text whose first character is already inside a reasoning block.
+
+    The caller has established that the *prompt* opened the block, so there is
+    no opener to find in ``text``: everything up to the first closing wrapper is
+    the reasoning, and the remainder is scanned normally. With no closing
+    wrapper anywhere the block never ended, and the whole text is hidden.
+
+    Splitting at the first closer rather than running the ordinary stack machine
+    is what makes this safe: a stray opener *inside* the prompt-opened block
+    would otherwise end the leading run and put the reasoning before it on
+    screen.
+    """
+    cut = -1
+    token_length = 0
+    for _, closing in pairs:
+        position = text.find(closing)
+        if position < 0:
+            continue
+        longer = position == cut and len(closing) > token_length
+        if cut < 0 or position < cut or longer:
+            cut, token_length = position, len(closing)
+    if cut < 0:
+        return _Scan(segments=[], blocks=[text], removed=True, unterminated=True)
+    rest = _scan(text[cut + token_length :], pairs)
+    return _Scan(
+        segments=rest.segments,
+        blocks=[text[:cut], *rest.blocks],
+        removed=True,
+        unterminated=rest.unterminated,
+    )
+
+
+def _scan(
+    text: str,
+    pairs: Sequence[tuple[str, str]],
+    *,
+    starts_in_reasoning: bool = False,
+) -> _Scan:
     """Split ``text`` into displayable segments and hidden reasoning blocks.
 
     A single left-to-right pass with a stack of expected closing wrappers, so
-    nested and repeated blocks both work. Three rules make it safe rather than
+    nested and repeated blocks both work. Four rules make it safe rather than
     merely correct:
 
+    * ``starts_in_reasoning`` says the block was opened by the prompt, before
+      this text began, and the pass starts inside it;
     * an opening wrapper that is never closed hides everything to end of text;
     * a closing wrapper with no matching opener hides everything back to the end
       of the previous block (the model's chat template can emit the opener
       itself, in which case the generated text starts *inside* the block);
     * only text outside every block is ever placed in a display segment.
     """
+    if starts_in_reasoning:
+        return _scan_from_inside(text, pairs)
     segments: list[str] = []
     blocks: list[str] = []
     stack: list[str] = []
@@ -345,6 +392,7 @@ def sanitize_answer(
     wrappers: Sequence[tuple[str, str]],
     *,
     show: bool,
+    starts_in_reasoning: bool = False,
 ) -> SanitizedAnswer:
     """Split raw model output into what to display and what to keep hidden.
 
@@ -354,6 +402,16 @@ def sanitize_answer(
     that is not a configured wrapper passes through untouched. Text with no block
     at all is returned byte-for-byte; whitespace is only normalised where a block
     was actually removed.
+
+    ``starts_in_reasoning`` is the caller's statement that generation began
+    *inside* a reasoning block, because the chat template opened one in the
+    prompt. That cannot be worked out from the text: reasoning with no tags and
+    a plain answer are the same string. When it is true the text is hidden up to
+    the first closing wrapper, and hidden **whole** — with
+    ``reasoning_unterminated`` set — when there is no closing wrapper at all.
+    The default of false leaves every existing caller's behaviour untouched;
+    :func:`yonga.adapters.runtime_genai.resolve_starts_in_reasoning` is what
+    establishes the value honestly, and errs toward hiding.
 
     With ``show=True`` the text is returned unchanged and the reasoning is still
     reported, so ``--show-reasoning`` can render it separately. Nothing is
@@ -366,9 +424,9 @@ def sanitize_answer(
     raw = text if isinstance(text, str) else str(text)
     try:
         pairs = _normalise_wrappers(wrappers)
-        if not pairs:
+        if not pairs and not starts_in_reasoning:
             return SanitizedAnswer(display_text=raw)
-        scan = _scan(raw, pairs)
+        scan = _scan(raw, pairs, starts_in_reasoning=starts_in_reasoning)
         reasoning_blocks = [block.strip() for block in scan.blocks]
         reasoning = "\n\n".join(block for block in reasoning_blocks if block) or None
         if show:
@@ -395,6 +453,7 @@ def sanitize_reasoning(
     wrappers: Sequence[tuple[str, str]],
     *,
     show: bool,
+    starts_in_reasoning: bool = False,
 ) -> tuple[str, str | None]:
     """Return just ``(display_text, reasoning_text)`` from :func:`sanitize_answer`.
 
@@ -402,7 +461,7 @@ def sanitize_reasoning(
     need to tell "said nothing" from "never finished thinking" apart should use
     :func:`sanitize_answer` instead.
     """
-    answer = sanitize_answer(text, wrappers, show=show)
+    answer = sanitize_answer(text, wrappers, show=show, starts_in_reasoning=starts_in_reasoning)
     return answer.display_text, answer.reasoning_text
 
 
@@ -866,6 +925,11 @@ class ChatSession:
             chosen,
             thinking_available=self._thinking_variable is not None,
         )
+        self._starts_in_reasoning = resolve_starts_in_reasoning(
+            profile,
+            template=self._chat_template,
+            thinking=self._thinking,
+        )
         self._show_reasoning = (
             chosen.show_reasoning if chosen.show_reasoning is not None else settings.show_reasoning
         )
@@ -954,6 +1018,19 @@ class ChatSession:
         sanitiser is the only defence in play.
         """
         return self._thinking_variable
+
+    @property
+    def starts_in_reasoning(self) -> bool:
+        """True when this artifact's chat template opens a reasoning block in the prompt.
+
+        The reply then begins inside that block and carries no opening wrapper of
+        its own, so the sanitiser is told to hide until the first closing wrapper
+        — and to hide the whole reply when none arrives. It is true whenever the
+        template can emit an opener and thinking could not be *proved* off, which
+        is the direction ``SPEC.md`` section 6.4 requires; ``--show-reasoning``
+        and ``/reasoning on`` both undo it.
+        """
+        return self._starts_in_reasoning
 
     @property
     def stats(self) -> bool:
@@ -1093,6 +1170,7 @@ class ChatSession:
                 raw.text,
                 self._profile.reasoning_wrappers,
                 show=self._show_reasoning,
+                starts_in_reasoning=self._starts_in_reasoning,
             )
             display = answer.display_text
             result = raw.model_copy(
@@ -1251,6 +1329,14 @@ class ChatSession:
         self.set_reasoning(show)
         if not show:
             return CommandOutcome(message="Reasoning blocks are now hidden.")
+        if self._thinking_variable is None and self._starts_in_reasoning:
+            return CommandOutcome(
+                message=(
+                    "Reasoning blocks are now shown. This chat template opens one in the "
+                    "prompt and nothing can switch it off, so replies were being hidden "
+                    "until it closed."
+                )
+            )
         if self._thinking_variable is not None and not self._thinking:
             return CommandOutcome(
                 message=(
@@ -1316,9 +1402,21 @@ class ChatSession:
         return extras
 
     def _thinking_summary(self) -> str:
-        """Describe the thinking state, naming the template variable that drives it."""
+        """Describe the thinking state, naming the template variable that drives it.
+
+        When no variable could be established the summary also has to say whether
+        reasoning is being hidden *by assumption*: the template opens a block
+        nothing can switch off, so replies are suppressed until it closes. A user
+        who is not told that has no way to connect an empty panel to a decision
+        this session made.
+        """
         variable = self._thinking_variable
         if variable is None:
+            if self._starts_in_reasoning:
+                return (
+                    "unavailable (no thinking variable; this template opens a reasoning "
+                    "block, so replies are hidden until it closes)"
+                )
             return "unavailable (this chat template has no thinking variable)"
         state = "on" if self._thinking else "off"
         return f"{state} ({variable}={str(self._thinking).lower()})"

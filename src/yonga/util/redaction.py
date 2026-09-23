@@ -6,8 +6,10 @@ never raise and must fail closed (drop the value) rather than leak it.
 
 from __future__ import annotations
 
+import os
 import re
 from collections.abc import Iterable, Mapping, Sequence
+from pathlib import Path
 
 REDACTED: str = "***REDACTED***"
 """Replacement text written in place of any secret value."""
@@ -58,6 +60,14 @@ Matching on segments rather than substrings keeps ordinary keys such as
 ``max_new_tokens`` or ``output_tokens`` readable in diagnostics output.
 """
 
+NON_SECRET_ENV_KEYS: frozenset[str] = frozenset({"PWD", "OLDPWD"})
+"""Variables whose names match a secret segment but which never hold a secret.
+
+``PWD``/``OLDPWD`` match the ``pwd`` segment and hold the working directory. They
+stay masked in :func:`redact_env` (harmless), but :func:`environment_secrets`
+must not turn a directory path into a literal that is blanked out everywhere.
+"""
+
 SECRET_KEY_PHRASES: tuple[str, ...] = (
     "api_key",
     "access_key",
@@ -75,6 +85,34 @@ SAFE_KEY_NAMES: frozenset[str] = frozenset(
         "output_tokens",
         "prompt_tokens",
         "max_new_tokens",
+        # Model/tokenizer config fields. These are small integers or short
+        # literal strings published in every public model repository, and they
+        # have to stay readable in `inspect` output and artifact manifests.
+        "bos_token",
+        "eos_token",
+        "pad_token",
+        "unk_token",
+        "sep_token",
+        "cls_token",
+        "mask_token",
+        "bos_token_id",
+        "eos_token_id",
+        "pad_token_id",
+        "unk_token_id",
+        "sep_token_id",
+        "cls_token_id",
+        "mask_token_id",
+        "decoder_start_token_id",
+        "image_token_id",
+        "video_token_id",
+        "vision_start_token_id",
+        "vision_end_token_id",
+        "vision_token_id",
+        "added_tokens_decoder",
+        "special_tokens_map_file",
+        "additional_special_tokens",
+        "tokenizer_class",
+        "clean_up_tokenization_spaces",
     }
 )
 """Key names that look secret-ish but only ever carry non-secret metadata."""
@@ -142,6 +180,51 @@ def is_secret_key(key: str) -> bool:
     if SECRET_KEY_SEGMENTS.intersection(_KEY_SPLIT.split(lower)):
         return True
     return any(phrase in lower for phrase in SECRET_KEY_PHRASES)
+
+
+def environment_secrets(env: Mapping[str, str] | None = None) -> tuple[str, ...]:
+    """Return the literal secret *values* present in ``env``, for ``extra_secrets``.
+
+    Pattern-based redaction only recognises secrets that *look* like secrets, so a
+    token whose value is an opaque string — a self-hosted Hub token, a password —
+    survives :func:`redact_text` untouched if a child process echoes it. Collecting
+    the values held under the known secret-bearing names closes that gap: whatever
+    a subprocess prints, the literal is masked.
+
+    This list is deliberately narrower than :func:`is_secret_key`, because the
+    consequence of a mistake runs the other way. In :func:`redact_env` a false
+    positive costs one masked value; here it would replace *every* occurrence of
+    that literal in every log line and recorded argv. A value that is merely an
+    existing filesystem path is therefore skipped — ``PWD`` matches the ``pwd``
+    key segment, and masking the working directory would corrupt the recorded
+    conversion command — as are values below :data:`MIN_SECRET_LENGTH` and the
+    names in :data:`NON_SECRET_ENV_KEYS`. Never raises.
+    """
+    try:
+        source = os.environ if env is None else env
+        items = list(source.items())
+    except Exception:  # pragma: no cover - hostile mapping
+        return ()
+    found: dict[str, None] = {}
+    for key, value in items:
+        name = key if isinstance(key, str) else str(key)
+        if name.upper() in NON_SECRET_ENV_KEYS or not is_secret_key(name):
+            continue
+        text = (value if isinstance(value, str) else str(value)).strip()
+        if len(text) < MIN_SECRET_LENGTH:
+            continue
+        if _is_existing_path(text):
+            continue
+        found.setdefault(text, None)
+    return tuple(found)
+
+
+def _is_existing_path(value: str) -> bool:
+    """Whether ``value`` names something that exists on this filesystem."""
+    try:
+        return os.sep in value and Path(value).exists()
+    except (OSError, ValueError):  # pragma: no cover - defensive
+        return False
 
 
 def _apply_extra_secrets(text: str, extra_secrets: Iterable[str]) -> str:

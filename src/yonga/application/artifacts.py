@@ -24,6 +24,13 @@ new one, never half an artifact.
 **Removal only touches what the tool created.** :meth:`ArtifactStore.remove`
 refuses any path outside ``paths.artifacts_dir`` and any path inside a Hugging
 Face cache root, whatever the caller passes (``SPEC.md`` sections 8.3 and 18.5).
+It also refuses to take the compile cache with it when another directory still
+claims the same manifest identity, and reports the bytes that actually went away
+rather than the bytes it hoped to free.
+
+The hidden staging root is swept rather than left to grow:
+:meth:`ArtifactStore.sweep_staging` applies the retention policy of
+``SPEC.md`` section 14 to ``paths.staging_dir``.
 """
 
 from __future__ import annotations
@@ -32,7 +39,7 @@ import json
 import os
 import re
 import shutil
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
@@ -40,6 +47,7 @@ from pathlib import Path
 from pydantic import BaseModel, ConfigDict, Field
 
 from yonga.adapters.filesystem import INCOMPLETE_MARKER_NAME, finalize_directory
+from yonga.application.jobs import SweepReport, sweep_job_directories
 from yonga.application.progress import NullSink, ProgressEvent, ProgressKind, ProgressSink
 from yonga.config.paths import Paths
 from yonga.config.settings import Settings
@@ -465,21 +473,33 @@ class ArtifactStore:
                 )
 
         manifest = self.manifest_for(target)
-        cache_dirs = self._compile_cache_dirs(target, manifest)
-        removed_paths = [target, *cache_dirs]
-        freed = sum(_directory_size(path) for path in removed_paths)
         notes: list[str] = []
         if manifest is None:
             notes.append(f"{target} has no readable manifest; removing the directory anyway.")
-        if not cache_dirs:
+
+        # The compile cache is keyed on the artifact's *identity*, so a second
+        # directory carrying the same manifest is entitled to the same cache. A
+        # copy of an artifact must therefore not take the original's compiled
+        # blobs with it when it goes.
+        shared = self._directories_sharing_identity(target, manifest)
+        cache_dirs = [] if shared else self._compile_cache_dirs(manifest)
+        if shared and manifest is not None:
+            notes.append(
+                f"The compile cache is keyed on artifact id {manifest.artifact_id}, which "
+                f"{len(shared)} other directory in the store still claims; it is kept."
+            )
+        elif manifest is not None and not cache_dirs:
             notes.append("No compile-cache entries were found for this artifact.")
+
+        removed_paths = [target, *cache_dirs]
+        planned = [(path, _directory_size(path)) for path in removed_paths]
 
         report = RemovalReport(
             artifact_dir=target,
             artifact_id=manifest.artifact_id if manifest is not None else None,
             removed=False,
             dry_run=dry_run,
-            freed_bytes=freed,
+            freed_bytes=sum(size for _, size in planned),
             removed_paths=removed_paths,
             compile_cache_paths=cache_dirs,
             notes=notes,
@@ -492,7 +512,44 @@ class ArtifactStore:
             shutil.rmtree(cache_dir, ignore_errors=True)
         self._prune_empty_parent(target, root)
         report.removed = not target.exists()
+        # Report what actually went away, not what was hoped for: a tree that
+        # survived because it was read-only must not be counted as reclaimed.
+        report.freed_bytes = max(0, sum(size - _directory_size(path) for path, size in planned))
         return report
+
+    # --- retention ----------------------------------------------------------
+
+    def sweep_staging(
+        self,
+        *,
+        protected: Iterable[str] = (),
+        now: datetime | None = None,
+        dry_run: bool = False,
+    ) -> SweepReport:
+        """Retire stale staging directories under ``paths.staging_dir``.
+
+        ``yonga list`` hides the staging root, so the space a failed preparation
+        leaves there is invisible until the disk fills. This is the garbage
+        collector that keeps it bounded: it removes the working directories of
+        jobs that are neither running nor recent, honouring
+        ``settings.workspace_retention_hours`` and
+        ``settings.workspace_retention_max``. See
+        :func:`yonga.application.jobs.sweep_job_directories` for the exact policy
+        and the containment rules — nothing outside the direct children of the
+        staging root is ever touched, and a live job's directory never is.
+        """
+        return sweep_job_directories(
+            self._paths.staging_dir,
+            paths=self._paths,
+            settings=self._settings,
+            protected=protected,
+            now=now,
+            dry_run=dry_run,
+        )
+
+    def staging_bytes(self) -> int:
+        """Total bytes held under the hidden staging root. Never raises."""
+        return _directory_size(self._paths.staging_dir)
 
     # --- internals ----------------------------------------------------------
 
@@ -768,26 +825,58 @@ class ArtifactStore:
         except OSError:  # pragma: no cover - defensive
             return candidate
 
-    def _compile_cache_dirs(
+    def _directories_sharing_identity(
         self,
-        artifact_dir: Path,
+        target: Path,
         manifest: ArtifactManifest | None,
     ) -> list[Path]:
-        """Return the existing compile-cache directories keyed to this artifact.
+        """Return other artifact directories that claim ``manifest``'s identity.
 
-        The cache key is a digest of (artifact fingerprint, device, OpenVINO
-        version, runtime properties), so it cannot be inverted. Instead every key
-        this artifact could plausibly have produced is recomputed from its own
-        manifest and the resulting directories are kept when they exist. The key
-        helpers are imported lazily from the OpenVINO probe adapter: they are pure
-        functions with no OpenVINO import of their own, and deriving the key twice
-        in two places would be a guaranteed source of drift.
+        The manifest is the identity and the directory name is convenience
+        (``docs/ARCHITECTURE.md`` section 9), so a copy of an artifact is the same
+        artifact and shares its compile cache. Removing one copy must leave that
+        cache alone while another directory can still use it.
         """
         if manifest is None:
             return []
-        from yonga.adapters.openvino_probe import artifact_fingerprint, compile_cache_key
+        shared: list[Path] = []
+        for directory in self._artifact_dirs():
+            try:
+                resolved = directory.expanduser().resolve()
+            except OSError:  # pragma: no cover - defensive
+                resolved = directory
+            if resolved == target:
+                continue
+            other = self.manifest_for(directory)
+            if other is not None and other.artifact_id == manifest.artifact_id:
+                shared.append(directory)
+        return shared
 
-        fingerprint = artifact_fingerprint(artifact_dir)
+    def _compile_cache_dirs(self, manifest: ArtifactManifest | None) -> list[Path]:
+        """Return the existing compile-cache directories keyed to this artifact.
+
+        The cache key is a digest of (artifact identity, device, OpenVINO version,
+        runtime properties), so it cannot be inverted. Instead every key this
+        artifact could plausibly have produced is recomputed from its own manifest
+        and the resulting directories are kept when they exist.
+
+        The identity half of the key is the manifest's ``artifact_id`` and nothing
+        else. Digesting the directory's *contents* instead would make two
+        byte-identical artifacts share a key even when they are different
+        artifacts, and would make the key change under an artifact whenever a file
+        in it changed. ``artifact_id`` is derived from the source repository,
+        resolved revision and profile, which is exactly what a compiled blob is
+        valid for. The OpenVINO version stays in the key because blobs are not
+        portable across runtime releases (``docs/ARCHITECTURE.md`` section 7).
+        The key helper is imported lazily from the OpenVINO probe adapter: it is a
+        pure function with no OpenVINO import of its own, and deriving the key
+        twice in two places would be a guaranteed source of drift.
+        """
+        if manifest is None:
+            return []
+        from yonga.adapters.openvino_probe import compile_cache_key
+
+        fingerprint = manifest.artifact_id
         runtime = manifest.recommended_runtime
         devices = set(manifest.device_probes)
         if runtime is not None:

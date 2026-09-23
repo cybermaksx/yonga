@@ -12,10 +12,12 @@ decision test asserts against them exactly rather than against round numbers.
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -48,9 +50,11 @@ from yonga.domain.artifacts import (
 from yonga.domain.diagnostics import (
     CancelledError,
     ExitCode,
+    ExportError,
     PreflightError,
     RemoteCodeRequiredError,
     SourceResolutionError,
+    ValidationError,
 )
 from yonga.domain.hardware import (
     DeviceKind,
@@ -293,11 +297,19 @@ class FakeRuntimeProbe:
         from yonga.domain.artifacts import role_for_filename
 
         role = role_for_filename(path.name)
+        # The real adapter records the companion weights file next to the XML;
+        # so does this one, or a test could not see a staging path recorded there.
+        companion = path.with_suffix(".bin")
+        bin_path = companion if companion.is_file() else None
         if path.name in self.unreadable:
             return IRDescription(
-                path=path, role=role, readable=False, read_error="Unsupported element type: STRiNG"
+                path=path,
+                role=role,
+                readable=False,
+                read_error="Unsupported element type: STRiNG",
+                bin_path=bin_path,
             )
-        return IRDescription(path=path, role=role, readable=True, bytes_total=64)
+        return IRDescription(path=path, role=role, readable=True, bytes_total=64, bin_path=bin_path)
 
     def compile(
         self,
@@ -1188,6 +1200,123 @@ def test_manifest_written_before_the_rule_id_field_existed_still_validates(
     assert restored.architecture == "arch-generic-text-generation"
 
 
+def test_manifest_records_paths_that_still_exist_after_finalization(
+    settings: Settings, hub: FakeHub
+) -> None:
+    """Nothing in the manifest may point into the staging directory that was renamed away.
+
+    In the real 9B manifest ``<data>/artifacts/.staging/<job-id>/model`` appeared
+    in ``export.argv``, in every ``validation.irs[].path`` and ``bin_path``, and
+    in every ``device_probes[*].submodels[].path``. The argv is a faithful record
+    of the command that ran and keeps its literal path; every field that names a
+    *file of this artifact* is rewritten relative to the artifact directory, the
+    same form ``manifest.files`` already uses.
+    """
+    service = build_service(settings=settings, hub=hub)
+    plan = service.plan(SAFETENSORS_REPO, device="gpu")
+    staging = plan.staging_dir
+
+    outcome = run_prepare(service, plan, settings)
+    manifest = outcome.manifest
+
+    assert not staging.exists()
+    assert manifest.validation is not None
+    assert manifest.validation.irs
+    for ir in manifest.validation.irs:
+        assert not ir.path.is_absolute()
+        assert (outcome.artifact_dir / ir.path).is_file()
+        assert ir.bin_path is not None
+        assert not ir.bin_path.is_absolute()
+        assert (outcome.artifact_dir / ir.bin_path).is_file()
+
+    probed = [
+        result.path
+        for report in manifest.device_probes.values()
+        for result in report.submodels
+        if result.path is not None
+    ]
+    assert probed
+    for probed_path in probed:
+        assert not probed_path.is_absolute()
+        assert (outcome.artifact_dir / probed_path).is_file()
+
+    # The literal staging path survives in exactly one place: the argv of the
+    # command that really ran, which is covered by its own test below.
+    recorded = manifest.to_json_text()
+    assert recorded.count(str(staging)) == 1
+    assert manifest.export.argv[-1] == str(staging)
+
+
+def test_export_argv_stays_literal_and_names_where_its_output_went(
+    settings: Settings, hub: FakeHub
+) -> None:
+    """The recorded command is what ran; the manifest says where its output ended up."""
+    service = build_service(settings=settings, hub=hub)
+    plan = service.plan(SAFETENSORS_REPO, device="gpu")
+    staging = plan.staging_dir
+
+    manifest = run_prepare(service, plan, settings).manifest
+
+    assert manifest.export.argv[-1] == str(staging)
+    assert manifest.export.arguments["output_dir"] == "."
+
+
+def test_a_cross_device_explicit_profile_is_disclosed_in_the_plan(
+    settings: Settings, hub: FakeHub
+) -> None:
+    """``--profile npu-int4-sym-cw --device gpu`` must say so before any work starts."""
+    service = build_service(settings=settings, hub=hub)
+
+    plan = service.plan(SAFETENSORS_REPO, device="gpu", profile_id="npu-int4-sym-cw")
+
+    assert plan.profile.id == "npu-int4-sym-cw"
+    assert plan.target_device == "GPU"
+    assert any(
+        "npu-int4-sym-cw" in note and "NPU" in note and "GPU" in note
+        for note in plan.known_limitations
+    )
+
+
+def test_a_matching_explicit_profile_adds_no_note(settings: Settings, hub: FakeHub) -> None:
+    """A profile that targets the requested device is unremarkable and stays silent."""
+    service = build_service(settings=settings, hub=hub)
+
+    plan = service.plan(SAFETENSORS_REPO, device="gpu", profile_id="gpu-int4-asym-g128")
+
+    assert plan.profile.id == "gpu-int4-asym-g128"
+    assert not any("not the requested" in note for note in plan.known_limitations)
+
+
+def test_a_manifest_full_of_old_staging_paths_still_validates(
+    settings: Settings, hub: FakeHub
+) -> None:
+    """Artifacts prepared before the paths were rewritten must keep loading.
+
+    Nothing in the schema changed, so an old manifest — absolute staging paths
+    in ``validation.irs`` and ``device_probes``, and no ``output_dir`` among the
+    export arguments — still parses and keeps exactly what it recorded.
+    """
+    service = build_service(settings=settings, hub=hub)
+    manifest = run_prepare(service, service.plan(SAFETENSORS_REPO, device="gpu"), settings).manifest
+
+    payload = manifest.to_json()
+    stale = "/home/someone/.local/share/yonga/artifacts/.staging/old-job/model"
+    validation = payload["validation"]
+    assert isinstance(validation, dict)
+    for ir in validation["irs"]:
+        ir["path"] = f"{stale}/{Path(str(ir['path'])).name}"
+        ir["bin_path"] = f"{stale}/{Path(str(ir['bin_path'])).name}"
+    export = payload["export"]
+    assert isinstance(export, dict)
+    del export["arguments"]["output_dir"]
+
+    restored = ArtifactManifest.model_validate(payload)
+
+    assert restored.validation is not None
+    assert all(str(ir.path).startswith(stale) for ir in restored.validation.irs)
+    assert "output_dir" not in restored.export.arguments
+
+
 def test_manifest_holds_no_user_paths_or_secrets(settings: Settings, hub: FakeHub) -> None:
     """The host summary is a description of the machine, not of this user's disk."""
     service = build_service(settings=settings, hub=hub)
@@ -1225,3 +1354,65 @@ def test_artifact_id_is_stable_for_the_same_source_and_profile(
 
     other_profile = run_prepare(service, service.plan(SAFETENSORS_REPO, device="cpu"), settings)
     assert other_profile.manifest.artifact_id != first.manifest.artifact_id
+
+
+# --- staging retention on failure ----------------------------------------------------
+
+
+def test_a_failed_export_leaves_no_staging_husk_behind(settings: Settings, hub: FakeHub) -> None:
+    """An export that wrote nothing has nothing to diagnose, so nothing is kept.
+
+    One husk per failed run is how ``artifacts/.staging`` grew to 15 directories
+    on the reference host without a single line of output mentioning it.
+    """
+    exporter = FakeExporter(succeed=False, stderr_tail=["exporter exploded"])
+    service = build_service(settings=settings, hub=hub, exporter=exporter)
+    plan = service.plan(SAFETENSORS_REPO, device="gpu")
+
+    with pytest.raises(ExportError):
+        run_prepare(service, plan, settings)
+
+    assert not settings.paths.job_staging_dir(plan.job_id).exists()
+    assert not plan.artifact_dir.exists()
+
+
+def test_a_failed_validation_keeps_the_partial_export_and_says_where(
+    settings: Settings, hub: FakeHub
+) -> None:
+    """SPEC section 16 retains raw diagnostics — and tells the user where they are."""
+    exporter = FakeExporter(write_tokenizer=False, numeric_models=())
+    service = build_service(settings=settings, hub=hub, exporter=exporter)
+    plan = service.plan(SAFETENSORS_REPO, device="gpu")
+    sink = CollectingSink()
+
+    with pytest.raises(ValidationError) as caught:
+        run_prepare(service, plan, settings, sink=sink)
+
+    staging = settings.paths.job_staging_dir(plan.job_id)
+    assert staging.is_dir()
+    assert (staging / "model" / "config.json").is_file()
+
+    failure = caught.value.diagnostic
+    assert failure.context["staging_dir"] == str(staging)
+    assert any(str(staging) in line for line in failure.remediation)
+    assert any(str(staging) in event.message for event in sink.of_kind(ProgressKind.LOG))
+
+
+def test_preparing_again_sweeps_the_staging_directories_that_piled_up(
+    settings: Settings, hub: FakeHub
+) -> None:
+    """The bounded sweep runs when the next job opens, which is what caps the root."""
+    staging_root = settings.paths.staging_dir
+    staging_root.mkdir(parents=True, exist_ok=True)
+    stale = staging_root / "abandoned-job"
+    (stale / "model").mkdir(parents=True)
+    (stale / "model" / "openvino_model.bin").write_bytes(b"\x00" * 4096)
+    old = (datetime.now(tz=UTC) - timedelta(hours=500)).timestamp()
+    os.utime(stale, (old, old))
+    service = build_service(settings=settings, hub=hub)
+
+    outcome = run_prepare(service, service.plan(SAFETENSORS_REPO, device="gpu"), settings)
+
+    assert outcome.artifact_dir.is_dir()
+    assert not stale.exists()
+    assert not settings.paths.job_staging_dir(outcome.job_id).exists()

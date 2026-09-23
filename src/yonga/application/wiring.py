@@ -289,8 +289,15 @@ class Wiring:
         """Return the supervised subprocess runner used by the exporter."""
         if self._command_runner is None:
             from yonga.adapters.subprocess import SubprocessRunner, default_line_selector
+            from yonga.util.redaction import environment_secrets
 
-            self._command_runner = SubprocessRunner(line_selector=default_line_selector)
+            # ``extra_secrets`` masks the literal values of the host's secret-bearing
+            # environment variables in captured output, which the shape-based patterns
+            # in ``redact_text`` cannot recognise on their own.
+            self._command_runner = SubprocessRunner(
+                line_selector=default_line_selector,
+                extra_secrets=environment_secrets(),
+            )
         return self._command_runner
 
     def hub_client(self) -> HubClient:

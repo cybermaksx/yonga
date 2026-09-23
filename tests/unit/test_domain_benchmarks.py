@@ -158,6 +158,7 @@ def make_result(**overrides: object) -> BenchmarkResult:
             "openvino_genai": "2026.4.0.0",
             "openvino_tokenizers": "2026.4.0.0",
         },
+        "runtime_properties": {"ATTENTION_BACKEND": "SDPA"},
         "settings": GenerationSettings(max_new_tokens=256),
         "warmups": 1,
         "runs": 2,
@@ -217,6 +218,37 @@ def test_results_differ_by_prompt_text_for_same_id() -> None:
     assert "prompt texts differ for the same prompt ids" in reasons
 
 
+def test_results_differ_by_runtime_properties() -> None:
+    """A different pipeline configuration is not a comparable benchmark.
+
+    Reproduced against two real GPU results on this host: the artifact built
+    with ``gpu-int4-asym-g128`` records ``ATTENTION_BACKEND=SDPA`` because its
+    profile declares it, the one built with ``npu-int4-sym-cw`` records nothing.
+    Everything else matched, so the pair was reported comparable with no reasons
+    at all, against ``SPEC.md`` section 6.5.
+    """
+    ok, reasons = make_result().comparable_to(make_result(runtime_properties={}))
+    assert not ok
+    assert any("ATTENTION_BACKEND" in reason for reason in reasons)
+    assert any("unset" in reason for reason in reasons)
+
+
+def test_results_differ_by_a_runtime_property_value() -> None:
+    """Two values for the same property are as incomparable as one missing value."""
+    other = make_result(runtime_properties={"ATTENTION_BACKEND": "PA"})
+    ok, reasons = make_result().comparable_to(other)
+    assert not ok
+    assert any("SDPA" in reason and "PA" in reason for reason in reasons)
+
+
+def test_runtime_property_names_are_compared_case_insensitively() -> None:
+    """OpenVINO property names are upper case; a lower-case record is the same key."""
+    other = make_result(runtime_properties={"attention_backend": "SDPA"})
+    ok, reasons = make_result().comparable_to(other)
+    assert ok
+    assert reasons == []
+
+
 def test_results_differ_by_package_versions() -> None:
     other = make_result(
         package_versions={
@@ -248,3 +280,30 @@ def test_aggregate_lookup_on_result() -> None:
     result = make_result(aggregates=[aggregate_runs(PROMPT.id, make_result().run_metrics)])
     assert result.aggregate_for(PROMPT.id) is not None
     assert result.aggregate_for("missing") is None
+
+
+def test_has_measurements_is_false_when_every_run_failed() -> None:
+    """One aggregate row is written per prompt even when nothing succeeded.
+
+    The row exists so the summary table can show the prompt, but it carries
+    ``runs=0``. Exit-code policy has to look at ``runs``, not at the presence of
+    the row, or a benchmark in which every generation raised reports success
+    with warnings instead of a generation failure.
+    """
+    empty = aggregate_runs("short", [])
+    assert empty.runs == 0
+
+    result = make_result(
+        run_metrics=[],
+        aggregates=[empty],
+        errors=["short run 1: GenerationError: synthetic generation failure"],
+    )
+
+    assert result.aggregates  # the row is present ...
+    assert result.has_measurements is False  # ... but nothing was measured
+
+
+def test_has_measurements_is_true_when_at_least_one_run_succeeded() -> None:
+    result = make_result(aggregates=[aggregate_runs("short", [run(1, ttft=100.0)])])
+
+    assert result.has_measurements is True

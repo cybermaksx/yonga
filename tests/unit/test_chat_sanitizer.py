@@ -394,3 +394,52 @@ def test_the_typed_sanitiser_is_total(show):
         assert isinstance(answer.display_text, str)
         assert isinstance(answer.reasoning_hidden, bool)
         assert isinstance(answer.reasoning_unterminated, bool)
+
+
+# --- generation that began inside the block -------------------------------------------
+#
+# A chat template can open the reasoning block in the *prompt*, so the model's
+# output contains no opener at all and is indistinguishable from a plain answer.
+# The sanitiser cannot deduce that, so it is told; the full behaviour, and the
+# rule that establishes the flag honestly, live in ``test_reasoning_leak.py``.
+
+
+def test_the_starting_state_defaults_to_outside_a_block():
+    """Every existing caller keeps today's behaviour, byte for byte."""
+    text = f"Step 1. Step 2. {SECRET}"
+    assert sanitize_answer(text, THINK, show=False).display_text == text
+    assert sanitize_answer(text, THINK, show=False, starts_in_reasoning=False).display_text == text
+
+
+def test_starting_inside_a_block_with_no_closer_hides_the_whole_reply():
+    text = f"Step 1. Step 2. {SECRET}"
+    answer = sanitize_answer(text, THINK, show=False, starts_in_reasoning=True)
+    assert SECRET not in answer.display_text
+    assert answer.is_empty is True
+    assert answer.reasoning_hidden is True
+    assert answer.reasoning_unterminated is True
+
+
+def test_starting_inside_a_block_ends_at_the_first_closer():
+    answer = sanitize_answer(
+        f"{SECRET}</think>the answer", THINK, show=False, starts_in_reasoning=True
+    )
+    assert answer.display_text == "the answer"
+    assert SECRET not in answer.display_text
+    assert answer.reasoning_unterminated is False
+
+
+def test_the_two_value_form_carries_the_starting_state_too():
+    raw = f"{SECRET} and nothing else"
+    display, reasoning = sanitize_reasoning(raw, THINK, show=False, starts_in_reasoning=True)
+    assert display == ""
+    assert reasoning == raw
+
+
+@pytest.mark.parametrize("show", [True, False])
+def test_the_sanitiser_is_total_from_inside_a_block_as_well(show):
+    for text in ("", "<think>", "</think>", "<think>" * 200, "\x00</think>\x00"):
+        answer = sanitize_answer(text, THINK, show=show, starts_in_reasoning=True)
+        assert isinstance(answer.display_text, str)
+        assert isinstance(answer.reasoning_hidden, bool)
+        assert isinstance(answer.reasoning_unterminated, bool)

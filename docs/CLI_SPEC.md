@@ -133,12 +133,17 @@ yonga prepare MODEL \
   [--profile PROFILE] \
   [--source REPO_ID] \
   [--trust-remote-code] \
+  [--ignore-exporter-requirements] \
   [--yes] \
   [--force] \
   [--no-repair]
 ```
 
 Default `--device auto`.
+
+`--ignore-exporter-requirements` converts even though a declared exporter package version is unmet,
+which otherwise stops the job in preflight; like `--trust-remote-code` it is its own deliberate flag
+and `--yes` does not imply it.
 
 Stages displayed:
 

@@ -25,6 +25,11 @@ Two upstream details are hidden here on purpose:
   registry profile states the answer outright, the artifact's own chat template
   is read and a candidate is applied only when that template actually references
   it. See :func:`resolve_thinking_variable`.
+* The same template evidence decides whether generation *begins* inside a
+  reasoning block. A template that opens ``<think>`` in the prompt produces a
+  reply with no opener in it at all, which no sanitiser can recognise on its
+  own, so :func:`resolve_starts_in_reasoning` establishes that state here and
+  fails safe when it cannot prove the block was closed.
 
 :class:`GenerationResult` carries the **raw** model text. ``display_text`` is set
 equal to ``text`` and ``reasoning_text`` to ``None`` here; hiding reasoning
@@ -81,7 +86,9 @@ __all__ = [
     "collect_metrics",
     "open_runtime",
     "read_chat_template",
+    "resolve_starts_in_reasoning",
     "resolve_thinking_variable",
+    "template_opens_reasoning",
     "template_references",
     "thinking_extra_context",
 ]
@@ -402,6 +409,100 @@ def thinking_extra_context(
     return {variable: enabled}
 
 
+def _profile_wrappers(profile: ChatProfileLike | None) -> tuple[tuple[str, str], ...]:
+    """Return a profile's reasoning wrappers, tolerating a profile that has none.
+
+    ``reasoning_wrappers`` is not part of :class:`ChatProfileLike` — the sanitiser
+    in the chat service is its real consumer — so it is read defensively here. A
+    profile that carries no attribute at all falls back to the defaults; a
+    profile that carries an *empty* list is taken at its word, because a family
+    with no recognisable wrapper has no opener to find and no closer to wait for.
+    """
+    if profile is None:
+        return DEFAULT_REASONING_WRAPPERS
+    raw = getattr(profile, "reasoning_wrappers", None)
+    if raw is None:
+        return DEFAULT_REASONING_WRAPPERS
+    try:
+        items = list(raw)
+    except TypeError:
+        return DEFAULT_REASONING_WRAPPERS
+    pairs: list[tuple[str, str]] = []
+    for item in items:
+        if isinstance(item, str):
+            continue
+        try:
+            parts = tuple(item)
+        except TypeError:
+            continue
+        if len(parts) != 2:
+            continue
+        opening, closing = parts
+        if isinstance(opening, str) and isinstance(closing, str) and opening and closing:
+            pairs.append((opening, closing))
+    return tuple(pairs)
+
+
+def template_opens_reasoning(
+    template: str | None,
+    wrappers: Sequence[tuple[str, str]] = DEFAULT_REASONING_WRAPPERS,
+) -> bool:
+    """True when ``template`` can emit a reasoning opener into the prompt itself.
+
+    Chat templates write the opener as a literal inside the rendered assistant
+    header — ``{{- '<think>\\n' }}`` — so the literal appearing anywhere in the
+    template source is the evidence. It is deliberately not asked *whether* the
+    branch that emits it runs: that depends on variables this process may not be
+    able to set, and the whole point of the check is to decide what to assume
+    when it cannot.
+
+    Never raises. An unreadable template is no evidence, which is the answer the
+    caller then has to fail safe about.
+    """
+    if not template:
+        return False
+    return any(opening in template for opening, _ in wrappers if opening)
+
+
+def resolve_starts_in_reasoning(
+    profile: ChatProfileLike | None,
+    *,
+    template: str | None = None,
+    thinking: bool | None = None,
+) -> bool:
+    """Whether generation begins *inside* a reasoning block the prompt opened.
+
+    A chat template that opens ``<think>`` in the prompt makes the model's reply
+    start in the middle of a reasoning block, with no opener of its own. Such a
+    reply is byte-for-byte indistinguishable from a plain answer, so the
+    sanitiser cannot work it out and has to be told — see ``sanitize_answer``'s
+    ``starts_in_reasoning``.
+
+    The rule has two halves and errs toward hiding, which is what ``SPEC.md``
+    section 6.4 requires of an unclosed block:
+
+    1. the template contains a reasoning opener at all, and
+    2. we could **not** establish that thinking is disabled.
+
+    Pushing the template variable false (the Qwen3.5 path) closes the block
+    inside the prompt, so the reply starts outside it and this is ``False``.
+    Pushing it *true*, or not being able to push anything — an unconditionally
+    opening template of the DeepSeek-R1-distill shape, where no variable guards
+    the opener — leaves the block open, so this is ``True``.
+
+    The cost of the assumption is a reply hidden in full when a model opens a
+    block and answers without ever closing it. That is the correct trade under
+    the spec, and it is recoverable: ``--show-reasoning`` and ``/reasoning on``
+    both reveal the text, and the renderer says so rather than drawing a blank
+    panel.
+    """
+    if not template_opens_reasoning(template, _profile_wrappers(profile)):
+        return False
+    context = thinking_extra_context(profile, thinking=thinking, template=template)
+    disabled = any(value is False for value in context.values())
+    return not disabled
+
+
 # --- runtime protocol -----------------------------------------------------------------
 
 
@@ -677,6 +778,9 @@ class GenAIChatRuntime:
         self._thinking_variable = resolve_thinking_variable(
             chat_profile, template=self._chat_template
         )
+        self._starts_in_reasoning = resolve_starts_in_reasoning(
+            chat_profile, template=self._chat_template, thinking=thinking
+        )
         self._extra_context_error: str | None = None
         self._closed = False
         self._chat_started = False
@@ -789,6 +893,18 @@ class GenAIChatRuntime:
         profile knows about, so the template is left untouched.
         """
         return self._thinking_variable
+
+    @property
+    def starts_in_reasoning(self) -> bool:
+        """True when this artifact's template opens a reasoning block in the prompt.
+
+        The reply then starts *inside* that block and carries no opener of its
+        own, which the chat service's sanitiser cannot see for itself. Reported
+        here because this is the layer that read the template and decided what
+        could be pushed into it; see
+        :func:`resolve_starts_in_reasoning` for the rule and why it fails safe.
+        """
+        return self._starts_in_reasoning
 
     @property
     def extra_context_error(self) -> str | None:

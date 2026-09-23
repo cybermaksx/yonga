@@ -34,10 +34,10 @@ Everything in this README was executed on one machine, and nothing here is a pro
 | OpenVINO Tokenizers | 2026.4.0.0 |
 | optimum-intel | 2.2.0 |
 | nncf | 3.4.0 |
-| transformers | 5.5.4 |
+| transformers | 5.2.0 |
 | huggingface_hub | 1.21.0 |
 
-The end-to-end path (`prepare` → `probe` → `chat` → `bench`) has been exercised on **CPU** with `Qwen/Qwen3-0.6B` quantized to INT4 asymmetric, group size 128. Device enumeration, NPU node/driver/compiler inspection and IR compilation have been exercised on this host's GPU and NPU. No other CPU, GPU, NPU, distribution, Python version or OpenVINO release has been tested. Treat the version list as *what was verified*, not as a support matrix.
+The end-to-end path (`prepare` → `probe` → `chat` → `bench`) has been exercised on **CPU** with `Qwen/Qwen3-0.6B` quantized to INT4 asymmetric, group size 128, and on **GPU** with the Qwen3.5-9B VLM of the reference case quantized to INT4 asymmetric, group size 128. The same VLM has also been prepared, probed and benchmarked on the GPU under the channel-wise `npu-int4-sym-cw` profile, for the size-and-speed comparison in [`docs/PROFILE_COMPARISON.md`](docs/PROFILE_COMPARISON.md). Device enumeration and NPU node/driver/compiler inspection have been exercised on this host's NPU, and so has IR compilation — which is how the NPU limitations below were observed: the tokenizer submodel compiles there, the language submodel of both models tried has not. No other CPU, GPU, NPU, distribution, Python version or OpenVINO release has been tested. Treat the version list as *what was verified*, not as a support matrix.
 
 ## What works today
 
@@ -141,7 +141,7 @@ When something fails, the diagnostic carries a stable code, remediation and a jo
 
 The first supported platform is Linux x86_64, with Ubuntu 24.04/26.04 as the primary tested distributions and Intel Core Ultra systems with CPU, Arc iGPU, and NPU. The architecture must permit Windows support later without rewriting the core model and compatibility logic.
 
-The tested software baseline is OpenVINO 2026.4.x, OpenVINO GenAI 2026.4.x, OpenVINO Tokenizers 2026.4.x, Optimum Intel 2.2, NNCF 3.4, Transformers 5.x, and `huggingface_hub` 1.x. Version compatibility is represented as registry data rather than scattered hard-coded checks, which is why a model can declare, for example, that its export needs `transformers ==5.2.*` while the host has 5.5.4 — `yonga` reports that mismatch instead of silently exporting something wrong.
+The tested software baseline is OpenVINO 2026.4.x, OpenVINO GenAI 2026.4.x, OpenVINO Tokenizers 2026.4.x, Optimum Intel 2.2, NNCF 3.4, Transformers 5.x, and `huggingface_hub` 1.x. Version compatibility is represented as registry data rather than scattered hard-coded checks, which is why a model can declare, for example, that its export needs `transformers ==5.2.*` while the host has some other release — `yonga` stops at preflight instead of silently exporting something wrong, and only `--ignore-exporter-requirements` overrides it.
 
 ## Core user experience
 
@@ -211,6 +211,7 @@ User-facing documentation:
 
 - [`docs/INSTALL.md`](docs/INSTALL.md) — Ubuntu prerequisites, extras, NPU driver and permissions, version rules.
 - [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) — every diagnostic code, exit codes, and how to read a job log.
+- [`docs/PROFILE_COMPARISON.md`](docs/PROFILE_COMPARISON.md) — two INT4 quantizations of the same Qwen3.5-9B weights measured on this host: size and speed only, with the caveats spelled out.
 - [`CHANGELOG.md`](CHANGELOG.md) — what changed in each release.
 
 An example compatibility entry for the real-world Qwen3.5 case used to derive this design is in [`registry/examples/qwen3_5.yaml`](registry/examples/qwen3_5.yaml).

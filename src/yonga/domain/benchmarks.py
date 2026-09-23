@@ -2,7 +2,8 @@
 
 Benchmark results are persisted as JSON and compared across devices and profiles, so
 comparability is part of the domain: two results may only be compared when the prompts,
-the sampling settings, the device and the relevant package versions match.
+the sampling settings, the device, the pipeline's runtime properties and the relevant
+package versions match.
 """
 
 from __future__ import annotations
@@ -39,6 +40,11 @@ def _sha256_text(text: str) -> str:
 def _normalise_package_name(name: str) -> str:
     """Normalise a distribution name so ``openvino-genai`` and ``openvino_genai`` match."""
     return name.strip().lower().replace("-", "_")
+
+
+def _normalise_property_name(name: str) -> str:
+    """Normalise a runtime property name; OpenVINO GenAI spells them upper case."""
+    return name.strip().upper()
 
 
 class PromptFixture(BaseModel):
@@ -225,6 +231,19 @@ class BenchmarkResult(BaseModel):
         return self
 
     @property
+    def has_measurements(self) -> bool:
+        """True when at least one prompt produced a successful measured run.
+
+        One :class:`AggregateMetrics` row is written per prompt in the suite
+        whether or not anything succeeded, so the *presence* of aggregates says
+        nothing about whether the benchmark measured anything. ``runs`` counts
+        the successful measured runs behind a row, so a benchmark in which every
+        run raised has aggregates but no measurements — and must be reported as a
+        generation failure rather than as success with warnings.
+        """
+        return any(aggregate.runs for aggregate in self.aggregates)
+
+    @property
     def prompt_signature(self) -> tuple[tuple[str, str], ...]:
         """Sorted ``(prompt_id, prompt_sha256)`` pairs of the measured runs."""
         return tuple(
@@ -241,7 +260,17 @@ class BenchmarkResult(BaseModel):
         return None
 
     def comparable_to(self, other: BenchmarkResult) -> tuple[bool, list[str]]:
-        """Return whether two results may be compared, plus the reasons they may not."""
+        """Return whether two results may be compared, plus the reasons they may not.
+
+        ``runtime_properties`` counts. ``SPEC.md`` section 6.5 forbids comparing
+        runs made "using different prompt/generation settings", and the
+        properties handed to the GenAI pipeline — ``ATTENTION_BACKEND``,
+        ``MAX_PROMPT_LEN``, ``MIN_RESPONSE_LEN`` — are exactly that: they decide
+        how the model is executed, not merely where. Two artifacts whose
+        profiles declare different pipeline properties produce different numbers
+        on the same device with the same prompts, so they are reported as
+        incomparable with the differing keys named.
+        """
         reasons: list[str] = []
         if self.schema_version != other.schema_version:
             reasons.append(
@@ -259,6 +288,7 @@ class BenchmarkResult(BaseModel):
                 reasons.append("prompt sets differ")
             else:
                 reasons.append("prompt texts differ for the same prompt ids")
+        reasons.extend(_runtime_property_reasons(self.runtime_properties, other.runtime_properties))
         reasons.extend(_package_version_reasons(self.package_versions, other.package_versions))
         return (not reasons, reasons)
 
@@ -278,4 +308,29 @@ def _package_version_reasons(mine: dict[str, str], theirs: dict[str, str]) -> li
         if first == second:
             continue
         reasons.append(f"{package} versions differ ({first or 'unknown'} vs {second or 'unknown'})")
+    return reasons
+
+
+def _runtime_property_reasons(mine: dict[str, str], theirs: dict[str, str]) -> list[str]:
+    """Report the pipeline runtime properties that differ between two runs.
+
+    Every key either side recorded is compared, because a property set on one
+    side and absent on the other is still a difference: the side that did not
+    record it ran on the plugin's default, which is a different configuration
+    rather than an unknown one. Names are folded to upper case first, so a
+    hand-written record spelling ``attention_backend`` matches the registry's
+    ``ATTENTION_BACKEND`` instead of being reported as two missing properties.
+    """
+    left = {_normalise_property_name(name): value for name, value in mine.items()}
+    right = {_normalise_property_name(name): value for name, value in theirs.items()}
+    reasons: list[str] = []
+    for name in sorted(set(left) | set(right)):
+        first = left.get(name)
+        second = right.get(name)
+        if first == second:
+            continue
+        reasons.append(
+            f"runtime property {name} differs "
+            f"({'unset' if first is None else first} vs {'unset' if second is None else second})"
+        )
     return reasons

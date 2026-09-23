@@ -54,13 +54,15 @@ From `docs/CLI_SPEC.md` section 15; the mapping from category to code lives in
 | 70 | registry/configuration error |
 | 99 | unexpected internal error |
 
+A closed stdout is **0**, not 99: see section 8.
+
 Codes 40, 41, 42 and 52 say *where* a job died rather than *why*, so they appear only when the
 category itself is uninformative. A conversion that fails for a classified reason exits with that
 reason's code: the NNCF group-size failure in section 5.4 exits **70**, not 40.
 
 ## 3. Registry issue codes
 
-Nine rules ship today.
+Eleven rules ship today.
 
 | Code | Rule id | Category | Exit | Means | Do this |
 |---|---|---|---|---|---|
@@ -73,6 +75,13 @@ Nine rules ship today.
 | `runtime.out_of_memory` | `runtime-out-of-memory` | `out_of_memory` | 30 | The host or the accelerator ran out of memory. | Close other applications; choose stronger compression or a smaller group size. |
 | `storage.insufficient_disk` | `storage-no-space-left` | `insufficient_disk` | 30 | A write failed because the filesystem is full (including OpenVINO's `basic_ios::clear: iostream error`). | Free space, or point `YONGA_CACHE_DIR` at a bigger disk. |
 | `export.quantization.group_size_mismatch` | `nncf-group-size-not-divisible` | `configuration_error` | 70 | The profile's group size does not divide the model's channel sizes. | `--profile npu-int4-sym-cw` (channel-wise, group size -1), or a profile with a smaller group size. |
+| `export.transformers.symbol_missing.qwen35` | `qwen35-exporter-transformers-symbol-mismatch` | `package_abi_mismatch` | 10 | The exporter's Qwen3.5 patcher imports `Qwen3_5DynamicCache` and the installed Transformers does not define it. Nothing is broken; the two releases disagree about the Qwen3.5 modelling code. | Install the release the registry pins: `pip install "transformers==5.2.*"`. `yonga inspect MODEL` prints the requirement and what is installed. |
+| `export.transformers.symbol_missing` | `exporter-transformers-symbol-mismatch` | `package_abi_mismatch` | 10 | Generic form of the above: `optimum/exporters/openvino/model_patcher.py` looked for something the installed Transformers does not provide, for any architecture. | Install the Transformers release the architecture requires; the failing import is in `yonga logs JOB_ID --raw`. |
+
+The last two are a backstop, not the usual path. When the registry declares the architecture's
+Transformers pin, preflight refuses before the download (section 5.6) and the export never runs.
+They classify what comes back when it runs anyway — under `--ignore-exporter-requirements`, or for
+an architecture whose pin the registry does not know.
 
 ## 4. Built-in signature codes
 
@@ -254,8 +263,14 @@ $ yonga prepare hf-internal-testing/tiny-random-LlamaForCausalLM --device cpu \
 7/7 Artifact ready at <data>/artifacts/hf-internal-testing--tiny-random-LlamaForCausalLM/…
 ```
 
-(`npu-int4-sym-cw` is named for the device it was written for, but a profile can be requested for
-any device; `prepare` notes that the profile targets a different device and uses it anyway.)
+`npu-int4-sym-cw` is named for the device it was written for, but a profile can be requested for any
+device: `prepare` uses an explicitly requested profile whatever device it declares, and names the
+mismatch in the plan before anything is downloaded.
+
+```text
+Known limitations
+• Profile npu-int4-sym-cw targets NPU, not the requested GPU.
+```
 
 ### 5.5 Gated or private repositories
 
@@ -287,6 +302,31 @@ Hugging Face
 
 `yonga` never prints a token. Job logs and diagnostics run through a redactor that replaces anything
 token-shaped with `***REDACTED***`.
+
+### 5.6 The architecture's Transformers pin is not met
+
+Exporting runs the architecture's modelling code from `transformers`, so the registry pins a release
+per architecture. When the installed one does not satisfy the pin, `prepare` stops in preflight —
+before the download, not after it — with `preflight.exporter_requirement_unsatisfied`, category
+`package_abi_mismatch`, exit **10**. The plan says so before you are asked to confirm anything:
+
+```text
+Known limitations
+• Exporter requirement not satisfied: transformers ==4.99.* is required, but 5.2.0 is installed
+
+BLOCKED — exporter requirements not satisfied
+x  transformers ==4.99.* is required, but 5.2.0 is installed
+Preparation stops at preflight, before the download and the conversion. Override with
+--ignore-exporter-requirements if you know the pin is stale; --yes does not.
+```
+
+Exit 10 rather than 30 is deliberate: nothing is short of a resource, and neither the model nor the
+registry is wrong. What cannot work is the combination of installed versions, which is what
+`package_abi_mismatch` means everywhere else in this document.
+
+`--yes` does not answer this one. `--ignore-exporter-requirements` does, and the override is written
+into the artifact's manifest so an artifact built past a declared pin can be explained later. The
+usual answer is a dedicated virtual environment for that export — see `docs/INSTALL.md` section 6.
 
 ## 6. Reading a job log
 
@@ -332,7 +372,70 @@ yonga logs JOB_ID --raw | grep -A5 export.failed
 
 `--debug` on the original command prints the same raw text to the terminal.
 
-## 7. When nothing matches
+## 7. What a failed job leaves behind
+
+Two working directories belong to a job rather than to an artifact, both keyed by job id:
+
+```
+~/.local/share/yonga/artifacts/.staging/<job-id>/model   # the export under construction
+~/.cache/yonga/tmp/<job-id>                              # the managed TMPDIR the tooling gets
+```
+
+Conversion happens in the staging directory; a successful run renames the finished model out of it
+onto `artifacts/<repo>/<revision>--<profile>` and removes what is left. Nothing outside the staging
+directory is ever half-written, which is why an interrupted `prepare` cannot corrupt an artifact you
+already have.
+
+A **failed** job keeps its staging directory when it holds a partial export worth reading, and the
+failure says where, as a last remediation line:
+
+```text
+  - Partial output was kept for diagnosis at ~/.local/share/yonga/artifacts/.staging/<job-id>
+```
+
+The same path is in the diagnostic's `staging_dir` context key, in the job state document
+(`logs/<job-id>.state.json`) and in the job log as `job.staging_retained`. Inside it, `model/` holds
+whatever the exporter produced before it died: which IR files exist, their sizes, and whether the
+tokenizer pair was written at all. The managed `TMPDIR` is kept on failure for the same reason and
+logged as `job.temp_retained`.
+
+A staging directory holding nothing but the incomplete marker is removed straight away — it is the
+residue of an export that never wrote a file, and keeping those is how `.staging` used to grow to
+gigabytes. Whatever survives is retired later by a bounded sweep that runs when the next job opens:
+`workspace_retention_hours` (72 by default) and `workspace_retention_max` (3) both apply, and a
+directory belonging to a job that is still running is never touched. Set either to `0` in the
+configuration file to retire stale directories as soon as a job opens.
+
+Neither root is inside the Hugging Face cache, and nothing here is ever deleted from it.
+
+## 8. Normal things that look like failures
+
+**A closed pipe.** `yonga logs JOB --raw | head -2` stops yonga's output the moment `head` has its
+two lines. Every command treats that as the normal end of output: nothing is printed, no diagnostic
+is rendered and the exit code is **0**, whether the output was a raw stream or a rendered table.
+Quitting `less` early, or any reader that stops before yonga has finished, is the same thing, and
+`set -o pipefail` is safe around it. A traceback, an `Exception ignored while flushing sys.stdout`,
+or exit 99, 120 or 1 from a pipeline like this is a bug worth reporting.
+
+**`registry validate` passing.** It checks the registry's *structure* and internal consistency:
+every rule parses, schema versions are supported, version specifiers are parseable, profile,
+chat-profile and repair references resolve, failure categories are known, repair implementation
+names exist in the code, and no two rules could win the same match at the same priority and
+specificity. That is the whole of it.
+
+It does **not** check that the values are ones OpenVINO accepts. An override declaring
+
+```yaml
+    device: MARS
+```
+
+validates cleanly, and so would a weight format no exporter has ever heard of. This is deliberate:
+device names and weight formats are upstream vocabulary, so an override targeting a device a future
+OpenVINO release adds needs no change to this code. The price is that "valid" here means "this file
+is well-formed and self-consistent", never "these values will work on your machine". The thing that
+finds out whether they work is `yonga prepare`, which asks OpenVINO.
+
+## 9. When nothing matches
 
 `runtime.unknown_error` means the failure is new. The raw text is in the diagnostic and in the job
 log. A good bug report contains:

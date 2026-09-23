@@ -392,6 +392,85 @@ def _all_ok(*values: str | None) -> bool | None:
     return None
 
 
+#: The artifact directory itself, in the relative form recorded paths use.
+_ARTIFACT_ROOT: Path = Path()
+
+
+def _artifact_relative(path: Path, staging: Path) -> Path:
+    """Return ``path`` as it will read once ``staging`` has been published.
+
+    Validation and probing run against the staging directory, so everything they
+    record names ``<data>/artifacts/.staging/<job-id>/model/...`` — a directory
+    that :meth:`ArtifactStore.finalize` renames onto the artifact directory and
+    that therefore does not exist by the time anyone reads the manifest. Every
+    such path is rewritten relative to the artifact directory instead, which is
+    the form ``manifest.files`` already uses and the only one that survives the
+    artifact being moved, copied to another host or published.
+
+    Paths outside the staging root are left exactly as they are: they name
+    something that is not part of this artifact, and inventing a relative path
+    for them would be a lie rather than a translation.
+    """
+    if path == staging:
+        return _ARTIFACT_ROOT
+    if path.is_relative_to(staging):
+        return path.relative_to(staging)
+    return path
+
+
+def _relocated_ir(ir: IRDescription, staging: Path) -> IRDescription:
+    """Copy one IR description with its file paths made artifact-relative."""
+    moved = ir.model_copy(deep=True)
+    moved.path = _artifact_relative(ir.path, staging)
+    if ir.bin_path is not None:
+        moved.bin_path = _artifact_relative(ir.bin_path, staging)
+    return moved
+
+
+def _relocated_probe_result(result: ProbeResult, staging: Path) -> ProbeResult:
+    """Copy one probe result with the file it named made artifact-relative."""
+    moved = result.model_copy(deep=True)
+    if result.path is not None:
+        moved.path = _artifact_relative(result.path, staging)
+    return moved
+
+
+def _relocated_validation(report: ValidationReport, staging: Path) -> ValidationReport:
+    """Copy a validation report so its IR paths outlive the staging directory."""
+    moved = report.model_copy(deep=True)
+    moved.irs = [_relocated_ir(ir, staging) for ir in report.irs]
+    return moved
+
+
+def _relocated_device_probe(report: DeviceProbeReport, staging: Path) -> DeviceProbeReport:
+    """Copy a device probe report so its submodel paths outlive staging."""
+    moved = report.model_copy(deep=True)
+    moved.submodels = [_relocated_probe_result(result, staging) for result in report.submodels]
+    if report.smoke_test is not None:
+        moved.smoke_test = _relocated_probe_result(report.smoke_test, staging)
+    return moved
+
+
+def _relocated_export(record: ExportRecord, staging: Path) -> ExportRecord:
+    """Copy an export record, adding where the command's output actually ended up.
+
+    ``argv`` is deliberately *not* rewritten. It is the record of a command that
+    was executed, and a command nobody ran is worth nothing in a bug report; its
+    last token is the staging directory, exactly as the exporter received it. So
+    the honest half stays literal and the usable half is recorded beside it:
+    ``arguments["output_dir"]`` gives the published home of that output
+    directory, relative to the artifact directory — ``"."``, the directory the
+    manifest itself lives in. Re-running the export therefore means replaying
+    ``argv`` with its final argument pointed at a directory of your choosing.
+    """
+    moved = record.model_copy(deep=True)
+    moved.arguments = {
+        **record.arguments,
+        "output_dir": _artifact_relative(staging, staging).as_posix(),
+    }
+    return moved
+
+
 class PrepareService:
     """Plans and runs model preparation, from Hub metadata to a published artifact."""
 
@@ -480,7 +559,7 @@ class PrepareService:
         )
         target_device = compatibility.selected_device or requested_device or "CPU"
 
-        profile, _profile_explanation = self._registry.resolve_profile(
+        profile, profile_explanation = self._registry.resolve_profile(
             device=target_device,
             arch_rule=arch_rule,
             meta=source_meta,
@@ -520,6 +599,14 @@ class PrepareService:
             # built on a weight-file hint says so before anything is downloaded
             # (``docs/CLI_SPEC.md`` section 1).
             known_limitations.extend(arch_explanation.notes)
+        # Profile resolution composes a note whenever the profile it returns is
+        # not the obvious one: an explicitly requested profile that targets
+        # another device, one whose version constraints this host does not meet,
+        # or a rule naming a profile the registry does not contain. Nothing else
+        # ever says so, so dropping the explanation here made those sentences
+        # unreachable. A user asking for `--profile npu-int4-sym-cw --device gpu`
+        # gets told, in the plan, before anything is downloaded.
+        known_limitations.extend(profile_explanation.notes)
         known_limitations.extend(
             f"Exporter requirement not satisfied: {problem}"
             for problem in exporter_requirements.problems
@@ -1083,8 +1170,29 @@ class PrepareService:
                 ignore_exporter_requirements=ignore_exporter_requirements,
             )
         except YongaError as error:
+            self._clean_up_staging(ctx)
             ctx.fail(tracker.stage, error.diagnostic)
             raise
+
+    @staticmethod
+    def _clean_up_staging(ctx: JobContext) -> None:
+        """Apply the staging retention policy to a failed preparation.
+
+        ``SPEC.md`` section 16 wants raw diagnostics retained, so a staging
+        directory holding a partial export survives and its path is announced —
+        :meth:`JobContext.fail` then records it in the job state and in the
+        failure diagnostic. A directory that produced no file is removed on the
+        spot: an empty husk diagnoses nothing, and leaving one behind per failed
+        run is how the hidden staging root filled up.
+        """
+        retained = ctx.retain_staging_for_diagnosis()
+        if retained is None:
+            return
+        ctx.emit(
+            ProgressKind.LOG,
+            f"Partial output kept for diagnosis at {retained}",
+            staging_dir=str(retained),
+        )
 
     def _execute(
         self,
@@ -1152,9 +1260,15 @@ class PrepareService:
             f"Fell back from {previous} to {nxt}." for previous, nxt in pairwise(fallbacks)
         )
 
+        # From here on nothing runs against the staging directory any more, and
+        # it is about to be renamed onto the artifact directory. Rewrite the
+        # paths it produced before they are frozen into the manifest and into
+        # ``.yonga/validation.json``.
+        validation = _relocated_validation(validation, staging)
+        probes = {name: _relocated_device_probe(report, staging) for name, report in probes.items()}
         manifest = self._build_manifest(
             plan=plan,
-            export=export.record,
+            export=_relocated_export(export.record, staging),
             validation=validation,
             repairs=repairs,
             probes=probes,
@@ -2368,6 +2482,10 @@ class PrepareService:
         File digests are deliberately *not* filled in here:
         :meth:`ArtifactStore.finalize` computes them after every repair has run,
         so the manifest always describes the bytes that were actually published.
+
+        Every path in ``validation``, ``probes`` and ``export`` has already been
+        made artifact-relative by :func:`_artifact_relative`; see its docstring
+        for why the export ``argv`` is the one thing left literal.
         """
         source = plan.resolved_source.source
         source_sha = (

@@ -262,8 +262,8 @@ between releases, the exported graph changes with it, so **an architecture can r
 Transformers version** — not merely a minimum.
 
 The registry records that requirement per architecture. Qwen3.5 is the shipped example: it declares
-`transformers ==5.2.*`, while the reference host has 5.5.4 installed. `yonga inspect` reports the
-conflict rather than hiding it (verified):
+`transformers ==5.2.*`, which is why the reference host has 5.2.0 installed rather than the newest
+release. `yonga inspect` states the requirement whether or not it is currently met (verified):
 
 ```text
 Known limitations
@@ -272,18 +272,42 @@ Known limitations
   - NPU is not a target for this architecture on OpenVINO 2026.x.
 ```
 
-`prepare` checks the same requirement during preflight and **warns** — it does not stop. The plan
-lists it under known limitations and preflight repeats it, with this exact wording (verified):
+`prepare` checks the same requirement during preflight and **stops** — it does not warn and carry
+on. The plan lists the unmet pin under known limitations and closes with a blocked banner (verified,
+reproduced here with a registry override pinning a version that is not installed):
 
 ```text
-Exporter requirement not satisfied: transformers ==5.2.* is required to export this model, but
-5.5.4 is installed. yonga does not change your environment automatically — install the required
-version yourself, e.g. `pip install "transformers==5.2.*"`.
+Known limitations
+• Exporter requirement not satisfied: transformers ==4.99.* is required, but 5.2.0 is installed
+
+────────────────────────────────────────────────────────────────────────────
+BLOCKED — exporter requirements not satisfied
+x  transformers ==4.99.* is required, but 5.2.0 is installed
+Preparation stops at preflight, before the download and the conversion. Override with
+--ignore-exporter-requirements if you know the pin is stale; --yes does not.
+```
+
+and then exits **10** without downloading anything (verified):
+
+```text
+✗ Exporter requirements are not satisfied
+
+Converting hf-internal-testing/tiny-random-LlamaForCausalLM needs transformers ==4.99.*, but 5.2.0
+is installed. yonga stops here, before the 14.2 MiB download and the conversion, because this export
+cannot succeed as the environment stands.
+
+  - Install the required version yourself: pip install 'transformers==4.99.*'
+  - yonga never installs, upgrades or removes packages in your environment; a future
+managed-environment feature will handle this properly.
+  - If you know this pin is stale, re-run with --ignore-exporter-requirements: yonga prepare
+hf-internal-testing/tiny-random-LlamaForCausalLM --ignore-exporter-requirements
+  - --yes does not and will not bypass this check, only --ignore-exporter-requirements does.
 ```
 
 A conversion run against the wrong Transformers version may still fail, or may succeed and produce a
-graph that behaves differently. The warning is your cue to fix the environment before trusting the
-artifact.
+graph that behaves differently — which is why the check is a gate and not a warning. If you know the
+pin is stale, `--ignore-exporter-requirements` proceeds and the override is recorded in the
+artifact's manifest. `--yes` never implies it.
 
 **`yonga` will not install or downgrade `transformers` for you.** Changing the version of a package
 in the environment you are running from is your decision, and downgrading `transformers` can break

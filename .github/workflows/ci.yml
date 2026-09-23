@@ -5,7 +5,9 @@
 # deselects `network`, `intel_gpu`, `intel_npu`, `large_model` and `slow`. No job
 # here passes `-m`: overriding that expression is how a CI run would start
 # depending on a device it does not have. Verified locally with every outbound
-# HTTP request blocked: 1608 passed, 1 skipped, 10 deselected.
+# connection refused, as the two steps below invoke it: `pytest tests/unit` is
+# 1627 passed and 1 skipped, `pytest tests/integration` is 44 passed and 10
+# deselected.
 name: CI
 
 on:
@@ -73,7 +75,7 @@ jobs:
       # transformers and torch, so mypy type-checks the whole tree without the
       # heavy wheels. Verified in a clean venv holding only the base package and
       # `[dev]` — which resolves typer 0.27.2 and click 8.5.0, not the typer
-      # 0.25.1 this repository's own .venv pins: clean, 108 source files.
+      # 0.25.1 this repository's own .venv pins: clean, 110 source files.
       - name: Install package and typing tooling
         run: python -m pip install -e ".[dev]"
 

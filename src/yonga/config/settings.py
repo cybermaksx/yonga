@@ -115,6 +115,23 @@ class Settings(BaseSettings):
     temp_size_multiplier: float = Field(default=2.5, gt=0.0)
     temp_safety_margin_bytes: int = Field(default=5 * GIB, ge=0)
     compile_cache_enabled: bool = True
+    workspace_retention_hours: int = Field(default=72, ge=0)
+    """How long a stale job working directory is kept before a sweep retires it.
+
+    Applies to both managed working roots: ``artifacts/.staging/<job-id>`` (a
+    partial export left by a failed preparation) and ``cache/tmp/<job-id>`` (the
+    managed ``TMPDIR``). A directory belonging to a job that is still running is
+    never swept, whatever this says. ``0`` retires every stale directory as soon
+    as a job opens.
+    """
+    workspace_retention_max: int = Field(default=3, ge=0)
+    """How many stale working directories survive the sweep, newest first.
+
+    The count bound and :attr:`workspace_retention_hours` are both enforced, so a
+    burst of failures cannot fill the disk while the window is still open. Only
+    directories that actually hold a partial export count; empty husks are always
+    retired.
+    """
     show_reasoning: bool = False
     hash_weights: bool = True
     bench_runs: int = Field(default=3, ge=1)

@@ -27,6 +27,8 @@ from yonga.adapters.runtime_genai import (
     build_generation_config,
     collect_metrics,
     open_runtime,
+    resolve_starts_in_reasoning,
+    template_opens_reasoning,
     thinking_extra_context,
 )
 from yonga.config.settings import Settings
@@ -749,4 +751,70 @@ def test_the_generation_result_defaults_report_nothing_hidden(artifact, settings
     result = runtime.generate(history, GenerationSettings())
     assert result.reasoning_hidden is False
     assert result.reasoning_unterminated is False
+    runtime.close()
+
+
+# --- whether generation begins inside a reasoning block --------------------------------
+#
+# A template that opens ``<think>`` in the prompt leaves the model's reply with
+# no opener of its own, which the chat service's sanitiser cannot recognise. The
+# runtime read the template and knows what it could push into it, so it is the
+# layer that decides — and it fails safe. The user-visible consequences are
+# pinned in ``test_reasoning_leak.py``.
+
+#: An opener emitted unconditionally, guarded by no variable at all.
+TEMPLATE_ALWAYS_OPENS = "{%- if add_generation_prompt %}{{- '<think>\\n' }}{%- endif %}\n"
+
+
+def test_an_opener_in_the_template_source_is_the_evidence():
+    assert template_opens_reasoning(TEMPLATE_ALWAYS_OPENS) is True
+    assert template_opens_reasoning(TEMPLATE_WITH_FLAG) is True
+    assert template_opens_reasoning(TEMPLATE_WITHOUT_FLAG) is False
+    assert template_opens_reasoning(None) is False
+
+
+def test_a_profile_with_no_wrappers_has_no_opener_to_look_for():
+    """Nothing to recognise means nothing to wait for, so nothing is assumed."""
+    profile = ChatProfile(reasoning_wrappers=[])
+    assert resolve_starts_in_reasoning(profile, template=TEMPLATE_ALWAYS_OPENS) is False
+
+
+def test_the_runtime_starts_outside_the_block_when_it_pushed_the_variable_false(
+    artifact, settings, genai
+):
+    write_template(artifact, TEMPLATE_WITH_FLAG)
+    runtime = make_runtime(artifact, settings, chat_profile=ChatProfile())
+    assert runtime.thinking_variable == "enable_thinking"
+    assert runtime.starts_in_reasoning is False
+    runtime.close()
+
+
+def test_the_runtime_starts_inside_the_block_when_thinking_is_on(artifact, settings, genai):
+    write_template(artifact, TEMPLATE_WITH_FLAG)
+    runtime = make_runtime(artifact, settings, chat_profile=ChatProfile(), thinking=True)
+    assert runtime.starts_in_reasoning is True
+    runtime.close()
+
+
+def test_an_unconditionally_opening_template_is_assumed_to_leave_the_block_open(
+    artifact, settings, genai
+):
+    """The DeepSeek-R1-distill shape: no variable can switch the opener off."""
+    write_template(artifact, TEMPLATE_ALWAYS_OPENS)
+    runtime = make_runtime(artifact, settings, chat_profile=ChatProfile())
+    assert runtime.thinking_variable is None
+    assert runtime.starts_in_reasoning is True
+    runtime.close()
+
+
+def test_a_template_with_no_opener_never_starts_inside_a_block(artifact, settings, genai):
+    write_template(artifact, TEMPLATE_WITHOUT_FLAG)
+    runtime = make_runtime(artifact, settings, chat_profile=ChatProfile())
+    assert runtime.starts_in_reasoning is False
+    runtime.close()
+
+
+def test_an_artifact_with_no_template_at_all_starts_outside_a_block(artifact, settings, genai):
+    runtime = make_runtime(artifact, settings, chat_profile=ChatProfile())
+    assert runtime.starts_in_reasoning is False
     runtime.close()

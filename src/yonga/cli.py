@@ -43,7 +43,12 @@ from yonga.application.artifacts import ArtifactStore
 from yonga.application.benchmark import DEFAULT_SUITE, benchmark_result_path
 from yonga.application.chat import ChatOptions, ChatService, ChatSession
 from yonga.application.inspect_model import InspectReport
-from yonga.application.jobs import JobContext, open_job
+from yonga.application.jobs import (
+    JobContext,
+    WorkspaceSweep,
+    open_job,
+    sweep_managed_workspaces,
+)
 from yonga.application.probe import ProbeOutcome
 from yonga.application.progress import ProgressSink, null_sink
 from yonga.application.wiring import Wiring, WiringFactory
@@ -86,6 +91,11 @@ SUITE_CHOICES: tuple[str, ...] = ("quick", "standard", "long")
 
 #: How many job logs ``yonga logs`` lists when no job id is given.
 LOG_LIST_LIMIT: int = 20
+
+#: Below this, stale working directories are not worth a line of the user's
+#: attention in ``yonga list``. Above it they are, because nothing else in the
+#: tool ever mentions the hidden staging root.
+STALE_NOTE_THRESHOLD_BYTES: int = 256 * 1024 * 1024
 
 
 # ======================================================================
@@ -260,16 +270,30 @@ def _dispatch(state: CliState, action: Callable[[], ExitCode]) -> None:
     """Run one command body and turn its outcome into a process exit code.
 
     Every exception class is handled here so that no command can leak a traceback:
-    typed failures keep their stable code, ``Ctrl-C`` is exit 60, and anything
-    else is exit 99 with the raw text held back for ``--debug``.
+    typed failures keep their stable code, ``Ctrl-C`` is exit 60, a closed stdout
+    is a quiet 0, and anything else is exit 99 with the raw text held back for
+    ``--debug``.
     """
     try:
         try:
             code = action()
         finally:
             state.close_sink()
+        # Commit the command's output here rather than leaving it to the
+        # interpreter. A short answer fits in the pipe buffer, so writing it
+        # never fails and the ``EPIPE`` surfaces in Click's own flush instead,
+        # where it becomes a bare exit 1. Flushing inside this ``try`` is what
+        # makes ``yonga registry paths | head -1`` end the same way
+        # ``yonga logs JOB --raw | head -2`` does.
+        sys.stdout.flush()
     except YongaError as error:
         code = state.fail(error)
+    except BrokenPipeError:
+        code = _closed_stdout()
+    except SystemExit as error:
+        if not _from_closed_stdout(error):
+            raise
+        code = _closed_stdout()
     except KeyboardInterrupt:
         code = state.report(
             diagnostic(
@@ -283,6 +307,60 @@ def _dispatch(state: CliState, action: Callable[[], ExitCode]) -> None:
     except Exception as error:  # the last line of defence; see the module docstring
         code = state.unexpected(error)
     raise typer.Exit(int(code))
+
+
+def _from_closed_stdout(error: BaseException) -> bool:
+    """Whether ``error`` is a library's reaction to stdout having been closed.
+
+    Rich does not let :class:`BrokenPipeError` out of a ``print``:
+    ``Console.on_broken_pipe`` silences the console and raises ``SystemExit(1)``
+    instead. Without this, a table piped into ``head`` would end with a
+    different exit code from a raw stream piped into ``head``, and a caller
+    running under ``set -o pipefail`` would see one of them as a failure. The
+    original exception is still on the chain, which is what this reads; any
+    other ``SystemExit`` is left alone to do what it was raised to do.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        if isinstance(current, BrokenPipeError):
+            return True
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _closed_stdout() -> ExitCode:
+    """Treat a closed stdout as the normal end of output and exit quietly.
+
+    ``yonga logs JOB --raw | head -2`` closes the pipe the moment ``head`` has
+    what it asked for, and every later write raises :class:`BrokenPipeError`
+    (Python ignores ``SIGPIPE``, so the process is not killed the way ``cat``
+    is). That is the reader saying "enough", not a failure of this program, so
+    nothing is printed, no diagnostic is rendered, and the exit code is 0 —
+    letting it fall through to the catch-all in :func:`_dispatch` instead made
+    piping into ``head``, ``less`` or ``jq`` look like exit 99 and a bug report.
+
+    Silencing it takes two steps, because the *interpreter* flushes ``stdout``
+    again at shutdown and would print ``Exception ignored ... BrokenPipeError``
+    on stderr afterwards — the second error the shell must never see. Pointing
+    the descriptor at ``/dev/null`` makes that last flush succeed silently; it
+    is the idiom from the Python documentation's note on ``SIGPIPE``. Under a
+    captured stream with no real descriptor ``fileno()`` raises, which is
+    harmless: there is no shutdown flush to a dead pipe to silence.
+    """
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+    except OSError:  # pragma: no cover - /dev/null is always openable
+        return ExitCode.SUCCESS
+    try:
+        os.dup2(devnull, sys.stdout.fileno())
+    except (OSError, ValueError, AttributeError):
+        pass
+    finally:
+        with suppress(OSError):
+            os.close(devnull)
+    return ExitCode.SUCCESS
 
 
 @contextmanager
@@ -689,32 +767,103 @@ def _prepare(
 @app.command("list")
 def list_artifacts(
     ctx: typer.Context,
+    clean: bool = typer.Option(
+        False,
+        "--clean",
+        help="Retire stale staging and temp directories under the retention policy.",
+    ),
     json_output: bool = typer.Option(False, "--json", help="Emit the catalogue as JSON."),
 ) -> None:
     """List the artifacts prepared on this host."""
     state = cli_state(ctx, json_output=json_output)
-    _dispatch(state, lambda: _list(state))
+    _dispatch(state, lambda: _list(state, clean=clean))
 
 
-def _list(state: CliState) -> ExitCode:
-    """Render the prepared-artifact catalogue (``docs/CLI_SPEC.md`` section 7)."""
+def _stale_working_dirs(state: CliState, *, clean: bool) -> WorkspaceSweep | None:
+    """Project (or perform) the working-directory sweep. Never fails the command."""
+    try:
+        return sweep_managed_workspaces(state.settings, dry_run=not clean)
+    except Exception:  # pragma: no cover - a sweep must never break 'yonga list'
+        return None
+
+
+def _stale_note(state: CliState, sweep: WorkspaceSweep | None, *, clean: bool) -> None:
+    """Print the one honest line about space held outside the artifact catalogue."""
+    if sweep is None:
+        return
+    if clean:
+        if sweep.removed_count:
+            state.console.print(
+                f"Reclaimed {human_bytes(sweep.freed_bytes)} from {sweep.removed_count} "
+                "stale working directories."
+            )
+        else:
+            state.console.print("No stale working directories to reclaim.")
+        return
+    if sweep.freed_bytes < STALE_NOTE_THRESHOLD_BYTES:
+        return
+    state.console.print(
+        f"{human_bytes(sweep.freed_bytes)} in {sweep.removed_count} stale working "
+        "directories can be reclaimed: yonga list --clean"
+    )
+
+
+def _list(state: CliState, *, clean: bool = False) -> ExitCode:
+    """Render the prepared-artifact catalogue (``docs/CLI_SPEC.md`` section 7).
+
+    ``--clean`` runs the working-directory retention sweep first; without it the
+    sweep is only projected, and a non-trivial total earns a single line so the
+    hidden staging root can never quietly eat the disk.
+    """
     store: ArtifactStore = state.graph.artifact_store()
+    sweep = _stale_working_dirs(state, clean=clean)
     summaries: Sequence[ArtifactSummary] = store.list_artifacts()
     if state.json_mode:
-        state.emit(
-            {
-                "artifacts": [summary.model_dump(mode="json") for summary in summaries],
-                "count": len(summaries),
-                "artifacts_dir": str(store.root),
-            }
-        )
+        document: dict[str, object] = {
+            "artifacts": [summary.model_dump(mode="json") for summary in summaries],
+            "count": len(summaries),
+            "artifacts_dir": str(store.root),
+        }
+        # Silence is the honest answer when there is nothing stale: the key only
+        # appears when it carries news, so a fresh home's document is unchanged.
+        if clean or sweep is None or sweep.removed_count:
+            document["stale_working_dirs"] = _stale_payload(state, sweep, clean=clean)
+        state.emit(document)
         return ExitCode.SUCCESS
     if not summaries:
         state.console.print("No prepared artifacts yet.")
         state.console.print("Prepare one with: yonga prepare MODEL")
-        return ExitCode.SUCCESS
-    state.console.print(tables.artifact_list(summaries))
+    else:
+        state.console.print(tables.artifact_list(summaries))
+    _stale_note(state, sweep, clean=clean)
     return ExitCode.SUCCESS
+
+
+def _stale_payload(
+    state: CliState,
+    sweep: WorkspaceSweep | None,
+    *,
+    clean: bool,
+) -> dict[str, object]:
+    """Describe the working-directory sweep for the ``--json`` document."""
+    paths = state.settings.paths
+    payload: dict[str, object] = {
+        "cleaned": clean,
+        "staging_dir": str(paths.staging_dir),
+        "temp_dir": str(paths.tmp_dir),
+    }
+    if sweep is None:
+        payload["available"] = False
+        return payload
+    payload.update(
+        {
+            "available": True,
+            "directories": sweep.removed_count,
+            "bytes": sweep.freed_bytes,
+            "retained_bytes": sweep.remaining_bytes,
+        }
+    )
+    return payload
 
 
 @app.command()
@@ -999,12 +1148,12 @@ def _bench(
         payload = result.to_json()
         payload["result_path"] = str(path)
         state.emit(payload, ok=not result.errors)
-        return _bench_exit(result.errors, bool(result.aggregates))
+        return _bench_exit(result.errors, result.has_measurements)
     state.console.print(tables.benchmark_summary(result))
     state.console.print(f"Saved: {path}")
     for error in result.errors:
         state.console.print_error(f"  {error}", style="yellow")
-    return _bench_exit(result.errors, bool(result.aggregates))
+    return _bench_exit(result.errors, result.has_measurements)
 
 
 def _bench_exit(errors: Sequence[str], measured: bool) -> ExitCode:

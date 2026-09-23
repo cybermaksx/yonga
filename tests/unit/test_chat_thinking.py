@@ -32,6 +32,7 @@ from yonga.adapters.runtime_genai import (
     ChatProfile,
     GenerationResult,
     read_chat_template,
+    resolve_starts_in_reasoning,
     resolve_thinking_variable,
     template_references,
     thinking_extra_context,
@@ -488,3 +489,55 @@ def test_the_generation_result_satisfies_the_renderers_protocol():
         output_tokens=60,
     )
     assert "60 tokens of reasoning" in render(render_answer(result))
+
+
+# --------------------------------------------------------------------------------------
+# the variable is also what decides where generation *starts*
+# --------------------------------------------------------------------------------------
+#
+# Pushing the variable false is not only how thinking is switched off; it is the
+# only proof that the prompt's reasoning block was closed before generation
+# began. Without that proof a template carrying an opener has to be assumed to
+# have left one open — see ``test_reasoning_leak.py`` for the full rule.
+
+
+def test_pushing_the_variable_false_proves_the_block_was_closed():
+    profile = ChatProfileView()
+    assert thinking_extra_context(profile, template=TEMPLATE_WITH_FLAG) == {
+        "enable_thinking": False
+    }
+    assert resolve_starts_in_reasoning(profile, template=TEMPLATE_WITH_FLAG) is False
+
+
+def test_asking_for_thinking_means_generation_starts_inside_the_block():
+    """With thinking on the template's opener is the last thing in the prompt."""
+    profile = ChatProfileView()
+    assert resolve_starts_in_reasoning(profile, template=TEMPLATE_WITH_FLAG, thinking=True) is True
+
+
+def test_a_template_with_no_opener_is_never_assumed_to_have_left_one_open():
+    profile = ChatProfileView()
+    assert resolve_starts_in_reasoning(profile, template=TEMPLATE_WITHOUT_FLAG) is False
+    assert resolve_starts_in_reasoning(profile, template=TEMPLATE_WITHOUT_FLAG, thinking=True) is (
+        False
+    )
+
+
+def test_vetoing_the_variable_does_not_prove_the_block_is_closed():
+    """``supports_thinking_flag: false`` means nothing is pushed, so nothing is proved."""
+    vetoed = ChatProfileView(supports_thinking_flag=False)
+    assert thinking_extra_context(vetoed, template=TEMPLATE_WITH_FLAG) == {}
+    assert resolve_starts_in_reasoning(vetoed, template=TEMPLATE_WITH_FLAG) is True
+
+
+def test_a_session_reports_the_starting_state_it_resolved(tmp_path):
+    service, _factory, _runtime = build_service(tmp_path)
+    artifact = write_artifact(tmp_path, qwen3_manifest())
+    (artifact / "chat_template.jinja").write_text(TEMPLATE_WITH_FLAG, encoding="utf-8")
+
+    session = service.open_artifact(artifact)
+    assert session.thinking_variable == "enable_thinking"
+    assert session.starts_in_reasoning is False
+
+    thinking = service.open_artifact(artifact, options=ChatOptions(thinking=True))
+    assert thinking.starts_in_reasoning is True

@@ -77,6 +77,12 @@ NPU_UNSUPPORTED_GRAPH = (
     "OneShotBufferizeVPU2VPUIP failed : Only supports FP16."
 )
 
+#: Job id of the multi-megabyte log the closed-pipe tests write and then read.
+LARGE_LOG_JOB_ID = "11111111-2222-3333-4444-555555555555"
+
+#: Job id of the one-record log used to reach the interpreter's shutdown flush.
+SMALL_LOG_JOB_ID = "22222222-2222-3333-4444-555555555555"
+
 #: A token-shaped string used to prove nothing secret reaches a JSON document.
 FAKE_TOKEN = "hf_clitestsecrettokenvalue000000000000"
 
@@ -197,6 +203,38 @@ class ExplodingArtifactStore(ArtifactStore):
     def list_artifacts(self) -> list[object]:  # type: ignore[override]
         """Fail the way a genuine bug would, with an untyped exception."""
         raise RuntimeError("synthetic catalogue failure")
+
+
+class ClosedPipeArtifactStore(ArtifactStore):
+    """An artifact store that fails the way a reader closing the pipe does."""
+
+    def list_artifacts(self) -> list[object]:  # type: ignore[override]
+        """Raise what the interpreter raises once stdout has no reader left."""
+        raise BrokenPipeError(32, "Broken pipe")
+
+
+class RichClosedPipeArtifactStore(ArtifactStore):
+    """An artifact store failing the way Rich reports a closed pipe.
+
+    ``rich.console.Console.on_broken_pipe`` never lets the ``BrokenPipeError``
+    out: it silences the console and raises ``SystemExit(1)`` with the original
+    exception still on the chain. This reproduces that exact shape.
+    """
+
+    def list_artifacts(self) -> list[object]:  # type: ignore[override]
+        """Raise ``SystemExit`` from a broken pipe, as Rich does."""
+        try:
+            raise BrokenPipeError(32, "Broken pipe")
+        except BrokenPipeError:
+            raise SystemExit(1) from None
+
+
+class DeliberateExitArtifactStore(ArtifactStore):
+    """An artifact store that exits on purpose, for no pipe-related reason."""
+
+    def list_artifacts(self) -> list[object]:  # type: ignore[override]
+        """Raise a plain ``SystemExit`` that must keep its own code."""
+        raise SystemExit(3)
 
 
 class FakeWiring(Wiring):
@@ -1095,6 +1133,181 @@ def test_an_unexpected_exception_exits_ninety_nine_without_a_traceback(
     assert "Traceback" not in result.stderr
     assert "synthetic catalogue failure" not in result.stderr
     assert str(home / "data" / "logs") in result.stderr
+
+
+def test_a_closed_stdout_is_a_quiet_success_not_a_bug(runner: CliRunner, home: Path) -> None:
+    """``BrokenPipeError`` is the reader saying "enough", never an internal error."""
+
+    def factory(settings: Settings) -> Wiring:
+        return FakeWiring(settings, store=ClosedPipeArtifactStore(settings.paths, settings))
+
+    result = invoke(runner, home, ["list"], factory=factory)
+    assert result.exit_code == int(ExitCode.SUCCESS)
+    assert "Unexpected internal error" not in result.stderr
+    assert "Traceback" not in result.stderr
+    assert "BrokenPipeError" not in result.stderr
+
+
+def test_a_closed_stdout_reported_by_rich_is_also_a_quiet_success(
+    runner: CliRunner, home: Path
+) -> None:
+    """Rich turns a closed pipe into ``SystemExit(1)``; that is still exit 0 here."""
+
+    def factory(settings: Settings) -> Wiring:
+        return FakeWiring(settings, store=RichClosedPipeArtifactStore(settings.paths, settings))
+
+    result = invoke(runner, home, ["list"], factory=factory)
+    assert result.exit_code == int(ExitCode.SUCCESS)
+    assert "Unexpected internal error" not in result.stderr
+
+
+def test_an_unrelated_system_exit_keeps_its_own_code(runner: CliRunner, home: Path) -> None:
+    """Only a ``SystemExit`` caused by a closed pipe is rewritten; others pass through."""
+
+    def factory(settings: Settings) -> Wiring:
+        return FakeWiring(settings, store=DeliberateExitArtifactStore(settings.paths, settings))
+
+    result = invoke(runner, home, ["list"], factory=factory)
+    assert result.exit_code == 3
+
+
+def write_into_a_broken_pipe(
+    home: Path, command: Sequence[str], *, reader: str, wait_for_reader: bool
+) -> tuple[int, str]:
+    """Run ``yonga command`` with stdout on a pipe whose reader walks away.
+
+    ``reader`` is the body of a throwaway Python process holding the read end;
+    with ``wait_for_reader`` the writer is not started until that process has
+    exited, which is how a command whose whole answer fits in the pipe buffer is
+    made to meet a closed pipe deterministically.
+    """
+    import subprocess
+    import sys
+
+    environment = dict(os.environ)
+    environment.update({"YONGA_CONFIG_DIR": str(home / "config"), "NO_COLOR": "1"})
+
+    consumer = subprocess.Popen([sys.executable, "-c", reader], stdin=subprocess.PIPE)
+    assert consumer.stdin is not None
+    if wait_for_reader:
+        consumer.wait(timeout=60)
+    writer = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "yonga",
+            "--data-dir",
+            str(home / "data"),
+            "--cache-dir",
+            str(home / "cache"),
+            *command,
+        ],
+        stdout=consumer.stdin,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=environment,
+    )
+    consumer.stdin.close()
+    consumer.wait(timeout=60)
+    _, stderr = writer.communicate(timeout=60)
+    return writer.returncode, stderr
+
+
+def test_piping_a_large_log_into_head_exits_quietly(tmp_path: Path) -> None:
+    """``yonga logs JOB --raw | head -2`` must not look like a crash.
+
+    Driven through a real process and a real pipe because that is the only place
+    the failure exists: the reader closes the pipe while yonga is still writing,
+    which needs a log far larger than the pipe buffer. Before the fix this
+    printed the exit-99 panel, and then the interpreter's own shutdown flush
+    printed a second error on top of it.
+    """
+    home = tmp_path / "home"
+    (home / "config").mkdir(parents=True)
+    logs_dir = home / "data" / "logs"
+    logs_dir.mkdir(parents=True)
+    record = json.dumps(
+        {
+            "timestamp": "2026-09-22T10:11:12.345Z",
+            "job_id": LARGE_LOG_JOB_ID,
+            "level": "info",
+            "event": "subprocess.output",
+            "message": "x" * 240,
+        }
+    )
+    # Several megabytes: far more than any pipe buffer, so the writer is
+    # guaranteed to still be writing when the reader walks away.
+    (logs_dir / f"{LARGE_LOG_JOB_ID}.jsonl").write_text((record + "\n") * 20_000, encoding="utf-8")
+
+    code, stderr = write_into_a_broken_pipe(
+        home,
+        ["logs", LARGE_LOG_JOB_ID, "--raw"],
+        reader="import sys; sys.stdin.readline(); sys.stdin.readline()",
+        wait_for_reader=False,
+    )
+
+    assert code == int(ExitCode.SUCCESS)
+    assert stderr == ""
+
+
+def test_a_small_raw_payload_does_not_leak_the_shutdown_flush(tmp_path: Path) -> None:
+    """Output small enough to sit in the buffer must not fail at interpreter exit.
+
+    Nothing raises while the command runs — the bytes are still in the stream's
+    buffer — so the failure lands in the interpreter's own final flush, which
+    prints ``Exception ignored while flushing sys.stdout`` and exits **120**.
+    Committing the output while the handler can still see it is what stops the
+    shell from being shown that second error.
+    """
+    home = tmp_path / "home"
+    (home / "config").mkdir(parents=True)
+    logs_dir = home / "data" / "logs"
+    logs_dir.mkdir(parents=True)
+    (logs_dir / f"{SMALL_LOG_JOB_ID}.jsonl").write_text(
+        json.dumps(
+            {
+                "timestamp": "2026-09-22T10:11:12.345Z",
+                "job_id": SMALL_LOG_JOB_ID,
+                "level": "info",
+                "event": "job.created",
+                "message": "job created",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    code, stderr = write_into_a_broken_pipe(
+        home,
+        ["logs", SMALL_LOG_JOB_ID, "--raw"],
+        reader="raise SystemExit(0)",
+        wait_for_reader=True,
+    )
+
+    assert code == int(ExitCode.SUCCESS)
+    assert stderr == ""
+
+
+def test_piping_a_rich_table_into_a_departed_reader_exits_quietly(tmp_path: Path) -> None:
+    """The other half of the same promise, for output Rich renders.
+
+    A short answer fits in the pipe buffer, so the reader has to be gone before
+    the command starts for the write to fail at all. Rich intercepts the
+    ``BrokenPipeError`` itself and exits 1, which a caller running under
+    ``set -o pipefail`` reads as a failure; the CLI turns it back into 0.
+    """
+    home = tmp_path / "home"
+    (home / "config").mkdir(parents=True)
+
+    code, stderr = write_into_a_broken_pipe(
+        home,
+        ["registry", "paths"],
+        reader="raise SystemExit(0)",
+        wait_for_reader=True,
+    )
+
+    assert code == int(ExitCode.SUCCESS)
+    assert stderr == ""
 
 
 def test_debug_adds_the_raw_error_text(runner: CliRunner, home: Path) -> None:

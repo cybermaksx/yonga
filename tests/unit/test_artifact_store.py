@@ -9,6 +9,8 @@ Each way an artifact can be broken gets its own case, because "ready" is what
 from __future__ import annotations
 
 import json
+import os
+import shutil
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -525,3 +527,188 @@ def test_remove_handles_an_artifact_without_a_manifest(
     assert report.removed is True
     assert report.artifact_id is None
     assert any("no readable manifest" in note for note in report.notes)
+
+
+# --- compile-cache identity ----------------------------------------------------------
+
+
+def cache_entry_for(settings: Settings, manifest: ArtifactManifest, *, size: int = 4096) -> Path:
+    """Create the compile-cache directory an artifact's identity would produce."""
+    key = compile_cache_key(
+        artifact_hash=manifest.artifact_id,
+        device="GPU",
+        openvino_version="2026.4.0",
+    )
+    entry = settings.paths.compile_cache_dir / key
+    entry.mkdir(parents=True, exist_ok=True)
+    (entry / "blob.cl_cache").write_bytes(b"\x00" * size)
+    return entry
+
+
+def copy_artifact(store: ArtifactStore, published: Path, *, family: str) -> Path:
+    """Make a byte-identical copy of an artifact somewhere else in the store."""
+    copy = store.root / family / published.name
+    copy.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(published, copy)
+    return copy
+
+
+def test_the_compile_cache_key_follows_the_manifest_identity(
+    store: ArtifactStore, settings: Settings, tmp_path: Path
+) -> None:
+    """The manifest is the identity; the bytes in the directory are not.
+
+    Editing a file inside a prepared artifact must not move its compile cache to
+    a different key, or the cache would be orphaned by every repair.
+    """
+    manifest = make_manifest()
+    published = publish(store, tmp_path, manifest=manifest)
+    cache_entry = cache_entry_for(settings, manifest)
+    (published / "openvino_language_model.bin").write_bytes(b"\xff" * 4096)
+
+    report = store.remove(published, dry_run=True)
+
+    assert cache_entry in report.compile_cache_paths
+
+
+def test_removing_a_copy_leaves_the_originals_compile_cache_alone(
+    store: ArtifactStore, settings: Settings, tmp_path: Path
+) -> None:
+    """A copy is the same artifact, so it does not own the cache by itself.
+
+    Keying the cache on the directory's contents made ``yonga remove`` on a
+    byte-identical copy delete the compiled blobs the original was still using.
+    """
+    manifest = make_manifest()
+    original = publish(store, tmp_path, manifest=manifest)
+    cache_entry = cache_entry_for(settings, manifest)
+    copy = copy_artifact(store, original, family="someone--else")
+
+    report = store.remove(copy)
+
+    assert report.removed is True
+    assert not copy.exists()
+    assert original.is_dir()
+    assert cache_entry.is_dir()
+    assert report.compile_cache_paths == []
+    assert any("still claims" in note for note in report.notes)
+
+
+def test_the_last_copy_standing_does_take_the_compile_cache(
+    store: ArtifactStore, settings: Settings, tmp_path: Path
+) -> None:
+    """Once nothing else claims the identity, the cache is garbage and goes."""
+    manifest = make_manifest()
+    original = publish(store, tmp_path, manifest=manifest)
+    cache_entry = cache_entry_for(settings, manifest)
+    copy = copy_artifact(store, original, family="someone--else")
+    store.remove(copy)
+
+    report = store.remove(original)
+
+    assert cache_entry in report.compile_cache_paths
+    assert not cache_entry.exists()
+
+
+def test_freed_bytes_counts_only_what_actually_went_away(
+    store: ArtifactStore, settings: Settings, tmp_path: Path
+) -> None:
+    """Counting a cache that was deliberately kept doubled the reported saving."""
+    manifest = make_manifest()
+    original = publish(store, tmp_path, manifest=manifest)
+    cache_entry = cache_entry_for(settings, manifest, size=64 * 1024)
+    copy = copy_artifact(store, original, family="someone--else")
+    copy_bytes = sum(item.stat().st_size for item in copy.rglob("*") if item.is_file())
+
+    report = store.remove(copy)
+
+    assert report.freed_bytes == copy_bytes
+    assert report.freed_bytes < copy_bytes + cache_entry.stat().st_size
+
+
+def test_freed_bytes_reports_nothing_when_removal_failed(
+    store: ArtifactStore, tmp_path: Path
+) -> None:
+    """A tree that survived a read-only directory was still counted as reclaimed."""
+    published = publish(store, tmp_path)
+    weights = published / "openvino_language_model.bin"
+    frozen = [published, *(item for item in published.rglob("*") if item.is_dir())]
+    modes = [(item, item.stat().st_mode) for item in frozen]
+    for item, _ in reversed(modes):
+        item.chmod(0o500)
+    try:
+        report = store.remove(published)
+    finally:
+        for item, mode in modes:
+            item.chmod(mode)
+
+    assert report.removed is False
+    assert weights.is_file()
+    assert report.freed_bytes == 0
+
+
+# --- staging retention ---------------------------------------------------------------
+
+
+def test_sweep_staging_retires_stale_directories_under_the_staging_root(
+    store: ArtifactStore, settings: Settings
+) -> None:
+    """``yonga list`` hides the staging root, so the store has to sweep it."""
+    root = settings.paths.staging_dir
+    root.mkdir(parents=True, exist_ok=True)
+    stale = root / "dead-job"
+    (stale / "model").mkdir(parents=True)
+    (stale / "model" / "openvino_model.bin").write_bytes(b"\x00" * 8192)
+    moment = (datetime.now(tz=UTC) - timedelta(hours=200)).timestamp()
+    os.utime(stale, (moment, moment))
+
+    report = store.sweep_staging()
+
+    assert stale in report.removed
+    assert not stale.exists()
+    assert report.freed_bytes >= 8192
+    assert store.staging_bytes() == 0
+
+
+def test_sweep_staging_leaves_published_artifacts_alone(
+    store: ArtifactStore, settings: Settings, tmp_path: Path
+) -> None:
+    """The sweep only ever touches direct children of the staging root."""
+    published = publish(store, tmp_path)
+    settings.paths.staging_dir.mkdir(parents=True, exist_ok=True)
+
+    store.sweep_staging()
+
+    assert published.is_dir()
+    assert store.is_ready(published)
+
+
+def test_a_stale_compile_cache_entry_never_breaks_a_removal(
+    store: ArtifactStore, settings: Settings, tmp_path: Path
+) -> None:
+    """Changing how a key is derived leaves old cache directories behind.
+
+    They are junk, not a hazard: an entry under a key this artifact cannot
+    produce is simply not claimed, and a non-directory sitting where a key would
+    be is not mistaken for one.
+    """
+    manifest = make_manifest()
+    published = publish(store, tmp_path, manifest=manifest)
+    cache_root = settings.paths.compile_cache_dir
+    cache_root.mkdir(parents=True, exist_ok=True)
+    stale = cache_root / "0123456789abcdef"
+    stale.mkdir()
+    (stale / "blob.cl_cache").write_bytes(b"\x00" * 32)
+    imposter = cache_root / compile_cache_key(
+        artifact_hash=manifest.artifact_id,
+        device="GPU",
+        openvino_version="2026.4.0",
+    )
+    imposter.write_text("not a cache directory\n", encoding="utf-8")
+
+    report = store.remove(published)
+
+    assert report.removed is True
+    assert imposter not in report.compile_cache_paths
+    assert stale.is_dir()
+    assert imposter.is_file()

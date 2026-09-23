@@ -531,8 +531,9 @@ class OptimumExporter:
 def _default_runner() -> CommandRunner:
     """Instantiate the real subprocess runner, imported lazily to keep imports light."""
     from yonga.adapters.subprocess import SubprocessRunner
+    from yonga.util.redaction import environment_secrets
 
-    runner: CommandRunner = SubprocessRunner()
+    runner: CommandRunner = SubprocessRunner(extra_secrets=environment_secrets())
     return runner
 
 
