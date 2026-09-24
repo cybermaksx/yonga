@@ -24,6 +24,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from yonga.domain.hardware import HardwareInventory, HuggingFaceAuthInfo
     from yonga.domain.models import ModelIdentity, ModelMetadata
     from yonga.domain.plans import ExporterRequirements, ExportRequest, ExportResult
+    from yonga.domain.publication import PublisherIdentity
 
 __all__ = [
     "CommandResult",
@@ -33,6 +34,7 @@ __all__ = [
     "FilesystemProbe",
     "HardwareProbe",
     "HubClient",
+    "HubPublisher",
     "HubSearch",
     "RuntimeProbe",
 ]
@@ -95,6 +97,31 @@ class HubSearch(Protocol):
 
     def search(self, query: str, *, limit: int = 20) -> list[ModelMetadata]:
         """Return metadata for the best matches, from the search response alone."""
+        ...
+
+
+@runtime_checkable
+class HubPublisher(Protocol):
+    """Writes to the Hugging Face Hub. The only port that ever uploads anything."""
+
+    def identity(self) -> PublisherIdentity | None:
+        """The logged-in account, or ``None`` without credentials. Never the token."""
+        ...
+
+    def repo_exists(self, repo_id: str) -> bool:
+        """Whether the model repository already exists."""
+        ...
+
+    def publish(
+        self,
+        repo_id: str,
+        *,
+        private: bool,
+        files: Sequence[tuple[str, Path]],
+        generated: Mapping[str, bytes],
+        message: str,
+    ) -> str:
+        """Create the repository if needed and upload everything in one commit; return its URL."""
         ...
 
 

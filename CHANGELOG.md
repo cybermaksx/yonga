@@ -51,6 +51,13 @@ manifest may change in any minor release.
   `yonga env list|remove` manage them and `doctor` reports their disk use. `--no-managed-env` restores
   the refusal; `--ignore-exporter-requirements` exports in the current environment and never builds
   one. Registry data can choose only a version for a package yonga lists, never a package of its own.
+- **`yonga publish ARTIFACT --repo NS/NAME`** uploads a prepared artifact to the Hugging Face Hub
+  in one commit, with a model card generated from the manifest. It refuses before uploading unless
+  the destination is writable, both source licenses permit redistribution (read fresh from the Hub;
+  unrecognised ones need `--license-reviewed`), the artifact is ready and every file still matches
+  its digest. The card says the artifact is a quantized conversion and not a fine-tune, discloses
+  repairs, and claims only devices whose probe passed. Private by default; `--dry-run` writes the
+  card locally; local paths, login name and hostname are anonymised.
 - **`yonga serve MODEL_OR_ARTIFACT [--host] [--port] [--device]`**, an OpenAI-compatible HTTP API:
   `GET /health`, `GET /v1/models`, `POST /v1/chat/completions` with SSE streaming. It serves the same
   session `chat` opens, loads the model at startup, binds `127.0.0.1` by default, answers one

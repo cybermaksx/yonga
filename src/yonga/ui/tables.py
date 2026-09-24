@@ -33,6 +33,7 @@ from yonga.domain.compatibility import (
 from yonga.domain.diagnostics import HealthSection, Severity
 from yonga.domain.models import ModelMetadata
 from yonga.domain.plans import PreparationPlan
+from yonga.domain.publication import PublishPlan
 from yonga.ui.console import human_bytes, human_duration, status_icon, status_style
 
 if TYPE_CHECKING:  # Registry types are consumed, never imported at runtime.
@@ -1041,3 +1042,47 @@ def _resolution_table(resolution: ResolutionExplanation, winner_id: str | None) 
     if resolution.notes:
         return Group(table, *(Text(f"  {line}", style="dim") for line in resolution.notes))
     return table
+
+
+def publication_plan(plan: PublishPlan) -> RenderableType:
+    """Render what ``yonga publish`` will upload, and on what evidence, before it does."""
+    body = _grid()
+    visibility = "private" if plan.private else "PUBLIC"
+    state = "existing, files replaced" if plan.repo_exists else "new"
+    body.add_row(
+        Text("Destination"),
+        Text.assemble((plan.url, "cyan"), (f"  {visibility}, {state}", "bold")),
+    )
+    body.add_row(Text("Artifact"), _text(plan.artifact_id))
+    for assessment in plan.licenses:
+        label = "License" if assessment.role == "source" else "Requested model license"
+        body.add_row(
+            Text(label),
+            Text.assemble(
+                (assessment.license or "not declared", "bold"),
+                (f"  {assessment.classification.value}  {assessment.repo_id}", "dim"),
+            ),
+        )
+    for evidence in plan.devices:
+        style = {"ok": "green", "failed": "red"}.get(evidence.status, "dim")
+        word = {"ok": "works", "failed": "failed", "not_tested": "not tested"}[evidence.status]
+        body.add_row(
+            Text(f"Device {evidence.device}"),
+            Text.assemble(
+                (word, style), (f"  {evidence.detail}" if evidence.detail else "", "dim")
+            ),
+        )
+    body.add_row(
+        Text("Upload"),
+        _text(f"{len(plan.files)} files, {human_bytes(plan.upload_bytes)}"),
+    )
+    blocks: list[RenderableType] = [body]
+    blocks.extend(_bullet_block("Repairs disclosed", plan.repairs, style="cyan"))
+    blocks.extend(_bullet_block("Warnings", plan.warnings, style="yellow"))
+    return Panel(
+        Group(*blocks),
+        title="Publication plan",
+        border_style="cyan",
+        box=ROUNDED,
+        padding=(1, 2),
+    )

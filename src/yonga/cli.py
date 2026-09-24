@@ -1193,6 +1193,130 @@ def _serve(
     return ExitCode.SUCCESS
 
 
+# ======================================================================
+# publish
+# ======================================================================
+@app.command()
+def publish(
+    ctx: typer.Context,
+    artifact: str = typer.Argument(..., metavar="ARTIFACT", help="Prepared artifact id or path."),
+    repo: str = typer.Option(
+        ..., "--repo", help="Destination NAMESPACE/NAME on the Hub. Always explicit."
+    ),
+    public: bool = typer.Option(
+        False, "--public", help="Create a public repository (the default is private)."
+    ),
+    update: bool = typer.Option(
+        False, "--update", help="Write into a repository that already exists."
+    ),
+    license_reviewed: bool = typer.Option(
+        False,
+        "--license-reviewed",
+        help=(
+            "State that you read a license yonga cannot classify and it permits "
+            "redistributing a quantized derivative. --yes never implies it."
+        ),
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Check everything and write the card locally; upload nothing."
+    ),
+    output: Path | None = typer.Option(
+        None, "--output", help="Where to write the card, manifest and upload list."
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Approve the upload without a prompt."),
+    json_output: bool = typer.Option(False, "--json", help="Emit the outcome as JSON."),
+) -> None:
+    """Upload a prepared artifact to the Hugging Face Hub with a generated model card."""
+    state = cli_state(ctx, json_output=json_output)
+    _dispatch(
+        state,
+        lambda: _publish(
+            state,
+            artifact,
+            repo=repo,
+            public=public,
+            update=update,
+            license_reviewed=license_reviewed,
+            dry_run=dry_run,
+            output=output,
+            yes=yes,
+        ),
+    )
+
+
+def _publish(
+    state: CliState,
+    artifact: str,
+    *,
+    repo: str,
+    public: bool,
+    update: bool,
+    license_reviewed: bool,
+    dry_run: bool,
+    output: Path | None,
+    yes: bool,
+) -> ExitCode:
+    """Plan, show, confirm and upload (``docs/CLI_SPEC.md`` section 14a)."""
+    service = state.graph.publish_service()
+    console = state.console
+    plan = service.plan(
+        artifact,
+        repo,
+        private=not public,
+        update=update,
+        license_reviewed=license_reviewed,
+        dry_run=dry_run,
+    )
+    console.print(tables.publication_plan(plan))
+    preview_dir = output
+    if dry_run and preview_dir is None:
+        preview_dir = Path.cwd() / f"yonga-publish-{plan.artifact_id}"
+    written = service.write_preview(plan, preview_dir) if preview_dir is not None else []
+    for path in written:
+        console.detail(f"Wrote {path}")
+    payload: dict[str, object] = {
+        "artifact_id": plan.artifact_id,
+        "repo_id": plan.repo_id,
+        "private": plan.private,
+        "repo_exists": plan.repo_exists,
+        "licenses": [a.model_dump(mode="json") for a in plan.licenses],
+        "devices": [d.model_dump(mode="json") for d in plan.devices],
+        "repairs": plan.repairs,
+        "files": [f.model_dump(mode="json", exclude={"local_path"}) for f in plan.files],
+        "upload_bytes": plan.upload_bytes,
+        "warnings": plan.warnings,
+        "preview_dir": str(preview_dir) if preview_dir is not None else None,
+        "dry_run": dry_run,
+        "url": None,
+    }
+    if dry_run:
+        console.print(f"Dry run: nothing was uploaded. The model card is in {preview_dir}.")
+        state.emit(payload)
+        return ExitCode.WARNINGS if plan.warnings else ExitCode.SUCCESS
+
+    visibility = "private" if plan.private else "PUBLIC"
+    question = (
+        f"Upload {len(plan.files)} files ({human_bytes(plan.upload_bytes)}) to "
+        f"{plan.url} as a {visibility} repository?"
+    )
+    if not console.confirm(question, default=False, assume_yes=yes):
+        raise CancelledError(
+            diagnostic(
+                "publish.declined",
+                FailureCategory.USER_CANCELLED,
+                "Nothing was uploaded",
+                f"{plan.repo_id} was left as it was.",
+                remediation=["Re-run with --yes to upload without a prompt."],
+            )
+        )
+    console.print(f"Uploading to {plan.url} ...")
+    url = service.publish(plan)
+    console.print(f"[green]Published[/] {plan.artifact_id}: {url}")
+    payload["url"] = url
+    state.emit(payload)
+    return ExitCode.WARNINGS if plan.warnings else ExitCode.SUCCESS
+
+
 def _serve_dependencies() -> Callable[..., object]:
     """Import the optional web stack, or say exactly how to install it."""
     try:

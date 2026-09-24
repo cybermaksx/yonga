@@ -199,6 +199,22 @@ yonga remove ARTIFACT               # artifact + its compile cache, nothing else
 TTFT 276 ms • 18.2 tok/s • TPOT 55.0 ms/token • 20 → 159 tokens
 ```
 
+### Publish it
+
+```bash
+yonga publish ARTIFACT --repo you/model-openvino-int4 --dry-run   # card + upload list, no upload
+yonga publish ARTIFACT --repo you/model-openvino-int4             # private repo, asks first
+yonga publish ARTIFACT --repo you/model-openvino-int4 --public --yes
+```
+
+The model card is generated from the manifest. It says the artifact is a quantized conversion,
+not a fine-tune, and lists the lineage with revisions, the export settings, every repair with
+digests, which devices passed a probe (and which failed or were never tested), and every file's
+SHA-256. The licenses of both the requested model and the converted source are checked on the Hub
+first. A license that forbids derivatives refuses. One yonga cannot classify needs
+`--license-reviewed`, your statement that you read it. Local paths, your login name and hostname
+never leave the machine.
+
 ### Serve it to other tools
 
 `pip install -e ".[serve]"` once, then:

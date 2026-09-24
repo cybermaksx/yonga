@@ -40,7 +40,7 @@ The end-to-end path (`prepare` → `probe` → `chat` → `bench`) has been exer
 
 ## What works today
 
-Thirteen commands; `registry` has three subcommands and `env` two:
+Fourteen commands; `registry` has three subcommands and `env` two:
 
 | Command | What it does |
 |---|---|
@@ -53,6 +53,7 @@ Thirteen commands; `registry` has three subcommands and `env` two:
 | `yonga probe ARTIFACT --device D` | Compiles the artifact's submodels on a device and reports what worked, with timings. |
 | `yonga chat ARTIFACT` | A local chat session with slash commands, hidden reasoning by default, and a metrics footer. |
 | `yonga bench ARTIFACT` | Runs a prompt suite and writes a reproducible JSON result under the data directory. |
+| `yonga publish ARTIFACT --repo NS/NAME` | Uploads an artifact to the Hugging Face Hub in one commit, with a model card generated from its manifest: lineage, quantization, every repair, per-device probe evidence, file digests. Checks both source licenses first; private by default; `--dry-run` writes the card locally. |
 | `yonga serve ARTIFACT` | An OpenAI-compatible HTTP API (`/v1/models`, `/v1/chat/completions` with SSE streaming, `/health`) over the same session `chat` uses, bound to `127.0.0.1` by default. |
 | `yonga env list` / `env remove KEY` | The isolated environments `prepare` builds when a model's exporter needs package versions other than the installed ones, and the disk they use. |
 | `yonga logs [JOB_ID]` | Lists job logs, prints one as a table, or `--raw` for the JSON Lines file. |

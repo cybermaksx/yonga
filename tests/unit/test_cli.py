@@ -50,6 +50,7 @@ from yonga.adapters import (
     FilesystemProbe,
     HardwareProbe,
     HubClient,
+    HubPublisher,
     RuntimeProbe,
 )
 from yonga.adapters.filesystem import system_temp_dir
@@ -531,6 +532,7 @@ def test_help_lists_every_documented_command(runner: CliRunner) -> None:
         "search",
         "env",
         "serve",
+        "publish",
     ):
         assert command in result.stdout
 
@@ -1712,3 +1714,101 @@ def test_serve_refuses_a_port_in_use_before_loading_anything(
     assert result.exit_code == int(ExitCode.REGISTRY)
     assert f"Cannot listen on 127.0.0.1:{port}" in result.stderr
     assert factory.opened == []
+
+
+# ======================================================================
+# publish
+# ======================================================================
+class PublishingWiring(FakeWiring):
+    """A FakeWiring whose Hub writer records instead of uploading."""
+
+    def __init__(self, settings: Settings, publisher: HubPublisher, hub: HubClient) -> None:
+        super().__init__(settings, hub=hub)
+        self._publisher = publisher
+
+    def hub_publisher(self) -> HubPublisher:
+        return self._publisher
+
+
+def _prepared_artifact_id(runner: CliRunner, home: Path, tmp_path: Path) -> str:
+    result = invoke(
+        runner,
+        home,
+        ["prepare", SAFETENSORS_REPO, "--device", "cpu", "--yes", "--json"],
+        factory=lambda settings: FakeWiring(settings, hub=hub_with(tmp_path=tmp_path)),
+    )
+    payload = json.loads(result.stdout)
+    return str(payload["artifact_id"])
+
+
+def _publish(
+    runner: CliRunner, home: Path, tmp_path: Path, args: Sequence[str], publisher: HubPublisher
+) -> Result:
+    hub = hub_with(tmp_path=tmp_path)
+    return invoke(
+        runner,
+        home,
+        ["publish", *args],
+        factory=lambda settings: PublishingWiring(settings, publisher, hub=hub),
+    )
+
+
+def test_publish_dry_run_writes_the_card_and_uploads_nothing(
+    runner: CliRunner, home: Path, tmp_path: Path
+) -> None:
+    from tests.unit.test_publish import FakePublisher, someone
+
+    artifact_id = _prepared_artifact_id(runner, home, tmp_path)
+    publisher = FakePublisher(someone())
+    preview = tmp_path / "preview"
+    result = _publish(
+        runner,
+        home,
+        tmp_path,
+        [artifact_id, "--repo", "someone/model", "--dry-run", "--output", str(preview)],
+        publisher,
+    )
+
+    assert result.exit_code in (int(ExitCode.SUCCESS), int(ExitCode.WARNINGS)), result.stderr
+    assert publisher.commits == []
+    assert "not a fine-tune" in (preview / "README.md").read_text(encoding="utf-8")
+    assert "Publication plan" in result.stdout
+    assert "nothing was uploaded" in result.stdout
+
+
+def test_publish_without_yes_in_a_script_uploads_nothing(
+    runner: CliRunner, home: Path, tmp_path: Path
+) -> None:
+    from tests.unit.test_publish import FakePublisher, someone
+
+    artifact_id = _prepared_artifact_id(runner, home, tmp_path)
+    publisher = FakePublisher(someone())
+    result = _publish(runner, home, tmp_path, [artifact_id, "--repo", "someone/m"], publisher)
+
+    assert result.exit_code == int(ExitCode.CANCELLED)
+    assert publisher.commits == []
+
+
+def test_publish_with_yes_uploads_privately_and_reports_the_url(
+    runner: CliRunner, home: Path, tmp_path: Path
+) -> None:
+    from tests.unit.test_publish import FakePublisher, someone
+
+    artifact_id = _prepared_artifact_id(runner, home, tmp_path)
+    publisher = FakePublisher(someone())
+    result = _publish(
+        runner, home, tmp_path, [artifact_id, "--repo", "someone/m", "--yes", "--json"], publisher
+    )
+
+    payload = one_document(result)
+    (commit,) = publisher.commits
+    assert commit.private is True
+    assert payload["url"] == "https://huggingface.co/someone/m/commit/abc123"
+    assert payload["private"] is True
+
+
+def test_publish_requires_a_destination(runner: CliRunner, home: Path) -> None:
+    result = invoke(runner, home, ["publish", "anything"])
+
+    assert result.exit_code != 0
+    assert "--repo" in result.stderr

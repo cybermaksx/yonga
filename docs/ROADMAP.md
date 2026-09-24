@@ -125,12 +125,19 @@ and the official `openai` Python client: plain, streamed and multi-turn completi
 mapping, and a disconnected 1500-token stream releasing the GPU (the next request answered in
 0.43 s). Not done: images, tool calls, stop sequences, concurrent generation.
 
-**2.2 — `yonga publish`. [M]**
-`SPEC.md` §21. The manifest already carries everything a generated model card needs — source
-lineage and revisions, quantization, repairs applied, device probe evidence, software versions.
-The discipline in that section's requirement list matters more than the plumbing: never describe a
-quantized conversion as a fine-tune, never label an artifact for a device whose probe failed, and
-always disclose repairs.
+**2.2 — `yonga publish`. [done]**
+One-commit upload of the manifest's files, the source's license files, a generated model card and
+an anonymised `yonga-manifest.json`. Every §21 requirement is a refusal with its own code, checked
+before upload: explicit destination, write access to the namespace, `--update` for an existing
+repo, both source licenses read fresh from the Hub (derivative-forbidding ones refuse, unrecognised
+ones need `--license-reviewed`), a ready artifact, and file digests that still match. The card
+calls the artifact a quantized conversion, not a fine-tune. It shows a device as working only on a
+passing probe, lists failed and untested devices explicitly, flags a profile whose target device
+was not verified, and discloses every repair with digests. Verified on the reference host by dry
+runs of the Qwen3.5-9B artifacts: the card and manifest contain no home path or login name, the
+Apache `LICENSE` is included, and the `npu-int4-sym-cw` artifact is described as verified on GPU
+only. An unauthenticated real upload is refused at planning (exit 21). **Nothing has been uploaded
+to the Hub yet**; the upload path is covered by a fake publisher and adapter tests.
 
 **2.3 — Remote registry. [M]**
 `REGISTRY_SPEC.md` §12. Compatibility knowledge moves faster than releases. This must be signed and

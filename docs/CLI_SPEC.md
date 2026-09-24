@@ -368,6 +368,55 @@ When `YONGA_API_KEY` is set in the environment, every endpoint except `/health` 
 `Authorization: Bearer <key>` (401 otherwise). The key is never logged or echoed. Binding a
 non-loopback address prints a warning, a stronger one without a key.
 
+## 14a. `publish`
+
+```bash
+yonga publish ARTIFACT --repo NAMESPACE/NAME \
+  [--public] \
+  [--update] \
+  [--license-reviewed] \
+  [--dry-run] [--output DIR] \
+  [--yes] [--json]
+```
+
+Implements `SPEC.md` section 21. The destination is always explicit, and the repository is private
+unless `--public` is passed. Before anything is uploaded, planning checks the following and refuses
+when a check fails:
+
+| Check | Refusal |
+|---|---|
+| `--repo` is `NAMESPACE/NAME` | `publish.repo_invalid` (70) |
+| not in offline mode | `publish.offline` (70) |
+| the artifact is ready: validated, one device probed OK | `publish.artifact_not_ready` (70) |
+| a token exists, can write, and owns the namespace (account or organisation) | `publish.hub.not_logged_in`, `…read_only_token`, `…foreign_namespace` (21) |
+| an existing repository is only written with `--update` | `publish.repo_exists` (70) |
+| no license involved forbids derivatives (`-nd`) | `publish.license.restricted` (70); `--license-reviewed` does not override it |
+| every license is recognised, or `--license-reviewed` states it was read | `publish.license.unreviewed` (70) |
+| every file still matches the manifest's SHA-256 | `publish.files_changed` (70) |
+
+Licenses are read fresh from the Hub for the requested model **and** the converted source: a
+derivative is bound by both. Recognised identifiers are permissive (`apache-2.0`, `mit`, `bsd-*`,
+`cc-by-4.0`, …), conditional (`llama3*`, `gemma`, `*openrail*`, `cc-by-nc-*`; allowed, and the card
+says the terms carry over), or restricted. Anything else, including no license, is unknown.
+`--yes` never implies `--license-reviewed`.
+
+The upload is one commit: the files the manifest lists, the source's `LICENSE*`/`NOTICE*`/
+`USE_POLICY*` files, a generated `README.md` and `yonga-manifest.json`, the manifest with the home
+directory, login name and hostname anonymised and secrets redacted. The artifact's `.yonga/`
+directory (repair backups, validation records) is never uploaded.
+
+The model card states that the artifact is a quantized conversion and not a fine-tune. It lists
+lineage with revisions and licenses, every export setting and package version, and every repair
+with its before and after digests. Devices appear with probe evidence: `works` only for a passing
+probe, `failed` with the diagnostic code, `not tested` for a device never probed. It also says so
+when the profile's target device is not among the verified ones, and lists every file with its
+SHA-256.
+
+`--dry-run` runs every check (credential problems become warnings) and writes `README.md`,
+`yonga-manifest.json` and `upload.txt` (digest, size and path of every file) to `--output`, by
+default `./yonga-publish-<artifact>`. Nothing is uploaded. Without `--dry-run` the upload asks for
+confirmation; `--yes` approves it, and a non-interactive run without `--yes` exits 60.
+
 ## 15. Exit codes
 
 Reserve stable classes:

@@ -31,6 +31,7 @@ from yonga.adapters import (
     FilesystemProbe,
     HardwareProbe,
     HubClient,
+    HubPublisher,
     HubSearch,
 )
 from yonga.adapters import RuntimeProbe as RuntimeProbePort
@@ -45,6 +46,7 @@ from yonga.application.inspect_model import InspectService
 from yonga.application.prepare import PrepareService, SmokeTester
 from yonga.application.probe import LocalArtifactStore, ProbeService
 from yonga.application.progress import ProgressSink
+from yonga.application.publish import PublishService
 from yonga.application.search import SearchService
 from yonga.config.paths import Paths
 from yonga.config.settings import Settings
@@ -339,6 +341,22 @@ class Wiring:
     def search_service(self) -> SearchService:
         """Build the ``yonga search`` service. It needs the Hub, never the hardware."""
         return SearchService(self.hub_search(), self.registry_resolver())
+
+    def hub_publisher(self) -> HubPublisher:
+        """Return the Hub writer. Built only by ``publish``; nothing else uploads."""
+        from yonga.adapters.hf_publish import HfPublisher
+
+        return HfPublisher()
+
+    def publish_service(self) -> PublishService:
+        """Build the ``yonga publish`` service."""
+        return PublishService(
+            store=self.artifact_store(),
+            hub=self.hub_client(),
+            publisher=self.hub_publisher(),
+            resolver=self.registry_resolver(),
+            settings=self._settings,
+        )
 
     def runtime_probe(self) -> RuntimeProbePort:
         """Return the OpenVINO runtime probe.
