@@ -46,11 +46,12 @@ dynamic-shape rule does, and the GenAI pipeline smoke test decides. A deferred f
 a device by itself — without pipeline evidence it stays failed. A second bug sat behind it: GenAI
 needs `MAX_PROMPT_LEN` as an integer, and every property yonga records is a string.
 
-**0.4 — Squash the 7 MB test fixture out of git history before the first push. [needs a decision]**
-Commit `65f4e4a` added `tests/fixtures/artifacts/tinyllm/` — twelve blobs, 7,406,017 bytes in total,
-the largest being a 3.6 MB `tokenizer.json`. `ff2dd19` removed it from the tree in favour of
-generating the tiny artifact, but every blob is still reachable in history and every clone will pay
-for it. This rewrites history, so it is the repository owner's call.
+**0.4 — Squash the 7 MB test fixture out of git history before the first push. [done]**
+An early commit added `tests/fixtures/artifacts/tinyllm/` — twelve blobs, 7,406,017 bytes — and a
+later one removed it in favour of generating the artifact, but the blobs stayed reachable in
+history. On 2026-09-24 the directory was filtered out of every commit: all thirteen commits and
+their messages are kept, the final tree is byte-identical, and `.git` went from 7.0 MB to 964 KB.
+Every commit from the one that added the fixture onward has a new SHA.
 
 **0.5 — NPU probes of large models are slow now, honestly. [partly done]**
 Because deferral hands the verdict to a real pipeline build, `yonga probe` of a large model on the
@@ -138,7 +139,6 @@ Small, real, and worth clearing before the next feature.
 
 | Where | What |
 |---|---|
-| job logs | Four pre-fix logs on the reference host still carry a 71-variable environment dump. No token-shaped string survives in them, and `--bundle` re-redacts and anonymises them before they could be shared, but the files themselves should be deleted. That deletes user data, so it is the owner's call. |
 | `docs/PROFILE_COMPARISON.md` | Measures size and speed only. Output quality was never evaluated, and that gap is the interesting one — a symmetric channel-wise INT4 artifact and an asymmetric group-128 one are not expected to be equally accurate. |
 
 ---
