@@ -269,6 +269,19 @@ question about `Qwen/Qwen3-0.6B` and the two rows swap: `arch-qwen3_5` is reject
 sections below it — model rule, profile, chat profile, derivative sources and candidates, and the
 per-device verdict with the rule that produced each one.
 
+### Newer registry knowledge between releases
+
+```bash
+cp publisher.pub ~/.config/yonga/registry-keys/      # trust a signing key: your decision, by hand
+yonga registry update --url https://example.org/yonga/bundle.json
+yonga registry status                                # which bundle, which key, still valid?
+yonga registry reset                                 # back to the built-in rules
+```
+
+A bundle is verified completely before it is installed, and again every time it is used. It must
+be signed by a trusted key, current, not older than the installed one, and plain YAML naming only
+repairs yonga already contains. A bundle that stops verifying is ignored, never trusted.
+
 Note that `registry validate` checks *structure and internal consistency*, not that device names or
 weight formats are ones OpenVINO actually supports — an override declaring `device: MARS` validates
 cleanly, by design, so a future device needs no code change.

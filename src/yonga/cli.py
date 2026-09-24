@@ -438,7 +438,7 @@ app = typer.Typer(
 )
 registry_app = typer.Typer(
     name="registry",
-    help="Inspect and validate the compatibility registry.",
+    help="Inspect, validate and update the compatibility registry.",
     no_args_is_help=True,
     add_completion=False,
 )
@@ -1707,6 +1707,215 @@ def _registry_paths(state: CliState) -> ExitCode:
     for name, value in paths.as_dict().items():
         state.console.print(f"  {name:<24} {value}")
     return ExitCode.SUCCESS
+
+
+@registry_app.command("update")
+def registry_update(
+    ctx: typer.Context,
+    url: str | None = typer.Option(
+        None, "--url", help="Bundle URL (https); the signature is fetched from URL.sig."
+    ),
+    file: Path | None = typer.Option(None, "--file", help="A bundle already on disk."),
+    signature: Path | None = typer.Option(
+        None, "--signature", help="Its signature (default: FILE.sig)."
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Install without a prompt."),
+    json_output: bool = typer.Option(False, "--json", help="Emit the outcome as JSON."),
+) -> None:
+    """Fetch, verify and install a signed remote registry bundle."""
+    state = cli_state(ctx, json_output=json_output)
+    _dispatch(
+        state,
+        lambda: _registry_update(state, url=url, file=file, signature=signature, yes=yes),
+    )
+
+
+def _registry_update(
+    state: CliState,
+    *,
+    url: str | None,
+    file: Path | None,
+    signature: Path | None,
+    yes: bool,
+) -> ExitCode:
+    """Verify a bundle completely, show what it changes, then install it."""
+    from yonga.registry.remote import RemoteRegistryStore, fetch
+
+    settings = state.settings
+    if settings.registry_update_policy == "never":
+        raise ConfigurationError(
+            diagnostic(
+                "registry.remote.disabled",
+                FailureCategory.CONFIGURATION_ERROR,
+                "Remote registry updates are disabled",
+                "registry_update_policy is 'never' in the configuration.",
+                remediation=['Set registry_update_policy = "manual" to allow updates.'],
+            )
+        )
+    if file is not None:
+        source = str(file)
+        try:
+            bundle_bytes = file.read_bytes()
+            signature_bytes = (signature or file.with_name(file.name + ".sig")).read_bytes()
+        except OSError as error:
+            raise ConfigurationError(
+                diagnostic(
+                    "registry.remote.file_unreadable",
+                    FailureCategory.CONFIGURATION_ERROR,
+                    "The bundle could not be read",
+                    str(error),
+                )
+            ) from error
+    else:
+        target = url or settings.registry_url
+        if not target:
+            raise ConfigurationError(
+                diagnostic(
+                    "registry.remote.no_source",
+                    FailureCategory.CONFIGURATION_ERROR,
+                    "No registry bundle to update from",
+                    "Neither --url, --file nor registry_url in the configuration is set.",
+                    remediation=["yonga registry update --url https://…/bundle.json"],
+                )
+            )
+        if settings.offline:
+            raise ConfigurationError(
+                diagnostic(
+                    "registry.remote.offline",
+                    FailureCategory.CONFIGURATION_ERROR,
+                    "Updating the registry needs the network",
+                    "yonga is in offline mode.",
+                    remediation=["Use --file with a bundle you already have."],
+                )
+            )
+        source = target
+        bundle_bytes = fetch(target)
+        signature_bytes = fetch(target + ".sig", limit=64 * 1024)
+
+    store = RemoteRegistryStore(settings.paths)
+    verified = store.verify(bundle_bytes, signature_bytes)
+    current = state.graph.registry()
+    incoming = [rule for document in verified.documents for rule in document.rules()]
+    known = set(current.rule_ids)
+    replaced = sorted(rule.id for rule in incoming if rule.id in known)
+    added = sorted(rule.id for rule in incoming if rule.id not in known)
+    bundle = verified.bundle
+    payload: dict[str, object] = {
+        "version": bundle.version,
+        "key_id": verified.key_id,
+        "sha256": verified.sha256,
+        "created_at": bundle.created_at.isoformat(),
+        "expires_at": bundle.expires_at.isoformat(),
+        "description": bundle.description,
+        "added": added,
+        "replaced": replaced,
+        "source": source,
+        "installed": False,
+    }
+    console = state.console
+    console.print(f"Signed by key {verified.key_id}; signature verified.")
+    console.print(
+        f"Bundle version {bundle.version}, created {bundle.created_at:%Y-%m-%d}, "
+        f"expires {bundle.expires_at:%Y-%m-%d}"
+    )
+    if bundle.description:
+        console.print(f"  {bundle.description}")
+    console.print(f"Adds {len(added)} rule(s), replaces {len(replaced)}.")
+    for rule_id in added:
+        console.detail(f"+ {rule_id}")
+    for rule_id in replaced:
+        console.detail(f"~ {rule_id}")
+    if not console.confirm("Install this registry bundle?", default=False, assume_yes=yes):
+        raise CancelledError(
+            diagnostic(
+                "registry.remote.declined",
+                FailureCategory.USER_CANCELLED,
+                "The registry was not changed",
+                "The bundle verified, but was not installed.",
+                remediation=["Re-run with --yes to install it without a prompt."],
+            )
+        )
+    store.install(verified, bundle_bytes, signature_bytes, source=source)
+    payload["installed"] = True
+    console.print(f"[green]Installed[/] registry bundle version {bundle.version}.")
+    state.emit(payload)
+    return ExitCode.SUCCESS
+
+
+@registry_app.command("status")
+def registry_status(
+    ctx: typer.Context,
+    json_output: bool = typer.Option(False, "--json", help="Emit the status as JSON."),
+) -> None:
+    """Show the installed remote registry bundle and whether it still verifies."""
+    state = cli_state(ctx, json_output=json_output)
+    _dispatch(state, lambda: _registry_status(state))
+
+
+def _registry_status(state: CliState) -> ExitCode:
+    """Re-verify the installed bundle from scratch and report what is in use."""
+    from yonga.registry.remote import RemoteRegistryStore, trusted_keys
+
+    settings = state.settings
+    store = RemoteRegistryStore(settings.paths)
+    installed = store.state()
+    keys = trusted_keys(settings.paths)
+    problem: str | None = None
+    in_use = False
+    if installed is not None:
+        try:
+            in_use = store.load() is not None and settings.registry_update_policy != "never"
+        except RegistryError as error:
+            problem = f"{error.diagnostic.code}: {error.diagnostic.message}"
+    payload: dict[str, object] = {
+        "policy": settings.registry_update_policy,
+        "trusted_keys": [{"key_id": k.key_id, "file": str(k.source)} for k in keys],
+        "installed": installed.model_dump(mode="json") if installed is not None else None,
+        "in_use": in_use,
+        "problem": problem,
+    }
+    if state.json_mode:
+        state.emit(payload)
+        return ExitCode.WARNINGS if problem else ExitCode.SUCCESS
+    console = state.console
+    console.print(f"Update policy   {settings.registry_update_policy}")
+    console.print(
+        f"Trusted keys    {', '.join(k.key_id for k in keys) or 'none'}  "
+        f"({settings.paths.registry_keys_dir})"
+    )
+    if installed is None:
+        console.print("Remote bundle   none installed; the built-in registry is in use.")
+        return ExitCode.SUCCESS
+    console.print(
+        f"Remote bundle   version {installed.version}, key {installed.key_id}, "
+        f"expires {installed.expires_at:%Y-%m-%d}, from {installed.source}"
+    )
+    if problem:
+        console.print(f"[yellow]Not in use:[/] {problem}")
+        return ExitCode.WARNINGS
+    console.print("In use          " + ("yes" if in_use else "no (policy is 'never')"))
+    return ExitCode.SUCCESS
+
+
+@registry_app.command("reset")
+def registry_reset(
+    ctx: typer.Context,
+    json_output: bool = typer.Option(False, "--json", help="Emit the outcome as JSON."),
+) -> None:
+    """Remove the installed remote bundle and go back to the built-in registry."""
+    state = cli_state(ctx, json_output=json_output)
+
+    def run() -> ExitCode:
+        from yonga.registry.remote import RemoteRegistryStore
+
+        removed = RemoteRegistryStore(state.settings.paths).reset()
+        state.console.print(
+            "Removed the remote registry bundle." if removed else "No remote bundle was installed."
+        )
+        state.emit({"removed": removed})
+        return ExitCode.SUCCESS
+
+    _dispatch(state, run)
 
 
 # ======================================================================

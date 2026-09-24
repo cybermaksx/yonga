@@ -79,6 +79,20 @@ class Paths:
         """Directory holding user-supplied compatibility registry overrides."""
         return self.config_dir / REGISTRY_OVERRIDES_DIRNAME
 
+    @property
+    def registry_keys_dir(self) -> Path:
+        """Public keys the user trusts to sign remote registry bundles.
+
+        Configuration, not data: trusting a key is a decision the user makes by
+        putting a file here, and nothing yonga downloads can add one.
+        """
+        return self.config_dir / "registry-keys"
+
+    @property
+    def remote_registry_dir(self) -> Path:
+        """The verified remote registry bundle, re-verified every time it is loaded."""
+        return self.data_dir / "registry-remote"
+
     # --- cache ---------------------------------------------------------
     @property
     def tmp_dir(self) -> Path:
@@ -175,6 +189,8 @@ class Paths:
             "data_dir": str(self.data_dir),
             "config_file": str(self.config_file),
             "registry_overrides_dir": str(self.registry_overrides_dir),
+            "registry_keys_dir": str(self.registry_keys_dir),
+            "remote_registry_dir": str(self.remote_registry_dir),
             "tmp_dir": str(self.tmp_dir),
             "compile_cache_dir": str(self.compile_cache_dir),
             "metadata_cache_dir": str(self.metadata_cache_dir),

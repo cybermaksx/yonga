@@ -55,6 +55,8 @@ BUILTIN_FILENAMES: tuple[str, ...] = (
 REGISTRY_SUFFIXES: tuple[str, ...] = (".yaml", ".yml")
 
 _BUILTIN_LAYER = "builtin"
+#: Name of the verified remote bundle's layer.
+REMOTE_LAYER = "remote"
 
 __all__ = [
     "BUILTIN_DIRNAME",
@@ -62,6 +64,7 @@ __all__ = [
     "BUILTIN_PACKAGE",
     "KNOWN_REPAIR_IMPLEMENTATIONS",
     "REGISTRY_SUFFIXES",
+    "REMOTE_LAYER",
     "builtin_registry_dir",
     "load_builtin_documents",
     "load_builtin_registry",
@@ -341,8 +344,16 @@ def registry_override_dirs(
 def load_registry(
     paths: Paths | None = None,
     extra_dirs: Sequence[Path] = (),
+    *,
+    remote_documents: Sequence[RegistryDocument] = (),
 ) -> Registry:
-    """Load the built-in registry, then apply user override directories.
+    """Load the built-in registry, then a verified remote layer, then user overrides.
+
+    ``remote_documents`` are the documents of a remote bundle that already
+    passed :func:`yonga.registry.remote.verify_bundle`; this function trusts its
+    caller for that. They form one layer after the built-in rules, so a bundle
+    can update shipped knowledge, and before every user override, so the user's
+    own rules always win.
 
     ``paths`` supplies ``Paths.registry_overrides_dir``; ``extra_dirs`` adds
     further directories after it (later layers win). Each directory is one merge
@@ -351,6 +362,8 @@ def load_registry(
     """
     merger = _Merger()
     merger.add_layer(_Layer(_BUILTIN_LAYER, load_builtin_documents()))
+    if remote_documents:
+        merger.add_layer(_Layer(REMOTE_LAYER, list(remote_documents)))
     for directory in registry_override_dirs(paths, extra_dirs):
         documents = override_documents(directory)
         if documents:

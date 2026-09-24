@@ -300,9 +300,33 @@ Desired advanced commands:
 yonga registry explain MODEL [--device DEVICE]
 yonga registry validate
 yonga registry paths
+yonga registry update [--url URL | --file BUNDLE [--signature SIG]] [--yes] [--json]
+yonga registry status [--json]
+yonga registry reset
 ```
 
 `explain` prints matched rules and why they won.
+
+`update` installs a remote registry bundle (`REGISTRY_SPEC.md` section 12). The URL defaults to
+`registry_url` in the configuration, which is unset: yonga contacts no registry server unless told
+to. It fetches `URL` and `URL.sig` over HTTPS only, or reads `--file` and `FILE.sig`. It then
+verifies the bundle completely, prints the signing key, the bundle's version and expiry and the
+rules it adds or replaces, and installs it after confirmation (`--yes` approves). Refusals, exit 70:
+`registry.remote.no_trusted_keys`, `untrusted_key`, `bad_signature`, `signature_malformed`,
+`expired`, `rollback` (older than the installed bundle), `tool_too_old`, `unsafe_path`,
+`unknown_repair_implementation` (a repair rule naming code this yonga does not contain),
+`too_large`, `insecure_url`. `registry_update_policy = "never"` refuses updates and ignores an
+installed bundle.
+
+The installed bundle is one layer between the built-in rules and the user override directories,
+and is verified again every time the registry loads. One that no longer verifies (expired, edited
+on disk, its key removed) is left out and the built-in registry is used; `status` reports why and
+exits 2. `reset` removes the bundle.
+
+Trust is configuration: a key is trusted when its public key (base64 of the raw 32-byte Ed25519 key,
+one line) is a `*.pub` file in `registry-keys/` under the configuration directory. yonga ships no
+key, and nothing it downloads can add one. `tools/registry_bundle.py` creates keys and builds signed
+bundles.
 
 ## 12a. `env`
 

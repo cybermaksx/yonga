@@ -51,12 +51,13 @@ from yonga.application.search import SearchService
 from yonga.config.paths import Paths
 from yonga.config.settings import Settings
 from yonga.domain.artifacts import ArtifactManifest, ProbeResult, ProbeStatus
-from yonga.domain.diagnostics import ConfigurationError, FailureCategory, diagnostic
+from yonga.domain.diagnostics import ConfigurationError, FailureCategory, RegistryError, diagnostic
 from yonga.domain.hardware import OpenVINODevice
 from yonga.domain.models import PipelineKind
 from yonga.registry.loader import load_registry
+from yonga.registry.remote import RemoteRegistryStore
 from yonga.registry.resolver import RegistryResolver, installed_registry_versions
-from yonga.registry.schema import Registry
+from yonga.registry.schema import Registry, RegistryDocument
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from collections.abc import Mapping, Sequence
@@ -400,8 +401,25 @@ class Wiring:
     def registry(self) -> Registry:
         """Load the builtin registry merged with the user's override layers."""
         if self._registry is None:
-            self._registry = load_registry(self.paths)
+            self._registry = load_registry(
+                self.paths, remote_documents=self.remote_registry_documents()
+            )
         return self._registry
+
+    def remote_registry_documents(self) -> list[RegistryDocument]:
+        """The installed remote bundle's documents, verified again; empty when unusable.
+
+        A bundle that no longer verifies (expired, edited on disk, its key
+        removed) is left out rather than failing every command: the built-in
+        registry is always a safe answer. ``yonga registry status`` says why.
+        """
+        if self._settings.registry_update_policy == "never":
+            return []
+        try:
+            verified = RemoteRegistryStore(self.paths).load()
+        except RegistryError:
+            return []
+        return [] if verified is None else list(verified.documents)
 
     def registry_resolver(self) -> RegistryResolver:
         """Return a resolver bound to the loaded registry and the host's tags."""

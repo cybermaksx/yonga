@@ -232,6 +232,39 @@ Built-in rules are shipped with the package and covered by tests. Every compatib
 
 A future remote registry must be authenticated/signed before automatic use. MVP should not fetch executable repair logic from the network.
 
+### 12.1 Remote bundles (implemented)
+
+A remote registry is distributed as one JSON document plus a detached signature:
+
+```json
+{
+  "format": 1,
+  "version": 7,
+  "created_at": "2026-09-24T12:00:00+00:00",
+  "expires_at": "2026-12-23T12:00:00+00:00",
+  "min_tool_version": "0.1.0",
+  "description": "NPU driver 1.30 signatures",
+  "files": {"issues/npu-1.30.yaml": "schema_version: 1\nissues:\n  - ..."}
+}
+```
+
+```json
+{"format": 1, "key_id": "40eb0328d070643d", "signature": "<base64 Ed25519 signature of the bundle bytes>"}
+```
+
+A bundle is used only when all of the following hold, and they are checked again on every load:
+
+- the signature verifies against a key in `registry-keys/`;
+- it has not expired, and its `version` is not lower than the installed one;
+- `min_tool_version`, when set, is not newer than the running yonga;
+- every file is a relative `.yaml`/`.yml` path and parses with `yaml.safe_load` into the strict
+  schema;
+- every repair rule names an implementation already compiled into yonga. Registry data selects a
+  built-in repair; it can never deliver one.
+
+The bundle forms one layer after the built-in rules and before user overrides: it may replace a
+shipped rule by id, and a user override replaces either.
+
 ## 13. Registry tests
 
 Required tests:

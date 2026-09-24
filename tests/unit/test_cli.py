@@ -1812,3 +1812,89 @@ def test_publish_requires_a_destination(runner: CliRunner, home: Path) -> None:
 
     assert result.exit_code != 0
     assert "--repo" in result.stderr
+
+
+# ======================================================================
+# registry update / status / reset
+# ======================================================================
+def _signed_bundle(tmp_path: Path, home: Path) -> Path:
+    """A signed bundle on disk, its key trusted in ``home``'s config directory."""
+    import base64
+
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    from tests.unit.test_remote_registry import bundle
+    from yonga.registry.remote import sign_bundle
+
+    key = Ed25519PrivateKey.generate()
+    keys = home / "config" / "registry-keys"
+    keys.mkdir(parents=True, exist_ok=True)
+    raw = key.public_key().public_bytes_raw()
+    (keys / "publisher.pub").write_text(base64.b64encode(raw).decode(), encoding="utf-8")
+    payload = bundle()
+    target = tmp_path / "bundle.json"
+    target.write_bytes(payload)
+    (tmp_path / "bundle.json.sig").write_bytes(sign_bundle(payload, key))
+    return target
+
+
+def test_registry_update_verifies_shows_and_installs(
+    runner: CliRunner, home: Path, tmp_path: Path
+) -> None:
+    target = _signed_bundle(tmp_path, home)
+
+    result = invoke(runner, home, ["registry", "update", "--file", str(target), "--yes"])
+
+    assert result.exit_code == int(ExitCode.SUCCESS), result.stderr
+    assert "signature verified" in result.stdout
+    assert "Adds 1 rule(s), replaces 0." in result.stdout
+    status = invoke(runner, home, ["registry", "status", "--json"])
+    payload = one_document(status)
+    assert payload["in_use"] is True
+    assert payload["installed"]["version"] == 1  # type: ignore[index]
+
+
+def test_registry_update_without_a_trusted_key_changes_nothing(
+    runner: CliRunner, home: Path, tmp_path: Path
+) -> None:
+    target = _signed_bundle(tmp_path, home)
+    (home / "config" / "registry-keys" / "publisher.pub").unlink()
+
+    result = invoke(runner, home, ["registry", "update", "--file", str(target), "--yes"])
+
+    assert result.exit_code == int(ExitCode.REGISTRY)
+    assert "No registry signing key is trusted" in result.stderr
+    assert not (home / "data" / "registry-remote" / "bundle.json").exists()
+
+
+def test_registry_update_without_yes_in_a_script_installs_nothing(
+    runner: CliRunner, home: Path, tmp_path: Path
+) -> None:
+    target = _signed_bundle(tmp_path, home)
+
+    result = invoke(runner, home, ["registry", "update", "--file", str(target)])
+
+    assert result.exit_code == int(ExitCode.CANCELLED)
+    assert not (home / "data" / "registry-remote" / "bundle.json").exists()
+
+
+def test_registry_update_with_no_source_says_how(runner: CliRunner, home: Path) -> None:
+    result = invoke(runner, home, ["registry", "update"])
+
+    assert result.exit_code == int(ExitCode.REGISTRY)
+    assert "--url" in result.stderr
+
+
+def test_registry_status_reports_a_bundle_that_stopped_verifying(
+    runner: CliRunner, home: Path, tmp_path: Path
+) -> None:
+    target = _signed_bundle(tmp_path, home)
+    invoke(runner, home, ["registry", "update", "--file", str(target), "--yes"])
+    (home / "config" / "registry-keys" / "publisher.pub").unlink()
+
+    result = invoke(runner, home, ["registry", "status"])
+
+    assert result.exit_code == int(ExitCode.WARNINGS)
+    assert "Not in use" in result.stdout
+    reset = invoke(runner, home, ["registry", "reset"])
+    assert "Removed the remote registry bundle." in reset.stdout

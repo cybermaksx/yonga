@@ -40,7 +40,7 @@ The end-to-end path (`prepare` → `probe` → `chat` → `bench`) has been exer
 
 ## What works today
 
-Fourteen commands; `registry` has three subcommands and `env` two:
+Fourteen commands; `registry` has six subcommands and `env` two:
 
 | Command | What it does |
 |---|---|
@@ -60,6 +60,7 @@ Fourteen commands; `registry` has three subcommands and `env` two:
 | `yonga registry validate` | Loads every registry layer and checks it is internally consistent. |
 | `yonga registry explain MODEL` | Shows which rules matched, which lost, and why. |
 | `yonga registry paths` | Where registry layers, configuration and managed data live. |
+| `yonga registry update` / `status` / `reset` | Installs a signed remote registry bundle after verifying it against a key you trust, reports whether the installed one still verifies, or removes it. |
 
 Global flags: `--json`, `--verbose`, `--debug`, `--offline`, `--config`, `--data-dir`, `--cache-dir`, `--version`.
 

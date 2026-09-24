@@ -51,6 +51,12 @@ manifest may change in any minor release.
   `yonga env list|remove` manage them and `doctor` reports their disk use. `--no-managed-env` restores
   the refusal; `--ignore-exporter-requirements` exports in the current environment and never builds
   one. Registry data can choose only a version for a package yonga lists, never a package of its own.
+- **Signed remote registry bundles:** `yonga registry update [--url | --file]`, `status`, `reset`.
+  A bundle is verified against Ed25519 keys the user trusts (yonga ships none) and refused when
+  expired, older than the installed one, or naming a path outside it. Every repair rule must name a
+  built-in implementation. The installed bundle is re-verified on every load and ignored if it
+  stops verifying. `cryptography` is now a dependency. `tools/registry_bundle.py` creates keys and
+  signed bundles.
 - **`yonga publish ARTIFACT --repo NS/NAME`** uploads a prepared artifact to the Hugging Face Hub
   in one commit, with a model card generated from the manifest. It refuses before uploading unless
   the destination is writable, both source licenses permit redistribution (read fresh from the Hub;

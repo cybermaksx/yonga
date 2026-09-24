@@ -49,6 +49,7 @@ dependencies = [
     "huggingface_hub>=1.0,<2",
     "psutil>=5.9",
     "PyYAML>=6",
+    "cryptography>=42",
 ]
 
 [project.optional-dependencies]

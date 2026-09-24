@@ -139,10 +139,17 @@ Apache `LICENSE` is included, and the `npu-int4-sym-cw` artifact is described as
 only. An unauthenticated real upload is refused at planning (exit 21). **Nothing has been uploaded
 to the Hub yet**; the upload path is covered by a fake publisher and adapter tests.
 
-**2.3 — Remote registry. [M]**
-`REGISTRY_SPEC.md` §12. Compatibility knowledge moves faster than releases. This must be signed and
-verified before automatic use, and must never be able to deliver executable repair logic — the
-YAML names a built-in implementation and that invariant is load-bearing.
+**2.3 — Remote registry. [done]**
+`yonga registry update | status | reset`, `REGISTRY_SPEC.md` §12.1. A bundle is one JSON document of
+registry YAML with a detached Ed25519 signature (`cryptography` is now a core dependency; the check
+is never optional). It is verified against keys the user placed in `registry-keys/` (yonga ships
+none), refused when expired or older than the installed one, and re-verified on every load, so an
+edit on disk withdraws it. Signed or not, it may only contain relative YAML paths, and every repair
+rule must name an implementation compiled into yonga. It is layered between built-in rules and user
+overrides. `tools/registry_bundle.py` makes keys and bundles. Verified end to end in scratch
+directories: untrusted refused, trusted installed and used, a one-byte edit on disk reported as
+`bad_signature` and dropped. There is no hosted registry or project signing key yet; that is
+infrastructure, not code.
 
 ---
 

@@ -147,6 +147,10 @@ class Settings(BaseSettings):
     bench_warmups: int = Field(default=1, ge=0)
     max_new_tokens: int = Field(default=4096, ge=1)
     registry_update_policy: Literal["never", "manual"] = "manual"
+    registry_url: str | None = None
+    """Where ``yonga registry update`` fetches a signed bundle from (``URL`` and ``URL.sig``).
+
+    Unset by default: yonga contacts no registry server unless told to."""
     telemetry: bool = False
     json_output: bool = False
     verbose: bool = False
