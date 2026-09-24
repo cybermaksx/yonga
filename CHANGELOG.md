@@ -98,6 +98,9 @@ manifest may change in any minor release.
 
 ### Fixed
 
+- **`bench` did not classify a model that failed to load.** It wrote a result with empty metrics and
+  exited 2, while `probe` and `chat` classified the same failure through the registry and exited
+  51. It now does the same, and no empty result is saved.
 - **GGUF-only repositories were described as unreadable by OpenVINO GenAI.** The code assumed the
   2026.4 build had no GGUF reader; it has one, verified above.
 - **A GGUF-only repository's architecture was reported as the first model type of the matching
@@ -138,13 +141,6 @@ manifest may change in any minor release.
   delivered as a new conversation. Multi-turn chat is unchanged: a history that
   genuinely extends the delivered turns is still continued incrementally. The LLM
   path is stateless and is not affected.
-
-### Known issues
-
-- `bench` does not classify a failed compile. When loading the artifact fails it
-  writes a result whose metrics are all empty, prints the raw exception under
-  "Errors" and exits 2. `probe` and `chat` classify the same failure through the
-  registry and exit 51. Use `yonga probe ARTIFACT --device D` to get the diagnosis.
 
 ## [0.1.0] - 2026-09-22
 

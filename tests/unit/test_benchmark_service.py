@@ -29,7 +29,13 @@ from yonga.application.probe import LocalArtifactStore
 from yonga.application.progress import CollectingSink
 from yonga.config.settings import Settings
 from yonga.domain.benchmarks import BenchmarkResult, GenerationSettings
-from yonga.domain.diagnostics import ConfigurationError
+from yonga.domain.diagnostics import (
+    ConfigurationError,
+    ExitCode,
+    FailureCategory,
+    YongaError,
+    diagnostic,
+)
 from yonga.domain.hardware import (
     DeviceKind,
     HardwareInventory,
@@ -642,11 +648,15 @@ def test_a_run_that_raises_is_an_error_entry_and_the_others_still_complete(
     assert aggregate.ttft_ms_mean == pytest.approx(200.0)
 
 
-def test_a_failed_load_is_recorded_rather_than_raised(
+def test_a_failed_load_is_a_typed_compile_failure_and_saves_nothing(
     tmp_path: Path,
     job_ctx: tuple[JobContext, CollectingSink],
 ) -> None:
-    """A model that will not load still produces a saved, honest record."""
+    """A model that will not load has no benchmark; the failure says why, exit 51.
+
+    It used to write a result with empty metrics and exit 2, while ``probe``
+    and ``chat`` classified the same failure: two answers to one question.
+    """
     ctx, _ = job_ctx
     settings = make_settings(tmp_path)
     factory = RecordingFactory(error=RuntimeError("NPU compiler rejected the graph"))
@@ -654,12 +664,40 @@ def test_a_failed_load_is_recorded_rather_than_raised(
         factory, LocalArtifactStore(settings.paths), FakeHardwareProbe(), settings
     )
 
-    result = service.run(make_artifact(tmp_path), device="NPU", suite="quick", ctx=ctx)
+    with pytest.raises(YongaError) as caught:
+        service.run(make_artifact(tmp_path), device="NPU", suite="quick", ctx=ctx)
 
-    assert result.run_metrics == []
-    assert result.compile_seconds is None
-    assert result.errors and "NPU compiler rejected the graph" in result.errors[0]
-    assert result.aggregates[0].runs == 0
+    assert caught.value.exit_code() is ExitCode.COMPILE
+    assert "NPU compiler rejected the graph" in (caught.value.diagnostic.raw_excerpt or "")
+    assert not list(settings.paths.benchmarks_dir.glob("*.json")), "no empty result is saved"
+
+
+def test_a_failed_load_takes_the_registry_diagnosis(
+    tmp_path: Path,
+    job_ctx: tuple[JobContext, CollectingSink],
+) -> None:
+    ctx, _ = job_ctx
+    settings = make_settings(tmp_path)
+    factory = RecordingFactory(error=RuntimeError("OneShotBufferizeVPU2VPUIP failed"))
+    known = diagnostic(
+        "npu.compiler.unsupported_graph",
+        FailureCategory.COMPILER_UNSUPPORTED_GRAPH,
+        "This graph cannot be compiled for the NPU",
+        "The NPU compiler ran and refused the graph.",
+        matched_rule_id="npu-compiler-unsupported-graph-generic",
+    )
+    service = BenchmarkService(
+        factory,
+        LocalArtifactStore(settings.paths),
+        FakeHardwareProbe(),
+        settings,
+        classifier=lambda raw, device: known if "Bufferize" in raw else None,
+    )
+
+    with pytest.raises(YongaError) as caught:
+        service.run(make_artifact(tmp_path), device="NPU", suite="quick", ctx=ctx)
+
+    assert caught.value.diagnostic.code == "npu.compiler.unsupported_graph"
 
 
 def test_an_overrun_run_is_recorded_as_a_timeout_error(

@@ -55,11 +55,13 @@ from yonga.domain.benchmarks import (
     aggregate_runs,
 )
 from yonga.domain.diagnostics import (
+    CompileError,
     ConfigurationError,
     Diagnostic,
     FailureCategory,
     Severity,
     ValidationError,
+    YongaError,
     diagnostic,
 )
 from yonga.domain.hardware import HardwareInventory, normalise_device
@@ -399,8 +401,13 @@ class BenchmarkService:
         *,
         prompts: PromptLibrary | None = None,
         peak_memory: PeakMemoryReader | None = None,
+        classifier: Callable[[str, str], Diagnostic | None] | None = None,
     ) -> None:
         """Wire the service to its adapters.
+
+        ``classifier`` turns a load failure's raw text into a registry diagnosis,
+        exactly as ``probe`` and ``chat`` do; without one the failure is reported
+        as the runtime described it.
 
         ``artifact_store`` defaults to a
         :class:`~yonga.application.probe.LocalArtifactStore`, ``prompts`` to the
@@ -411,6 +418,7 @@ class BenchmarkService:
         self._factory = runtime_factory
         self._settings = settings
         self._hardware = hardware_probe
+        self._classifier = classifier
         paths = None if settings is None else settings.paths
         self._store: ArtifactStoreLike = artifact_store or LocalArtifactStore(paths)
         self._prompts = prompts or load_prompt_library()
@@ -422,6 +430,16 @@ class BenchmarkService:
         return self._prompts
 
     # --- running ----------------------------------------------------------
+
+    def _classified(self, error: YongaError, device: str) -> YongaError:
+        """The registry's diagnosis of a load failure, when a rule recognises it."""
+        if self._classifier is None:
+            return error
+        raw = error.diagnostic.raw_excerpt or error.diagnostic.message
+        found = self._classifier(raw, device) if raw.strip() else None
+        if found is None or found.matched_rule_id is None:
+            return error
+        return YongaError(found)
 
     def run(
         self,
@@ -484,8 +502,25 @@ class BenchmarkService:
                 properties=dict(runtime_properties) or None,
                 settings=self._settings,
             )
+        except YongaError as exc:
+            # A model that cannot load has no benchmark. Writing an empty result
+            # and exiting 2 hid the reason; ``probe`` and ``chat`` classify the
+            # same failure and exit 51, and so does this now.
+            raise self._classified(exc, target) from exc
         except Exception as exc:
-            errors.append(f"load failed: {_error_text(exc)}")
+            raw = redact_text(_error_text(exc))
+            raise self._classified(
+                CompileError(
+                    diagnostic(
+                        "bench.load_failed",
+                        FailureCategory.UNKNOWN_RUNTIME_ERROR,
+                        f"Could not load the model on {target}",
+                        raw,
+                        raw_excerpt=raw,
+                    )
+                ),
+                target,
+            ) from exc
         else:
             compile_seconds = time.perf_counter() - started
             reported = getattr(runtime, "load_seconds", None)

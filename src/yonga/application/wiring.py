@@ -52,7 +52,13 @@ from yonga.application.search import SearchService
 from yonga.config.paths import Paths
 from yonga.config.settings import Settings
 from yonga.domain.artifacts import ArtifactManifest, ProbeResult, ProbeStatus
-from yonga.domain.diagnostics import ConfigurationError, FailureCategory, RegistryError, diagnostic
+from yonga.domain.diagnostics import (
+    ConfigurationError,
+    Diagnostic,
+    FailureCategory,
+    RegistryError,
+    diagnostic,
+)
 from yonga.domain.hardware import OpenVINODevice
 from yonga.domain.models import PipelineKind
 from yonga.registry.loader import load_registry
@@ -564,11 +570,17 @@ class Wiring:
 
     def benchmark_service(self) -> BenchmarkService:
         """Build the ``yonga bench`` service."""
+        resolver = self.registry_resolver()
+
+        def classify(raw: str, device: str) -> Diagnostic | None:
+            return resolver.classify(raw_error=raw, device=device, stage="bench")
+
         return BenchmarkService(
             self.benchmark_runtime_factory(),
             self.readable_artifacts(),
             self.hardware_probe(),
             self._settings,
+            classifier=classify,
         )
 
 
