@@ -38,6 +38,10 @@ manifest may change in any minor release.
 - NPU profiles carry `MAX_PROMPT_LEN=1024` / `MIN_RESPONSE_LEN=128`, so the manifest records the
   static-shape budget an NPU artifact was probed with.
 - `ProbeStatus.DEFERRED`, for a raw compile the pipeline was asked to settle.
+- **`yonga search QUERY [--limit N] [--device D]`** searches the Hub in one request and runs each
+  result through the registry's identification, marking GGUF-header identities. Compatibility is
+  shown per architecture next to a format hint, because an MLX or AWQ repository can report a
+  supported architecture it cannot be converted from. Works without OpenVINO installed.
 - **`yonga logs JOB_ID --bundle`** writes a bug-report archive: job log and state, artifact manifest
   and validation record, and a host report, redacted again and with the home directory, hostname and
   login name anonymised. `yonga logs` and the bundle now share one job resolver.

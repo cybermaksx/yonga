@@ -243,6 +243,39 @@ def _hub_diagnostic(
     )
 
 
+def _search_hit_metadata(info: Any) -> ModelMetadata:
+    """Map one ``list_models`` result onto :class:`ModelMetadata`.
+
+    Identity comes from the Hub's own ``config`` summary when the repository has
+    a ``config.json``, and from the GGUF header otherwise -- the same two sources
+    :meth:`HuggingFaceAdapter.inspect` uses, so search and inspect identify a
+    repository the same way.
+    """
+    summary = getattr(info, "config", None)
+    architectures: list[str] = []
+    model_type: str | None = None
+    if isinstance(summary, Mapping):
+        architectures = _string_list(summary.get("architectures"))
+        raw_type = summary.get("model_type")
+        model_type = raw_type.strip() if isinstance(raw_type, str) and raw_type.strip() else None
+    sha = getattr(info, "sha", None)
+    return ModelMetadata(
+        identity=ModelIdentity(repo_id=str(getattr(info, "id", "") or "")),
+        resolved_revision=sha.strip() if isinstance(sha, str) and sha.strip() else None,
+        gated=bool(getattr(info, "gated", False)),
+        pipeline_tag=_optional_str(getattr(info, "pipeline_tag", None)),
+        tags=_string_list(getattr(info, "tags", None)),
+        library_name=_optional_str(getattr(info, "library_name", None)),
+        architectures=architectures,
+        model_type=model_type,
+        parameter_count=_parameter_count(info),
+        gguf_metadata=_compact_gguf_metadata(getattr(info, "gguf", None)),
+        downloads=_optional_int(getattr(info, "downloads", None)),
+        likes=_optional_int(getattr(info, "likes", None)),
+        last_modified=_isoformat(getattr(info, "last_modified", None)),
+    )
+
+
 def translate_hub_error(
     error: BaseException,
     *,
@@ -1205,6 +1238,50 @@ class HuggingFaceAdapter:
             likes=_optional_int(getattr(info, "likes", None)),
             last_modified=_isoformat(getattr(info, "last_modified", None)),
         )
+
+    #: Search result fields, in one request: identity for registry matching
+    #: (``config`` for Transformers repos, ``gguf`` for GGUF-only ones), a format
+    #: hint (``library_name``, ``tags``) and ranking signals. No file is fetched.
+    SEARCH_EXPAND: tuple[str, ...] = (
+        "config",
+        "gguf",
+        "pipeline_tag",
+        "tags",
+        "library_name",
+        "downloads",
+        "likes",
+        "gated",
+        "safetensors",
+        "lastModified",
+    )
+
+    def search(self, query: str, *, limit: int = 20) -> list[ModelMetadata]:
+        """Search the Hub and describe each hit from the search response alone.
+
+        One ``list_models`` call carries everything used here, so a search costs
+        one request however many results come back -- no ``config.json`` is
+        downloaded per hit. The metadata is therefore thinner than
+        :meth:`inspect`'s: there is no file inventory, so ``formats`` is empty
+        and the format is only hinted at by tags and the library name.
+        """
+        if self.offline:
+            raise translate_hub_error(
+                LocalEntryNotFoundError("searching the Hub needs network access"),
+                operation="search",
+                offline=True,
+            )
+        try:
+            results = list(
+                self._api.list_models(
+                    search=query,
+                    limit=max(1, limit),
+                    sort="downloads",
+                    expand=list(self.SEARCH_EXPAND),
+                )
+            )
+        except Exception as error:
+            raise translate_hub_error(error, operation="search", offline=self.offline) from error
+        return [_search_hit_metadata(info) for info in results]
 
     # --- download ------------------------------------------------------
 

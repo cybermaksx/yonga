@@ -13,7 +13,6 @@ The tool is **NPU-first, not NPU-only**. If a model cannot compile on the NPU, `
 This is a 0.1.0 MVP. It prepares, validates, runs and benchmarks OpenVINO artifacts on one machine, and it is honest about the parts that do not exist yet:
 
 - **`serve` is not implemented.** `docs/CLI_SPEC.md` section 14 describes it as phase 2; there is no HTTP server, no OpenAI-compatible endpoint and no code for one.
-- **`search` is not implemented.** `docs/CLI_SPEC.md` section 5 describes Hub search; `yonga` has no search command today. Use the Hugging Face website and pass the repository id to `yonga inspect`.
 - **Not published on PyPI.** `pip install yonga` does not work yet; install from a clone (see below).
 - **Windows is not supported yet.** The architecture keeps the door open, but every device, driver and path probe is written and tested against Linux only.
 - The registry ships knowledge for a small number of architectures. Everything else resolves through generic rules, which is why `inspect` says `inferred` rather than `official` for most models.
@@ -41,11 +40,12 @@ The end-to-end path (`prepare` → `probe` → `chat` → `bench`) has been exer
 
 ## What works today
 
-Ten commands, one of which (`registry`) has three subcommands:
+Eleven commands, one of which (`registry`) has three subcommands:
 
 | Command | What it does |
 |---|---|
 | `yonga doctor` | Host report: OS, CPU, RAM, package versions, OpenVINO ABI family, devices, NPU node/driver/compiler, storage, Hugging Face auth. Exits 0/2/10. |
+| `yonga search QUERY` | Searches the Hub in one request and shows what the registry knows about each result's architecture, with a format hint and any declared derivative. Compatibility is per architecture; `inspect` answers whether a repository can actually be prepared. |
 | `yonga inspect MODEL` | Reads Hub metadata (no weights), identifies the architecture, shows per-device compatibility with its evidence level, the source that would be converted, and known limitations. |
 | `yonga prepare MODEL` | Plans, confirms, downloads, converts with an explicit quantization profile, validates the IR, applies known repairs, probes the runtime, and publishes an artifact with a manifest. |
 | `yonga list` | The artifacts prepared on this host, with profile, size, and last benchmark. |

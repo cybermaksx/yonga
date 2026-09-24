@@ -57,7 +57,7 @@ from yonga.registry.schema import (
     ModelRule,
 )
 
-__all__ = ["InspectReport", "InspectService"]
+__all__ = ["InspectReport", "InspectService", "identified_from"]
 
 
 def _distribution_versions(versions: Mapping[str, str | None]) -> dict[str, str | None]:
@@ -86,7 +86,7 @@ def _export_spec(
     return None
 
 
-def _identified_from(
+def identified_from(
     architecture_rule: ArchitectureRule | None,
     explanation: ResolutionExplanation,
 ) -> str | None:
@@ -308,7 +308,7 @@ class InspectService:
             resolved_revision=resolved_revision,
             metadata=metadata,
             architecture=self._architecture_label(metadata, architecture_rule),
-            architecture_identified_from=_identified_from(
+            architecture_identified_from=identified_from(
                 architecture_rule, architecture_explanation
             ),
             architecture_rule_id=architecture_rule.id if architecture_rule is not None else None,

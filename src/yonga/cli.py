@@ -536,6 +536,35 @@ def _doctor(state: CliState, *, full: bool) -> ExitCode:
 
 
 # ======================================================================
+# search
+# ======================================================================
+@app.command()
+def search(
+    ctx: typer.Context,
+    query: str = typer.Argument(..., metavar="QUERY", help="Words to search the Hub for."),
+    limit: int = typer.Option(20, "--limit", min=1, max=100, help="How many results to show."),
+    device: str | None = typer.Option(
+        None, "--device", help="Show compatibility for one device: npu, gpu, cpu or auto."
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Emit the results as JSON."),
+) -> None:
+    """Search the Hugging Face Hub and show what the registry knows about each result."""
+    state = cli_state(ctx, json_output=json_output)
+    _dispatch(state, lambda: _search(state, query, limit=limit, device=device))
+
+
+def _search(state: CliState, query: str, *, limit: int, device: str | None) -> ExitCode:
+    """One Hub request; no repository files are fetched (``docs/CLI_SPEC.md`` section 5)."""
+    chosen = _device(device)
+    report = state.graph.search_service().search(query, limit=limit)
+    if state.json_mode:
+        state.emit(report.to_json())
+        return ExitCode.SUCCESS
+    state.console.print(tables.search_results(report, device=chosen))
+    return ExitCode.SUCCESS
+
+
+# ======================================================================
 # inspect
 # ======================================================================
 @app.command()

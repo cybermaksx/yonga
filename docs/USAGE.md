@@ -55,7 +55,28 @@ yonga doctor --full                  # adds a registry section
 
 ---
 
-## 2. Look before you download
+## 2. Find a model, then look before you download
+
+```bash
+yonga search "qwen3.5 9b"
+yonga search "qwen3.5 9b" --device npu      # one device's column only
+```
+
+One Hub request, and no repository files are fetched. Each result is identified the same way
+`inspect` identifies it — from the Hub's config summary, or from the GGUF header for a GGUF-only
+repository (marked `*`) — and shown with what the registry knows about that architecture on CPU,
+GPU and NPU. Read the columns for what they are:
+
+- **Compatibility is per architecture, not per repository.** `lmstudio-community/Qwen3.5-9B-MLX-4bit`
+  reports `qwen3_5`, but its weights are MLX, which the exporter cannot convert. The **Format**
+  column is there for exactly this, hinted from the Hub's tags; `mlx`, `awq` and `gptq` are warning
+  signs.
+- `?` means the registry makes no claim — never that the model works.
+- `+` marks a repository the registry declares a conversion source for; the footnote names it.
+
+Then `inspect` the one you want: it reads the file list and answers whether *this* repository can be
+prepared on *this* host.
+
 
 ```bash
 yonga inspect Qwen/Qwen3-0.6B
@@ -261,7 +282,7 @@ up; nothing can be mistaken for a usable model. `yonga list --clean` retires the
 ## 8. Running the test suite
 
 ```bash
-pytest                       # 1793 of 1811 tests; network and hardware markers excluded by default
+pytest                       # 1824 of 1843 tests; network and hardware markers excluded by default
 ruff check . && ruff format --check .
 mypy src tests
 ```
@@ -270,7 +291,7 @@ Markers: `network`, `openvino`, `intel_gpu`, `intel_npu`, `slow`, `large_model`.
 
 ```bash
 pytest -m openvino           # 25 tests, needs OpenVINO (the 17 CPU ones plus the hardware ones)
-pytest -m network            # 10 tests, hits the real Hub
+pytest -m network            # 11 tests, hits the real Hub
 pytest -m intel_gpu          # 3 tests on a real Intel GPU
 pytest -m intel_npu          # 5 tests on a real Intel NPU
 ```

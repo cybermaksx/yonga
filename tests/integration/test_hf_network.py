@@ -177,3 +177,22 @@ def test_auth_info_reports_state_without_a_token_value(adapter, tmp_path):
     if info.logged_in:
         assert info.token_source is not None
         assert not info.token_source.startswith("hf_")
+
+
+@pytest.mark.network
+def test_search_identifies_real_results_through_the_registry() -> None:
+    """One real Hub request: config-identified and GGUF-identified Qwen3.5 repos."""
+    from yonga.adapters.hf import HuggingFaceAdapter
+    from yonga.application.search import SearchService
+    from yonga.registry import RegistryResolver, load_builtin_registry
+
+    report = SearchService(HuggingFaceAdapter(), RegistryResolver(load_builtin_registry())).search(
+        "qwen3.5 9b", limit=10
+    )
+
+    by_repo = {hit.repo_id: hit for hit in report.hits}
+    assert "Qwen/Qwen3.5-9B" in by_repo
+    official = by_repo["Qwen/Qwen3.5-9B"]
+    assert official.architecture == "qwen3_5" and official.identified_from is None
+    hinted = [hit for hit in report.hits if hit.identified_from == "GGUF metadata"]
+    assert hinted, "at least one GGUF-only Qwen3.5 repository should be identified by its header"

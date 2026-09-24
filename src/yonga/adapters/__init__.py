@@ -31,6 +31,7 @@ __all__ = [
     "FilesystemProbe",
     "HardwareProbe",
     "HubClient",
+    "HubSearch",
     "RuntimeProbe",
 ]
 
@@ -78,6 +79,20 @@ class HubClient(Protocol):
 
     def auth_info(self) -> HuggingFaceAuthInfo:
         """Report authentication state. Must never expose the token value."""
+        ...
+
+
+@runtime_checkable
+class HubSearch(Protocol):
+    """Searches the Hugging Face Hub.
+
+    Kept separate from :class:`HubClient` so a component that only searches
+    does not have to implement downloads, and so every existing ``HubClient``
+    stays valid unchanged.
+    """
+
+    def search(self, query: str, *, limit: int = 20) -> list[ModelMetadata]:
+        """Return metadata for the best matches, from the search response alone."""
         ...
 
 

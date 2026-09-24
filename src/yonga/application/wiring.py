@@ -25,7 +25,14 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
-from yonga.adapters import CommandRunner, Exporter, FilesystemProbe, HardwareProbe, HubClient
+from yonga.adapters import (
+    CommandRunner,
+    Exporter,
+    FilesystemProbe,
+    HardwareProbe,
+    HubClient,
+    HubSearch,
+)
 from yonga.adapters import RuntimeProbe as RuntimeProbePort
 from yonga.application.artifacts import ArtifactStore
 from yonga.application.benchmark import BenchmarkService
@@ -37,6 +44,7 @@ from yonga.application.inspect_model import InspectService
 from yonga.application.prepare import PrepareService, SmokeTester
 from yonga.application.probe import LocalArtifactStore, ProbeService
 from yonga.application.progress import ProgressSink
+from yonga.application.search import SearchService
 from yonga.config.paths import Paths
 from yonga.config.settings import Settings
 from yonga.domain.artifacts import ArtifactManifest, ProbeResult, ProbeStatus
@@ -307,6 +315,28 @@ class Wiring:
 
             self._hub_client = HuggingFaceAdapter(self._settings)
         return self._hub_client
+
+    def hub_search(self) -> HubSearch:
+        """Return the Hub searcher -- the same adapter as :meth:`hub_client`.
+
+        A Hub client that cannot search is a wiring error, reported as such
+        rather than papered over by quietly building a second, networked client.
+        """
+        client = self.hub_client()
+        if not isinstance(client, HubSearch):
+            raise ConfigurationError(
+                diagnostic(
+                    "wiring.hub.no_search",
+                    FailureCategory.CONFIGURATION_ERROR,
+                    "Search is unavailable",
+                    "The configured Hugging Face client does not support searching.",
+                )
+            )
+        return client
+
+    def search_service(self) -> SearchService:
+        """Build the ``yonga search`` service. It needs the Hub, never the hardware."""
+        return SearchService(self.hub_search(), self.registry_resolver())
 
     def runtime_probe(self) -> RuntimeProbePort:
         """Return the OpenVINO runtime probe.

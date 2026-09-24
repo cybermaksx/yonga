@@ -36,6 +36,7 @@ from yonga.domain.plans import PreparationPlan
 from yonga.ui.console import human_bytes, human_duration, status_icon, status_style
 
 if TYPE_CHECKING:  # Registry types are consumed, never imported at runtime.
+    from yonga.application.search import SearchReport
     from yonga.registry.resolver import RegistryExplanation
 
 __all__ = [
@@ -47,6 +48,7 @@ __all__ = [
     "preparation_plan",
     "probe_report",
     "registry_explanation",
+    "search_results",
 ]
 
 _DASH = "—"
@@ -683,6 +685,74 @@ def artifact_list(summaries: Sequence[ArtifactSummary]) -> RenderableType:
             "No prepared artifacts yet. Run 'yonga prepare MODEL' to make one.", style="dim"
         )
     return _ArtifactList(summaries)
+
+
+# ----------------------------------------------------------------------
+# search
+# ----------------------------------------------------------------------
+def search_results(report: SearchReport, *, device: str | None = None) -> RenderableType:
+    """Render ``yonga search`` (``docs/CLI_SPEC.md`` section 5).
+
+    With ``device`` set only that device's column is shown. An architecture
+    identified from a GGUF header is marked ``*`` and footnoted, the same
+    disclosure ``inspect`` makes, because every device claim on that row rests
+    on the identification. A declared derivative is marked ``+`` and named in a
+    footnote, so long repository ids keep the width they need.
+    """
+    if not report.hits:
+        return Text(f"No models on the Hub match {report.query!r}.", style="dim")
+    devices = [device.upper()] if device and device.lower() != "auto" else ["CPU", "GPU", "NPU"]
+    table = Table(box=SIMPLE, show_edge=False, pad_edge=False)
+    table.add_column("Model", overflow="fold", min_width=24)
+    table.add_column("Arch", no_wrap=True)
+    for name in devices:
+        table.add_column(name, no_wrap=True, justify="center")
+    table.add_column("Format", no_wrap=True)
+    table.add_column("DL", no_wrap=True, justify="right")
+    hinted = False
+    derivatives: list[str] = []
+    for hit in report.hits:
+        arch = Text(hit.architecture or _DASH, style="" if hit.architecture else "dim")
+        if hit.identified_from:
+            arch.append("*", style="yellow")
+            hinted = True
+        cells: list[RenderableType] = [Text(hit.repo_id), arch]
+        for name in devices:
+            entry = hit.compatibility_for(name)
+            if entry is None or entry.status is DeviceStatus.UNKNOWN:
+                cells.append(Text("?", style="dim"))
+                continue
+            severity = _DEVICE_STATUS_SEVERITY[entry.status]
+            cells.append(Text(status_icon(severity), style=status_style(severity)))
+        formats = Text(",".join(hit.formats) or _DASH, style="" if hit.formats else "dim")
+        if hit.derivative:
+            formats.append("+", style="cyan")
+            derivatives.append(f"+ {hit.repo_id} converts from {hit.derivative} (needs approval)")
+        cells.append(formats)
+        cells.append(Text(_compact_count(hit.downloads)))
+        table.add_row(*cells)
+    footer: list[RenderableType] = []
+    if hinted:
+        footer.append(
+            Text("* architecture identified from GGUF metadata; no config.json.", style="dim")
+        )
+    footer.extend(Text(line, style="dim") for line in derivatives)
+    footer.append(
+        Text("✓ supported   ✗ unsupported   ! experimental   ? no registry claim", style="dim")
+    )
+    footer.extend(Text(note, style="dim") for note in report.notes)
+    return Group(table, *footer)
+
+
+def _compact_count(value: int | None) -> str:
+    """Render a count as ``9.8M`` / ``896k`` / ``512``."""
+    if value is None:
+        return _DASH
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.1f}M"
+    if value >= 1_000:
+        return f"{value / 1_000:.0f}k"
+    return str(value)
 
 
 # ----------------------------------------------------------------------

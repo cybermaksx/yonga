@@ -7,7 +7,7 @@ few days, **L** a substantial piece of work.
 The MVP works end to end on one machine: ten commands (`registry` carries three subcommands of its
 own — `validate`, `explain`, `paths`), the full Qwen3.5 reference case (GGUF-only source → declared derivative → 17.5 GiB download → INT4 conversion → seven VLM submodels
 validated → tokenizer repaired → GPU probed → artifact with a complete manifest), and — since
-2026-09-24 — NPU preparation, chat and benchmarking of a small LLM. 1792 default tests plus eight
+2026-09-24 — NPU preparation, chat and benchmarking of a small LLM. 1824 default tests plus eight
 hardware tests, ruff and mypy clean. What follows is what it does *not* yet have.
 
 ---
@@ -65,11 +65,13 @@ inconclusive, and a bounded timeout for pipeline builds.
 
 ## Phase 1 — make it useful to a second person
 
-**1.1 — `yonga search`. [M]**
-`CLI_SPEC.md` §5. Hub search enriched with compatibility, so the loop starts inside the tool
-instead of on the website. The hard part is honesty: do not claim compatibility for a repository
-whose architecture you have not established, which for GGUF-only repos means reading the header.
-The registry and inspect paths already do this work.
+**1.1 — `yonga search`. [done]**
+`CLI_SPEC.md` §5. One `list_models` request returns, per hit, the Hub's config summary and the GGUF
+header, so every result goes through the same registry identification as `inspect` — alias rung
+included — with no per-repository download. The honesty problem turned out to be preparability,
+not identity: an MLX or AWQ repository reports a supported architecture it cannot be converted
+from. Search therefore shows device knowledge per architecture beside a format hint from Hub tags,
+and defers to `inspect` for whether a repository can be prepared.
 
 **1.2 — Managed export environments. [L]**
 The single sharpest edge today. Qwen3.5 needs `transformers==5.2.*`; something else will need a

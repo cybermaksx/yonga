@@ -66,7 +66,7 @@ from yonga.domain.hardware import (
     OpenVINODevice,
     PackageInfo,
 )
-from yonga.domain.models import PipelineKind
+from yonga.domain.models import ModelMetadata, PipelineKind
 from yonga.registry.resolver import RegistryResolver
 
 GIB = 1024**3
@@ -1149,6 +1149,72 @@ def test_logs_bundle_needs_a_job(runner: CliRunner, home: Path) -> None:
     result = invoke(runner, home, ["logs", "--bundle"])
     assert result.exit_code == int(ExitCode.REGISTRY)
     assert "yonga logs JOB_ID --bundle" in result.stderr
+
+
+class SearchingHub:
+    """A HubSearch double returning one config-identified and one GGUF-identified hit."""
+
+    def search(self, query: str, *, limit: int = 20) -> list[ModelMetadata]:
+        from yonga.domain.models import ModelIdentity
+
+        return [
+            ModelMetadata(
+                identity=ModelIdentity(repo_id="Qwen/Qwen3.5-9B"),
+                resolved_revision=None,
+                model_type="qwen3_5",
+                architectures=["Qwen3_5ForConditionalGeneration"],
+                tags=["safetensors"],
+                downloads=9_787_242,
+            ),
+            ModelMetadata(
+                identity=ModelIdentity(repo_id="unsloth/Qwen3.5-9B-GGUF"),
+                resolved_revision=None,
+                gguf_metadata={"architecture": "qwen35"},
+                tags=["gguf"],
+            ),
+        ][:limit]
+
+
+class SearchWiring(FakeWiring):
+    def hub_search(self) -> SearchingHub:
+        return SearchingHub()
+
+
+def test_search_json_is_one_document_with_registry_knowledge(runner: CliRunner, home: Path) -> None:
+    result = invoke(
+        runner, home, ["--json", "search", "qwen3.5"], factory=lambda s: SearchWiring(s)
+    )
+
+    assert result.exit_code == int(ExitCode.SUCCESS)
+    document = json.loads(result.stdout)
+    first, second = document["hits"]
+    assert first["architecture"] == "qwen3_5" and first["identified_from"] is None
+    assert second["architecture"] == "qwen3_5" and second["identified_from"] == "GGUF metadata"
+    npu = next(entry for entry in first["compatibility"] if entry["device"] == "NPU")
+    assert npu["status"] == "unsupported"
+
+
+def test_search_table_states_what_its_compatibility_means(runner: CliRunner, home: Path) -> None:
+    result = invoke(runner, home, ["search", "qwen3.5"], factory=lambda s: SearchWiring(s))
+
+    assert result.exit_code == int(ExitCode.SUCCESS)
+    assert "Qwen/Qwen3.5-9B" in result.stdout
+    assert "yonga inspect MODEL" in result.stdout
+
+
+def test_search_rejects_an_unknown_device(runner: CliRunner, home: Path) -> None:
+    result = invoke(
+        runner, home, ["search", "qwen", "--device", "mars"], factory=lambda s: SearchWiring(s)
+    )
+    assert result.exit_code == int(ExitCode.REGISTRY)
+
+
+def test_search_with_a_hub_that_cannot_search_fails_loudly(runner: CliRunner, home: Path) -> None:
+    """A wiring error is reported, never papered over with a second networked client."""
+    result = invoke(runner, home, ["search", "qwen"])
+
+    assert result.exit_code == int(ExitCode.REGISTRY)
+    assert "Search is unavailable" in result.stderr
 
 
 # ======================================================================
