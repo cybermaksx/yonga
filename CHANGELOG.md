@@ -60,6 +60,9 @@ manifest may change in any minor release.
   never a device's default. On Qwen3.5-9B, `npu-int4-sym-cw` diverges from INT8 2.5 times as much as
   `gpu-int4-asym-g128` (KL 0.197 vs 0.080, perplexity +22 % vs +7 %): see `PROFILE_COMPARISON.md`
   section 8.
+- **`cpu-int4-asym-g128-r08` profile**, opt-in: INT4 with 20 % of layers kept at INT8. On
+  Qwen3-0.6B it cuts the divergence from FP16 by 31 % (KL 0.245 vs 0.356) for 10.5 % more disk.
+  It is never selected automatically.
 - **Signed remote registry bundles:** `yonga registry update [--url | --file]`, `status`, `reset`.
   A bundle is verified against Ed25519 keys the user trusts (yonga ships none) and refused when
   expired, older than the installed one, or naming a path outside it. Every repair rule must name a

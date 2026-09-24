@@ -419,6 +419,24 @@ better artifact. The channel-wise symmetric format exists because the NPU needs 
 models; that is a reason to use it on the NPU, and on this evidence not a reason to use it anywhere
 else.
 
+### 8.5 The small-model cost, and what keeping some layers at INT8 buys
+
+Section 8.1 showed that INT4 at ratio 1.0 costs `Qwen/Qwen3-0.6B` a third of its perplexity. Three
+variants of the CPU profile were prepared and measured against FP16 in the same way (CPU, f32):
+
+| Profile | Size | Mean KL | Top-1 agreement | Perplexity change |
+|---|---|---|---|---|
+| `cpu-int4-asym-g128` (ratio 1.0) | 389 MiB | 0.3563 | 70.18 % | +32.83 % |
+| ratio 1.0, group size 64 | 397 MiB | 0.2862 | 73.57 % | +22.86 % |
+| ratio 0.8 (`cpu-int4-asym-g128-r08`) | 430 MiB | 0.2447 | 74.60 % | +21.99 % |
+| ratio 0.6 | 471 MiB | 0.2036 | 77.63 % | +21.44 % |
+| `cpu-int8-asym-ref` | 592 MiB | 0.0074 | 95.42 % | +0.33 % |
+
+Keeping 20 % of the layers at INT8 cuts the divergence by 31 % for 10.5 % more disk; 40 % buys a
+further 17 % for twice that. The ratio-0.8 profile now ships as `cpu-int4-asym-g128-r08`, opt-in
+through `--profile`. It is not made the default for small models, because one measured model is
+not evidence about all of them, and the registry has no size condition to express the rule with.
+
 Reproduce:
 
 ```bash

@@ -179,7 +179,7 @@ Small, real, and worth clearing before the next feature.
 
 | Where | What |
 |---|---|
-| Default INT4 profiles on small models | `yonga eval` measured `Qwen/Qwen3-0.6B` at ratio 1.0 INT4 losing about a third of its perplexity against FP16 (KL 0.36, 70 % top-1 agreement), where the 9B model loses 7 %. A registry rule giving sub-2B models a mixed INT4/INT8 ratio (optimum-intel's own default for small models is below 1.0) should be measured with `eval` and then added as data. |
+| Default INT4 profiles on small models | Measured on `Qwen/Qwen3-0.6B` (`PROFILE_COMPARISON.md` §8.5): ratio 1.0 INT4 costs +32.8 % perplexity against FP16, and ratio 0.8 cuts the KL divergence by 31 % for 10.5 % more disk. The ratio-0.8 profile ships opt-in as `cpu-int4-asym-g128-r08`. Making it a default needs two things: a registry match condition on model size (the schema has none), and `yonga eval` measurements on more than one small model. |
 
 ---
 
