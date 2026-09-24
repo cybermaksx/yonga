@@ -47,7 +47,13 @@ from yonga.adapters.filesystem import INCOMPLETE_MARKER_NAME
 from yonga.application.progress import NullSink, ProgressEvent, ProgressKind, ProgressSink
 from yonga.config.paths import Paths
 from yonga.config.settings import Settings
-from yonga.domain.diagnostics import Diagnostic, Severity
+from yonga.domain.diagnostics import (
+    Diagnostic,
+    FailureCategory,
+    Severity,
+    YongaError,
+    diagnostic,
+)
 from yonga.domain.plans import JobStage, JobState
 from yonga.util.jsonlog import JobLogger, null_logger
 from yonga.util.redaction import environment_secrets
@@ -297,6 +303,37 @@ class JobContext:
         if self.state is not None:
             self.state.fail(diagnostic)
 
+    def fail_unfinished(self, error: BaseException) -> None:
+        """Record ``error`` as the job's end, unless a terminal state is already recorded.
+
+        A service records its own typed failures. This is for everything else
+        that ends a job: Ctrl-C above all, but also a bug. Without it the state
+        document stayed at the last stage reached, so the job looked live for
+        :data:`LIVE_JOB_GRACE_HOURS`, which protected its staging directory from
+        the sweep and from export reuse, for a job nobody was running. Never raises.
+        """
+        state = self.state
+        if state is None or state.stage.is_terminal:
+            return
+        if isinstance(error, YongaError):
+            ended = error.diagnostic
+        elif isinstance(error, KeyboardInterrupt):
+            ended = diagnostic(
+                "job.cancelled",
+                FailureCategory.USER_CANCELLED,
+                "Cancelled",
+                "The job was interrupted before it finished.",
+            )
+        else:
+            ended = diagnostic(
+                "job.aborted",
+                FailureCategory.UNKNOWN_RUNTIME_ERROR,
+                "The job ended unexpectedly",
+                f"{type(error).__name__} ended the job before it finished.",
+            )
+        with suppress(Exception):
+            self.fail(state.stage, ended)
+
 
 class JobStateStore:
     """Reads and writes the small per-job state JSON document.
@@ -380,6 +417,11 @@ class JobStateStore:
         if target_device is not None:
             self._state.target_device = target_device
         self.save()
+
+    @property
+    def stage(self) -> JobStage:
+        """The stage the job last reached."""
+        return self._state.stage
 
     def fail(self, diagnostic: Diagnostic) -> None:
         """Move the job to ``failed``, recording the diagnostic, and persist."""
@@ -704,6 +746,9 @@ def open_job(
     try:
         yield ctx
         succeeded = True
+    except BaseException as error:
+        ctx.fail_unfinished(error)
+        raise
     finally:
         if succeeded:
             if create_temp:

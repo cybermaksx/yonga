@@ -443,6 +443,13 @@ registry_app = typer.Typer(
     add_completion=False,
 )
 app.add_typer(registry_app, name="registry")
+env_app = typer.Typer(
+    name="env",
+    help="List and remove the managed environments exports run in.",
+    no_args_is_help=True,
+    add_completion=False,
+)
+app.add_typer(env_app, name="env")
 
 
 def _version_callback(value: bool) -> None:
@@ -677,6 +684,22 @@ def prepare(
             "Deliberate and separate: --yes never enables it."
         ),
     ),
+    no_managed_env: bool = typer.Option(
+        False,
+        "--no-managed-env",
+        help=(
+            "Never build a managed export environment; refuse instead when the installed "
+            "packages cannot meet the exporter requirements."
+        ),
+    ),
+    fresh_export: bool = typer.Option(
+        False,
+        "--fresh-export",
+        help=(
+            "Export again even when a failed job left a completed export with identical "
+            "inputs that could be reused."
+        ),
+    ),
     yes: bool = typer.Option(False, "--yes", "-y", help="Answer ordinary questions with yes."),
     force: bool = typer.Option(False, "--force", help="Re-prepare even if an artifact exists."),
     no_repair: bool = typer.Option(False, "--no-repair", help="Never modify the exported IR."),
@@ -698,6 +721,10 @@ def prepare(
             yes=yes,
             force=force,
             no_repair=no_repair,
+            # Ignoring the requirements means exporting in *this* environment
+            # regardless; building a managed one would make the flag meaningless.
+            managed_env=not no_managed_env and not ignore_exporter_requirements,
+            reuse_export=not fresh_export,
         ),
     )
 
@@ -715,6 +742,8 @@ def _prepare(
     yes: bool,
     force: bool,
     no_repair: bool,
+    managed_env: bool = True,
+    reuse_export: bool = True,
 ) -> ExitCode:
     """Run the seven preparation stages (``docs/CLI_SPEC.md`` section 6)."""
     target = _device(device)
@@ -743,6 +772,8 @@ def _prepare(
             trust_remote_code=trust_remote_code,
             force=force,
             job=job,
+            managed_env=managed_env,
+            reuse_export=reuse_export,
         )
         console.print(tables.preparation_plan(plan))
         with _quiet_native_stdout(state.json_mode):
@@ -1200,6 +1231,81 @@ def _bench_exit(errors: Sequence[str], measured: bool) -> ExitCode:
 # ======================================================================
 # registry
 # ======================================================================
+@env_app.command("list")
+def env_list(
+    ctx: typer.Context,
+    json_output: bool = typer.Option(False, "--json", help="Emit the environments as JSON."),
+) -> None:
+    """Show the managed export environments and the disk they use."""
+    state = cli_state(ctx, json_output=json_output)
+    _dispatch(state, lambda: _env_list(state))
+
+
+def _env_list(state: CliState) -> ExitCode:
+    """List every completed managed export environment."""
+    environments = state.graph.export_environments().environments()
+    total = sum(environment.size_bytes for environment in environments)
+    if state.json_mode:
+        state.emit(
+            {
+                "environments": [
+                    environment.model_dump(mode="json") for environment in environments
+                ],
+                "total_bytes": total,
+            }
+        )
+        return ExitCode.SUCCESS
+    if not environments:
+        state.console.print(
+            "No managed export environments. yonga builds one when a model's exporter "
+            "requirements cannot be met by the installed packages.",
+            style="dim",
+        )
+        return ExitCode.SUCCESS
+    for environment in environments:
+        pins = ", ".join(
+            f"{name}{specifier}"
+            for name, specifier in environment.spec.packages.items()
+            if specifier
+        )
+        state.console.print(
+            f"{environment.key}  {human_bytes(environment.size_bytes):>9}  "
+            f"{environment.created_at:%Y-%m-%d}  {environment.path}"
+        )
+        state.console.print(f"    {pins}", style="dim")
+    state.console.print(f"{len(environments)} environment(s), {human_bytes(total)} in total.")
+    return ExitCode.SUCCESS
+
+
+@env_app.command("remove")
+def env_remove(
+    ctx: typer.Context,
+    key: str = typer.Argument(..., metavar="KEY", help="Environment key, or a unique prefix."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Do not ask for confirmation."),
+    json_output: bool = typer.Option(False, "--json", help="Emit the result as JSON."),
+) -> None:
+    """Delete one managed export environment. It is rebuilt if a later export needs it."""
+    state = cli_state(ctx, json_output=json_output)
+    _dispatch(state, lambda: _env_remove(state, key, yes=yes))
+
+
+def _env_remove(state: CliState, key: str, *, yes: bool) -> ExitCode:
+    """Remove one environment after confirmation."""
+    manager = state.graph.export_environments()
+    matches = [env for env in manager.environments() if env.key.startswith(key.strip())]
+    if len(matches) == 1 and not state.json_mode:
+        target = matches[0]
+        question = f"Delete {target.path} ({human_bytes(target.size_bytes)})?"
+        if not state.console.confirm(question, default=False, assume_yes=yes):
+            return ExitCode.CANCELLED
+    removed = manager.remove(key)
+    if state.json_mode:
+        state.emit({"removed": removed.key, "path": str(removed.path), "bytes": removed.size_bytes})
+        return ExitCode.SUCCESS
+    state.console.print(f"Removed {removed.path} ({human_bytes(removed.size_bytes)} freed).")
+    return ExitCode.SUCCESS
+
+
 @registry_app.command("validate")
 def registry_validate(
     ctx: typer.Context,

@@ -74,18 +74,32 @@ not identity: an MLX or AWQ repository reports a supported architecture it canno
 from. Search therefore shows device knowledge per architecture beside a format hint from Hub tags,
 and defers to `inspect` for whether a repository can be prepared.
 
-**1.2 — Managed export environments. [L]**
-The single sharpest edge today. Qwen3.5 needs `transformers==5.2.*`; something else will need a
-different pin; they cannot coexist. yonga currently diagnoses the mismatch and stops, which is
-correct but leaves the user to hand-manage a venv. `AGENT_PROMPT.md` §13.2 anticipates this: "a
-future managed environment feature can solve this properly." Build it — a per-architecture
-throwaway environment created on demand, used for the export subprocess only, cached and
-garbage-collected. This is what turns "diagnoses the problem" into "handles it".
+**1.2 — Managed export environments. [done]**
+When the installed packages cannot meet an exporter requirement, `prepare` builds an isolated venv
+under `~/.cache/yonga/envs/export-<key>/` and runs only the export subprocess in it. The spec mirrors
+the installed packages and changes only the failing pin; the key digests every pin, so the same
+requirements always reuse the same environment. It is built at preflight, before the download,
+verified by importing the exporter, and marked complete last, so a half-built one is never used.
+`yonga env list|remove`, `doctor` storage report, `--no-managed-env` to refuse instead. Verified on
+the reference host: the Qwen3.5-9B CPU export ran in `export-d1aedd10dc08` (torch 2.14.0+cpu,
+transformers 5.2.0, 1.44 GiB) and the manifest names it. Building it found one trap worth knowing:
+`optimum-intel` pulls `torchvision`, and PyPI's CUDA build of it cannot register its operators
+against a CPU torch, so both now come from PyTorch's CPU index.
 
-**1.3 — Real resume for interrupted preparation. [M]**
-Downloads already resume through the Hub cache; export restarts from scratch, which on a 17.5 GiB
-model is expensive. Investigate what optimum-intel can actually resume, and only promise what it
-delivers — `ARCHITECTURE.md` §5 is explicit about not claiming generic resumability.
+**1.3 — Reuse of a completed export after a failed job. [done]**
+What optimum-intel can resume: nothing. `main_export` runs `export_from_model` and then weight
+compression in one process, marks no stage as done, and a run killed part-way leaves files that look
+like a finished run's. So an interrupted *export* still restarts, and yonga says so. What it can do
+is keep an export that *finished* when a later stage fails — a probe failure, a validation defect,
+Ctrl-C during repair or the smoke test. The exporter's success writes `.yonga/export-complete.json`
+into staging: a fingerprint of every input (source revision, profile, task, exporter packages or
+managed environment, yonga version) plus the size, mtime and, for files up to 16 MiB, the digest of
+each file. An identical `prepare` finds it at plan time ("Export: reused from failed job …"), claims
+it by rename, restores repaired files from the repair's own backups, rejects anything that changed,
+and skips the download and the conversion. `--fresh-export` declines. On the reference host an
+interrupted Qwen3-0.6B CPU preparation retried in 9.4 s instead of 34 s. Building it found that
+Ctrl-C never recorded a terminal job state, so a cancelled job looked live for 24 hours; `open_job`
+now records `job.cancelled`.
 
 **1.4 — Bug-report bundles. [done]**
 `IMPLEMENTATION_PLAN.md` milestone 11. `yonga logs JOB_ID --bundle` writes a `.tar.gz` with the job

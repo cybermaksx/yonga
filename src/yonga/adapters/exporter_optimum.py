@@ -294,15 +294,22 @@ class OptimumExporter:
 
     # --- argv ----------------------------------------------------------
 
-    def resolve_launcher(self) -> list[str]:
-        """Return the configured launcher, or discover one. Raises ``ConfigurationError``."""
+    def resolve_launcher(self, request: ExportRequest | None = None) -> list[str]:
+        """Return the launcher for ``request``. Raises ``ConfigurationError``.
+
+        Precedence: a launcher given to the constructor (a test seam) wins, then
+        the request's managed-environment interpreter, then discovery in the
+        interpreter yonga runs in.
+        """
         if self._launcher is not None:
             return list(self._launcher)
+        if request is not None and request.interpreter is not None:
+            return [str(request.interpreter), "-m", OPTIMUM_CLI_MODULE]
         return resolve_launcher()
 
     def build_argv(self, request: ExportRequest) -> list[str]:
         """Translate an :class:`ExportRequest` into the exact argv to execute."""
-        return build_export_argv(request, launcher=self.resolve_launcher())
+        return build_export_argv(request, launcher=self.resolve_launcher(request))
 
     # --- requirements --------------------------------------------------
 
@@ -323,7 +330,9 @@ class OptimumExporter:
         refusal to start all come back as an :class:`ExportResult` whose
         ``success`` is ``False`` and whose ``diagnostic`` explains why.
         """
-        package_versions = {
+        # In a managed environment the versions that matter are the environment's,
+        # not the ones installed alongside yonga.
+        package_versions = dict(request.environment_versions) or {
             name: version for name, version in self.requirements().items() if version is not None
         }
 

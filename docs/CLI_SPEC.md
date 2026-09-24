@@ -134,6 +134,8 @@ yonga prepare MODEL \
   [--source REPO_ID] \
   [--trust-remote-code] \
   [--ignore-exporter-requirements] \
+  [--no-managed-env] \
+  [--fresh-export] \
   [--yes] \
   [--force] \
   [--no-repair]
@@ -141,9 +143,21 @@ yonga prepare MODEL \
 
 Default `--device auto`.
 
-`--ignore-exporter-requirements` converts even though a declared exporter package version is unmet,
-which otherwise stops the job in preflight; like `--trust-remote-code` it is its own deliberate flag
+`--ignore-exporter-requirements` converts in the current environment even though a declared exporter
+package version is unmet. Otherwise such a job runs its export in a managed export environment, or,
+under `--no-managed-env`, stops in preflight. Like `--trust-remote-code` it is its own deliberate flag
 and `--yes` does not imply it.
+
+`--no-managed-env` refuses to build a managed export environment, so an exporter requirement the
+installed packages cannot meet stops preparation at preflight instead. `--ignore-exporter-requirements`
+also never builds one: it means "export in this environment regardless".
+
+When an earlier job with identical inputs completed its export and then failed, the plan shows an
+`Export` row naming that job, and stages 4 and 5 are skipped: the retained export is adopted once
+every file has been shown to be what the exporter wrote, with repaired files restored from their
+backups first. Anything that does not check out is discarded and the export runs normally. The
+manifest records `export.reused_from_job`. `--fresh-export` always exports again. An export that was
+itself interrupted is never reused.
 
 Stages displayed:
 
@@ -289,6 +303,17 @@ yonga registry paths
 ```
 
 `explain` prints matched rules and why they won.
+
+## 12a. `env`
+
+```bash
+yonga env list [--json]
+yonga env remove KEY [--yes]
+```
+
+Lists and removes the managed export environments `prepare` builds when an architecture's exporter
+requirements cannot be met by the installed packages. They live under the cache directory, are used
+only by the export subprocess, and never modify the environment yonga runs in.
 
 ## 13. `logs`
 

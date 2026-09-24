@@ -60,7 +60,14 @@ from typing import Literal, Protocol, runtime_checkable
 from pydantic import BaseModel, ConfigDict, Field
 
 from yonga import __version__
-from yonga.adapters import Exporter, FilesystemProbe, HardwareProbe, HubClient, RuntimeProbe
+from yonga.adapters import (
+    ExportEnvironments,
+    Exporter,
+    FilesystemProbe,
+    HardwareProbe,
+    HubClient,
+    RuntimeProbe,
+)
 from yonga.adapters.filesystem import (
     format_bytes,
     is_tool_owned_incomplete,
@@ -68,6 +75,7 @@ from yonga.adapters.filesystem import (
     system_temp_dir,
 )
 from yonga.adapters.filesystem import plan_disk as plan_disk_usage
+from yonga.application import export_reuse
 from yonga.application.artifacts import ArtifactStore
 from yonga.application.jobs import JobContext, new_job_id
 from yonga.application.progress import ProgressKind
@@ -76,6 +84,7 @@ from yonga.domain.artifacts import (
     MANIFEST_SCHEMA_VERSION,
     ArtifactManifest,
     DeviceProbeReport,
+    ExportCheckpoint,
     ExportRecord,
     IRDescription,
     ManifestModelRef,
@@ -108,6 +117,11 @@ from yonga.domain.diagnostics import (
     YongaError,
     diagnostic,
 )
+from yonga.domain.environments import (
+    ESTIMATED_ENVIRONMENT_BYTES,
+    EnvironmentSpec,
+    ExportEnvironment,
+)
 from yonga.domain.hardware import HardwareInventory, normalise_device
 from yonga.domain.models import (
     ModelFormat,
@@ -121,6 +135,7 @@ from yonga.domain.models import (
 from yonga.domain.plans import (
     CONFIRMATION_DEVICE_FALLBACK,
     CONFIRMATION_LARGE_DOWNLOAD,
+    CONFIRMATION_MANAGED_ENVIRONMENT,
     CONFIRMATION_OVERWRITE_EXISTING,
     CONFIRMATION_REMOTE_CODE,
     CONFIRMATION_REPAIR,
@@ -487,6 +502,7 @@ class PrepareService:
         artifact_store: ArtifactStore,
         settings: Settings,
         smoke_tester: SmokeTester | None = None,
+        export_environments: ExportEnvironments | None = None,
     ) -> None:
         """Wire the service to its adapters.
 
@@ -504,6 +520,9 @@ class PrepareService:
         self._artifacts = artifact_store
         self._settings = settings
         self._smoke = smoke_tester
+        # Optional: without it an unmet exporter pin blocks at preflight, exactly
+        # as it did before managed export environments existed.
+        self._environments = export_environments
 
     # ==================================================================
     # planning
@@ -520,8 +539,14 @@ class PrepareService:
         trust_remote_code: bool = False,
         force: bool = False,
         job: JobContext | None = None,
+        managed_env: bool = True,
+        reuse_export: bool = True,
     ) -> PreparationPlan:
         """Decide everything, change nothing.
+
+        ``reuse_export`` lets the plan adopt a completed export that a failed job
+        with identical inputs left behind (see :mod:`yonga.application.export_reuse`);
+        the CLI turns it off for ``--fresh-export``.
 
         Metadata lookups are the only I/O: no download, no conversion, no
         directory is created. The returned plan is what the CLI prints before
@@ -608,10 +633,25 @@ class PrepareService:
         # unreachable. A user asking for `--profile npu-int4-sym-cw --device gpu`
         # gets told, in the plan, before anything is downloaded.
         known_limitations.extend(profile_explanation.notes)
-        known_limitations.extend(
-            f"Exporter requirement not satisfied: {problem}"
-            for problem in exporter_requirements.problems
+        export_environment = self._plan_export_environment(
+            exporter_requirements, resolved_source=resolved_source, allowed=managed_env
         )
+        environment_ready = (
+            export_environment is not None
+            and self._environments is not None
+            and self._environments.find(export_environment) is not None
+        )
+        if export_environment is not None:
+            known_limitations.extend(
+                f"The installed packages do not meet an exporter requirement ({problem}); the "
+                f"export runs in managed environment {export_environment.name} instead."
+                for problem in exporter_requirements.problems
+            )
+        else:
+            known_limitations.extend(
+                f"Exporter requirement not satisfied: {problem}"
+                for problem in exporter_requirements.problems
+            )
         known_limitations.extend(
             f"Exporter requirement could not be checked: {note}" for note in exporter_unverifiable
         )
@@ -625,9 +665,10 @@ class PrepareService:
             artifact_dir=artifact_dir,
             reuse=reuse,
             force=force,
+            export_environment=None if environment_ready else export_environment,
         )
 
-        return PreparationPlan(
+        plan = PreparationPlan(
             job_id=job_id,
             created_at=_now(),
             requested=requested,
@@ -652,9 +693,38 @@ class PrepareService:
             confirmations=confirmations,
             reuse_existing_artifact=reuse,
             force=force,
+            export_environment=export_environment,
+            export_environment_ready=environment_ready,
         )
+        if not reuse_export or reuse is not None or resolved_source.already_openvino:
+            return plan
+        reusable = export_reuse.find_reusable(
+            paths, self._export_fingerprint(plan), exclude_job=job_id
+        )
+        return plan if reusable is None else plan.model_copy(update={"reusable_export": reusable})
 
     # --- planning helpers -------------------------------------------------
+
+    def _plan_export_environment(
+        self,
+        requirements: ExporterRequirements,
+        *,
+        resolved_source: ResolvedSource,
+        allowed: bool,
+    ) -> EnvironmentSpec | None:
+        """The managed environment this export needs, or None if it needs none.
+
+        Only an unmet pin calls for one, and only on a job that actually runs
+        the exporter: an OpenVINO source is copied, never converted. Refusing is
+        kept available -- ``--no-managed-env``, the ``managed_export_envs``
+        setting, or a service built without an environment manager -- and then
+        preflight blocks on the pin as before.
+        """
+        if not requirements.problems or resolved_source.already_openvino:
+            return None
+        if not allowed or not self._settings.managed_export_envs or self._environments is None:
+            return None
+        return self._environments.spec_for(requirements, reason="; ".join(requirements.problems))
 
     def _pin_from_hub(self, identity: ModelIdentity) -> ModelIdentity:
         """Resolve a branch or tag to a commit SHA when ``inspect`` did not.
@@ -1068,9 +1138,28 @@ class PrepareService:
         artifact_dir: Path,
         reuse: Path | None,
         force: bool,
+        export_environment: EnvironmentSpec | None = None,
     ) -> list[ConfirmationReason]:
         """Collect everything the user has to agree to before work starts."""
         reasons: list[ConfirmationReason] = []
+        if export_environment is not None:
+            pins = ", ".join(
+                f"{name}{specifier}"
+                for name, specifier in export_environment.packages.items()
+                if name == "transformers" and specifier
+            )
+            reasons.append(
+                ConfirmationReason(
+                    code=CONFIRMATION_MANAGED_ENVIRONMENT,
+                    message=(
+                        f"A managed export environment ({pins or export_environment.name}) will be "
+                        f"built under {self._settings.paths.envs_dir}: up to about "
+                        f"{format_bytes(ESTIMATED_ENVIRONMENT_BYTES)} of packages from PyPI and "
+                        "the PyTorch CPU index. It is used only by the export, is reused by "
+                        "later jobs, and your own Python environment is not changed."
+                    ),
+                )
+            )
         if resolved_source.requires_confirmation or resolved_source.is_derivative:
             reasons.append(
                 ConfirmationReason(
@@ -1231,17 +1320,35 @@ class PrepareService:
         warnings = self._preflight(
             plan, ctx, ignore_exporter_requirements=ignore_exporter_requirements
         )
+        staging = self._staging_dir(plan, ctx)
+        adopted = self._adopt_export(plan, staging, ctx)
+        # Built at preflight, before the model download: a failed build then costs
+        # minutes, not a multi-gigabyte download that was never going to be used.
+        environment = None if adopted is not None else self._ensure_export_environment(plan, ctx)
         ctx.advance(JobStage.PREFLIGHT_OK)
 
         self._stage(ctx, 4)
         tracker.stage = JobStage.DOWNLOADED
-        snapshot = self._download(plan, ctx)
+        if adopted is not None:
+            ctx.emit(
+                ProgressKind.DOWNLOAD,
+                "Not needed: the export is reused",
+                status="skipped",
+            )
+        snapshot = None if adopted is not None else self._download(plan, ctx)
         ctx.advance(JobStage.DOWNLOADED)
 
-        staging = self._staging_dir(plan, ctx)
         self._stage(ctx, 5)
         tracker.stage = JobStage.EXPORTED
-        export = self._convert(plan, snapshot, staging, ctx)
+        if adopted is not None or snapshot is None:
+            export = self._reused_export_outcome(adopted)
+            ctx.emit(
+                ProgressKind.EXPORT,
+                f"Reusing the completed export of job {export.record.reused_from_job}",
+                status="reused",
+            )
+        else:
+            export = self._convert(plan, snapshot, staging, ctx, environment=environment)
         warnings.extend(export.notes)
         ctx.advance(JobStage.EXPORTED)
 
@@ -1554,8 +1661,9 @@ class PrepareService:
         remediation = [
             *(f"Install the required version yourself: {command}" for command in commands),
             (
-                "yonga never installs, upgrades or removes packages in your environment; "
-                "a future managed-environment feature will handle this properly."
+                "yonga never installs, upgrades or removes packages in your environment. "
+                "Without --no-managed-env (and with managed_export_envs left on) it runs "
+                "this export in an isolated environment it builds instead."
             ),
             (
                 f"If you know this pin is stale, re-run with {IGNORE_EXPORTER_REQUIREMENTS_FLAG}: "
@@ -1703,6 +1811,53 @@ class PrepareService:
 
     # --- download and conversion -----------------------------------------
 
+    def _export_fingerprint(self, plan: PreparationPlan) -> str:
+        """Digest what determines this plan's export output; see ``export_reuse``."""
+        source = plan.resolved_source.source
+        metadata = plan.resolved_source.metadata
+        environment = plan.export_environment
+        return export_reuse.export_fingerprint(
+            source_repo_id=source.repo_id,
+            source_revision=(metadata.resolved_revision if metadata else None) or source.revision,
+            task=plan.task,
+            profile=plan.profile.model_dump(mode="json"),
+            trust_remote_code=plan.trust_remote_code_enabled,
+            backend=_EXPORT_BACKEND,
+            environment_key=None if environment is None else environment.key,
+            package_versions={} if environment is not None else self._package_versions(),
+        )
+
+    def _adopt_export(
+        self, plan: PreparationPlan, staging: Path, ctx: JobContext
+    ) -> ExportCheckpoint | None:
+        """Take over the plan's reusable export, if it has one and it checks out."""
+        candidate = plan.reusable_export
+        if candidate is None:
+            return None
+        adopted = export_reuse.adopt(candidate, staging, ctx)
+        if adopted is None:
+            ctx.emit(
+                ProgressKind.LOG,
+                f"The retained export of job {candidate.job_id} no longer matches; exporting.",
+                severity=Severity.WARNING,
+            )
+            return None
+        return adopted
+
+    @staticmethod
+    def _reused_export_outcome(checkpoint: ExportCheckpoint | None) -> _ExportOutcome:
+        """The export stage's result when an earlier job's export was adopted."""
+        assert checkpoint is not None  # guarded by the caller: no snapshot means adopted
+        record = checkpoint.record.model_copy(update={"reused_from_job": checkpoint.job_id})
+        finished = checkpoint.completed_at.strftime("%Y-%m-%d %H:%M UTC")
+        return _ExportOutcome(
+            record=record,
+            notes=[
+                f"The export was reused from failed job {checkpoint.job_id}, which completed "
+                f"it at {finished} with identical inputs; it was not run again."
+            ],
+        )
+
     def _download(self, plan: PreparationPlan, ctx: JobContext) -> Path:
         """Materialise the pinned source revision in the Hugging Face cache."""
         source = plan.resolved_source.source
@@ -1726,18 +1881,82 @@ class PrepareService:
             return plan.staging_dir
         return self._artifacts.staging_model_dir(ctx.job_id)
 
+    def _ensure_export_environment(
+        self, plan: PreparationPlan, ctx: JobContext
+    ) -> ExportEnvironment | None:
+        """Build (or reuse) the managed environment the plan chose, if any."""
+        spec = plan.export_environment
+        if spec is None:
+            return None
+        if self._environments is None:
+            raise PreflightError(
+                diagnostic(
+                    "export.env.unavailable",
+                    FailureCategory.CONFIGURATION_ERROR,
+                    "Managed export environments are unavailable",
+                    "The plan needs a managed export environment, but this service was "
+                    "built without an environment manager.",
+                )
+            )
+        if not plan.export_environment_ready:
+            self._require_environment_space(plan)
+        environment = self._environments.ensure(spec, ctx)
+        ctx.emit(
+            ProgressKind.LOG,
+            f"Exporting in managed environment {environment.spec.name}",
+            key=environment.key,
+        )
+        return environment
+
+    def _require_environment_space(self, plan: PreparationPlan) -> None:
+        """Refuse to build an environment the cache filesystem cannot also hold.
+
+        The environment and the export's managed temp directory both live under
+        the cache directory, and both are needed at once. Temp space was already
+        checked on its own; when the environment shares that filesystem it has
+        to fit *on top of* the temp requirement, or the export would run out of
+        room halfway through.
+        """
+        envs_dir = self._settings.paths.envs_dir
+        usage = self._filesystem.usage(envs_dir)
+        free = int(getattr(usage, "available_bytes", 0) or getattr(usage, "free_bytes", 0) or 0)
+        if not free:
+            return  # unknown: the filesystem probe already reported it as a warning
+        needed = ESTIMATED_ENVIRONMENT_BYTES
+        temp = plan.disk.temp.temp_filesystem
+        shared = temp.mount_point is not None and temp.mount_point == getattr(
+            usage, "mount_point", None
+        )
+        if shared:
+            needed += plan.disk.temp.total_required_bytes
+        if free >= needed:
+            return
+        also = " alongside the export's temporary files" if shared else ""
+        raise PreflightError(
+            diagnostic(
+                "export.env.insufficient_disk",
+                FailureCategory.INSUFFICIENT_DISK,
+                "Not enough space to build the export environment",
+                f"About {format_bytes(ESTIMATED_ENVIRONMENT_BYTES)} is needed under {envs_dir}"
+                f"{also} ({format_bytes(needed)} in all); {format_bytes(free)} is free.",
+                remediation=["Free space, or point YONGA_CACHE_DIR at a bigger disk."],
+            )
+        )
+
     def _convert(
         self,
         plan: PreparationPlan,
         snapshot: Path,
         staging: Path,
         ctx: JobContext,
+        *,
+        environment: ExportEnvironment | None = None,
     ) -> _ExportOutcome:
         """Produce OpenVINO IR in ``staging``, by conversion or by copying IR."""
         mark_incomplete(staging, job_id=ctx.job_id)
         if plan.resolved_source.already_openvino:
             return self._copy_openvino_source(plan, snapshot, staging, ctx)
-        return self._export(plan, snapshot, staging, ctx)
+        return self._export(plan, snapshot, staging, ctx, environment=environment)
 
     def _copy_openvino_source(
         self,
@@ -1802,6 +2021,8 @@ class PrepareService:
         snapshot: Path,
         staging: Path,
         ctx: JobContext,
+        *,
+        environment: ExportEnvironment | None = None,
     ) -> _ExportOutcome:
         """Run the exporter and turn a failure into a classified diagnostic."""
         started = _now()
@@ -1813,6 +2034,8 @@ class PrepareService:
             trust_remote_code=plan.trust_remote_code_enabled,
             extra_env=dict(ctx.temp_env),
             model_ref=str(snapshot),
+            interpreter=None if environment is None else environment.python,
+            environment_versions={} if environment is None else dict(environment.installed),
         )
         result = self._exporter.export(request, ctx)
         # The exporter empties its output directory before it starts, which takes the
@@ -1829,6 +2052,7 @@ class PrepareService:
             package_versions=result.package_versions or self._package_versions(),
             duration_seconds=result.duration_seconds,
             started_at=started,
+            environment_key=None if environment is None else environment.key,
         )
         if result.success:
             ctx.logger.info(
@@ -1836,6 +2060,11 @@ class PrepareService:
                 "conversion finished",
                 profile=plan.profile.id,
                 duration_seconds=result.duration_seconds,
+            )
+            # Before validation touches anything: the checkpoint describes the
+            # export exactly as the exporter left it.
+            export_reuse.write_checkpoint(
+                staging, fingerprint=self._export_fingerprint(plan), record=record, ctx=ctx
             )
             return _ExportOutcome(record=record, result=result)
 

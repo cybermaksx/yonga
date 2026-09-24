@@ -115,6 +115,15 @@ class Settings(BaseSettings):
     temp_size_multiplier: float = Field(default=2.5, gt=0.0)
     temp_safety_margin_bytes: int = Field(default=5 * GIB, ge=0)
     compile_cache_enabled: bool = True
+    managed_export_envs: bool = True
+    """Build an isolated export environment when the installed packages cannot
+    satisfy an architecture's exporter requirements, instead of refusing.
+
+    The environment lives under the cache directory and is used only by the
+    export subprocess; the user's own environment is never modified. Creating
+    one is confirmed in the preparation plan. ``--no-managed-env`` or
+    ``managed_export_envs = false`` restores the refusal.
+    """
     workspace_retention_hours: int = Field(default=72, ge=0)
     """How long a stale job working directory is kept before a sweep retires it.
 

@@ -40,6 +40,7 @@ import pytest
 from typer.testing import CliRunner
 from typer.testing import Result as CliResult
 
+from tests.support import RefusingRunner, SimulatedPipRunner
 from tests.unit.test_prepare_planning import (
     INSTALLED_EXPORT_VERSIONS,
     MISMATCHED_EXPORT_VERSIONS,
@@ -63,7 +64,14 @@ from tests.unit.test_prepare_planning import (
     write_tokenizer_pair,
     yes_flag,
 )
-from yonga.adapters import Exporter, FilesystemProbe, HardwareProbe, HubClient, RuntimeProbe
+from yonga.adapters import (
+    CommandRunner,
+    Exporter,
+    FilesystemProbe,
+    HardwareProbe,
+    HubClient,
+    RuntimeProbe,
+)
 from yonga.adapters.filesystem import system_temp_dir
 from yonga.application.prepare import (
     IGNORE_EXPORTER_REQUIREMENTS_FLAG,
@@ -183,7 +191,7 @@ def test_the_diagnostic_names_both_versions_and_the_pip_command(
     assert "pip install 'transformers==5.2.*'" in remediation
     # AGENT_PROMPT.md 13.2: yonga diagnoses and instructs, it never installs.
     assert "never installs" in remediation
-    assert "future managed-environment feature" in remediation
+    assert "isolated environment" in remediation and "--no-managed-env" in remediation
     assert IGNORE_EXPORTER_REQUIREMENTS_FLAG in remediation
 
 
@@ -423,11 +431,23 @@ class PreflightWiring(Wiring):
     service, the real preflight and the real exit-code mapping.
     """
 
-    def __init__(self, settings: Settings, *, hub: FakeHub, exporter: FakeExporter) -> None:
-        """Bind the doubles this CLI test needs."""
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        hub: FakeHub,
+        exporter: FakeExporter,
+        runner: CommandRunner | None = None,
+    ) -> None:
+        """Bind the doubles this CLI test needs.
+
+        ``runner`` defaults to one that refuses to spawn anything, so the real
+        export-environment manager can never reach the network from this test.
+        """
         super().__init__(settings)
         self._fake_hub = hub
         self._fake_exporter = exporter
+        self._fake_runner: CommandRunner = runner if runner is not None else RefusingRunner()
         self._fake_hardware = FakeHardwareProbe(reference_inventory())
         self._fake_filesystem = FakeFilesystemProbe(tmpfs_paths=(system_temp_dir(),))
         self._fake_runtime = FakeRuntimeProbe()
@@ -462,6 +482,10 @@ class PreflightWiring(Wiring):
         """Return a resolver with pinned versions, so rules match deterministically."""
         return self._fake_resolver
 
+    def command_runner(self) -> CommandRunner:
+        """Return the runner that refuses (or simulates) every process."""
+        return self._fake_runner
+
 
 def invoke_prepare(
     home: Path,
@@ -469,12 +493,13 @@ def invoke_prepare(
     *,
     hub: FakeHub,
     exporter: FakeExporter,
+    runner: CommandRunner | None = None,
 ) -> CliResult:
     """Run ``yonga prepare`` against the fakes, inside private XDG directories."""
 
     def build(settings: Settings) -> Wiring:
         """Return the faked adapter graph for one invocation."""
-        return PreflightWiring(settings, hub=hub, exporter=exporter)
+        return PreflightWiring(settings, hub=hub, exporter=exporter, runner=runner)
 
     return CliRunner().invoke(
         app,
@@ -500,7 +525,7 @@ def home(tmp_path: Path) -> Path:
 def test_cli_prepare_with_yes_stops_with_the_environment_exit_code(
     home: Path, tmp_path: Path
 ) -> None:
-    """The observed defect, at the command line: ``--yes`` is not a bypass."""
+    """With managed environments refused, ``--yes`` is still not a bypass."""
     hub = FakeHub(
         repos={SAFETENSORS_REPO: safetensors_metadata()},
         snapshots={SAFETENSORS_REPO: make_snapshot(tmp_path, "snapshot-cli")},
@@ -509,7 +534,7 @@ def test_cli_prepare_with_yes_stops_with_the_environment_exit_code(
 
     result = invoke_prepare(
         home,
-        ["prepare", SAFETENSORS_REPO, "--device", "cpu", "--yes"],
+        ["prepare", SAFETENSORS_REPO, "--device", "cpu", "--yes", "--no-managed-env"],
         hub=hub,
         exporter=exporter,
     )
@@ -519,6 +544,63 @@ def test_cli_prepare_with_yes_stops_with_the_environment_exit_code(
     assert exporter.requests == []
     stderr = " ".join(result.stderr.split())
     assert "pip install 'transformers==5.2.*'" in stderr
+
+
+def test_cli_prepare_with_yes_builds_a_managed_environment_and_converts(
+    home: Path, tmp_path: Path
+) -> None:
+    """The fix, at the command line: ``--yes`` approves the environment, the export runs in it.
+
+    The real environment manager runs; only the processes it would spawn are
+    simulated. The export is handed the environment's interpreter.
+    """
+    hub = FakeHub(
+        repos={SAFETENSORS_REPO: safetensors_metadata()},
+        snapshots={SAFETENSORS_REPO: make_snapshot(tmp_path, "snapshot-cli")},
+    )
+    exporter = mismatched_exporter()
+    pip = SimulatedPipRunner()
+
+    result = invoke_prepare(
+        home,
+        ["prepare", SAFETENSORS_REPO, "--device", "cpu", "--yes"],
+        hub=hub,
+        exporter=exporter,
+        runner=pip,
+    )
+
+    assert result.exit_code in (int(ExitCode.SUCCESS), int(ExitCode.WARNINGS)), result.stderr
+    assert pip.requirements["transformers"] in ("==5.2.*", "==5.2.0", "==5.2.1")
+    (request,) = exporter.requests
+    assert request.interpreter is not None
+    assert request.interpreter.parent.parent.parent == home / "cache" / "envs"
+    assert "managed export environment" in " ".join(result.stdout.split())
+
+
+def test_cli_ignoring_requirements_never_builds_an_environment(home: Path, tmp_path: Path) -> None:
+    """``--ignore-exporter-requirements`` means "export here"; a managed env would defeat it."""
+    hub = FakeHub(
+        repos={SAFETENSORS_REPO: safetensors_metadata()},
+        snapshots={SAFETENSORS_REPO: make_snapshot(tmp_path, "snapshot-cli")},
+    )
+    exporter = mismatched_exporter()
+
+    result = invoke_prepare(
+        home,
+        [
+            "prepare",
+            SAFETENSORS_REPO,
+            "--device",
+            "cpu",
+            "--yes",
+            IGNORE_EXPORTER_REQUIREMENTS_FLAG,
+        ],
+        hub=hub,
+        exporter=exporter,
+    )
+
+    assert result.exit_code in (int(ExitCode.SUCCESS), int(ExitCode.WARNINGS)), result.stderr
+    assert exporter.requests[0].interpreter is None
 
 
 def test_cli_prepare_with_the_explicit_flag_converts(home: Path, tmp_path: Path) -> None:

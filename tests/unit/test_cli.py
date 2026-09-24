@@ -28,6 +28,7 @@ import pytest
 # annotation tracks whichever version is installed.
 from typer.testing import CliRunner, Result
 
+from tests.support import RefusingRunner
 from tests.unit.test_prepare_planning import (
     GGUF_REPO,
     SAFETENSORS_REPO,
@@ -42,7 +43,14 @@ from tests.unit.test_prepare_planning import (
     make_snapshot,
     safetensors_metadata,
 )
-from yonga.adapters import Exporter, FilesystemProbe, HardwareProbe, HubClient, RuntimeProbe
+from yonga.adapters import (
+    CommandRunner,
+    Exporter,
+    FilesystemProbe,
+    HardwareProbe,
+    HubClient,
+    RuntimeProbe,
+)
 from yonga.adapters.filesystem import system_temp_dir
 from yonga.adapters.runtime_genai import ChatHistory, ChatProfileLike, ChatRuntime, GenerationResult
 from yonga.application.artifacts import ArtifactStore
@@ -282,6 +290,10 @@ class FakeWiring(Wiring):
     def hub_client(self) -> HubClient:
         """Return the in-memory hub."""
         return self._fake_hub
+
+    def command_runner(self) -> CommandRunner:
+        """Refuse every process: an unfaked adapter must not reach the network."""
+        return RefusingRunner()
 
     def hardware_probe(self) -> HardwareProbe:
         """Return the fixed host inventory."""

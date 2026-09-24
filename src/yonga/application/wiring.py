@@ -34,6 +34,7 @@ from yonga.adapters import (
     HubSearch,
 )
 from yonga.adapters import RuntimeProbe as RuntimeProbePort
+from yonga.adapters.export_env import ExportEnvironmentManager
 from yonga.application.artifacts import ArtifactStore
 from yonga.application.benchmark import BenchmarkService
 from yonga.application.benchmark import RuntimeFactory as BenchmarkRuntimeFactory
@@ -220,6 +221,7 @@ class Wiring:
         """Bind the graph to the settings resolved for this invocation."""
         self._settings = settings
         self._hardware_probe: HardwareProbe | None = None
+        self._export_environments: ExportEnvironmentManager | None = None
         self._filesystem: FilesystemProbe | None = None
         self._command_runner: CommandRunner | None = None
         self._hub_client: HubClient | None = None
@@ -434,6 +436,7 @@ class Wiring:
             self.registry(),
             self._settings,
             progress=progress,
+            export_environments=self.export_environments().environments,
         )
 
     def inspect_service(self, *, progress: ProgressSink | None = None) -> InspectService:
@@ -458,7 +461,16 @@ class Wiring:
             artifact_store=self.artifact_store(),
             settings=self._settings,
             smoke_tester=self.smoke_tester(),
+            export_environments=self.export_environments(),
         )
+
+    def export_environments(self) -> ExportEnvironmentManager:
+        """Return the manager of isolated export environments."""
+        if self._export_environments is None:
+            self._export_environments = ExportEnvironmentManager(
+                self._settings.paths, self.command_runner(), offline=self._settings.offline
+            )
+        return self._export_environments
 
     def probe_service(self) -> ProbeService:
         """Build the ``yonga probe`` service."""

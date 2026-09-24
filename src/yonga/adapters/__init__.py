@@ -20,13 +20,15 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from yonga.application.jobs import JobContext
     from yonga.domain.artifacts import IRDescription, ProbeResult
+    from yonga.domain.environments import EnvironmentSpec, ExportEnvironment
     from yonga.domain.hardware import HardwareInventory, HuggingFaceAuthInfo
     from yonga.domain.models import ModelIdentity, ModelMetadata
-    from yonga.domain.plans import ExportRequest, ExportResult
+    from yonga.domain.plans import ExporterRequirements, ExportRequest, ExportResult
 
 __all__ = [
     "CommandResult",
     "CommandRunner",
+    "ExportEnvironments",
     "Exporter",
     "FilesystemProbe",
     "HardwareProbe",
@@ -93,6 +95,29 @@ class HubSearch(Protocol):
 
     def search(self, query: str, *, limit: int = 20) -> list[ModelMetadata]:
         """Return metadata for the best matches, from the search response alone."""
+        ...
+
+
+@runtime_checkable
+class ExportEnvironments(Protocol):
+    """Builds and finds the isolated environments exports run in."""
+
+    def spec_for(
+        self,
+        requirements: ExporterRequirements,
+        *,
+        installed: Mapping[str, str | None] | None = None,
+        reason: str = "",
+    ) -> EnvironmentSpec:
+        """The environment that meets ``requirements`` while changing least."""
+        ...
+
+    def find(self, spec: EnvironmentSpec) -> ExportEnvironment | None:
+        """The completed environment for ``spec``, if one is built."""
+        ...
+
+    def ensure(self, spec: EnvironmentSpec, ctx: JobContext) -> ExportEnvironment:
+        """Return the environment for ``spec``, building and verifying it if needed."""
         ...
 
 

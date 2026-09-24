@@ -140,10 +140,44 @@ tokenizer defect that needs repairing, and a device the registry rules out. Expe
 ~50 GiB of scratch space.
 
 > It needs `transformers==5.2.*`. On a newer release the export fails inside optimum-intel with
-> `ImportError: cannot import name 'Qwen3_5DynamicCache'`. yonga now stops at preflight and tells
-> you, rather than downloading 17.5 GiB first. Note that a newer transformers still *loads* the
-> config and reports `model_type: qwen3_5` — a successful config load is not evidence the export
-> will work.
+> `ImportError: cannot import name 'Qwen3_5DynamicCache'` — even though a newer transformers still
+> *loads* the config and reports `model_type: qwen3_5`, so a successful config load is not evidence
+> the export will work. yonga does not ask you to downgrade anything: the plan shows an **Export
+> environment** row, and the export runs in an isolated environment it builds under
+> `~/.cache/yonga/envs/` (next section).
+
+### Managed export environments
+
+When the installed packages cannot meet a model's exporter requirements, the export runs in an
+isolated environment instead of failing. It mirrors the packages yonga runs with and changes only
+the failing pin; torch comes from PyTorch's CPU index. It is built once, at preflight and before
+the model download, verified, and reused by later jobs. The artifact's manifest records which
+environment exported it (`export.environment_key`).
+
+```bash
+yonga env list               # environments and the disk they use
+yonga env remove KEY         # delete one; rebuilt if a later export needs it
+yonga prepare MODEL --no-managed-env                 # refuse instead (exit 10, names the pin)
+yonga prepare MODEL --ignore-exporter-requirements   # export in *your* environment anyway
+```
+
+`--yes` approves building an environment. It never implies `--ignore-exporter-requirements`.
+
+### Retrying after a failure
+
+Downloads resume through the Hugging Face cache. An export interrupted part-way restarts: the
+upstream exporter cannot continue from the middle. But an export that *finished* is kept when a
+later stage fails (a device probe, validation, Ctrl-C during the smoke test), and retrying the same
+command reuses it — the plan shows `Export  reused from failed job …` and stages 4–5 are skipped.
+
+```bash
+yonga prepare MODEL --device cpu            # Ctrl-C during 7/7 Probing runtime
+yonga prepare MODEL --device cpu            # adopts the finished export, validates and probes
+yonga prepare MODEL --device cpu --fresh-export   # export again regardless
+```
+
+Only an identical request qualifies: same source revision, profile, task and exporter packages (or
+managed environment). Every file is checked first; anything changed is discarded and the export runs.
 
 ---
 

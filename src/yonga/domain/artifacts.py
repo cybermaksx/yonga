@@ -433,6 +433,51 @@ class ExportRecord(BaseModel):
     package_versions: dict[str, str] = Field(default_factory=dict)
     duration_seconds: float | None = None
     started_at: datetime | None = None
+    environment_key: str | None = None
+    """The managed export environment the export ran in, or ``None`` for yonga's own."""
+    reused_from_job: str | None = None
+    """The failed job whose completed export this artifact reused, or ``None`` when
+    this job ran the export itself. See :class:`ExportCheckpoint`."""
+
+
+#: File name, inside :data:`MANIFEST_DIRNAME`, of an export's completion checkpoint.
+EXPORT_CHECKPOINT_FILENAME = "export-complete.json"
+
+
+class CheckpointFile(BaseModel):
+    """One exported file as it stood the moment the export finished."""
+
+    model_config = _LENIENT
+
+    size: int
+    mtime_ns: int
+    sha256: str | None = None
+    """Digest of small files (IR XML, tokenizers, configs): the ones repairs rewrite.
+    Weight files are identified by size and modification time instead, because
+    hashing gigabytes on every successful export would cost more than it protects."""
+
+
+class ExportCheckpoint(BaseModel):
+    """Proof that an export in a staging directory ran to completion.
+
+    Written by the preparation that ran the export, immediately after the
+    exporter succeeded and before validation touched anything. A later
+    preparation whose :attr:`fingerprint` is identical may adopt the directory
+    instead of exporting again: that is the only resume yonga offers, because
+    the upstream export is a single in-process run that cannot continue from
+    part-way through (``docs/ARCHITECTURE.md`` section 5).
+    """
+
+    model_config = _LENIENT
+
+    schema_version: int = 1
+    fingerprint: str
+    """Digest of everything that determines the export's output."""
+    job_id: str
+    completed_at: datetime
+    record: ExportRecord
+    files: dict[str, CheckpointFile] = Field(default_factory=dict)
+    """Relative POSIX path to its state, for every file the exporter produced."""
 
 
 class ArtifactManifest(BaseModel):

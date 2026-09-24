@@ -351,6 +351,38 @@ def test_live_job_ids_reads_the_state_documents(settings: Settings) -> None:
     assert live_job_ids(settings.paths) == frozenset({"running"})
 
 
+def test_an_interrupted_job_records_that_it_ended(settings: Settings) -> None:
+    """Ctrl-C used to leave the state at the last stage, so the job looked live for a day."""
+    with (
+        pytest.raises(KeyboardInterrupt),
+        open_job(settings=settings, requested_model=MODEL, job_id="interrupted") as ctx,
+    ):
+        ctx.advance(JobStage.VALIDATING)
+        raise KeyboardInterrupt
+
+    store = JobStateStore.load(settings.paths.job_state_path("interrupted"))
+    assert store.stage is JobStage.FAILED
+    assert store.state.diagnostic is not None
+    assert store.state.diagnostic.code == "job.cancelled"
+    assert "interrupted" not in live_job_ids(settings.paths)
+
+
+def test_a_recorded_failure_is_not_overwritten_on_the_way_out(settings: Settings) -> None:
+    recorded = diagnostic(
+        "export.failed", FailureCategory.UNKNOWN_RUNTIME_ERROR, "Export failed", "boom"
+    )
+    with (
+        pytest.raises(RuntimeError),
+        open_job(settings=settings, requested_model=MODEL, job_id="failed") as ctx,
+    ):
+        ctx.fail(JobStage.EXPORTED, recorded)
+        raise RuntimeError("the service re-raised")
+
+    store = JobStateStore.load(settings.paths.job_state_path("failed"))
+    assert store.state.diagnostic is not None
+    assert store.state.diagnostic.code == "export.failed"
+
+
 def test_live_job_ids_forgets_a_job_that_stopped_writing(settings: Settings) -> None:
     """A crashed job must not pin gigabytes for ever by never reaching a terminal stage."""
     write_state(settings, "abandoned", "exported", hours=LIVE_JOB_GRACE_HOURS + 1)

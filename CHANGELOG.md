@@ -11,6 +11,9 @@ manifest may change in any minor release.
 
 ### Fixed
 
+- **A cancelled job looked like it was still running for 24 hours.** Ctrl-C (or any exception a
+  service did not record) left the job state at its last stage, so the sweep and export reuse both
+  treated its staging directory as live. The job now records `job.cancelled` or `job.aborted`.
 - **yonga could not prepare an NPU artifact for any LLM.** The probe compiled each numeric
   submodel raw and took a failure as the verdict, but a raw `Core.compile_model` rejects every
   dynamically shaped LLM on the NPU ("to_shape was called on a dynamic shape"), while the OpenVINO
@@ -38,6 +41,22 @@ manifest may change in any minor release.
 - NPU profiles carry `MAX_PROMPT_LEN=1024` / `MIN_RESPONSE_LEN=128`, so the manifest records the
   static-shape budget an NPU artifact was probed with.
 - `ProbeStatus.DEFERRED`, for a raw compile the pipeline was asked to settle.
+- **Managed export environments.** When the installed packages cannot meet an architecture's exporter
+  requirements -- Qwen3.5 needs `transformers==5.2.*` -- `prepare` builds an isolated environment
+  under the cache directory and runs the export in it, instead of refusing and leaving the user to
+  reshape their own environment. It mirrors the packages yonga runs with and changes only the failing
+  pin; torch and torchvision come from PyTorch's CPU index (1.44 GiB against a 6.2 GB CUDA install).
+  It is confirmed in the plan, built and verified at preflight before the model download, never used
+  half-built, reused by later jobs, and recorded in the manifest as `export.environment_key`.
+  `yonga env list|remove` manage them and `doctor` reports their disk use. `--no-managed-env` restores
+  the refusal; `--ignore-exporter-requirements` exports in the current environment and never builds
+  one. Registry data can choose only a version for a package yonga lists, never a package of its own.
+- **Reuse of a completed export after a failed job.** A successful export now writes a checkpoint
+  (fingerprint of every input, plus each file's size, mtime and small-file digest) into staging. When
+  a later stage fails, an identical `prepare` adopts the retained export, restoring repaired files
+  from their backups and rejecting anything that changed, and skips the download and conversion.
+  The plan says so and the manifest records `export.reused_from_job`; `--fresh-export` declines. An
+  export interrupted part-way still restarts: optimum-intel cannot resume one.
 - **`yonga search QUERY [--limit N] [--device D]`** searches the Hub in one request and runs each
   result through the registry's identification, marking GGUF-header identities. Compatibility is
   shown per architecture next to a format hint, because an MLX or AWQ repository can report a

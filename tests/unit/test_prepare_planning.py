@@ -23,6 +23,7 @@ from pathlib import Path
 import pytest
 
 from yonga.adapters import (
+    ExportEnvironments,
     Exporter,
     FilesystemProbe,
     HardwareProbe,
@@ -661,6 +662,7 @@ def build_service(
     filesystem: FilesystemProbe | None = None,
     resolver: RegistryResolver | None = None,
     smoke: SmokeTester | None = None,
+    environments: ExportEnvironments | None = None,
 ) -> PrepareService:
     """Assemble a :class:`PrepareService` from fakes, with sensible defaults."""
     return PrepareService(
@@ -677,6 +679,7 @@ def build_service(
         artifact_store=ArtifactStore(settings.paths, settings),
         settings=settings,
         smoke_tester=smoke if smoke is not None else FakeSmokeTester(),
+        export_environments=environments,
     )
 
 

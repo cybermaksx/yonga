@@ -95,6 +95,11 @@ class Paths:
         """Cache of cheap Hub metadata lookups."""
         return self.cache_dir / "metadata"
 
+    @property
+    def envs_dir(self) -> Path:
+        """Managed export environments, one virtual environment per package set."""
+        return self.cache_dir / "envs"
+
     # --- data ----------------------------------------------------------
     @property
     def artifacts_dir(self) -> Path:

@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from yonga.domain.compatibility import CompatibilityDecision
 from yonga.domain.diagnostics import Diagnostic
+from yonga.domain.environments import EnvironmentSpec
 from yonga.domain.hardware import FilesystemInfo, HardwareInventory, normalise_device
 from yonga.domain.models import ModelIdentity, PipelineKind, ResolvedSource
 
@@ -27,6 +28,7 @@ CONFIRMATION_LARGE_DOWNLOAD = "large_download"
 CONFIRMATION_REPAIR = "repair"
 CONFIRMATION_DEVICE_FALLBACK = "device_fallback"
 CONFIRMATION_OVERWRITE_EXISTING = "overwrite_existing"
+CONFIRMATION_MANAGED_ENVIRONMENT = "managed_export_environment"
 
 #: Confirmation codes that ``--yes`` must never auto-approve (see SPEC.md 18.1).
 SECURITY_SENSITIVE_CONFIRMATION_CODES: frozenset[str] = frozenset({CONFIRMATION_REMOTE_CODE})
@@ -213,6 +215,19 @@ class ExporterRequirements(BaseModel):
         return {name: spec for name, spec in declared.items() if spec is not None}
 
 
+class ReusableExport(BaseModel):
+    """A failed job's completed export that an identical preparation can adopt."""
+
+    model_config = ConfigDict(frozen=True)
+
+    job_id: str
+    """The job that ran the export."""
+    path: Path
+    """Its retained staging directory."""
+    completed_at: datetime
+    fingerprint: str
+
+
 class PreparationPlan(BaseModel):
     """Everything decided before a preparation job starts doing expensive work."""
 
@@ -251,6 +266,14 @@ class PreparationPlan(BaseModel):
     confirmations: list[ConfirmationReason] = Field(default_factory=list)
     reuse_existing_artifact: Path | None = None
     force: bool = False
+    export_environment: EnvironmentSpec | None = None
+    """The managed environment the export will run in, when the installed packages
+    cannot meet the architecture's exporter requirements."""
+    export_environment_ready: bool = False
+    """Whether :attr:`export_environment` is already built (no download needed)."""
+    reusable_export: ReusableExport | None = None
+    """A completed export, left by a failed job, that this plan will adopt instead
+    of exporting again. ``None`` when there is none or reuse was declined."""
 
     @field_validator("target_device")
     @classmethod
@@ -283,7 +306,11 @@ class PreparationPlan(BaseModel):
         The preflight gate and the plan panel both read this one property, so
         the panel cannot announce a block the service will not perform.
         """
-        return bool(self.exporter.problems) and not self.resolved_source.already_openvino
+        return (
+            bool(self.exporter.problems)
+            and not self.resolved_source.already_openvino
+            and self.export_environment is None
+        )
 
     def to_json(self) -> dict[str, object]:
         """Return a fully JSON-serialisable representation of the plan."""
@@ -302,6 +329,12 @@ class ExportRequest(BaseModel):
     trust_remote_code: bool = False
     extra_env: dict[str, str] = Field(default_factory=dict)
     model_ref: str | None = None
+    interpreter: Path | None = None
+    """Run the export with this Python -- a managed export environment's -- instead
+    of the one yonga runs in. ``None`` means yonga's own interpreter."""
+    environment_versions: dict[str, str] = Field(default_factory=dict)
+    """Package versions installed in :attr:`interpreter`'s environment, recorded as
+    the export's package versions so the manifest names what actually ran."""
 
     @property
     def resolved_model_ref(self) -> str:

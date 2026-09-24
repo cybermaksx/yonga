@@ -40,7 +40,7 @@ The end-to-end path (`prepare` → `probe` → `chat` → `bench`) has been exer
 
 ## What works today
 
-Eleven commands, one of which (`registry`) has three subcommands:
+Twelve commands; `registry` has three subcommands and `env` two:
 
 | Command | What it does |
 |---|---|
@@ -53,6 +53,7 @@ Eleven commands, one of which (`registry`) has three subcommands:
 | `yonga probe ARTIFACT --device D` | Compiles the artifact's submodels on a device and reports what worked, with timings. |
 | `yonga chat ARTIFACT` | A local chat session with slash commands, hidden reasoning by default, and a metrics footer. |
 | `yonga bench ARTIFACT` | Runs a prompt suite and writes a reproducible JSON result under the data directory. |
+| `yonga env list` / `env remove KEY` | The isolated environments `prepare` builds when a model's exporter needs package versions other than the installed ones, and the disk they use. |
 | `yonga logs [JOB_ID]` | Lists job logs, prints one as a table, or `--raw` for the JSON Lines file. |
 | `yonga registry validate` | Loads every registry layer and checks it is internally consistent. |
 | `yonga registry explain MODEL` | Shows which rules matched, which lost, and why. |
@@ -76,7 +77,7 @@ The extras are separate because they cost very different amounts of disk:
 - **`export`** — `optimum-intel[openvino]`, `nncf` (which pull in `transformers` and `torch`). Needed by `prepare` to convert and quantize a model.
 - **`dev`** — pytest, ruff, mypy.
 
-Without the extras `yonga` still runs: `doctor`, `inspect`, `list`, `logs` and `registry` work, and `doctor` exits 10 and tells you which package is missing and which extra installs it. `yonga` never installs, upgrades or removes a package on your behalf; it prints the command for you to run.
+Without the extras `yonga` still runs: `doctor`, `inspect`, `list`, `logs` and `registry` work, and `doctor` exits 10 and tells you which package is missing and which extra installs it. `yonga` never installs, upgrades or removes a package in the environment you installed it into; it prints the command for you to run. (When a model's exporter needs different package versions, `prepare` builds an isolated environment for that export instead — see `docs/INSTALL.md` section 6.)
 
 Full prerequisites, the Intel NPU driver situation on Linux, and the version rules that actually bite are in [`docs/INSTALL.md`](docs/INSTALL.md).
 

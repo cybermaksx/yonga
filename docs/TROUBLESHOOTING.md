@@ -324,14 +324,22 @@ token-shaped with `***REDACTED***`.
 ### 5.6 The architecture's Transformers pin is not met
 
 Exporting runs the architecture's modelling code from `transformers`, so the registry pins a release
-per architecture. When the installed one does not satisfy the pin, `prepare` stops in preflight —
-before the download, not after it — with `preflight.exporter_requirement_unsatisfied`, category
-`package_abi_mismatch`, exit **10**. The plan says so before you are asked to confirm anything:
+per architecture. When the installed one does not satisfy the pin, `prepare` runs the export in a
+**managed export environment** — an isolated virtual environment it builds under
+`~/.cache/yonga/envs/` with the pinned release — and says so in the plan before you confirm:
 
 ```text
-Known limitations
-• Exporter requirement not satisfied: transformers ==4.99.* is required, but 5.2.0 is installed
+Export environment          managed export-68334e6a480b
+                            transformers==5.2.*  will be built
+```
 
+Nothing in your own environment changes. See `docs/INSTALL.md` section 6 for what goes into it.
+
+With `--no-managed-env` (or `managed_export_envs = false`) it stops in preflight instead — before the
+download, not after it — with `preflight.exporter_requirement_unsatisfied`, category
+`package_abi_mismatch`, exit **10**:
+
+```text
 BLOCKED — exporter requirements not satisfied
 x  transformers ==4.99.* is required, but 5.2.0 is installed
 Preparation stops at preflight, before the download and the conversion. Override with
@@ -342,9 +350,35 @@ Exit 10 rather than 30 is deliberate: nothing is short of a resource, and neithe
 registry is wrong. What cannot work is the combination of installed versions, which is what
 `package_abi_mismatch` means everywhere else in this document.
 
-`--yes` does not answer this one. `--ignore-exporter-requirements` does, and the override is written
-into the artifact's manifest so an artifact built past a declared pin can be explained later. The
-usual answer is a dedicated virtual environment for that export — see `docs/INSTALL.md` section 6.
+`--ignore-exporter-requirements` exports in your environment regardless — it never builds a managed
+one — and the override is written into the artifact's manifest so an artifact built past a declared
+pin can be explained later. `--yes` does not imply it.
+
+### 5.7 A managed export environment could not be built
+
+| Code | Category | Exit | Meaning |
+|---|---|---|---|
+| `export.env.install_failed` | `download_failure` | 20 | `venv` or `pip` exited non-zero. pip's full output is in `yonga logs JOB_ID --raw`. |
+| `export.env.verify_failed` | `package_abi_mismatch` | 10 | It installed, but a version does not match the specification, or the exporter would not import. |
+| `export.env.offline` | `download_failure` | 20 | A new environment is needed and offline mode is on. An existing one is reused offline. |
+| `export.env.insufficient_disk` | `insufficient_disk` | 30 | The cache filesystem cannot hold the environment *alongside* the export's temporary files. |
+| `export.env.cancelled` | `user_cancelled` | 60 | Interrupted while building. |
+
+A failed or interrupted build removes its directory, and an environment is only used once a marker
+written after verification exists, so a half-built one is never picked up. Just re-run.
+
+A real case, from the reference host. The first build failed verification with:
+
+```text
+RuntimeError: operator torchvision::nms does not exist
+ModuleNotFoundError: Could not import module 'PreTrainedModel'.
+```
+
+`optimum-intel` requires `torchvision`, and pip had fetched it from PyPI — the CUDA build — while
+torch had come from the CPU index. The two cannot load together. yonga now installs every
+torch-built package (`torch`, `torchvision`) from the same CPU index. If you see this error in an
+environment of your own, install both from one index:
+`pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu`.
 
 ## 6. Reading a job log
 
@@ -416,6 +450,13 @@ The same path is in the diagnostic's `staging_dir` context key, in the job state
 whatever the exporter produced before it died: which IR files exist, their sizes, and whether the
 tokenizer pair was written at all. The managed `TMPDIR` is kept on failure for the same reason and
 logged as `job.temp_retained`.
+
+When the export itself had finished, `model/.yonga/export-complete.json` is there too, and running
+the same `prepare` again adopts the directory instead of exporting (`export.reused` in the new job's
+log; `export.reuse_rejected` with the reason when a file no longer matches, after which it exports
+normally). Pass `--fresh-export` to keep it out of the way. A cancelled or crashed job records a
+terminal state (`job.cancelled`, `job.aborted`) on its way out, so it never looks like it is still
+running.
 
 A staging directory holding nothing but the incomplete marker is removed straight away — it is the
 residue of an export that never wrote a file, and keeping those is how `.staging` used to grow to

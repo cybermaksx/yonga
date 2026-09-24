@@ -39,6 +39,15 @@ source .venv/bin/activate
 pip install -e ".[openvino,export]"
 ```
 
+On a machine without an NVIDIA GPU, install the CPU build of torch first. The `export` extra pulls
+torch in, and the default PyPI build on Linux carries CUDA — on the reference host 1.2 GB of torch
+plus 3.2 GB of NVIDIA libraries that an Intel AI PC never uses. The CPU wheel is 196 MB:
+
+```bash
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install -e ".[openvino,export]"
+```
+
 The extras map to what you intend to do:
 
 | Extra | Packages | Needed for |
@@ -60,8 +69,11 @@ OpenVINO
                     in the environment yonga runs from.
 ```
 
-That last line is a rule, not a disclaimer. `yonga` never runs `pip`, `apt`, `modprobe`, `sudo` or
-`usermod`. It tells you the command; you decide whether to run it.
+That last line is a rule, not a disclaimer. `yonga` never runs `apt`, `modprobe`, `sudo` or
+`usermod`, and never runs `pip` in the environment you installed it into. It tells you the command;
+you decide whether to run it. The one place it does run `pip` is inside a *managed export
+environment* it creates under its own cache directory, and only after you confirm it in the
+preparation plan (section 6).
 
 Check the installation:
 
@@ -272,56 +284,54 @@ Known limitations
   - NPU is not a target for this architecture on OpenVINO 2026.x.
 ```
 
-`prepare` checks the same requirement during preflight and **stops** — it does not warn and carry
-on. The plan lists the unmet pin under known limitations and closes with a blocked banner (verified,
-reproduced here with a registry override pinning a version that is not installed):
+When the installed packages cannot meet that requirement, `prepare` runs the export in a **managed
+export environment** instead of stopping: an isolated virtual environment under
+`~/.cache/yonga/envs/`, used only by the export subprocess. Your own environment is never changed.
+The plan says so before anything happens (real output, with `transformers 5.5.4` installed):
 
 ```text
-Known limitations
-• Exporter requirement not satisfied: transformers ==4.99.* is required, but 5.2.0 is installed
-
-────────────────────────────────────────────────────────────────────────────
-BLOCKED — exporter requirements not satisfied
-x  transformers ==4.99.* is required, but 5.2.0 is installed
-Preparation stops at preflight, before the download and the conversion. Override with
---ignore-exporter-requirements if you know the pin is stale; --yes does not.
+Export environment          managed export-68334e6a480b
+                            transformers==5.2.*  will be built
+• The installed packages do not meet an exporter requirement (transformers
+  ==5.2.* is required, but 5.5.4 is installed); the export runs in managed
+  environment export-68334e6a480b instead.
+Confirmation required
+·  A managed export environment (transformers==5.2.*) will be built under
+   ~/.cache/yonga/envs: up to about 3.0 GiB of packages from PyPI and the
+   PyTorch CPU index. [...]
 ```
 
-and then exits **10** without downloading anything (verified):
+What goes into it:
 
-```text
-✗ Exporter requirements are not satisfied
+- the packages yonga itself runs with — the same `optimum-intel`, `nncf` and `torch` — with only the
+  failing pin changed, so the environment differs from a known-good one in exactly one place;
+- `openvino` and `openvino-tokenizers` pinned to the **runtime's** release, because the runtime has
+  to read the IR the export writes;
+- `torch` and `torchvision` from PyTorch's CPU wheel index. Exporting runs on the CPU, and the
+  default PyPI build of torch on Linux carries CUDA: 1.2 GB of torch plus 3.2 GB of NVIDIA libraries,
+  against a 196 MB CPU wheel. The Qwen3.5 environment on the reference host is 1.44 GiB in total.
 
-Converting hf-internal-testing/tiny-random-LlamaForCausalLM needs transformers ==4.99.*, but 5.2.0
-is installed. yonga stops here, before the 14.2 MiB download and the conversion, because this export
-cannot succeed as the environment stands.
-
-  - Install the required version yourself: pip install 'transformers==4.99.*'
-  - yonga never installs, upgrades or removes packages in your environment; a future
-managed-environment feature will handle this properly.
-  - If you know this pin is stale, re-run with --ignore-exporter-requirements: yonga prepare
-hf-internal-testing/tiny-random-LlamaForCausalLM --ignore-exporter-requirements
-  - --yes does not and will not bypass this check, only --ignore-exporter-requirements does.
-```
-
-A conversion run against the wrong Transformers version may still fail, or may succeed and produce a
-graph that behaves differently — which is why the check is a gate and not a warning. If you know the
-pin is stale, `--ignore-exporter-requirements` proceeds and the override is recorded in the
-artifact's manifest. `--yes` never implies it.
-
-**`yonga` will not install or downgrade `transformers` for you.** Changing the version of a package
-in the environment you are running from is your decision, and downgrading `transformers` can break
-other things in the same environment. The usual answer is a dedicated virtual environment for that
-export:
+It is built at preflight, before the model download, so a failed build costs minutes rather than a
+multi-gigabyte download. It is verified by importing the exporter inside it and checking every
+version against the specification, and only then marked complete; an interrupted build is never
+used. Later jobs with the same requirements reuse it. The manifest of every artifact exported in one
+records its key. Registry data can only choose a *version* for a package yonga already lists — never
+name a package of its own — so a registry override cannot make yonga install something else.
 
 ```bash
-python3 -m venv .venv-qwen35
-source .venv-qwen35/bin/activate
-pip install -e ".[openvino,export]" 'transformers==5.2.*'
+yonga env list               # what exists, and the disk it uses (doctor shows the total too)
+yonga env remove KEY         # delete one; it is rebuilt if a later export needs it
 ```
 
-Check with `yonga doctor`, which lists the installed `transformers` version among the package
-checks, and with `yonga inspect MODEL`, which lists the architecture's known limitations.
+Opting out restores the old refusal: `--no-managed-env`, or `managed_export_envs = false` in
+`config.toml`. Preparation then stops at preflight and exits **10** without downloading anything,
+naming the pin and the `pip install` command that would satisfy it. `--ignore-exporter-requirements`
+means "export in my environment anyway": it never builds a managed environment, and the override is
+recorded in the artifact's manifest. `--yes` approves building an environment, but never implies
+`--ignore-exporter-requirements`.
+
+Building an environment needs the network once; offline, a job that needs a new one stops with
+`export.env.offline`, while an environment that already exists is reused.
 
 ## 7. Verifying the installation
 

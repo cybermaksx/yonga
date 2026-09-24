@@ -26,7 +26,7 @@ Intel accelerator by handing it fake probes.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -47,6 +47,7 @@ from yonga.domain.diagnostics import (
     Severity,
     worst_severity,
 )
+from yonga.domain.environments import ExportEnvironment
 from yonga.domain.hardware import (
     FilesystemInfo,
     HardwareInventory,
@@ -103,8 +104,8 @@ EXPORT_INSTALL_HINT: str = "Install the conversion extras: pip install 'yonga[ex
 
 #: yonga changes nothing about the Python environment; say so next to every hint.
 NEVER_INSTALLS_NOTE: str = (
-    "yonga never installs, upgrades or removes a package: run the command yourself "
-    "in the environment yonga runs from."
+    "yonga never installs, upgrades or removes a package in the environment it runs "
+    "from: run the command yourself."
 )
 
 #: Below this much free space a filesystem is called out as an error, not a warning.
@@ -230,14 +231,20 @@ class DoctorService:
         settings: Settings | None = None,
         *,
         progress: ProgressSink | None = None,
+        export_environments: Callable[[], Sequence[ExportEnvironment]] | None = None,
     ) -> None:
-        """Store the injected adapters. Nothing is probed until :meth:`run`."""
+        """Store the injected adapters. Nothing is probed until :meth:`run`.
+
+        ``export_environments`` lists the managed export environments, so the
+        report can say how much disk they hold.
+        """
         self._hardware = hardware_probe
         self._runtime = runtime_probe
         self._hub = hub_client
         self._registry = registry
         self._settings = settings if settings is not None else Settings()
         self._progress: ProgressSink = progress if progress is not None else null_sink()
+        self._export_environments = export_environments
 
     # --- entry point ---------------------------------------------------
 
@@ -556,9 +563,33 @@ class DoctorService:
             _system_temp_check(inventory.system_temp, floor),
             _managed_temp_check(inventory.managed_temp, paths.tmp_dir),
         ]
+        environments = self._environment_check(paths.envs_dir)
+        if environments is not None:
+            checks.append(environments)
         if full:
             checks.extend(_extra_filesystem_checks(inventory, paths.artifacts_dir, paths.tmp_dir))
         return HealthSection(id="storage", title="Storage", checks=_finalise(checks))
+
+    def _environment_check(self, root: Path) -> HealthCheck | None:
+        """How many managed export environments exist and the disk they use."""
+        if self._export_environments is None:
+            return None
+        try:
+            environments = list(self._export_environments())
+        except Exception:
+            # Reporting disk use must never make doctor fail.
+            return None
+        total = sum(environment.size_bytes for environment in environments)
+        value = (
+            f"{len(environments)} built, {format_bytes(total)}" if environments else "none built"
+        )
+        return HealthCheck(
+            id="storage.export_environments",
+            label="export environments",
+            status=Severity.OK,
+            value=value,
+            detail=f"{root} — isolated environments exports run in; `yonga env list`",
+        )
 
     # --- hugging face -----------------------------------------------------
 

@@ -453,6 +453,39 @@ def preparation_plan(plan: PreparationPlan) -> RenderableType:
         body.add_row(Text("Remote code"), Text.assemble(Text("required  ", style="bold"), remote))
     else:
         body.add_row(Text("Remote code"), Text("not required", style="dim"))
+    environment = plan.export_environment
+    if environment is not None:
+        pins = ", ".join(
+            f"{name}{specifier}"
+            for name, specifier in environment.packages.items()
+            if name == "transformers" and specifier
+        )
+        state = (
+            "exists, reused"
+            if plan.export_environment_ready
+            else "built only if the reused export fails its checks"
+            if plan.reusable_export is not None
+            else "will be built"
+        )
+        body.add_row(
+            Text("Export environment"),
+            Text.assemble(
+                Text(f"managed {environment.name}", style="cyan"),
+                (f"  {pins}  " if pins else "  ", ""),
+                (state, "dim"),
+            ),
+        )
+
+    reusable = plan.reusable_export
+    if reusable is not None:
+        finished = reusable.completed_at.strftime("%Y-%m-%d %H:%M UTC")
+        body.add_row(
+            Text("Export"),
+            Text.assemble(
+                Text(f"reused from failed job {reusable.job_id[:8]}", style="cyan"),
+                (f"  completed {finished}, identical inputs; --fresh-export to redo", "dim"),
+            ),
+        )
 
     blocks: list[RenderableType] = [body]
     blocks.extend(_bullet_block("Expected repairs", plan.expected_repairs, style="cyan"))
