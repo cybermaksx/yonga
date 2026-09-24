@@ -25,7 +25,9 @@ Design rules enforced here:
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import json
 import os
 import shutil
 import sys
@@ -42,6 +44,7 @@ from yonga.domain.diagnostics import (
     diagnostic,
 )
 from yonga.domain.plans import (
+    DeclaredRequirement,
     ExporterRequirements,
     ExportRequest,
     ExportResult,
@@ -276,6 +279,7 @@ class OptimumExporter:
         *,
         launcher: Sequence[str] | None = None,
         timeout: float | None = None,
+        cache_dir: Path | None = None,
     ) -> None:
         """Create an exporter.
 
@@ -291,6 +295,7 @@ class OptimumExporter:
         self._runner = runner if runner is not None else _default_runner()
         self._launcher = list(launcher) if launcher is not None else None
         self._timeout = timeout
+        self._cache_dir = cache_dir
 
     # --- argv ----------------------------------------------------------
 
@@ -316,6 +321,95 @@ class OptimumExporter:
     def requirements(self) -> dict[str, str | None]:
         """Return installed versions of every package the export depends on."""
         return {name: installed_version(name) for name in EXPORT_PACKAGES}
+
+    def declared_requirements(
+        self, model_type: str, task: str | None
+    ) -> DeclaredRequirement | None:
+        """The Transformers range optimum-intel itself declares for ``model_type``.
+
+        Each optimum-intel export config carries ``MIN_TRANSFORMERS_VERSION`` and
+        often ``MAX_TRANSFORMERS_VERSION``, and the exporter refuses to run
+        outside them ("The current version of Transformers does not allow for
+        the export of the model. Maximum required is 5.0"). Reading the range
+        here lets preflight know before the download, and lets a managed
+        export environment satisfy it, for any architecture and without a
+        registry entry per model. The registry's own pin, where one exists,
+        still wins.
+
+        The lookup imports optimum and torch, which takes seconds, so it runs in
+        a child process and its answer is cached per optimum-intel version.
+        ``None`` when optimum-intel is absent or declares nothing usable.
+        """
+        version = installed_version("optimum-intel")
+        if version is None or not model_type:
+            return None
+        key = f"{version}|{model_type}|{task or ''}"
+        cached = self._read_bounds_cache()
+        entry = cached.get(key)
+        if entry is None:
+            entry = self._lookup_bounds(model_type, task)
+            if entry is None:
+                return None
+            cached[key] = entry
+            self._write_bounds_cache(cached)
+        low, high, config = entry.get("min"), entry.get("max"), entry.get("config")
+        parts = [f">={low}" if low else "", f"<={high}" if high else ""]
+        specifier = ",".join(part for part in parts if part)
+        if not specifier:
+            return None
+        return DeclaredRequirement(
+            transformers=specifier,
+            source=f"optimum-intel {version} {config or 'export config'} for {model_type}",
+        )
+
+    def _lookup_bounds(self, model_type: str, task: str | None) -> dict[str, str | None] | None:
+        script = (
+            "import json, sys\n"
+            "import optimum.exporters.openvino\n"
+            "from optimum.exporters.tasks import TasksManager\n"
+            "model_type, task = sys.argv[1], sys.argv[2] or 'text-generation-with-past'\n"
+            "ctor = TasksManager.get_exporter_config_constructor(\n"
+            "    exporter='openvino', model_type=model_type, task=task,\n"
+            "    library_name='transformers')\n"
+            "cls = getattr(ctor, 'func', ctor)\n"
+            "def text(value):\n"
+            "    return None if value is None else str(getattr(value, 'base_version', value))\n"
+            "print(json.dumps({'min': text(getattr(cls, 'MIN_TRANSFORMERS_VERSION', None)),\n"
+            "                  'max': text(getattr(cls, 'MAX_TRANSFORMERS_VERSION', None)),\n"
+            "                  'config': cls.__name__}))\n"
+        )
+        result = self._runner.run([sys.executable, "-c", script, model_type, task or ""])
+        if result.returncode != 0:
+            return None
+        for line in reversed(list(result.stdout_lines)):
+            try:
+                parsed = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(parsed, dict):
+                return {key: parsed.get(key) for key in ("min", "max", "config")}
+        return None
+
+    def _bounds_cache_path(self) -> Path | None:
+        return None if self._cache_dir is None else self._cache_dir / "exporter-bounds.json"
+
+    def _read_bounds_cache(self) -> dict[str, dict[str, str | None]]:
+        path = self._bounds_cache_path()
+        if path is None:
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _write_bounds_cache(self, data: dict[str, dict[str, str | None]]) -> None:
+        path = self._bounds_cache_path()
+        if path is None:
+            return
+        with contextlib.suppress(OSError):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
 
     def check_requirements(self, req: ExporterRequirements) -> ExporterRequirements:
         """Fill ``satisfied``/``problems`` on ``req`` from this host's installed versions."""

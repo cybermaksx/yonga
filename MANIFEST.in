@@ -1,0 +1,10 @@
+# The source distribution is what a downstream packager builds and tests from:
+# everything needed to run the test suite and read the documentation.
+include LICENSE README.md CHANGELOG.md SPEC.md
+recursive-include docs *.md
+recursive-include tests *.py *.xml *.json *.yaml *.yml *.txt *.bin *.jinja
+recursive-include tools *.py
+recursive-include registry *.yaml *.yml
+# The prompt the project was built from is not project documentation.
+exclude AGENT_PROMPT.md
+global-exclude __pycache__ *.py[cod]

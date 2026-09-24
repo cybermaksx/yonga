@@ -215,6 +215,17 @@ class ExporterRequirements(BaseModel):
         return {name: spec for name, spec in declared.items() if spec is not None}
 
 
+class DeclaredRequirement(BaseModel):
+    """A package range the exporter itself declares for an architecture."""
+
+    model_config = ConfigDict(frozen=True)
+
+    transformers: str
+    """A PEP 440 specifier, e.g. ``>=4.57,<=5.0``."""
+    source: str
+    """Where it was read from, for the plan and the manifest."""
+
+
 class ReusableExport(BaseModel):
     """A failed job's completed export that an identical preparation can adopt."""
 

@@ -1229,7 +1229,20 @@ def eval_command(
     state = cli_state(ctx, json_output=json_output)
 
     def run() -> ExitCode:
-        from yonga.application.evaluation import load_corpus, result_payload
+        try:
+            import numpy  # noqa: F401  (eval computes distributions with it)
+
+            from yonga.application.evaluation import load_corpus, result_payload
+        except ImportError as error:
+            raise ConfigurationError(
+                diagnostic(
+                    "eval.dependencies.missing",
+                    FailureCategory.PACKAGE_ABI_MISMATCH,
+                    "eval needs the OpenVINO runtime",
+                    f"yonga eval runs the IR through OpenVINO and needs numpy: {error}.",
+                    remediation=["pip install 'yonga[openvino]'"],
+                )
+            ) from error
 
         service = state.graph.evaluation_service(progress=state.sink())
         chosen = _device(device)

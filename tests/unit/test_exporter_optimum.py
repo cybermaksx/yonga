@@ -35,6 +35,7 @@ from yonga.domain.plans import (
     QuantizationSettings,
 )
 from yonga.util.redaction import REDACTED
+from yonga.util.versions import installed_version
 
 LAUNCHER = ["/usr/bin/python3", "-m", OPTIMUM_CLI_MODULE]
 
@@ -171,6 +172,13 @@ def make_request(
 
 
 # --- argv construction ---------------------------------------------------
+
+
+#: These read the *really installed* exporter packages, which only the ``export``
+#: extra provides; without it there is nothing to read, and that is not a failure.
+requires_export_extra = pytest.mark.skipif(
+    installed_version("optimum-intel") is None, reason="needs the yonga[export] extra"
+)
 
 
 @pytest.mark.parametrize("profile_id", sorted(PROFILE_FLAGS))
@@ -575,6 +583,7 @@ def test_output_tails_are_bounded(job: JobContext) -> None:
 # --- requirements --------------------------------------------------------
 
 
+@requires_export_extra
 def test_requirements_returns_every_export_package() -> None:
     versions = OptimumExporter(FakeRunner(), launcher=LAUNCHER).requirements()
     assert set(versions) == set(EXPORT_PACKAGES)
@@ -583,6 +592,7 @@ def test_requirements_returns_every_export_package() -> None:
     assert versions["transformers"] is not None
 
 
+@requires_export_extra
 def test_check_requirements_flags_a_mismatch_against_the_really_installed_version() -> None:
     """A pin the installed transformers cannot satisfy is reported, naming both versions.
 

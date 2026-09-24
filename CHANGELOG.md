@@ -9,33 +9,7 @@ manifest may change in any minor release.
 
 ## [Unreleased]
 
-### Fixed
-
-- **GGUF-only repositories were described as unreadable by OpenVINO GenAI.** The code assumed the
-  2026.4 build had no GGUF reader; it has one, verified above.
-- **A GGUF-only repository's architecture was reported as the first model type of the matching
-  family rule** (`llama` for a Qwen2.5 file). `inspect` now names the one the file declares.
-- **A cancelled job looked like it was still running for 24 hours.** Ctrl-C (or any exception a
-  service did not record) left the job state at its last stage, so the sweep and export reuse both
-  treated its staging directory as live. The job now records `job.cancelled` or `job.aborted`.
-- **yonga could not prepare an NPU artifact for any LLM.** The probe compiled each numeric
-  submodel raw and took a failure as the verdict, but a raw `Core.compile_model` rejects every
-  dynamically shaped LLM on the NPU ("to_shape was called on a dynamic shape"), while the OpenVINO
-  GenAI pipeline reshapes first and runs. Registry issue rules can now declare
-  `defer_to_pipeline`; the dynamic-shape rule does, the raw attempt is recorded as `deferred`, and
-  the pipeline smoke test decides. A deferred failure never passes a device on its own. Both
-  `prepare` and `probe` behave this way. Verified on the reference host: `Qwen/Qwen3-0.6B` with
-  `npu-int4-sym-g128` now prepares, chats and benchmarks on the NPU (67.3 tok/s).
-- **GenAI rejected the NPU's static-shape properties.** `MAX_PROMPT_LEN` and `MIN_RESPONSE_LEN`
-  were passed as strings, as every recorded property is; GenAI requires integers. The runtime
-  adapter now types them at the boundary.
-- **A known NPU compiler rejection was reported as "yonga hit a bug" (exit 99).** The NPU compiler
-  writes its reason to the native file descriptors, not into the Python exception, and the adapter's
-  generic `runtime.genai.load_failed` bypassed the registry entirely. yonga now captures native
-  output around every native compile, classifies pipeline failures through the registry first, and
-  exits 51 for an unclassified probe failure. The Qwen3.5 NPU failure now classifies as
-  `npu.compiler.unsupported_graph.qwen35`, the code the specification pins. Capturing native output
-  also keeps compiler log lines out of `--json` output.
+## [0.2.0] - 2026-09-24
 
 ### Added
 
@@ -123,6 +97,32 @@ manifest may change in any minor release.
   quantizations.
 
 ### Fixed
+
+- **GGUF-only repositories were described as unreadable by OpenVINO GenAI.** The code assumed the
+  2026.4 build had no GGUF reader; it has one, verified above.
+- **A GGUF-only repository's architecture was reported as the first model type of the matching
+  family rule** (`llama` for a Qwen2.5 file). `inspect` now names the one the file declares.
+- **A cancelled job looked like it was still running for 24 hours.** Ctrl-C (or any exception a
+  service did not record) left the job state at its last stage, so the sweep and export reuse both
+  treated its staging directory as live. The job now records `job.cancelled` or `job.aborted`.
+- **yonga could not prepare an NPU artifact for any LLM.** The probe compiled each numeric
+  submodel raw and took a failure as the verdict, but a raw `Core.compile_model` rejects every
+  dynamically shaped LLM on the NPU ("to_shape was called on a dynamic shape"), while the OpenVINO
+  GenAI pipeline reshapes first and runs. Registry issue rules can now declare
+  `defer_to_pipeline`; the dynamic-shape rule does, the raw attempt is recorded as `deferred`, and
+  the pipeline smoke test decides. A deferred failure never passes a device on its own. Both
+  `prepare` and `probe` behave this way. Verified on the reference host: `Qwen/Qwen3-0.6B` with
+  `npu-int4-sym-g128` now prepares, chats and benchmarks on the NPU (67.3 tok/s).
+- **GenAI rejected the NPU's static-shape properties.** `MAX_PROMPT_LEN` and `MIN_RESPONSE_LEN`
+  were passed as strings, as every recorded property is; GenAI requires integers. The runtime
+  adapter now types them at the boundary.
+- **A known NPU compiler rejection was reported as "yonga hit a bug" (exit 99).** The NPU compiler
+  writes its reason to the native file descriptors, not into the Python exception, and the adapter's
+  generic `runtime.genai.load_failed` bypassed the registry entirely. yonga now captures native
+  output around every native compile, classifies pipeline failures through the registry first, and
+  exits 51 for an unclassified probe failure. The Qwen3.5 NPU failure now classifies as
+  `npu.compiler.unsupported_graph.qwen35`, the code the specification pins. Capturing native output
+  also keeps compiler log lines out of `--json` output.
 
 - **A VLM artifact can be benchmarked with more than one run, and `/reset` really
   resets it.** `VLMPipeline` has no chat-history overload in this build, so the

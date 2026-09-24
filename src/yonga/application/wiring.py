@@ -43,7 +43,6 @@ from yonga.application.benchmark import RuntimeFactory as BenchmarkRuntimeFactor
 from yonga.application.chat import ChatService
 from yonga.application.chat import RuntimeFactory as ChatRuntimeFactory
 from yonga.application.doctor import DoctorService
-from yonga.application.evaluation import EvaluationService, LogitsScorer
 from yonga.application.inspect_model import InspectService
 from yonga.application.prepare import PrepareService, SmokeTester
 from yonga.application.probe import LocalArtifactStore, ProbeService
@@ -65,6 +64,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from collections.abc import Mapping, Sequence
 
     from yonga.adapters.system_linux import DeviceSnapshot
+    from yonga.application.evaluation import EvaluationService
 
 __all__ = [
     "AnyArtifactStore",
@@ -346,7 +346,12 @@ class Wiring:
         return SearchService(self.hub_search(), self.registry_resolver())
 
     def evaluation_service(self, *, progress: ProgressSink | None = None) -> EvaluationService:
-        """Build the ``yonga eval`` service. OpenVINO is imported only when it scores."""
+        """Build the ``yonga eval`` service. OpenVINO is imported only when it scores.
+
+        Imported here, not at module scope: evaluation needs numpy, which only the
+        ``openvino`` extra brings, and ``yonga --help`` must work without it.
+        """
+        from yonga.application.evaluation import EvaluationService, LogitsScorer
 
         def scorer(path: Path, device: str) -> LogitsScorer:
             from yonga.adapters.openvino_logits import LogitsModel
@@ -396,7 +401,9 @@ class Wiring:
         if self._exporter is None:
             from yonga.adapters.exporter_optimum import OptimumExporter
 
-            self._exporter = OptimumExporter(self.command_runner())
+            self._exporter = OptimumExporter(
+                self.command_runner(), cache_dir=self.paths.metadata_cache_dir
+            )
         return self._exporter
 
     def chat_runtime_factory(self) -> ChatRuntimeFactory:

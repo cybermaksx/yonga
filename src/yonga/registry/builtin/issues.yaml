@@ -489,6 +489,39 @@ issues:
   # Each signature has to stand on its own, because `exception_contains` is a
   # disjunction — there is no way to require two strings at once — so each entry
   # below is chosen to be conclusive by itself rather than merely suggestive.
+  - id: exporter-transformers-version-range
+    schema_version: 1
+    status: active
+    priority: 60
+    summary: optimum-intel refuses the installed Transformers for this architecture
+    match:
+      case_sensitive: true
+      exception_contains:
+        - "The current version of Transformers does not allow for the export of the model"
+    classification:
+      code: export.transformers.out_of_range
+      category: package_abi_mismatch
+      environment_broken: false
+      retry_same_device: false
+    recommendation:
+      title: This architecture needs a different Transformers release
+      message: >-
+        optimum-intel's export configuration for this architecture declares the
+        Transformers releases it supports, and the installed one is outside
+        them. Nothing is broken; the two releases disagree about the modelling
+        code. yonga reads that range before exporting and runs the export in a
+        managed environment that satisfies it, so this appears only when that
+        was turned off or the range could not be read.
+      remediation:
+        - "Let yonga build the environment: drop --no-managed-env (or set managed_export_envs = true)."
+        - "Or install a release in the range the error names, e.g. pip install 'transformers<=5.0'"
+    sources:
+      - kind: tested
+        note: >-
+          optimum-intel 2.2.0 with Transformers 5.5.4 on the reference host:
+          LiquidAI/LFM2-350M ("Maximum required is 5.4.0") and
+          unsloth/gemma-3-1b-it ("Maximum required is 5.0").
+
   - id: exporter-transformers-symbol-mismatch
     schema_version: 1
     status: active

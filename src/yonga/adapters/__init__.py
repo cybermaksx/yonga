@@ -24,12 +24,18 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from yonga.domain.environments import EnvironmentSpec, ExportEnvironment
     from yonga.domain.hardware import HardwareInventory, HuggingFaceAuthInfo
     from yonga.domain.models import ModelIdentity, ModelMetadata
-    from yonga.domain.plans import ExporterRequirements, ExportRequest, ExportResult
+    from yonga.domain.plans import (
+        DeclaredRequirement,
+        ExporterRequirements,
+        ExportRequest,
+        ExportResult,
+    )
     from yonga.domain.publication import PublisherIdentity
 
 __all__ = [
     "CommandResult",
     "CommandRunner",
+    "DeclaresRequirements",
     "ExportEnvironments",
     "Exporter",
     "FilesystemProbe",
@@ -109,6 +115,17 @@ class GGUFInspector(Protocol):
 
     def gguf_header(self, model: ModelIdentity, filename: str) -> GGUFHeader:
         """The header of ``filename`` in ``model`` (pinned to a revision)."""
+        ...
+
+
+@runtime_checkable
+class DeclaresRequirements(Protocol):
+    """An exporter that can say which package versions an architecture needs."""
+
+    def declared_requirements(
+        self, model_type: str, task: str | None
+    ) -> DeclaredRequirement | None:
+        """The range the exporter declares for ``model_type``, or ``None``."""
         ...
 
 

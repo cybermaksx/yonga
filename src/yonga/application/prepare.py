@@ -61,6 +61,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from yonga import __version__
 from yonga.adapters import (
+    DeclaresRequirements,
     ExportEnvironments,
     Exporter,
     FilesystemProbe,
@@ -374,6 +375,22 @@ class _ExportOutcome:
     notes: list[str] = field(default_factory=list)
 
 
+def _runtime_task(task: str | None) -> str | None:
+    """The export task yonga's runtime can use for a Hub pipeline tag.
+
+    The Hub tags a causal LM ``text-generation``, and optimum-intel exports
+    exactly that when asked: a stateless model with no KV cache and no
+    ``beam_idx`` input, which OpenVINO GenAI's ``LLMPipeline`` cannot run
+    ("Port for tensor name beam_idx was not found", observed exporting
+    OLMo-2 on the reference host). Every text-generation artifact yonga makes
+    is run by that pipeline, so the stateful ``-with-past`` export is the
+    only useful one. A registry rule that names a task still wins.
+    """
+    if task == "text-generation":
+        return "text-generation-with-past"
+    return task
+
+
 def _artifact_key(resolved: ResolvedSource, profile: ConversionProfile) -> str:
     """What names an artifact: its profile, or for a GGUF import the file's quantization.
 
@@ -612,8 +629,13 @@ class PrepareService:
             model_rule=model_rule,
             explicit_profile_id=profile_id,
         )
+        task = self._task(source_meta, arch_rule, model_rule)
         exporter_requirements, exporter_unverifiable = self._exporter_requirements(
-            arch_rule, model_rule
+            arch_rule,
+            model_rule,
+            model_type=source_meta.model_type,
+            task=task,
+            skip_exporter=resolved_source.gguf_file is not None or resolved_source.already_openvino,
         )
 
         source_sha = source_meta.resolved_revision or resolved_source.source.revision
@@ -640,7 +662,6 @@ class PrepareService:
         )
 
         pipeline = self._pipeline_kind(source_meta, arch_rule)
-        task = self._task(source_meta, arch_rule, model_rule)
         remote_code_required = self._remote_code_required(source_meta, arch_rule, model_rule)
         expected_repairs = [rule.id for rule in self._expected_repairs()]
         known_limitations = list(arch_rule.known_limitations) if arch_rule is not None else []
@@ -952,8 +973,18 @@ class PrepareService:
         self,
         arch_rule: ArchitectureRule | None,
         model_rule: ModelRule | None,
+        *,
+        model_type: str | None = None,
+        task: str | None = None,
+        skip_exporter: bool = False,
     ) -> tuple[ExporterRequirements, list[str]]:
-        """Compare the registry's declared exporter constraints against this host.
+        """Compare the declared exporter constraints against this host.
+
+        The registry's pins come first. Where it pins no Transformers version,
+        the range optimum-intel's own export config declares for the model type
+        is used instead, when the exporter can report one: that is the range the
+        exporter will enforce anyway, so knowing it here lets preflight refuse,
+        or a managed export environment satisfy it, before the download.
 
         A mismatch is reported, never fixed: yonga does not install or downgrade
         packages in the user's environment (``AGENT_PROMPT.md`` section 13.2).
@@ -977,6 +1008,19 @@ class PrepareService:
             openvino=spec.openvino if spec is not None else None,
             nncf=spec.nncf if spec is not None else None,
         )
+        declared_by: str | None = None
+        if (
+            requirements.transformers is None
+            and not skip_exporter
+            and model_type
+            and isinstance(self._exporter, DeclaresRequirements)
+        ):
+            declared = self._exporter.declared_requirements(model_type, task)
+            if declared is not None:
+                requirements = requirements.model_copy(
+                    update={"transformers": declared.transformers}
+                )
+                declared_by = declared.source
         versions = self._exporter.requirements()
         problems: list[str] = []
         unverifiable: list[str] = []
@@ -994,7 +1038,10 @@ class PrepareService:
             installed_text = (
                 f"{installed} is installed" if installed else f"{name} is not installed"
             )
-            problems.append(f"{name} {specifier} is required, but {installed_text}")
+            origin = (
+                f" (declared by {declared_by})" if name == "transformers" and declared_by else ""
+            )
+            problems.append(f"{name} {specifier} is required{origin}, but {installed_text}")
         return (
             requirements.model_copy(update={"problems": problems, "satisfied": not problems}),
             unverifiable,
@@ -1137,7 +1184,7 @@ class PrepareService:
             return model_rule.export.task
         if arch_rule is not None and arch_rule.export.task:
             return arch_rule.export.task
-        return metadata.task
+        return _runtime_task(metadata.task)
 
     @staticmethod
     def _remote_code_required(

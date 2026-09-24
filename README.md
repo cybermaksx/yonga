@@ -10,7 +10,7 @@ The tool is **NPU-first, not NPU-only**. If a model cannot compile on the NPU, `
 
 ## Status: MVP
 
-This is a 0.1.0 MVP. It prepares, validates, runs and benchmarks OpenVINO artifacts on one machine, and it is honest about the parts that do not exist yet:
+This is the 0.2.0 release. It prepares, validates, runs and benchmarks OpenVINO artifacts on one machine, and it is honest about the parts that do not exist yet:
 
 - **`serve` is deliberately small.** It serves one artifact, text only, one request at a time, and refuses what it cannot honour (`n` > 1, stop sequences, tools, JSON response formats, images) with a 400 rather than ignoring it.
 - **Not published on PyPI.** `pip install yonga` does not work yet; install from a clone (see below).

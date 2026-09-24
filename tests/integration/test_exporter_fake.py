@@ -25,6 +25,7 @@ from yonga.config.settings import load_settings
 from yonga.domain.diagnostics import FailureCategory
 from yonga.domain.plans import ConversionProfile, ExportRequest, QuantizationSettings
 from yonga.util.redaction import REDACTED
+from yonga.util.versions import installed_version
 
 FAKE_CLI = Path(__file__).resolve().parents[1] / "fixtures" / "fake_optimum_cli.py"
 
@@ -86,6 +87,13 @@ def read_json(path: Path) -> object:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+#: These read the *really installed* exporter packages, which only the ``export``
+#: extra provides; without it there is nothing to read, and that is not a failure.
+requires_export_extra = pytest.mark.skipif(
+    installed_version("optimum-intel") is None, reason="needs the yonga[export] extra"
+)
+
+
 def test_argv_reaches_the_child_verbatim_with_no_shell(
     job: JobContext, make_runner: Callable[[], CommandRunner]
 ) -> None:
@@ -131,6 +139,7 @@ def test_managed_temp_directory_is_visible_to_the_child(
     assert Path(str(seen["TMPDIR"])).is_dir()
 
 
+@requires_export_extra
 def test_successful_export_writes_its_fixture_files_and_captures_logs(
     job: JobContext, make_runner: Callable[[], CommandRunner]
 ) -> None:

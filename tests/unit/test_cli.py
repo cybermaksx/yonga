@@ -19,6 +19,7 @@ import json
 import os
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -44,6 +45,9 @@ from tests.unit.test_prepare_planning import (
     safetensors_metadata,
 )
 from yonga import cli as cli_module
+
+if TYPE_CHECKING:
+    from yonga.application.evaluation import EvaluationService
 from yonga.adapters import (
     CommandRunner,
     Exporter,
@@ -58,7 +62,6 @@ from yonga.adapters.runtime_genai import ChatHistory, ChatProfileLike, ChatRunti
 from yonga.application.artifacts import ArtifactStore
 from yonga.application.benchmark import RuntimeFactory as BenchmarkRuntimeFactory
 from yonga.application.chat import RuntimeFactory as ChatRuntimeFactory
-from yonga.application.evaluation import EvaluationService
 from yonga.application.prepare import SmokeTester
 from yonga.application.progress import ProgressSink
 from yonga.application.wiring import Wiring
@@ -1915,6 +1918,7 @@ class EvaluatingWiring(FakeWiring):
 
     def evaluation_service(self, *, progress: ProgressSink | None = None) -> EvaluationService:
         from tests.unit.test_evaluation import FakeScorer, FakeStore, manifest
+        from yonga.application.evaluation import EvaluationService
 
         manifests = {"ref": manifest("ref", weight="int8"), "cand": manifest("cand", weight="int4")}
         scorers = {"ref": FakeScorer("ref"), "cand": FakeScorer("cand", perturb=1.0)}
@@ -1929,6 +1933,7 @@ class EvaluatingWiring(FakeWiring):
 def test_eval_prints_the_comparison_and_saves_it(
     runner: CliRunner, home: Path, tmp_path: Path
 ) -> None:
+    pytest.importorskip("numpy")
     result = invoke(
         runner,
         home,
@@ -1944,6 +1949,7 @@ def test_eval_prints_the_comparison_and_saves_it(
 
 
 def test_eval_json_is_one_document(runner: CliRunner, home: Path, tmp_path: Path) -> None:
+    pytest.importorskip("numpy")
     result = invoke(
         runner,
         home,

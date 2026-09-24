@@ -11,9 +11,12 @@ import math
 from pathlib import Path
 from typing import ClassVar
 
+import pytest
+
+pytest.importorskip("numpy")
+
 import numpy as np
 import numpy.typing as npt
-import pytest
 
 from yonga.adapters.openvino_logits import log_softmax
 from yonga.application.evaluation import (
