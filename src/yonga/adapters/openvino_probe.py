@@ -29,6 +29,7 @@ from contextlib import suppress
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from yonga.adapters.native_output import capture_native_output, with_native_output
 from yonga.domain.artifacts import (
     IRDescription,
     PortDescription,
@@ -565,13 +566,19 @@ class OpenVINOProbe:
                 properties=config,
                 message=redact_text(f"{type(exc).__name__}: {exc}"),
             )
-        try:
-            model = core.read_model(str(path))
-            if config:
-                core.compile_model(model, device, config)
-            else:
-                core.compile_model(model, device)
-        except Exception as exc:
+        # The NPU compiler writes its real reason to the native descriptors, not
+        # into the exception, so it is captured and handed to the classifier.
+        with capture_native_output() as native:
+            try:
+                model = core.read_model(str(path))
+                if config:
+                    core.compile_model(model, device, config)
+                else:
+                    core.compile_model(model, device)
+                failure: Exception | None = None
+            except Exception as exc:
+                failure = exc
+        if failure is not None:
             return ProbeResult(
                 device=device,
                 role=role,
@@ -579,7 +586,7 @@ class OpenVINOProbe:
                 status=ProbeStatus.FAILED,
                 duration_seconds=time.perf_counter() - started,
                 properties=config,
-                message=redact_text(str(exc)),
+                message=redact_text(with_native_output(str(failure), native)),
             )
         return ProbeResult(
             device=device,

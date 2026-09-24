@@ -700,3 +700,35 @@ def test_equally_specific_rules_are_broken_deterministically_without_raising():
     result, explanation = resolver_.classify_explained(raw_error="kaboom")
     assert result.code == "x.a"
     assert any("equally specific" in note for note in explanation.notes)
+
+
+# --- which raw failures the GenAI pipeline must settle -------------------------------
+
+
+def test_only_the_dynamic_shape_rejection_is_deferred_to_the_pipeline() -> None:
+    """A raw dynamic-shape failure is not evidence; a real compiler rejection is."""
+    from yonga.registry import RegistryResolver, load_builtin_registry
+
+    resolver = RegistryResolver(load_builtin_registry())
+    dynamic = resolver.classify(
+        raw_error="Exception ...\nto_shape was called on a dynamic shape.", device="NPU"
+    )
+    fp16 = resolver.classify(
+        raw_error="OneShotBufferizeVPU2VPUIP failed : Only supports FP16.", device="NPU"
+    )
+
+    assert dynamic.code == "npu.compiler.dynamic_shape"
+    assert dynamic.defer_to_pipeline is True
+    assert fp16.defer_to_pipeline is False
+
+
+def test_npu_profiles_carry_the_static_shape_budget() -> None:
+    """The NPU pipeline reshapes to these; the manifest records what was probed."""
+    from yonga.registry import load_builtin_registry
+
+    profiles = {rule.id: rule.to_conversion_profile() for rule in load_builtin_registry().profiles}
+    for profile_id in ("npu-int4-sym-cw", "npu-int4-sym-g128"):
+        runtime = profiles[profile_id].runtime_properties
+        assert runtime["MAX_PROMPT_LEN"] == "1024"
+        assert runtime["MIN_RESPONSE_LEN"] == "128"
+    assert "MAX_PROMPT_LEN" not in profiles["gpu-int4-asym-g128"].runtime_properties

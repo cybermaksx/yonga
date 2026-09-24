@@ -28,12 +28,19 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT = REPO_ROOT / "tests" / "fixtures" / ".cache" / "tinyllm"
 SOURCE_MODEL = "hf-internal-testing/tiny-random-LlamaForCausalLM"
+
+#: The NPU artifact: a small *real* LLM, because the GenAI NPU pipeline rejects
+#: the tiny random Llama's toy shapes. Exported with the npu-int4-sym-g128
+#: profile's flags; verified on the reference host to load and generate through
+#: LLMPipeline on the NPU. About 400 MB of IR from a ~1.4 GB download.
+NPU_OUTPUT = REPO_ROOT / "tests" / "fixtures" / ".cache" / "npu-llm"
+NPU_SOURCE_MODEL = "Qwen/Qwen3-0.6B"
 TOKENIZER_IRS = ("openvino_tokenizer.xml", "openvino_detokenizer.xml")
 DEFECT = 'precision="STRiNG"'
 
 
-def build(output: Path, *, source: str = SOURCE_MODEL) -> int:
-    """Export the tiny model and report whether the expected defect is present."""
+def build(output: Path, *, source: str = SOURCE_MODEL, group_size: int = -1) -> int:
+    """Export a model and report whether the expected tokenizer defect is present."""
     output.parent.mkdir(parents=True, exist_ok=True)
     tmp = output.parent / f"{output.name}.tmp"
     argv = [
@@ -51,7 +58,7 @@ def build(output: Path, *, source: str = SOURCE_MODEL) -> int:
         "--sym",
         "--ratio",
         "1.0",
-        "--group-size=-1",
+        f"--group-size={group_size}",
         str(tmp),
     ]
     print("running:", " ".join(argv))
@@ -80,10 +87,19 @@ def build(output: Path, *, source: str = SOURCE_MODEL) -> int:
 def main() -> int:
     """Parse arguments and build the artifact."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
-    parser.add_argument("--source", default=SOURCE_MODEL)
+    parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument("--source", default=None)
+    parser.add_argument(
+        "--npu",
+        action="store_true",
+        help="build the NPU-profile artifact the intel_npu tests need (a small real LLM)",
+    )
     args = parser.parse_args()
-    return build(args.output, source=args.source)
+    if args.npu:
+        return build(
+            args.output or NPU_OUTPUT, source=args.source or NPU_SOURCE_MODEL, group_size=128
+        )
+    return build(args.output or DEFAULT_OUTPUT, source=args.source or SOURCE_MODEL)
 
 
 if __name__ == "__main__":

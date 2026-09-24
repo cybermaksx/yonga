@@ -46,6 +46,7 @@ from yonga.domain.artifacts import (
     ProbeResult,
     ProbeStatus,
     SubmodelRole,
+    failure_text,
     manifest_path,
 )
 from yonga.domain.compatibility import DeviceStatus
@@ -54,13 +55,16 @@ from yonga.domain.diagnostics import (
     Diagnostic,
     FailureCategory,
     Severity,
+    YongaError,
     diagnostic,
 )
 from yonga.domain.hardware import normalise_device
-from yonga.domain.models import ModelIdentity, ModelMetadata
+from yonga.domain.models import ModelIdentity, ModelMetadata, PipelineKind
+from yonga.util.redaction import redact_text
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from yonga.adapters import RuntimeProbe
+    from yonga.application.prepare import SmokeTester
     from yonga.registry.resolver import RegistryResolver
 
 __all__ = [
@@ -92,6 +96,7 @@ _DEVICE_STATUS_ORDER: tuple[DeviceStatus, ...] = (
 #: Worst-wins ranking used when one role is probed more than once on one device.
 _STATUS_SEVERITY: Mapping[ProbeStatus, int] = {
     ProbeStatus.OK: 0,
+    ProbeStatus.DEFERRED: 1,
     ProbeStatus.SKIPPED: 1,
     ProbeStatus.NOT_ATTEMPTED: 2,
     ProbeStatus.FAILED: 3,
@@ -283,22 +288,27 @@ def role_device_matrix(reports: Iterable[DeviceProbeReport]) -> dict[str, dict[s
     NPU is reported under ``CPU`` — which is the truth. When one role is probed
     more than once on the same device the worse status wins, so a partially
     failing role can never be presented as working.
+
+    A :attr:`ProbeStatus.DEFERRED` raw compile reads as the device's verdict:
+    deferral means the pipeline decides, so a role the GenAI pipeline ran is
+    ``ok`` and one it could not run is ``failed``. The pipeline smoke test itself
+    covers the whole model rather than one role, so it has no row of its own.
     """
     matrix: dict[str, dict[str, str]] = {}
     for report in reports:
-        results = [*report.submodels]
-        if report.smoke_test is not None:
-            results.append(report.smoke_test)
-        for result in results:
+        for result in report.submodels:
+            status = result.status
+            if status is ProbeStatus.DEFERRED:
+                status = ProbeStatus.OK if report.status is ProbeStatus.OK else ProbeStatus.FAILED
             role = (result.role or SubmodelRole.OTHER).value
             per_device = matrix.setdefault(role, {})
             previous = per_device.get(result.device)
             if previous is None:
-                per_device[result.device] = result.status.value
+                per_device[result.device] = status.value
                 continue
             previous_rank = _STATUS_SEVERITY.get(ProbeStatus(previous), 0)
-            if _STATUS_SEVERITY[result.status] > previous_rank:
-                per_device[result.device] = result.status.value
+            if _STATUS_SEVERITY[status] > previous_rank:
+                per_device[result.device] = status.value
     return matrix
 
 
@@ -314,16 +324,23 @@ class ProbeService:
         registry_resolver: RegistryResolver,
         artifact_store: ArtifactStoreLike | None = None,
         settings: Settings | None = None,
+        smoke_tester: SmokeTester | None = None,
     ) -> None:
         """Wire the service to its adapters.
 
         ``artifact_store`` defaults to a :class:`LocalArtifactStore` over the
         settings' managed artifacts directory, so the service is usable with a
         bare directory path and no catalogue.
+
+        ``smoke_tester`` builds a real GenAI pipeline. It is consulted only to
+        settle a raw compile the registry marks ``defer_to_pipeline`` -- a probe
+        stays a cheap compile check otherwise. Without one, a deferred failure
+        leaves the device unproven rather than passed.
         """
         self._runtime = runtime_probe
         self._resolver = registry_resolver
         self._settings = settings
+        self._smoke = smoke_tester
         paths = None if settings is None else settings.paths
         self._store: ArtifactStoreLike = artifact_store or LocalArtifactStore(paths)
 
@@ -470,6 +487,7 @@ class ProbeService:
             reports.append(
                 self._probe_device(
                     candidate,
+                    artifact_dir=artifact_dir,
                     targets=numeric,
                     tokenizer=tokenizer,
                     manifest=manifest,
@@ -543,12 +561,19 @@ class ProbeService:
         self,
         device: str,
         *,
+        artifact_dir: Path,
         targets: Sequence[IRDescription],
         tokenizer: ProbeResult | None,
         manifest: ArtifactManifest | None,
         ctx: JobContext | None,
     ) -> DeviceProbeReport:
-        """Compile every numeric target on one device and build its report."""
+        """Compile every numeric target on one device and build its report.
+
+        A raw failure the registry marks ``defer_to_pipeline`` is recorded as
+        :attr:`ProbeStatus.DEFERRED` and settled by building the GenAI pipeline:
+        the device passes only if that pipeline generates. With no pipeline
+        evidence the device is reported failed, never passed by default.
+        """
         results: list[ProbeResult] = []
         total = len(targets)
         for index, ir in enumerate(targets, start=1):
@@ -559,19 +584,134 @@ class ProbeService:
                 current=index,
                 total=total,
             )
-            results.append(self._probe_one(ir, device=device, manifest=manifest, ctx=ctx))
+            results.append(
+                _defer_if_marked(
+                    self._probe_one(ir, device=device, manifest=manifest, ctx=ctx), device
+                )
+            )
         if tokenizer is not None:
             # Carried into every device report on purpose: the tokenizer is part
             # of the pipeline on any device, and its own ``device`` field keeps
             # the record honest about where it was actually compiled.
             results.append(tokenizer)
+
+        deferred = [result for result in results if result.status is ProbeStatus.DEFERRED]
+        if not deferred:
+            return DeviceProbeReport(
+                device=device,
+                status=_report_status(results),
+                submodels=results,
+                diagnostic=_first_diagnostic(results),
+                attempted_at=_now(),
+            )
+
+        smoke = self._settle_on_pipeline(artifact_dir, device, manifest=manifest, ctx=ctx)
+        others = [result for result in results if result.status is not ProbeStatus.DEFERRED]
+        if smoke.status is ProbeStatus.OK:
+            status = _report_status([*others, smoke])
+            verdict = _first_diagnostic(others)
+        elif smoke.status is ProbeStatus.FAILED:
+            status = ProbeStatus.FAILED
+            verdict = smoke.diagnostic or deferred[0].diagnostic
+        else:
+            status = ProbeStatus.FAILED
+            first = deferred[0].diagnostic
+            verdict = (
+                None
+                if first is None
+                else first.model_copy(
+                    update={
+                        "message": (
+                            f"{first.message} The GenAI pipeline that settles this could not "
+                            f"be built ({smoke.message or smoke.status.value}), so {device} "
+                            "support is unproven."
+                        )
+                    }
+                )
+            )
         return DeviceProbeReport(
             device=device,
-            status=_report_status(results),
+            status=status,
             submodels=results,
-            diagnostic=_first_diagnostic(results),
+            smoke_test=smoke,
+            diagnostic=verdict,
             attempted_at=_now(),
         )
+
+    def _settle_on_pipeline(
+        self,
+        artifact_dir: Path,
+        device: str,
+        *,
+        manifest: ArtifactManifest | None,
+        ctx: JobContext | None,
+    ) -> ProbeResult:
+        """Build the GenAI pipeline on ``device`` and generate a few tokens.
+
+        The manifest's recommended runtime properties are applied only when they
+        were recorded for this same device: a GPU artifact's
+        ``ATTENTION_BACKEND=SDPA`` means nothing to the NPU, whose pipeline falls
+        back to GenAI's own static-shape defaults.
+        """
+        from yonga.application.prepare import SMOKE_MAX_NEW_TOKENS, SMOKE_PROMPT
+
+        if self._smoke is None:
+            return ProbeResult(
+                device=device,
+                status=ProbeStatus.SKIPPED,
+                message="no GenAI pipeline smoke tester is configured",
+            )
+        pipeline = PipelineKind.UNKNOWN if manifest is None else manifest.pipeline
+        runtime = None if manifest is None else manifest.recommended_runtime
+        properties: dict[str, str] = {}
+        if runtime is not None and normalise_device(runtime.device) == normalise_device(device):
+            properties = dict(runtime.properties)
+        weights = _weight_bytes(artifact_dir)
+        notice = f"Building the GenAI pipeline on {device} to settle the probe"
+        if weights >= _SLOW_PIPELINE_BUILD_BYTES:
+            # Measured on the reference host: a 9B INT4 model's NPU build ran
+            # past 15 minutes at ~9 GiB RSS. Say so before the wait, not after.
+            notice += (
+                f" -- this compiles {weights / 2**30:.1f} GiB of weights and can take many minutes"
+            )
+        self._emit(ctx, notice, device=device)
+        try:
+            result = self._smoke.smoke_test(
+                artifact_dir,
+                device=device,
+                pipeline=pipeline,
+                properties=properties,
+                prompt=SMOKE_PROMPT,
+                max_new_tokens=SMOKE_MAX_NEW_TOKENS,
+            )
+        except YongaError as error:
+            result = ProbeResult(
+                device=device,
+                status=ProbeStatus.FAILED,
+                diagnostic=error.diagnostic,
+                message=error.diagnostic.message,
+            )
+        except Exception as exc:
+            result = ProbeResult(
+                device=device,
+                status=ProbeStatus.FAILED,
+                message=redact_text(f"{type(exc).__name__}: {exc}"),
+            )
+        if result.status is ProbeStatus.FAILED:
+            # Registry first, even over a diagnostic the adapter attached: a
+            # pipeline load failure arrives generic, and only the registry
+            # recognises the compiler signature in its raw text.
+            adapter = result.diagnostic
+            raw = failure_text(result)
+            if raw:
+                classified = self._classify(raw, device=device, manifest=manifest, ctx=ctx)
+                if (
+                    classified.category is not FailureCategory.UNKNOWN_RUNTIME_ERROR
+                    or adapter is None
+                ):
+                    result = result.model_copy(update={"diagnostic": classified})
+        self._emit_result(result, ctx=ctx)
+        return result
 
     def _probe_one(
         self,
@@ -702,6 +842,38 @@ class ProbeService:
             diagnostic=result.diagnostic,
             role=role,
         )
+
+
+#: Above this much weight data a pipeline build is slow enough to warn about.
+_SLOW_PIPELINE_BUILD_BYTES: int = 2 * 2**30
+
+
+def _weight_bytes(artifact_dir: Path) -> int:
+    """Total size of the IR weight files at the top level of an artifact."""
+    total = 0
+    with suppress(OSError):
+        for path in artifact_dir.glob("*.bin"):
+            with suppress(OSError):
+                total += path.stat().st_size
+    return total
+
+
+def _defer_if_marked(result: ProbeResult, device: str) -> ProbeResult:
+    """Re-label a raw failure the registry says the GenAI pipeline must decide."""
+    diagnosis = result.diagnostic
+    if result.status is not ProbeStatus.FAILED or diagnosis is None:
+        return result
+    if not diagnosis.defer_to_pipeline:
+        return result
+    return result.model_copy(
+        update={
+            "status": ProbeStatus.DEFERRED,
+            "message": (
+                f"A raw compile on {device} is not conclusive for this graph; the GenAI "
+                f"pipeline decides. Raw error: {result.message or diagnosis.message}"
+            ),
+        }
+    )
 
 
 def _report_status(results: Sequence[ProbeResult]) -> ProbeStatus:

@@ -818,3 +818,30 @@ def test_an_artifact_with_no_template_at_all_starts_outside_a_block(artifact, se
     runtime = make_runtime(artifact, settings, chat_profile=ChatProfile())
     assert runtime.starts_in_reasoning is False
     runtime.close()
+
+
+# --- properties are typed at the GenAI boundary --------------------------------------
+
+
+def test_integer_pipeline_properties_are_passed_as_integers() -> None:
+    """GenAI rejects "1024" for MAX_PROMPT_LEN ("Type mismatch: expected ... int")."""
+    from yonga.adapters.runtime_genai import pipeline_kwargs
+
+    converted = pipeline_kwargs({"MAX_PROMPT_LEN": "1024", "MIN_RESPONSE_LEN": " 128 "})
+
+    assert converted == {"MAX_PROMPT_LEN": 1024, "MIN_RESPONSE_LEN": 128}
+
+
+def test_other_pipeline_properties_pass_through_unchanged() -> None:
+    from yonga.adapters.runtime_genai import pipeline_kwargs
+
+    given = {"ATTENTION_BACKEND": "SDPA", "CACHE_DIR": "/cache/dir"}
+
+    assert pipeline_kwargs(given) == given
+
+
+def test_an_unparsable_integer_property_is_left_for_genai_to_reject() -> None:
+    """yonga does not guess; GenAI reports the mismatch in its own words."""
+    from yonga.adapters.runtime_genai import pipeline_kwargs
+
+    assert pipeline_kwargs({"MAX_PROMPT_LEN": "lots"}) == {"MAX_PROMPT_LEN": "lots"}

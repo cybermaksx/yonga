@@ -85,6 +85,7 @@ from yonga.domain.artifacts import (
     RepairRecord,
     SubmodelRole,
     ValidationReport,
+    failure_text,
 )
 from yonga.domain.compatibility import (
     CompatibilityDecision,
@@ -2180,11 +2181,19 @@ class PrepareService:
         during validation. Each numeric submodel is recorded separately so a VLM
         whose vision tower behaves differently from its language model is visible
         in the manifest rather than averaged away.
+
+        A raw compile failure the registry marks ``defer_to_pipeline`` does not
+        decide the device. It is what a raw ``Core.compile_model`` hits on every
+        dynamically shaped LLM on the NPU, whereas the GenAI pipeline reshapes
+        first -- so the smoke test, which builds that pipeline, is the verdict.
+        Deferral never makes a device look supported by itself: without a
+        successful smoke test the device is reported failed.
         """
         attempted_at = _now()
         properties = self._compile_properties(plan.profile)
         results: list[ProbeResult] = []
         failure: Diagnostic | None = None
+        deferred: Diagnostic | None = None
         numeric = 0
 
         for ir in validation.irs:
@@ -2219,15 +2228,31 @@ class PrepareService:
                 file=ir.path.name,
                 raw=redact_text(result.message or ""),
             )
-            if failure is None:
-                failure = self._classify(
-                    result.message or "",
-                    device=device,
-                    stage="probe",
-                    ctx=ctx,
-                    metadata=source_meta,
-                    fallback=result.diagnostic,
+            classified = self._classify(
+                result.message or "",
+                device=device,
+                stage="probe",
+                ctx=ctx,
+                metadata=source_meta,
+                fallback=result.diagnostic,
+            )
+            if classified.defer_to_pipeline:
+                results[-1] = result.model_copy(
+                    update={
+                        "status": ProbeStatus.DEFERRED,
+                        "diagnostic": classified,
+                        "message": (
+                            f"A raw compile on {device} is not conclusive for this graph; "
+                            "the GenAI pipeline smoke test decides. Raw error: "
+                            f"{result.message or classified.message}"
+                        ),
+                    }
                 )
+                if deferred is None:
+                    deferred = classified
+                continue
+            if failure is None:
+                failure = classified
 
         if numeric == 0:
             failure = diagnostic(
@@ -2248,13 +2273,18 @@ class PrepareService:
 
         smoke = self._smoke_test(plan, staging, device, ctx)
         if smoke.status is ProbeStatus.FAILED:
-            classified = smoke.diagnostic or self._classify(
-                smoke.message or "",
+            # The registry is consulted even when the adapter already attached a
+            # generic diagnostic: a pipeline load failure arrives as
+            # runtime.genai.load_failed, and only the registry can recognise
+            # the compiler signature inside its raw text. The adapter's
+            # diagnostic remains the fallback for text no rule matches.
+            classified = self._classify(
+                failure_text(smoke),
                 device=device,
                 stage="smoke",
                 ctx=ctx,
                 metadata=source_meta,
-                fallback=None,
+                fallback=smoke.diagnostic,
             )
             return DeviceProbeReport(
                 device=device,
@@ -2263,6 +2293,34 @@ class PrepareService:
                 smoke_test=smoke,
                 diagnostic=classified,
                 attempted_at=attempted_at,
+            )
+        if deferred is not None and smoke.status is not ProbeStatus.OK:
+            # The raw compile was set aside for the pipeline to judge, and the
+            # pipeline was never exercised: there is no evidence either way, so
+            # the device is not claimed.
+            unsettled = deferred.model_copy(
+                update={
+                    "message": (
+                        f"{deferred.message} The GenAI pipeline smoke test that settles this "
+                        f"could not run ({smoke.message or smoke.status.value}), so {device} "
+                        "support is unproven."
+                    )
+                }
+            )
+            return DeviceProbeReport(
+                device=device,
+                status=ProbeStatus.FAILED,
+                submodels=results,
+                smoke_test=smoke,
+                diagnostic=unsettled,
+                attempted_at=attempted_at,
+            )
+        if deferred is not None:
+            ctx.logger.info(
+                "probe.deferred_resolved",
+                "raw compile failure overruled by a successful pipeline smoke test",
+                device=device,
+                code=deferred.code,
             )
         return DeviceProbeReport(
             device=device,

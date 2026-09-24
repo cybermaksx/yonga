@@ -34,3 +34,28 @@ def find_broken_artifact() -> Path | None:
         if (candidate / "openvino_tokenizer.xml").is_file():
             return candidate
     return None
+
+
+#: A small real model exported with an NPU profile. The tiny random Llama above
+#: is rejected by the GenAI NPU pipeline (its 4-head x 4-dim toy shapes break the
+#: NPU transformation), so proving NPU generation needs a genuine small LLM.
+GENERATED_NPU_ARTIFACT = REPO_ROOT / "tests" / "fixtures" / ".cache" / "npu-llm"
+
+NPU_ARTIFACT_MISSING = (
+    "the NPU test artifact is not present; "
+    "generate it with: python tools/make_test_artifact.py --npu"
+)
+
+
+def find_npu_artifact() -> Path | None:
+    """Return an unrepaired NPU-profile LLM artifact, or None if unavailable.
+
+    Order: the ``YONGA_TEST_NPU_ARTIFACT`` override, then the generated cache.
+    """
+    override = os.environ.get("YONGA_TEST_NPU_ARTIFACT")
+    candidates = [Path(override)] if override else []
+    candidates.append(GENERATED_NPU_ARTIFACT)
+    for candidate in candidates:
+        if (candidate / "openvino_tokenizer.xml").is_file():
+            return candidate
+    return None

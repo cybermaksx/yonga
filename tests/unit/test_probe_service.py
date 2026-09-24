@@ -36,11 +36,13 @@ from yonga.domain.artifacts import (
     PortDescription,
     ProbeResult,
     ProbeStatus,
+    RecommendedRuntime,
     SubmodelRole,
     manifest_path,
     role_for_filename,
 )
 from yonga.domain.diagnostics import ConfigurationError, FailureCategory
+from yonga.domain.models import PipelineKind
 from yonga.registry.loader import load_builtin_registry
 from yonga.registry.resolver import RegistryResolver
 from yonga.util.jsonlog import null_logger
@@ -255,14 +257,38 @@ def write_manifest(artifact: Path, *, repo_id: str, model_type: str | None = Non
     path.write_text(manifest.to_json_text(), encoding="utf-8")
 
 
+class FakeSmokeTester:
+    """A SmokeTester that records its calls and returns a scripted outcome."""
+
+    def __init__(self, *, error: str | None = None) -> None:
+        self.error = error
+        self.calls: list[dict[str, object]] = []
+
+    def smoke_test(
+        self,
+        artifact_dir: Path,
+        *,
+        device: str,
+        pipeline: object,
+        properties: Mapping[str, str],
+        prompt: str,
+        max_new_tokens: int,
+    ) -> ProbeResult:
+        self.calls.append({"device": device, "properties": dict(properties)})
+        if self.error is not None:
+            return ProbeResult(device=device, status=ProbeStatus.FAILED, message=self.error)
+        return ProbeResult(device=device, status=ProbeStatus.OK, message="generated 24 token(s)")
+
+
 def service(
     runtime: FakeRuntimeProbe,
     tmp_path: Path,
     *,
     store: ArtifactStoreLike | None = None,
+    smoke: FakeSmokeTester | None = None,
 ) -> ProbeService:
     """Build the service under test."""
-    return ProbeService(runtime, resolver(), store, make_settings(tmp_path))
+    return ProbeService(runtime, resolver(), store, make_settings(tmp_path), smoke_tester=smoke)
 
 
 # --- role assignment ------------------------------------------------------------------
@@ -376,8 +402,10 @@ def test_a_failing_compile_is_classified_not_a_raw_traceback(
     reports = service(runtime, tmp_path).probe(artifact, device="npu", ctx=ctx)
 
     report = reports[0]
+    # No pipeline was available to settle the raw failure, so the device is not
+    # passed -- but the raw compile is recorded as deferred, not as the verdict.
     assert report.status is ProbeStatus.FAILED
-    failed = next(result for result in report.submodels if result.status is ProbeStatus.FAILED)
+    failed = next(result for result in report.submodels if result.status is ProbeStatus.DEFERRED)
     assert failed.diagnostic is not None
     assert failed.diagnostic.code == "npu.compiler.dynamic_shape"
     assert failed.diagnostic.category is FailureCategory.COMPILER_UNSUPPORTED_GRAPH
@@ -390,7 +418,99 @@ def test_a_failing_compile_is_classified_not_a_raw_traceback(
     assert "to_shape was called on a dynamic shape" in (failed.diagnostic.raw_excerpt or "")
     assert report.diagnostic is not None
     assert report.diagnostic.code == "npu.compiler.dynamic_shape"
+    assert "unproven" in report.diagnostic.message
     assert any(event.kind is ProgressKind.PROBE for event in sink.events)
+
+
+# --- raw NPU compile failures the GenAI pipeline must settle -------------------------
+
+
+def test_a_deferred_npu_failure_passes_when_the_pipeline_generates(tmp_path: Path) -> None:
+    """The dynamic-shape raw failure is overruled by a pipeline that really generates.
+
+    This is the reference-host finding: a raw compile_model of an LLM fails on
+    the NPU for every model, while LLMPipeline reshapes and runs.
+    """
+    artifact = make_artifact(tmp_path)
+    write_manifest(artifact, repo_id="acme/model")
+    runtime = FakeRuntimeProbe(compile_errors={"NPU": NPU_DYNAMIC_SHAPE_ERROR})
+    smoke = FakeSmokeTester()
+
+    report = service(runtime, tmp_path, smoke=smoke).probe(artifact, device="npu")[0]
+
+    assert report.status is ProbeStatus.OK
+    assert report.smoke_test is not None and report.smoke_test.status is ProbeStatus.OK
+    raw = [result for result in report.submodels if result.status is ProbeStatus.DEFERRED]
+    assert raw, "the raw compile attempt must stay on record"
+    assert "to_shape was called on a dynamic shape" in (raw[0].message or "")
+    assert [call["device"] for call in smoke.calls] == ["NPU"]
+
+
+def test_a_deferred_npu_failure_fails_with_the_pipeline_error(tmp_path: Path) -> None:
+    """When the pipeline fails too, the pipeline's error is the verdict."""
+    artifact = make_artifact(tmp_path)
+    write_manifest(artifact, repo_id="acme/model", model_type="qwen3_5")
+    runtime = FakeRuntimeProbe(compile_errors={"NPU": NPU_DYNAMIC_SHAPE_ERROR})
+    smoke = FakeSmokeTester(error="OneShotBufferizeVPU2VPUIP failed : Only supports FP16.")
+
+    report = service(runtime, tmp_path, smoke=smoke).probe(artifact, device="npu")[0]
+
+    assert report.status is ProbeStatus.FAILED
+    assert report.diagnostic is not None
+    assert report.diagnostic.code == "npu.compiler.unsupported_graph.qwen35"
+
+
+def test_a_conclusive_failure_never_builds_a_pipeline(tmp_path: Path) -> None:
+    """Only a deferred failure is settled on the pipeline; a real one stands."""
+    artifact = make_artifact(tmp_path)
+    write_manifest(artifact, repo_id="acme/model", model_type="qwen3_5")
+    runtime = FakeRuntimeProbe(
+        compile_errors={"NPU": "OneShotBufferizeVPU2VPUIP failed : Only supports FP16."}
+    )
+    smoke = FakeSmokeTester()
+
+    report = service(runtime, tmp_path, smoke=smoke).probe(artifact, device="npu")[0]
+
+    assert report.status is ProbeStatus.FAILED
+    assert smoke.calls == []
+    assert report.smoke_test is None
+
+
+def test_a_successful_compile_never_builds_a_pipeline(tmp_path: Path) -> None:
+    """A probe stays a cheap compile check when nothing needs settling."""
+    artifact = make_artifact(tmp_path)
+    write_manifest(artifact, repo_id="acme/model")
+    smoke = FakeSmokeTester()
+
+    report = service(FakeRuntimeProbe(), tmp_path, smoke=smoke).probe(artifact, device="gpu")[0]
+
+    assert report.status is ProbeStatus.OK
+    assert smoke.calls == []
+
+
+def test_another_devices_runtime_properties_are_not_applied(tmp_path: Path) -> None:
+    """A GPU artifact's recommended properties are not forced onto the NPU pipeline."""
+    artifact = make_artifact(tmp_path)
+    manifest = ArtifactManifest(
+        artifact_id="artifact-0002",
+        created_at=datetime(2026, 9, 22, 12, 0, tzinfo=UTC),
+        tool_version="0.1.0",
+        requested_model=ManifestModelRef(repo_id="acme/model"),
+        resolved_source=ManifestModelRef(repo_id="acme/model", resolved_revision="abc123"),
+        export=ExportRecord(profile="gpu-int4-asym-g128"),
+        recommended_runtime=RecommendedRuntime(
+            device="GPU", pipeline=PipelineKind.LLM, properties={"ATTENTION_BACKEND": "SDPA"}
+        ),
+    )
+    path = manifest_path(artifact)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(manifest.to_json_text(), encoding="utf-8")
+    runtime = FakeRuntimeProbe(compile_errors={"NPU": NPU_DYNAMIC_SHAPE_ERROR})
+    smoke = FakeSmokeTester()
+
+    service(runtime, tmp_path, smoke=smoke).probe(artifact, device="npu")
+
+    assert smoke.calls == [{"device": "NPU", "properties": {}}]
 
 
 def test_a_failing_tokenizer_read_is_classified(tmp_path: Path) -> None:
@@ -650,3 +770,33 @@ def test_no_progress_sink_is_required(tmp_path: Path) -> None:
     reports = service(FakeRuntimeProbe(), tmp_path).probe(artifact, device="CPU")
     assert [report.device for report in reports] == ["CPU"]
     assert reports[0].attempted_at is not None
+
+
+def test_a_large_pipeline_build_is_announced_as_slow(
+    tmp_path: Path, job_ctx: tuple[JobContext, CollectingSink]
+) -> None:
+    """A 9B NPU build ran past 15 minutes on the reference host; warn before waiting."""
+    artifact = make_artifact(tmp_path)
+    write_manifest(artifact, repo_id="acme/model")
+    with (artifact / "openvino_model.bin").open("wb") as weights:
+        weights.truncate(3 * 2**30)  # sparse: no disk is actually used
+    runtime = FakeRuntimeProbe(compile_errors={"NPU": NPU_DYNAMIC_SHAPE_ERROR})
+    ctx, sink = job_ctx
+
+    service(runtime, tmp_path, smoke=FakeSmokeTester()).probe(artifact, device="npu", ctx=ctx)
+
+    messages = [event.message for event in sink.events]
+    assert any("can take many minutes" in message for message in messages)
+
+
+def test_a_small_pipeline_build_is_not_announced_as_slow(
+    tmp_path: Path, job_ctx: tuple[JobContext, CollectingSink]
+) -> None:
+    artifact = make_artifact(tmp_path)
+    write_manifest(artifact, repo_id="acme/model")
+    runtime = FakeRuntimeProbe(compile_errors={"NPU": NPU_DYNAMIC_SHAPE_ERROR})
+    ctx, sink = job_ctx
+
+    service(runtime, tmp_path, smoke=FakeSmokeTester()).probe(artifact, device="npu", ctx=ctx)
+
+    assert not any("can take many minutes" in event.message for event in sink.events)

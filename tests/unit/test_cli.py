@@ -1421,3 +1421,51 @@ def test_environment_is_not_leaked_into_json(runner: CliRunner, home: Path) -> N
     result = invoke(runner, home, ["doctor", "--json"], env={"HF_TOKEN": FAKE_TOKEN})
     assert FAKE_TOKEN not in result.stdout
     assert os.environ.get("HF_TOKEN") != FAKE_TOKEN or True
+
+
+# --- a failed probe is a compilation failure, never "yonga hit a bug" --------------
+
+
+def test_an_unclassified_probe_failure_exits_as_a_compile_failure(tmp_path: Path) -> None:
+    """Exit 99 means an internal bug; a device that could not compile is exit 51.
+
+    On the reference host the Qwen3.5 NPU pipeline failure used to arrive as the
+    adapter's generic ``runtime.genai.load_failed`` and exit 99.
+    """
+    from yonga.application.probe import ProbeOutcome
+    from yonga.cli import _probe_exit
+    from yonga.domain.artifacts import DeviceProbeReport, ProbeStatus
+    from yonga.domain.diagnostics import ExitCode, FailureCategory, diagnostic
+
+    generic = diagnostic(
+        "runtime.genai.load_failed",
+        FailureCategory.UNKNOWN_RUNTIME_ERROR,
+        "Could not load the model on NPU",
+        "Compilation failed",
+    )
+    outcome = ProbeOutcome(
+        artifact_dir=tmp_path,
+        reports=[DeviceProbeReport(device="NPU", status=ProbeStatus.FAILED, diagnostic=generic)],
+    )
+
+    assert _probe_exit(outcome) is ExitCode.COMPILE
+
+
+def test_a_classified_probe_failure_keeps_its_own_exit_code(tmp_path: Path) -> None:
+    from yonga.application.probe import ProbeOutcome
+    from yonga.cli import _probe_exit
+    from yonga.domain.artifacts import DeviceProbeReport, ProbeStatus
+    from yonga.domain.diagnostics import FailureCategory, diagnostic
+
+    classified = diagnostic(
+        "npu.permission_denied",
+        FailureCategory.PERMISSION_DENIED,
+        "NPU not accessible",
+        "Permission denied on /dev/accel/accel0",
+    )
+    outcome = ProbeOutcome(
+        artifact_dir=tmp_path,
+        reports=[DeviceProbeReport(device="NPU", status=ProbeStatus.FAILED, diagnostic=classified)],
+    )
+
+    assert _probe_exit(outcome) is classified.exit_code()

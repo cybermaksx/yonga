@@ -222,8 +222,15 @@ yonga prepare tiiuae/falcon-rw-1b --device cpu --yes     # exit 22, tells you to
 **An explicit device never silently falls back.**
 
 ```bash
-yonga probe ARTIFACT --device npu     # exit 51, recommends GPU, does not switch to it
+# An artifact the NPU cannot compile -- for example the Qwen3.5 one prepared with
+# --profile npu-int4-sym-cw: exit 51, classified npu.compiler.unsupported_graph.qwen35,
+# recommends GPU, and does not switch to it.
+yonga probe ARTIFACT --device npu
 ```
+
+On the NPU a probe builds the real GenAI pipeline whenever the raw compile is inconclusive, which is
+every LLM. For a small model that takes seconds; for a 9B model it is a full NPU compilation and can
+take well over ten minutes and several GiB of RAM.
 
 In `--device auto` yonga *may* fall back — but only for a compatibility failure. A broken
 environment (permission denied, missing driver) stops instead of being hidden behind another device.
@@ -246,7 +253,7 @@ up; nothing can be mistaken for a usable model. `yonga list --clean` retires the
 ## 8. Running the test suite
 
 ```bash
-pytest                       # 1769 of 1779 tests; network and hardware markers excluded by default
+pytest                       # 1793 of 1811 tests; network and hardware markers excluded by default
 ruff check . && ruff format --check .
 mypy src tests
 ```
@@ -254,19 +261,28 @@ mypy src tests
 Markers: `network`, `openvino`, `intel_gpu`, `intel_npu`, `slow`, `large_model`.
 
 ```bash
-pytest -m openvino           # 17 tests, needs OpenVINO, runs on CPU
+pytest -m openvino           # 25 tests, needs OpenVINO (the 17 CPU ones plus the hardware ones)
 pytest -m network            # 10 tests, hits the real Hub
+pytest -m intel_gpu          # 3 tests on a real Intel GPU
+pytest -m intel_npu          # 5 tests on a real Intel NPU
 ```
 
-**Be aware of what is not covered.** `intel_gpu`, `intel_npu`, `slow` and `large_model` currently
-select **zero tests**. Every GPU and NPU result in this project came from hand-run commands, not
-from automated coverage. The `openvino`-marked tests run on CPU against a tiny generated artifact.
+The hardware tests run against real devices and skip, with the command that fixes it, when the
+device or their artifact is missing. On the GPU they cover generation with metrics, compile-cache
+reuse, and the probe routing the tokenizer to CPU. On the NPU they cover node access, a raw compile
+being deferred rather than taken as the verdict, a pipeline failure coming out typed instead of as
+exit 99, generation with string-valued properties, and yonga's own probe passing an NPU LLM.
 
-Some integration tests need that artifact, which is generated rather than committed so a clone does
-not carry binary weights:
+**Be aware of what is not covered.** `slow` and `large_model` still select zero tests, and CI has no
+Intel hardware, so the hardware suites only run where someone runs them. The large-model results in
+this repository — the Qwen3.5 reference case above all — are still hand-run.
+
+Some tests need artifacts that are generated rather than committed, so a clone does not carry binary
+weights:
 
 ```bash
-python tools/make_test_artifact.py      # ~7 MB, needs network once
+python tools/make_test_artifact.py        # tiny random Llama, ~7 MB, needs network once
+python tools/make_test_artifact.py --npu  # Qwen3-0.6B with the NPU profile, ~400 MB of IR
 ```
 
 Without it those tests skip with a message telling you to run exactly that.

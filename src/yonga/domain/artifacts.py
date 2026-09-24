@@ -263,6 +263,14 @@ class ProbeStatus(str, Enum):
     FAILED = "failed"
     SKIPPED = "skipped"
     NOT_ATTEMPTED = "not_attempted"
+    DEFERRED = "deferred"
+    """A raw compile failed in a way that is not evidence about this model.
+
+    Used when the registry marks the failure ``defer_to_pipeline``: on the NPU a
+    raw ``Core.compile_model`` rejects every dynamically shaped LLM, while the
+    OpenVINO GenAI pipeline reshapes first. The raw attempt is kept on record
+    under this status and the device verdict comes from the pipeline smoke test.
+    """
 
 
 class ProbeResult(BaseModel):
@@ -288,6 +296,24 @@ class ProbeResult(BaseModel):
     def ok(self) -> bool:
         """True when the probe succeeded."""
         return self.status is ProbeStatus.OK
+
+
+def failure_text(result: ProbeResult) -> str:
+    """All the raw text a failed probe carries, for the classifier.
+
+    A diagnostic's ``raw_excerpt`` is capped and keeps the *head*, but the line
+    that identifies an NPU compiler rejection is captured native output appended
+    at the *end*. The result's ``message`` holds the full text in yonga's own
+    adapters, so both are read and the excerpt is only a fallback.
+    """
+    parts: list[str] = []
+    for part in (
+        result.message,
+        None if result.diagnostic is None else result.diagnostic.raw_excerpt,
+    ):
+        if part and part not in parts:
+            parts.append(part)
+    return "\n".join(parts)
 
 
 class DeviceProbeReport(BaseModel):

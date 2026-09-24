@@ -6,45 +6,60 @@ few days, **L** a substantial piece of work.
 
 The MVP works end to end on one machine: ten commands (`registry` carries three subcommands of its
 own — `validate`, `explain`, `paths`), the full Qwen3.5 reference case (GGUF-only source → declared derivative → 17.5 GiB download → INT4 conversion → seven VLM submodels
-validated → tokenizer repaired → GPU probed → artifact with a complete manifest), 1779 tests, ruff
-and mypy clean. What follows is what it does *not* yet have.
+validated → tokenizer repaired → GPU probed → artifact with a complete manifest), and — since
+2026-09-24 — NPU preparation, chat and benchmarking of a small LLM. 1792 default tests plus eight
+hardware tests, ruff and mypy clean. What follows is what it does *not* yet have.
 
 ---
 
-## Phase 0 — close the honesty gaps (do this first)
+## Phase 0 — close the honesty gaps
 
-These are places where the project currently looks better covered than it is. None is a bug; each
-is a claim without evidence behind it.
+These were places where the project looked better covered than it was. Items 0.1–0.3 closed on
+2026-09-24; working them turned up a defect that made NPU preparation impossible, described under
+0.3.
 
-**0.1 — Hardware test coverage actually exists. [M]**
-`intel_gpu`, `intel_npu`, `slow` and `large_model` select **zero tests**. Every GPU and NPU result
-in this repository came from a command someone typed. A reader seeing those markers in
-`pyproject.toml` will assume otherwise. Write real marked tests: GPU compile of a small artifact,
-NPU compile producing a *classified* failure, tokenizer-on-CPU-while-numeric-on-GPU routing, and
-the compile-cache reuse path. They will not run in CI — that is fine, `docs/TESTING.md` §6 specifies
-exactly these hardware acceptance tests and §11 always expected them on a self-hosted runner — but
-they must exist and pass on a real Core Ultra host.
+**0.1 — Hardware test coverage actually exists. [done]**
+`intel_gpu` and `intel_npu` now select real tests in `tests/hardware/` — three on the GPU
+(generation with metrics, compile-cache reuse, the probe service with the tokenizer routed to CPU)
+and five on the NPU (node access, raw-compile deferral, a typed pipeline failure, generation with
+manifest-shaped properties, and the probe service passing an NPU LLM). All eight pass on the
+reference host. The NPU generation tests need `python tools/make_test_artifact.py --npu` once; they
+skip with that instruction otherwise. `slow` and `large_model` still select nothing.
 
-**0.2 — Reconcile the NPU acceptance signature. [S]**
-`AGENT_PROMPT.md` §18 pins `OneShotBufferizeVPU2VPUIP failed : Only supports FP16.` as *the*
-Qwen3.5 NPU signature. The registry rule exists and its unit test passes against a fixture string,
-but that error **did not reproduce** on this stack — the real artifact fails with
-`to_shape was called on a dynamic shape` and classifies as `npu.compiler.dynamic_shape`. Either the
-original observation came from a different code path (likely the GenAI NPU pipeline with static
-reshaping, not a direct `compile_model`) or the stack has moved. Find out which, and record the
-answer in `REFERENCE_NOTES.md` rather than leaving a rule whose only evidence is a fixture.
+**0.2 — Reconcile the NPU acceptance signature. [done]**
+The signature `AGENT_PROMPT.md` §18 pins does reproduce — on the pipeline path, not on a raw
+compile. A raw `Core.compile_model` of Qwen3.5 on the NPU fails first on dynamic shapes; through
+`VLMPipeline`, which reshapes to a static budget, the compiler reaches the real rejection:
+`OneShotBufferizeVPU2VPUIP failed : Only supports FP16.` Two further things were needed before yonga
+could *classify* it: the NPU compiler writes that line to the native file descriptors, never into
+the Python exception, so yonga now captures them around every native compile; and a pipeline
+failure used to arrive as a generic `runtime.genai.load_failed` that bypassed the registry and
+exited 99 ("yonga hit a bug"). It now classifies as `npu.compiler.unsupported_graph.qwen35`, exit 51.
 
-**0.3 — Prove the NPU path with a model that should work. [M]**
-Everything we know about NPU behaviour comes from a model the registry already rules out. Prepare a
-small LLM the NPU *is* expected to handle (the OpenVINO GenAI NPU guidance suggests ~4-5B with
-`group_size 128`), through `LLMPipeline` with `MAX_PROMPT_LEN`/`MIN_RESPONSE_LEN` set. Until that
-succeeds, "NPU-first" is a design stance rather than a demonstrated capability.
+**0.3 — Prove the NPU path with a model that should work. [done]**
+`yonga prepare Qwen/Qwen3-0.6B --device npu --profile npu-int4-sym-g128` produces a ready NPU
+artifact; `chat` answers on the NPU and `bench` measures 67.3 tok/s, TTFT 165 ms over 256 tokens.
+Getting there exposed the real defect: the probe compiled each numeric submodel *raw* and treated a
+failure as the verdict, but a raw compile rejects every dynamically shaped LLM on the NPU, so no
+NPU artifact could ever be finalized. Registry issue rules can now declare `defer_to_pipeline`; the
+dynamic-shape rule does, and the GenAI pipeline smoke test decides. A deferred failure never passes
+a device by itself — without pipeline evidence it stays failed. A second bug sat behind it: GenAI
+needs `MAX_PROMPT_LEN` as an integer, and every property yonga records is a string.
 
-**0.4 — Squash the 7 MB test fixture out of git history before the first push. [S]**
+**0.4 — Squash the 7 MB test fixture out of git history before the first push. [needs a decision]**
 Commit `65f4e4a` added `tests/fixtures/artifacts/tinyllm/` — twelve blobs, 7,406,017 bytes in total,
 the largest being a 3.6 MB `tokenizer.json`. `ff2dd19` removed it from the tree in favour of
 generating the tiny artifact, but every blob is still reachable in history and every clone will pay
-for it.
+for it. This rewrites history, so it is the repository owner's call.
+
+**0.5 — NPU probes of large models are slow now, honestly. [partly done]**
+Because deferral hands the verdict to a real pipeline build, `yonga probe` of a large model on the
+NPU no longer fails instantly on a raw compile — it performs the NPU compilation the answer actually
+depends on. Measured on the reference host: the GPU-quantized Qwen3.5-9B artifact was still
+compiling for the NPU after 15 minutes at ~9 GiB RSS. The instant answer was false, so this is the
+right trade. The probe now says before the wait when it is about to compile more than 2 GiB of
+weights. Still open: a `--quick` mode that stops at the raw compile and labels the result
+inconclusive, and a bounded timeout for pipeline builds.
 
 ---
 

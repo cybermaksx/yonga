@@ -42,7 +42,7 @@ from tests.unit.test_prepare_planning import (
 )
 from yonga.application.progress import CollectingSink, ProgressKind
 from yonga.config.settings import Settings
-from yonga.domain.artifacts import ProbeStatus
+from yonga.domain.artifacts import ProbeResult, ProbeStatus
 from yonga.domain.diagnostics import (
     DeviceUnsupportedError,
     ExitCode,
@@ -51,6 +51,7 @@ from yonga.domain.diagnostics import (
     PreflightError,
     RepairError,
     ValidationError,
+    diagnostic,
 )
 from yonga.domain.plans import CONFIRMATION_DEVICE_FALLBACK, ConfirmationReason
 from yonga.util.hashing import sha256_file
@@ -530,3 +531,175 @@ def test_cramped_artifact_filesystem_is_reported_separately(
     assert plan.disk.temp.sufficient is True
     assert plan.disk.artifact_sufficient is False
     assert plan.disk.sufficient is False
+
+
+# --- a raw NPU compile is not a verdict: the GenAI pipeline decides ------------------
+#
+# On the reference host a raw ``Core.compile_model`` of Qwen3-0.6B (INT4 sym, g128)
+# fails on the NPU with the dynamic-shape message below, while ``LLMPipeline`` on
+# the same NPU reshapes and generates. Before deferral existed, the raw failure
+# ended the probe, so yonga could not prepare an NPU artifact for any LLM at all.
+
+#: The raw-compile rejection, verbatim from the reference host.
+NPU_DYNAMIC_SHAPE = (
+    "Exception from src/plugins/intel_npu/src/compiler_adapter/src/ze_graph_ext_wrappers.cpp:425:\n"
+    "Compilation failed. Level0 pfnCreate2 result: ZE_RESULT_ERROR_INVALID_ARGUMENT\n"
+    "[NPU_VCL] Compiler returned msg:\n"
+    "Exception from src/core/src/partial_shape.cpp:261:\n"
+    "to_shape was called on a dynamic shape."
+)
+
+
+class SkippingSmokeTester(FakeSmokeTester):
+    """A smoke tester that never builds a pipeline -- no evidence either way."""
+
+    def smoke_test(self, artifact_dir, *, device, pipeline, properties, prompt, max_new_tokens):
+        self.calls.append((device, dict(properties), max_new_tokens))
+        return ProbeResult(device=device, status=ProbeStatus.SKIPPED, message="not run")
+
+
+class GenericFailureSmokeTester(FakeSmokeTester):
+    """Fails the way the real adapter does: a generic diagnostic around raw text."""
+
+    raw: str = ""
+
+    def smoke_test(self, artifact_dir, *, device, pipeline, properties, prompt, max_new_tokens):
+        self.calls.append((device, dict(properties), max_new_tokens))
+        generic = diagnostic(
+            "runtime.genai.load_failed",
+            FailureCategory.UNKNOWN_RUNTIME_ERROR,
+            f"Could not load the model on {device}",
+            "Compilation failed",
+            raw_excerpt=self.raw,
+        )
+        return ProbeResult(
+            device=device,
+            status=ProbeStatus.FAILED,
+            diagnostic=generic,
+            message=generic.message,
+        )
+
+
+def test_a_deferred_npu_compile_is_settled_by_the_pipeline(
+    settings: Settings, hub: FakeHub
+) -> None:
+    """The dynamic-shape raw failure is overruled when the pipeline generates."""
+    runtime = FakeRuntimeProbe(compile_failures={"NPU": NPU_DYNAMIC_SHAPE})
+    smoke = FakeSmokeTester()
+    service = build_service(settings=settings, hub=hub, runtime=runtime, smoke=smoke)
+    plan = service.plan(SAFETENSORS_REPO, device="npu")
+
+    outcome = run_prepare(service, plan, settings)
+
+    report = outcome.manifest.device_probes["NPU"]
+    assert report.status is ProbeStatus.OK
+    assert report.smoke_test is not None and report.smoke_test.status is ProbeStatus.OK
+    raw = [result for result in report.submodels if result.status is ProbeStatus.DEFERRED]
+    assert raw, "the raw compile attempt must stay on record"
+    assert "to_shape was called on a dynamic shape" in (raw[0].message or "")
+    # The NPU profile's static-shape budget reached the pipeline.
+    npu_calls = [properties for device, properties, _ in smoke.calls if device == "NPU"]
+    assert npu_calls and npu_calls[0]["MAX_PROMPT_LEN"] == "1024"
+    assert npu_calls[0]["MIN_RESPONSE_LEN"] == "128"
+
+
+def test_a_deferred_npu_compile_without_pipeline_evidence_is_not_a_pass(
+    settings: Settings, hub: FakeHub
+) -> None:
+    """Deferral never passes a device on its own; no pipeline evidence means failed."""
+    runtime = FakeRuntimeProbe(compile_failures={"NPU": NPU_DYNAMIC_SHAPE})
+    service = build_service(
+        settings=settings, hub=hub, runtime=runtime, smoke=SkippingSmokeTester()
+    )
+    plan = service.plan(SAFETENSORS_REPO, device="npu")
+
+    with pytest.raises(DeviceUnsupportedError) as caught:
+        run_prepare(service, plan, settings)
+
+    assert caught.value.diagnostic.code == "npu.compiler.dynamic_shape"
+    assert "unproven" in caught.value.diagnostic.message
+    assert not plan.artifact_dir.exists()
+
+
+def test_a_pipeline_failure_is_classified_by_the_registry_not_the_adapter(
+    settings: Settings, hub: FakeHub
+) -> None:
+    """A generic adapter diagnostic must not hide the compiler signature it carries.
+
+    The real adapter reports every pipeline load failure as
+    ``runtime.genai.load_failed``; the NPU compiler's reason arrives only in the
+    raw text (captured from the native descriptors). The registry must see it.
+    """
+    runtime = FakeRuntimeProbe(compile_failures={"NPU": NPU_DYNAMIC_SHAPE})
+    smoke = GenericFailureSmokeTester()
+    smoke.raw = (
+        "Compilation failed\n--- native output ---\n"
+        "[ERROR] [vpux-compiler] OneShotBufferizeVPU2VPUIP failed : Only supports FP16."
+    )
+    service = build_service(settings=settings, hub=hub, runtime=runtime, smoke=smoke)
+    plan = service.plan(SAFETENSORS_REPO, device="npu")
+
+    with pytest.raises(DeviceUnsupportedError) as caught:
+        run_prepare(service, plan, settings)
+
+    assert caught.value.diagnostic.code == "npu.compiler.unsupported_graph.qwen35"
+    assert caught.value.diagnostic.environment_broken is False
+
+
+def test_a_conclusive_npu_compile_failure_still_stops_before_the_pipeline(
+    settings: Settings, hub: FakeHub
+) -> None:
+    """Only a failure the registry marks deferrable is handed to the pipeline."""
+    runtime = FakeRuntimeProbe(compile_failures={"NPU": NPU_UNSUPPORTED_GRAPH})
+    smoke = FakeSmokeTester()
+    service = build_service(settings=settings, hub=hub, runtime=runtime, smoke=smoke)
+    plan = service.plan(SAFETENSORS_REPO, device="npu")
+
+    with pytest.raises(DeviceUnsupportedError):
+        run_prepare(service, plan, settings)
+
+    assert [device for device, _, _ in smoke.calls if device == "NPU"] == []
+
+
+def test_the_signature_is_found_even_after_a_long_traceback(
+    settings: Settings, hub: FakeHub
+) -> None:
+    """A capped, head-first excerpt must not truncate away the decisive native line.
+
+    The NPU compiler's reason is captured native output appended *after* the
+    exception text, so a long traceback plus plugin noise would push it past the
+    excerpt's cap. Classification reads the full message instead.
+    """
+    long_text = (
+        "Compilation failed\n"
+        + "Exception from src/inference/src/dev/plugin.cpp:54:\n" * 200
+        + "--- native output ---\n"
+        + "[INFO] plugin chatter\n" * 200
+        + "[ERROR] [vpux-compiler] OneShotBufferizeVPU2VPUIP failed : Only supports FP16."
+    )
+
+    class LongFailureSmokeTester(FakeSmokeTester):
+        def smoke_test(self, artifact_dir, *, device, pipeline, properties, prompt, max_new_tokens):
+            self.calls.append((device, dict(properties), max_new_tokens))
+            generic = diagnostic(
+                "runtime.genai.load_failed",
+                FailureCategory.UNKNOWN_RUNTIME_ERROR,
+                f"Could not load the model on {device}",
+                long_text,
+                raw_excerpt=long_text,
+            )
+            assert "OneShotBufferize" not in (generic.raw_excerpt or ""), "precondition"
+            return ProbeResult(
+                device=device, status=ProbeStatus.FAILED, diagnostic=generic, message=long_text
+            )
+
+    runtime = FakeRuntimeProbe(compile_failures={"NPU": NPU_DYNAMIC_SHAPE})
+    service = build_service(
+        settings=settings, hub=hub, runtime=runtime, smoke=LongFailureSmokeTester()
+    )
+    plan = service.plan(SAFETENSORS_REPO, device="npu")
+
+    with pytest.raises(DeviceUnsupportedError) as caught:
+        run_prepare(service, plan, settings)
+
+    assert caught.value.diagnostic.code == "npu.compiler.unsupported_graph.qwen35"

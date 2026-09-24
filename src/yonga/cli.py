@@ -976,6 +976,11 @@ def _probe_exit(outcome: ProbeOutcome) -> ExitCode:
         return ExitCode.SUCCESS
     for report in outcome.reports:
         if report.diagnostic is not None:
+            # A probe that failed is a compilation failure by definition. An
+            # unclassified diagnostic must not surface as exit 99 ("yonga hit a
+            # bug") -- the same rule CompileError.fallback_exit_code encodes.
+            if report.diagnostic.category is FailureCategory.UNKNOWN_RUNTIME_ERROR:
+                return ExitCode.COMPILE
             return report.diagnostic.exit_code()
     return ExitCode.COMPILE
 

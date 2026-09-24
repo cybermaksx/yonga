@@ -907,6 +907,7 @@ class RegistryResolver:
             fallback_devices=list(recommendation.fallback_devices),
             environment_broken=rule.classification.environment_broken,
             retry_same_device=rule.classification.retry_same_device,
+            defer_to_pipeline=rule.classification.defer_to_pipeline,
             matched_rule_id=rule.id,
             raw_excerpt=_excerpt(text),
             log_path=log_path,

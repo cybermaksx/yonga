@@ -1,0 +1,133 @@
+"""Real Intel NPU: access, deferral of raw compiles, and pipeline generation.
+
+These guard the finding that made NPU preparation possible at all. On the
+reference host a raw ``Core.compile_model`` of any stateful LLM fails on the NPU
+with "to_shape was called on a dynamic shape", while OpenVINO GenAI's
+``LLMPipeline`` reshapes to a static budget and generates. yonga used to treat
+the raw failure as the verdict, so it could never prepare an NPU artifact.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+import pytest
+
+from tests.hardware._support import (
+    isolated_settings,
+    npu_artifact,
+    require_device,
+    tiny_artifact,
+)
+
+if TYPE_CHECKING:
+    from yonga.application.probe import ProbeService
+
+pytestmark = [pytest.mark.openvino, pytest.mark.intel_npu]
+
+
+@pytest.fixture(autouse=True)
+def _npu() -> None:
+    require_device("NPU")
+
+
+def _probe_service(tmp_path: Path) -> ProbeService:
+    from yonga.adapters.openvino_probe import OpenVINOProbe
+    from yonga.application.probe import ProbeService
+    from yonga.application.wiring import GenAISmokeTester
+    from yonga.registry import RegistryResolver, load_builtin_registry
+
+    return ProbeService(
+        OpenVINOProbe(),
+        RegistryResolver(load_builtin_registry()),
+        None,
+        isolated_settings(tmp_path),
+        smoke_tester=GenAISmokeTester(),
+    )
+
+
+def test_the_npu_node_is_accessible() -> None:
+    """``docs/TESTING.md`` 6: /dev/accel is accessible and OpenVINO lists the NPU."""
+    from yonga.adapters.system_linux import LinuxSystemProbe
+
+    npu = LinuxSystemProbe().inventory().npu
+
+    assert npu is not None
+    assert npu.accessible is True
+
+
+def test_a_raw_npu_compile_of_an_llm_is_deferred_not_a_verdict(tmp_path: Path) -> None:
+    from yonga.adapters.openvino_probe import OpenVINOProbe
+    from yonga.domain.artifacts import ProbeStatus
+    from yonga.registry import RegistryResolver, load_builtin_registry
+
+    artifact = tiny_artifact(tmp_path)
+    result = OpenVINOProbe().compile(artifact / "openvino_model.xml", "NPU")
+
+    assert result.status is ProbeStatus.FAILED
+    assert "to_shape was called on a dynamic shape" in (result.message or "")
+    classified = RegistryResolver(load_builtin_registry()).classify(
+        raw_error=result.message or "", device="NPU"
+    )
+    assert classified.defer_to_pipeline is True
+    assert classified.environment_broken is False
+
+
+def test_an_npu_pipeline_failure_is_typed_never_an_internal_error(tmp_path: Path) -> None:
+    """The tiny random Llama is rejected by the NPU pipeline: a real, fast failure."""
+    from yonga.cli import _probe_exit
+    from yonga.domain.artifacts import ProbeStatus, SubmodelRole
+    from yonga.domain.diagnostics import ExitCode
+
+    outcome = _probe_service(tmp_path).probe_detailed(tiny_artifact(tmp_path), device="npu")
+    report = outcome.reports[0]
+
+    assert report.status is ProbeStatus.FAILED
+    language = [r for r in report.submodels if r.role is SubmodelRole.LANGUAGE]
+    assert language and language[0].status is ProbeStatus.DEFERRED
+    assert report.smoke_test is not None and report.smoke_test.status is ProbeStatus.FAILED
+    assert report.diagnostic is not None
+    assert _probe_exit(outcome) is not ExitCode.INTERNAL
+
+
+def test_an_npu_llm_generates_with_manifest_shaped_properties(tmp_path: Path) -> None:
+    """String-valued properties, as a manifest stores them, reach GenAI typed.
+
+    GenAI rejects the *string* "1024" for MAX_PROMPT_LEN ("Type mismatch:
+    expected types: int or int64_t"), and every property yonga records is a
+    string because it round-trips through YAML and JSON. The values are passed
+    as literal strings here, independent of the registry, so this fails if the
+    runtime adapter ever stops converting them.
+    """
+    from yonga.adapters.runtime_genai import ChatHistory, open_runtime
+    from yonga.domain.benchmarks import GenerationSettings
+    from yonga.domain.models import PipelineKind
+
+    runtime = open_runtime(
+        npu_artifact(tmp_path),
+        device="NPU",
+        pipeline=PipelineKind.LLM,
+        properties={"MAX_PROMPT_LEN": "1024", "MIN_RESPONSE_LEN": "128"},
+        settings=isolated_settings(tmp_path),
+    )
+    try:
+        history = ChatHistory()
+        history.add_user("What is the capital of France? One word.")
+        result = runtime.generate(history, GenerationSettings(max_new_tokens=16, do_sample=False))
+    finally:
+        runtime.close()
+
+    assert result.output_tokens is not None and result.output_tokens > 0
+
+
+def test_the_probe_service_passes_an_npu_llm_through_the_pipeline(tmp_path: Path) -> None:
+    """The regression guard: yonga's own NPU probe now passes a real LLM."""
+    from yonga.domain.artifacts import ProbeStatus, SubmodelRole
+
+    report = _probe_service(tmp_path).probe(npu_artifact(tmp_path), device="npu")[0]
+
+    assert report.status is ProbeStatus.OK
+    language = [r for r in report.submodels if r.role is SubmodelRole.LANGUAGE]
+    assert language and language[0].status is ProbeStatus.DEFERRED
+    assert report.smoke_test is not None and report.smoke_test.status is ProbeStatus.OK

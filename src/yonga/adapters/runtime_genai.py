@@ -50,6 +50,11 @@ from typing import Any, Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from yonga.adapters.native_output import (
+    NativeOutput,
+    capture_native_output,
+    with_native_output,
+)
 from yonga.adapters.openvino_probe import (
     artifact_fingerprint,
     compile_cache_dir,
@@ -741,6 +746,31 @@ def _leading_system(messages: Sequence[ChatMessage]) -> list[ChatMessage]:
 # --- the runtime ----------------------------------------------------------------------
 
 
+#: OpenVINO GenAI pipeline properties that must be passed as integers.
+#: Registry and manifest data keep every property as a string, because it has to
+#: round-trip through YAML and JSON, but GenAI extracts these typed: handed the
+#: string "1024" for MAX_PROMPT_LEN it raises "Failed to extract MAX_PROMPT_LEN.
+#: Type mismatch: expected types: int or int64_t" (observed on the reference host).
+INTEGER_PIPELINE_PROPERTIES: frozenset[str] = frozenset({"MAX_PROMPT_LEN", "MIN_RESPONSE_LEN"})
+
+
+def pipeline_kwargs(properties: Mapping[str, str]) -> dict[str, object]:
+    """Convert string-valued properties into what the GenAI constructor accepts.
+
+    Only properties known to need another type are converted; everything else
+    passes through unchanged. A value that does not parse is left as given so
+    GenAI reports the mismatch in its own words rather than yonga guessing.
+    """
+    converted: dict[str, object] = {}
+    for name, value in properties.items():
+        if name.upper() in INTEGER_PIPELINE_PROPERTIES:
+            with suppress(ValueError):
+                converted[name] = int(str(value).strip())
+                continue
+        converted[name] = value
+    return converted
+
+
 class GenAIChatRuntime:
     """An OpenVINO GenAI pipeline kept alive across turns.
 
@@ -824,23 +854,35 @@ class GenAIChatRuntime:
                 )
             )
         started = time.perf_counter()
-        try:
-            if self._pipeline_kind is PipelineKind.VLM:
-                pipeline = self._genai.VLMPipeline(
-                    str(self._artifact_dir), self._device, **self._properties
-                )
-            else:
-                pipeline = self._genai.LLMPipeline(
-                    str(self._artifact_dir), self._device, **self._properties
-                )
-        except Exception as exc:
-            raise CompileError(self._load_failed_diagnostic(exc), cause=exc) from exc
+        # Compilation happens here. The NPU compiler reports its real reason on
+        # the native descriptors rather than in the exception, so capture them.
+        failure: Exception | None = None
+        pipeline: Any = None
+        with capture_native_output() as native:
+            try:
+                if self._pipeline_kind is PipelineKind.VLM:
+                    pipeline = self._genai.VLMPipeline(
+                        str(self._artifact_dir), self._device, **pipeline_kwargs(self._properties)
+                    )
+                else:
+                    pipeline = self._genai.LLMPipeline(
+                        str(self._artifact_dir), self._device, **pipeline_kwargs(self._properties)
+                    )
+            except Exception as exc:
+                failure = exc
+        if failure is not None:
+            raise CompileError(
+                self._load_failed_diagnostic(failure, native=native), cause=failure
+            ) from failure
         self._load_seconds = time.perf_counter() - started
         return pipeline
 
-    def _load_failed_diagnostic(self, error: BaseException) -> Diagnostic:
+    def _load_failed_diagnostic(
+        self, error: BaseException, *, native: NativeOutput | None = None
+    ) -> Diagnostic:
         """Build the load/compile failure diagnostic, keeping the raw runtime text."""
-        raw = redact_text(str(error))
+        text = str(error) if native is None else with_native_output(str(error), native)
+        raw = redact_text(text)
         return diagnostic(
             "runtime.genai.load_failed",
             FailureCategory.UNKNOWN_RUNTIME_ERROR,

@@ -33,6 +33,22 @@ Checked on the reference host, 2026-09-22 (one host, one stack; not a general la
 - `transformers` 5.5.4 still loads `Qwen3_5Config` and still reports `model_type: qwen3_5`, so a
   successful config load says nothing about whether the export will work.
 
+Checked on the reference host, 2026-09-24 (same caveat):
+
+- A raw `Core.compile_model` of a stateful LLM on the NPU fails with
+  `to_shape was called on a dynamic shape` for every model tried, including Qwen3-0.6B, which then
+  loads and generates through `LLMPipeline(..., "NPU", MAX_PROMPT_LEN=1024, MIN_RESPONSE_LEN=128)`.
+  A raw compile is therefore not evidence about NPU support for an LLM; the pipeline is.
+- Through `VLMPipeline` on the NPU, Qwen3.5 (INT4 symmetric, group -1) is rejected with
+  `OneShotBufferizeVPU2VPUIP failed : Only supports FP16.` — the signature this specification pins.
+  It is written by native code to stdout or stderr (both observed, depending on how the process was
+  started) and is absent from the Python exception, which reads only
+  `[NPU_VCL] Compiler returned msg: Compilation failed`.
+- `MAX_PROMPT_LEN` / `MIN_RESPONSE_LEN` must be integers; the string `"1024"` raises
+  `Failed to extract MAX_PROMPT_LEN. Type mismatch: expected types: int or int64_t`.
+- The tiny random Llama test model is rejected by the NPU pipeline
+  (`Model references undeclared parameters`), so NPU generation needs a small real model.
+
 ## OpenVINO GenAI API
 
 - VLMPipeline: https://docs.openvino.ai/2026/api/genai_api/_autosummary/openvino_genai.VLMPipeline.html

@@ -67,7 +67,7 @@ Eleven rules ship today.
 | Code | Rule id | Category | Exit | Means | Do this |
 |---|---|---|---|---|---|
 | `npu.compiler.unsupported_graph.qwen35` | `qwen35-npu-fp16-bufferize` | `compiler_unsupported_graph` | 51 | The NPU compiler refused a Qwen3.5 graph: an operation is implemented only for FP16 on the NPU. | Prepare for the GPU: `yonga prepare MODEL --device gpu`. The NPU is not broken. |
-| `npu.compiler.dynamic_shape` | `npu-compiler-dynamic-shape` | `compiler_unsupported_graph` | 51 | The IR still has dynamic dimensions; the NPU compiler needs static shapes. | Load through OpenVINO GenAI with `MAX_PROMPT_LEN`/`MIN_RESPONSE_LEN` instead of compiling the raw IR, or use the GPU. |
+| `npu.compiler.dynamic_shape` | `npu-compiler-dynamic-shape` | `compiler_unsupported_graph` | 51 | A raw compile kept the IR's dynamic dimensions; the NPU compiler needs static shapes. The rule is `defer_to_pipeline`: yonga records the raw failure as `deferred` and lets the GenAI pipeline, which reshapes to `MAX_PROMPT_LEN`/`MIN_RESPONSE_LEN`, decide. You see this code only when that pipeline could not be built either. | Read the pipeline error in `yonga logs JOB_ID --raw`; if it names a compiler pass, the model is not NPU-compatible — use the GPU. |
 | `npu.compiler.unsupported_graph` | `npu-compiler-unsupported-graph-generic` | `compiler_unsupported_graph` | 51 | The NPU compiler refused the graph, and no family-specific rule applies. | Use GPU or CPU; re-check after an OpenVINO/NPU compiler update. |
 | `npu.compiler.pass_failed` | `npu-compiler-pass-failed` | `compiler_unsupported_graph` | 51 | A named NPU compiler pass failed, and the compiler answered — so the driver is working. | Use the GPU; the failing pass is in `yonga logs JOB_ID --raw`. |
 | `tokenizer.ir.string_precision` | `tokenizer-string-precision-read` | `tokenizer_ir_incompatible` | 41 | The exported tokenizer XML writes `precision="STRiNG"`, which OpenVINO cannot read. | `yonga prepare MODEL --force`; the repair is applied automatically during validation. |
@@ -127,10 +127,25 @@ the Level Zero driver *answered*, the NPU compiler *ran*, and it *returned a mes
 broken driver looks different: the NPU is absent from `openvino.Core().available_devices`, or the
 error is `ZE_RESULT_ERROR_UNINITIALIZED`. Only those are classified as `device.driver_missing`.
 
-So `yonga` classifies this as `npu.compiler.dynamic_shape` (or
-`npu.compiler.unsupported_graph[.qwen35]` for the bufferization form), with
-`environment_broken: false`, and offers GPU and CPU as fallbacks. `yonga doctor` will still show the
-NPU as healthy, because it is:
+This particular message is also not evidence about the *model*. A raw `Core.compile_model` keeps
+an LLM's dynamic shapes, so it fails this way on the NPU for every stateful LLM — including ones the
+NPU runs perfectly well. On this host Qwen3-0.6B (INT4 symmetric, group 128) fails the raw compile
+with exactly this text and then loads and generates through `LLMPipeline` on the same NPU. So
+`yonga` records it as `deferred` and builds the GenAI pipeline to decide. When that pipeline fails
+too, its error is the verdict: for Qwen3.5 it is the one below, classified as
+`npu.compiler.unsupported_graph.qwen35` with `environment_broken: false` and GPU/CPU offered as
+fallbacks.
+
+```text
+[ERROR] [vpux-compiler] OneShotBufferizeVPU2VPUIP failed : Only supports FP16.
+```
+
+That line never appears in the Python exception — the NPU compiler writes it to the process's native
+standard output or error. `yonga` captures both descriptors around every native compile so the
+registry can see it; without the capture the same failure would read only
+`[NPU_VCL] Compiler returned msg: Compilation failed`.
+
+`yonga doctor` will still show the NPU as healthy, because it is:
 
 ```text
 NPU
@@ -139,9 +154,12 @@ NPU
 ✓  compiler-in-plugin  available  the NPU plugin compiles graphs itself
 ```
 
-Do not "fix" this by reinstalling the driver. Either run the model on the GPU, or load it through
-OpenVINO GenAI with `MAX_PROMPT_LEN` and `MIN_RESPONSE_LEN` set, which is what gives the NPU the
-static shapes it needs.
+Do not "fix" this by reinstalling the driver. A deferred raw compile needs nothing from you; a
+failed pipeline means the graph is not NPU-compatible on this compiler, so run the model on the GPU.
+
+Probing a large model on the NPU can take many minutes, because the pipeline build is a real NPU
+compilation of the whole model. An instant answer used to come from the raw compile, and it was
+wrong for every LLM.
 
 The dynamic-shape message is one form of this. Another, seen on this host by loading a Qwen3-0.6B
 artifact with `yonga chat ARTIFACT --device npu`, names the compiler pass instead:

@@ -437,6 +437,7 @@ class Wiring:
             self.registry_resolver(),
             self.readable_artifacts(),
             self._settings,
+            smoke_tester=self.smoke_tester(),
         )
 
     def chat_service(self, *, progress: ProgressSink | None = None) -> ChatService:

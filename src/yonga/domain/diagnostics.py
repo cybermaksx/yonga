@@ -148,6 +148,7 @@ class Diagnostic(BaseModel):
     fallback_devices: list[str] = Field(default_factory=list)
     environment_broken: bool = False
     retry_same_device: bool = False
+    defer_to_pipeline: bool = False
     matched_rule_id: str | None = None
     raw_excerpt: str | None = None
     log_path: Path | None = None

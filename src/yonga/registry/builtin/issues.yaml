@@ -56,6 +56,14 @@ issues:
       category: compiler_unsupported_graph
       environment_broken: false
       retry_same_device: false
+      # A raw Core.compile_model of a stateful LLM keeps its dynamic shapes, so
+      # on the NPU it fails for EVERY such model -- it is not evidence about
+      # this one. The GenAI NPU pipeline reshapes to MAX_PROMPT_LEN /
+      # MIN_RESPONSE_LEN before compiling, which is how the model actually
+      # runs. Verified on the reference host: Qwen3-0.6B (INT4 sym, g128) fails
+      # the raw compile with this exact message, then loads and generates
+      # through LLMPipeline on the same NPU. So the pipeline decides.
+      defer_to_pipeline: true
     recommendation:
       title: The NPU needs a statically shaped graph
       message: >-
@@ -70,8 +78,10 @@ issues:
         - cpu
       remediation:
         - >-
-          Load the artifact through OpenVINO GenAI with MAX_PROMPT_LEN and
-          MIN_RESPONSE_LEN set, rather than compiling the IR directly.
+          yonga already probes the NPU through the GenAI pipeline, which
+          reshapes to MAX_PROMPT_LEN / MIN_RESPONSE_LEN. If you are seeing this,
+          that pipeline could not be built either -- read the smoke-test error
+          in the job log for the real reason.
         - "Or run this model on the GPU: yonga prepare MODEL --device gpu"
     sources:
       - kind: tested

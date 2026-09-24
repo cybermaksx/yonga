@@ -9,7 +9,35 @@ manifest may change in any minor release.
 
 ## [Unreleased]
 
+### Fixed
+
+- **yonga could not prepare an NPU artifact for any LLM.** The probe compiled each numeric
+  submodel raw and took a failure as the verdict, but a raw `Core.compile_model` rejects every
+  dynamically shaped LLM on the NPU ("to_shape was called on a dynamic shape"), while the OpenVINO
+  GenAI pipeline reshapes first and runs. Registry issue rules can now declare
+  `defer_to_pipeline`; the dynamic-shape rule does, the raw attempt is recorded as `deferred`, and
+  the pipeline smoke test decides. A deferred failure never passes a device on its own. Both
+  `prepare` and `probe` behave this way. Verified on the reference host: `Qwen/Qwen3-0.6B` with
+  `npu-int4-sym-g128` now prepares, chats and benchmarks on the NPU (67.3 tok/s).
+- **GenAI rejected the NPU's static-shape properties.** `MAX_PROMPT_LEN` and `MIN_RESPONSE_LEN`
+  were passed as strings, as every recorded property is; GenAI requires integers. The runtime
+  adapter now types them at the boundary.
+- **A known NPU compiler rejection was reported as "yonga hit a bug" (exit 99).** The NPU compiler
+  writes its reason to the native file descriptors, not into the Python exception, and the adapter's
+  generic `runtime.genai.load_failed` bypassed the registry entirely. yonga now captures native
+  output around every native compile, classifies pipeline failures through the registry first, and
+  exits 51 for an unclassified probe failure. The Qwen3.5 NPU failure now classifies as
+  `npu.compiler.unsupported_graph.qwen35`, the code the specification pins. Capturing native output
+  also keeps compiler log lines out of `--json` output.
+
 ### Added
+
+- **Hardware tests.** `pytest -m intel_gpu` (3 tests) and `pytest -m intel_npu` (5 tests) run on a
+  real Intel GPU and NPU; they were empty markers before. `tools/make_test_artifact.py --npu`
+  builds the small real LLM the NPU generation tests need.
+- NPU profiles carry `MAX_PROMPT_LEN=1024` / `MIN_RESPONSE_LEN=128`, so the manifest records the
+  static-shape budget an NPU artifact was probed with.
+- `ProbeStatus.DEFERRED`, for a raw compile the pipeline was asked to settle.
 
 - **`docs/PROFILE_COMPARISON.md`** — the same Qwen3.5-9B weights quantized twice
   (`gpu-int4-asym-g128` and `npu-int4-sym-cw`), both converted and benchmarked on this

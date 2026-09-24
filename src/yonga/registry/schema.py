@@ -788,6 +788,16 @@ class IssueClassification(BaseModel):
     category: str
     environment_broken: bool = False
     retry_same_device: bool = False
+    defer_to_pipeline: bool = False
+    """The probe that produced this failure is not how the runtime executes the model.
+
+    Set it for a failure a raw ``Core.compile_model`` hits on every model of a
+    kind -- a dynamically shaped LLM on the NPU -- where the OpenVINO GenAI
+    pipeline, which reshapes before compiling, is the real test. A deferred
+    failure is recorded but does not decide the device; the pipeline smoke test
+    does. It never makes a device look supported on its own: with no pipeline
+    evidence the device stays failed.
+    """
 
     @field_validator("code")
     @classmethod

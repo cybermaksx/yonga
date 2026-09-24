@@ -17,6 +17,14 @@ profiles:
       symmetric: true
       ratio: 1.0
       group_size: -1
+    runtime:
+      # GenAI pipeline properties, never handed to a raw Core.compile_model.
+      # The NPU compiles statically shaped graphs only; these tell the GenAI
+      # NPU pipeline what static prompt and response budget to reshape to.
+      # 1024 / 128 are the documented GenAI NPU defaults, stated explicitly
+      # so the manifest records what the artifact was probed with.
+      MAX_PROMPT_LEN: "1024"
+      MIN_RESPONSE_LEN: "128"
     constraints:
       openvino: ">=2026.2,<2027"
     rationale: >-
@@ -39,6 +47,14 @@ profiles:
       symmetric: true
       ratio: 1.0
       group_size: 128
+    runtime:
+      # GenAI pipeline properties, never handed to a raw Core.compile_model.
+      # The NPU compiles statically shaped graphs only; these tell the GenAI
+      # NPU pipeline what static prompt and response budget to reshape to.
+      # 1024 / 128 are the documented GenAI NPU defaults, stated explicitly
+      # so the manifest records what the artifact was probed with.
+      MAX_PROMPT_LEN: "1024"
+      MIN_RESPONSE_LEN: "128"
     constraints:
       openvino: ">=2026.2,<2027"
     rationale: >-
