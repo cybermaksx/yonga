@@ -233,18 +233,20 @@ Use sparingly for CLI tables because terminal width can make them brittle. Prefe
 
 ## 11. CI matrix
 
-Suggested GitHub Actions baseline:
+`.github/workflows/ci.yml`, on ubuntu-latest:
 
 ```text
-Python: 3.11, 3.12, 3.13, 3.14
-OS: ubuntu-latest
-Jobs:
-  lint
-  typing
-  unit
-  integration-no-network
-  optional-openvino-cpu
+lint           ruff check and ruff format --check over the whole tree
+typing         mypy src tests, Python 3.11-3.14, with the serve extra and no OpenVINO
+tests          unit and integration, Python 3.11-3.14, full toolchain (OpenVINO CPU plugin)
+base-install   unit and integration with no OpenVINO or export extras, Python 3.11 and 3.14
+package        build, twine check --strict, and a smoke test of the wheel in a clean venv
 ```
+
+No job passes `-m`: the default `addopts` deselect `network`, `intel_gpu`, `intel_npu`,
+`large_model` and `slow`, and overriding that is how a CI run would start depending on hardware or
+a network it does not have. `.github/workflows/release.yml` publishes a tagged version
+(`docs/RELEASING.md`).
 
 Hardware CI can be self-hosted later and must not block ordinary contributor PRs unless specifically required.
 
