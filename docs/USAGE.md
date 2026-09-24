@@ -189,10 +189,18 @@ cleanly, by design, so a future device needs no code change.
 yonga logs                      # recent jobs
 yonga logs JOB_ID               # one job as a table
 yonga logs JOB_ID --raw         # the JSON Lines file
+yonga logs JOB_ID --bundle      # a .tar.gz to attach to a bug report
 ```
 
 Every job writes `~/.local/share/yonga/logs/<job>.jsonl` with the full raw error preserved, even
 when the terminal shows a short explanation. `--debug` adds the raw exception to the terminal.
+
+`--bundle` packs the job log, its state, the artifact's manifest and validation record when there
+is one, and a `doctor --json` host report into a single archive, with a `README.txt` listing what
+went in. It is built to be shareable, including publicly: every file is redacted again for secrets,
+and your home directory, hostname and login name are rewritten to `~`, `<host>` and `<user>`. It only
+reads yonga's own directories. Still read it before you share it. `--output PATH` chooses where it
+goes; otherwise it lands in the current directory as `yonga-report-<job>.tar.gz`.
 
 ---
 

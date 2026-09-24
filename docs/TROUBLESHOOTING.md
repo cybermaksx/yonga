@@ -141,7 +141,7 @@ fallbacks.
 ```
 
 That line never appears in the Python exception — the NPU compiler writes it to the process's native
-standard output or error. `yonga` captures both descriptors around every native compile so the
+standard output. `yonga` captures both descriptors around every native compile so the
 registry can see it; without the capture the same failure would read only
 `[NPU_VCL] Compiler returned msg: Compilation failed`.
 

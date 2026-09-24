@@ -84,10 +84,13 @@ Downloads already resume through the Hub cache; export restarts from scratch, wh
 model is expensive. Investigate what optimum-intel can actually resume, and only promise what it
 delivers — `ARCHITECTURE.md` §5 is explicit about not claiming generic resumability.
 
-**1.4 — Bug-report bundles. [S]**
-`IMPLEMENTATION_PLAN.md` milestone 11. One command that collects the job log, the manifest, the
-hardware inventory and the redacted argv into an attachable archive. Every repair and classifier in
-the registry is a candidate upstream bug; this makes reporting them cheap.
+**1.4 — Bug-report bundles. [done]**
+`IMPLEMENTATION_PLAN.md` milestone 11. `yonga logs JOB_ID --bundle` writes a `.tar.gz` with the job
+log and state, the artifact manifest and validation record, and a `doctor --json` host report, plus
+a README listing the contents. Every file is redacted again and the home directory, hostname and
+login name are anonymised, because a bundle is meant to be attached to public issues. Building it
+against the reference host's oldest logs found that a hostname embedding the login name
+(`<user>-x1carbon`) leaked both, so the hostname is anonymised first.
 
 ---
 
@@ -133,7 +136,7 @@ Small, real, and worth clearing before the next feature.
 
 | Where | What |
 |---|---|
-| job logs | Four pre-fix logs on the reference host still carry a 71-variable environment dump. No token-shaped string survives in them, but they should be deleted. |
+| job logs | Four pre-fix logs on the reference host still carry a 71-variable environment dump. No token-shaped string survives in them, and `--bundle` re-redacts and anonymises them before they could be shared, but the files themselves should be deleted. That deletes user data, so it is the owner's call. |
 | `docs/PROFILE_COMPARISON.md` | Measures size and speed only. Output quality was never evaluated, and that gap is the interesting one — a symmetric channel-wise INT4 artifact and an asymmetric group-128 one are not expected to be equally accurate. |
 
 ---

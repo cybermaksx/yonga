@@ -41,8 +41,9 @@ Checked on the reference host, 2026-09-24 (same caveat):
   A raw compile is therefore not evidence about NPU support for an LLM; the pipeline is.
 - Through `VLMPipeline` on the NPU, Qwen3.5 (INT4 symmetric, group -1) is rejected with
   `OneShotBufferizeVPU2VPUIP failed : Only supports FP16.` — the signature this specification pins.
-  It is written by native code to stdout or stderr (both observed, depending on how the process was
-  started) and is absent from the Python exception, which reads only
+  It is written by native code to standard output (yonga's `--json` mode redirects descriptor 1 to
+  descriptor 2, which is why it can surface on stderr there) and is absent from the Python
+  exception, which reads only
   `[NPU_VCL] Compiler returned msg: Compilation failed`.
 - `MAX_PROMPT_LEN` / `MIN_RESPONSE_LEN` must be integers; the string `"1024"` raises
   `Failed to extract MAX_PROMPT_LEN. Type mismatch: expected types: int or int64_t`.

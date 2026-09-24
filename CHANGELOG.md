@@ -38,6 +38,10 @@ manifest may change in any minor release.
 - NPU profiles carry `MAX_PROMPT_LEN=1024` / `MIN_RESPONSE_LEN=128`, so the manifest records the
   static-shape budget an NPU artifact was probed with.
 - `ProbeStatus.DEFERRED`, for a raw compile the pipeline was asked to settle.
+- **`yonga logs JOB_ID --bundle`** writes a bug-report archive: job log and state, artifact manifest
+  and validation record, and a host report, redacted again and with the home directory, hostname and
+  login name anonymised. `yonga logs` and the bundle now share one job resolver.
+- `probe` says before the wait when a pipeline build will compile more than 2 GiB of weights.
 
 - **`docs/PROFILE_COMPARISON.md`** — the same Qwen3.5-9B weights quantized twice
   (`gpu-int4-asym-g128` and `npu-int4-sym-cw`), both converted and benchmarked on this

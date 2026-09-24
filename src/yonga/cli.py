@@ -1306,16 +1306,44 @@ def logs(
     ctx: typer.Context,
     job_id: str | None = typer.Argument(None, metavar="JOB_ID", help="Job id, or a prefix."),
     raw: bool = typer.Option(False, "--raw", help="Print the JSON Lines file verbatim."),
+    bundle: bool = typer.Option(
+        False,
+        "--bundle",
+        help="Write a redacted, anonymised .tar.gz for a bug report "
+        "(log, state, manifest, host report).",
+    ),
+    output: Path | None = typer.Option(
+        None, "--output", help="Where to write the --bundle archive.", dir_okay=False
+    ),
     json_output: bool = typer.Option(False, "--json", help="Emit the records as JSON."),
 ) -> None:
     """Show the job logs kept on disk, most recent first."""
     state = cli_state(ctx, json_output=json_output)
-    _dispatch(state, lambda: _logs(state, job_id, raw=raw))
+    _dispatch(state, lambda: _logs(state, job_id, raw=raw, bundle=bundle, output=output))
 
 
-def _logs(state: CliState, job_id: str | None, *, raw: bool) -> ExitCode:
+def _logs(
+    state: CliState,
+    job_id: str | None,
+    *,
+    raw: bool,
+    bundle: bool = False,
+    output: Path | None = None,
+) -> ExitCode:
     """List job logs, or render one (``docs/CLI_SPEC.md`` section 13)."""
     logs_dir = state.settings.paths.logs_dir
+    if bundle:
+        if job_id is None:
+            raise ConfigurationError(
+                diagnostic(
+                    "logs.bundle.no_job",
+                    FailureCategory.CONFIGURATION_ERROR,
+                    "--bundle needs a job",
+                    "Name the job to bundle.",
+                    remediation=["Find one with: yonga logs, then: yonga logs JOB_ID --bundle"],
+                )
+            )
+        return _log_bundle(state, job_id, output=output)
     if job_id is None:
         return _log_index(state, logs_dir)
     path = _log_path(logs_dir, job_id)
@@ -1336,6 +1364,35 @@ def _logs(state: CliState, job_id: str | None, *, raw: bool) -> ExitCode:
         stamp = str(record.get("timestamp", ""))[11:23]
         style = "red" if level == "error" else ("yellow" if level == "warning" else "")
         state.console.print(f"  {stamp}  {level:<7} {event:<26} {message}", style=style or None)
+    return ExitCode.SUCCESS
+
+
+def _log_bundle(state: CliState, job_id: str, *, output: Path | None) -> ExitCode:
+    """Write a bug-report bundle for one job and say what went into it."""
+    from yonga.application.report import build_bundle
+
+    host: dict[str, object] | None = None
+    try:
+        with _quiet_native_stdout(True):
+            host = state.graph.doctor_service().run().to_json()
+    except Exception:
+        # A host report makes a bundle more useful; failing to gather one must
+        # not prevent sharing the log that describes the failure.
+        host = None
+    result = build_bundle(state.settings.paths, job_id, output=output, host_report=host)
+    if state.json_mode:
+        state.emit(result.to_json())
+        return ExitCode.SUCCESS
+    state.console.print(f"Bug-report bundle written to {result.path}")
+    for member in result.members:
+        state.console.print(f"  {member.name:<16} {member.description}")
+    for note in result.notes:
+        state.console.print_error(note, style="dim")
+    state.console.print(
+        "Secrets were redacted; your home directory, hostname and login name anonymised. "
+        "Read it before sharing.",
+        style="dim",
+    )
     return ExitCode.SUCCESS
 
 
@@ -1375,33 +1432,9 @@ def _log_index(state: CliState, logs_dir: Path) -> ExitCode:
 
 def _log_path(logs_dir: Path, job_id: str) -> Path:
     """Resolve a job id (or an unambiguous prefix) to its log file."""
-    exact = logs_dir / f"{job_id}.jsonl"
-    if exact.is_file():
-        return exact
-    matches = sorted(path for path in logs_dir.glob(f"{job_id}*.jsonl") if path.is_file())
-    if len(matches) == 1:
-        return matches[0]
-    if not matches:
-        raise ConfigurationError(
-            diagnostic(
-                "logs.not_found",
-                FailureCategory.CONFIGURATION_ERROR,
-                "No such job log",
-                f"No job log for {job_id!r} exists in {logs_dir}.",
-                remediation=["List the jobs that do exist: yonga logs"],
-                context={"job_id": job_id},
-            )
-        )
-    raise ConfigurationError(
-        diagnostic(
-            "logs.ambiguous",
-            FailureCategory.CONFIGURATION_ERROR,
-            "That job id prefix is ambiguous",
-            f"{len(matches)} job logs start with {job_id!r}.",
-            remediation=["Use the full job id: yonga logs " + matches[0].stem],
-            context={"job_id": job_id},
-        )
-    )
+    from yonga.application.report import find_job_log
+
+    return find_job_log(logs_dir, job_id)
 
 
 def _log_records(path: Path) -> list[dict[str, object]]:

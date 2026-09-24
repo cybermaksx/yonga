@@ -295,9 +295,11 @@ yonga registry paths
 ```bash
 yonga logs [JOB_ID]
 yonga logs JOB_ID --raw
+yonga logs JOB_ID --bundle [--output PATH]
 ```
 
-Useful after failed conversion.
+Useful after failed conversion. `--bundle` writes a redacted, anonymised archive of the job log, job
+state, artifact manifest and host report for attaching to a bug report.
 
 ## 14. `serve` (phase 2)
 

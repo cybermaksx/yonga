@@ -9,13 +9,15 @@ the case that matters: when it rejects a graph, the Python exception says only
 
 while the actual reason -- for example
 ``[vpux-compiler] OneShotBufferizeVPU2VPUIP failed : Only supports FP16.`` --
-is written by native code to stdout or stderr (both were observed on the
-reference host, depending on how the process was started). Without capturing
-it the registry classifier never sees the signature it was written for.
+is written by native code to standard output. Without capturing it the
+registry classifier never sees the signature it was written for. Both
+descriptors are captured anyway: nothing guarantees a plugin keeps to one.
 
 Capturing also protects ``--json``: native lines written to descriptor 1 while
 a pipeline builds would otherwise land in front of the one JSON document the
-CLI promises on stdout.
+CLI promises on stdout. The CLI's ``_quiet_native_stdout`` guards the same
+contract more broadly, moving descriptor 1 to descriptor 2 around a whole
+service call in ``--json`` mode; the two compose, this one nested inside.
 
 While the block runs, descriptors 1 and 2 are pointed at a temporary file, and
 ``sys.stdout`` / ``sys.stderr`` are pointed at duplicates of the *original*

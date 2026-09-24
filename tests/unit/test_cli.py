@@ -1116,6 +1116,41 @@ def test_logs_for_an_unknown_job_is_a_configuration_error(runner: CliRunner, hom
     assert "yonga logs" in result.stderr
 
 
+def test_logs_bundle_writes_an_archive_and_reports_it_as_json(
+    runner: CliRunner, home: Path, tmp_path: Path
+) -> None:
+    """``--bundle --json`` emits exactly one document naming the archive it wrote."""
+    import tarfile
+
+    logs_dir = home / "data" / "logs"
+    logs_dir.mkdir(parents=True)
+    job_id = "22222222-3333-4444-5555-666666666666"
+    (logs_dir / f"{job_id}.jsonl").write_text(
+        json.dumps({"event": "job.failed", "message": "conversion failed"}) + "\n",
+        encoding="utf-8",
+    )
+    target = tmp_path / "bundle.tar.gz"
+
+    result = invoke(
+        runner, home, ["--json", "logs", "22222222", "--bundle", "--output", str(target)]
+    )
+
+    assert result.exit_code == int(ExitCode.SUCCESS)
+    document = json.loads(result.stdout)
+    assert document["job_id"] == job_id
+    assert Path(document["path"]) == target
+    with tarfile.open(target) as archive:
+        names = {Path(member.name).name for member in archive.getmembers()}
+    assert {"README.txt", "job.jsonl"} <= names
+
+
+def test_logs_bundle_needs_a_job(runner: CliRunner, home: Path) -> None:
+    (home / "data" / "logs").mkdir(parents=True)
+    result = invoke(runner, home, ["logs", "--bundle"])
+    assert result.exit_code == int(ExitCode.REGISTRY)
+    assert "yonga logs JOB_ID --bundle" in result.stderr
+
+
 # ======================================================================
 # failure rendering
 # ======================================================================
