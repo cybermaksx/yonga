@@ -588,7 +588,23 @@ class ExportSpec(BaseModel):
     task: str | None = None
     pipeline: PipelineKind = PipelineKind.UNKNOWN
     trust_remote_code: bool = False
+    native_implementation: bool = False
+    """Transformers implements this architecture itself.
+
+    A repository of such a model may still ship its own modelling code and an
+    ``auto_map`` (Phi-4-mini does). With ``trust_remote_code`` off, Transformers
+    ignores that code and uses its own implementation, so the export needs no
+    remote code and the repository's Python is never run. Declaring this is a
+    claim about Transformers, not about any repository, and it never *enables*
+    remote code: a rule that sets both is contradictory and is rejected.
+    """
     extra_args: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _native_excludes_remote_code(self) -> ExportSpec:
+        if self.native_implementation and self.trust_remote_code:
+            raise ValueError("native_implementation and trust_remote_code contradict each other")
+        return self
 
     def specifiers(self) -> dict[str, str]:
         """Return the non-empty version specifiers keyed by distribution name."""

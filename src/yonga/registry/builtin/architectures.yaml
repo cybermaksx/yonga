@@ -140,3 +140,39 @@ architectures:
         note: >-
           Family-level fallback so unknown members of well-known decoder-only
           families still get a usable CPU/GPU plan.
+
+  - id: arch-phi3
+    schema_version: 1
+    status: active
+    priority: 100
+    summary: Phi-3 / Phi-4-mini decoder-only family
+    match:
+      model_types:
+        - phi3
+      architectures:
+        - Phi3ForCausalLM
+    export:
+      pipeline: llm
+      task: text-generation-with-past
+      trust_remote_code: false
+      # Phi-4-mini's repository ships modeling_phi3.py and an auto_map, but
+      # Transformers has implemented phi3 natively since 4.40: with remote code
+      # off that file is ignored and never run.
+      native_implementation: true
+    devices:
+      cpu:
+        status: unknown
+        evidence: unknown
+      gpu:
+        status: unknown
+        evidence: unknown
+      npu:
+        status: unknown
+        evidence: unknown
+    recommended_device: gpu
+    profiles:
+      gpu: gpu-int4-asym-g128
+      cpu: cpu-int4-asym-g128
+    sources:
+      - kind: official_docs
+        url: https://huggingface.co/docs/transformers/model_doc/phi3

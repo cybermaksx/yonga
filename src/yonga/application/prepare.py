@@ -680,6 +680,13 @@ class PrepareService:
         # unreachable. A user asking for `--profile npu-int4-sym-cw --device gpu`
         # gets told, in the plan, before anything is downloaded.
         known_limitations.extend(profile_explanation.notes)
+        if source_meta.requires_remote_code and not remote_code_required:
+            files = ", ".join(source_meta.remote_code_files) or "an auto_map"
+            known_limitations.append(
+                f"The repository ships its own modelling code ({files}). It is not run: "
+                "Transformers implements this architecture natively, and remote code stays "
+                "off."
+            )
         if resolved_source.gguf_file is not None:
             types = ", ".join(
                 f"{name} x{count}" for name, count in resolved_source.gguf_tensor_types.items()
@@ -1192,13 +1199,23 @@ class PrepareService:
         arch_rule: ArchitectureRule | None,
         model_rule: ModelRule | None,
     ) -> bool:
-        """Whether conversion cannot proceed without executing repository code."""
-        if metadata.requires_remote_code:
+        """Whether conversion cannot proceed without executing repository code.
+
+        A repository's ``auto_map`` means remote code *unless* the registry
+        declares that Transformers implements the architecture natively: then the
+        repository's code is ignored with ``trust_remote_code`` off and never run.
+        """
+        spec = (
+            model_rule.export
+            if model_rule is not None and model_rule.export is not None
+            else arch_rule.export
+            if arch_rule is not None
+            else None
+        )
+        if spec is not None and spec.trust_remote_code:
             return True
-        if model_rule is not None and model_rule.export is not None:
-            return bool(model_rule.export.trust_remote_code)
-        if arch_rule is not None:
-            return bool(arch_rule.export.trust_remote_code)
+        if metadata.requires_remote_code:
+            return not (spec is not None and spec.native_implementation)
         return False
 
     def _expected_repairs(self) -> list[RepairRule]:
