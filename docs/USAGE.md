@@ -199,6 +199,27 @@ yonga remove ARTIFACT               # artifact + its compile cache, nothing else
 TTFT 276 ms • 18.2 tok/s • TPOT 55.0 ms/token • 20 → 159 tokens
 ```
 
+### Serve it to other tools
+
+`pip install -e ".[serve]"` once, then:
+
+```bash
+yonga serve ARTIFACT --device gpu              # http://127.0.0.1:8000/v1, model loaded at startup
+curl -s localhost:8000/v1/models
+curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model":"ARTIFACT","messages":[{"role":"user","content":"Hi"}],"stream":true}'
+```
+
+Any OpenAI client works with `base_url="http://127.0.0.1:8000/v1"`. The model answers to the name
+you served it under, its artifact id, and its source repository. It is the same session `chat`
+opens: same chat profile, generation defaults and hidden reasoning, including while streaming. The
+client owns the conversation and sends all of it each time; nothing is kept between requests.
+Requests are answered one at a time, and a streaming client that disconnects stops its generation.
+
+Binding anything but loopback (`--host 0.0.0.0`) prints a warning. Set `YONGA_API_KEY` in the
+environment to require `Authorization: Bearer <key>` on every endpoint except `/health`; it is read
+from the environment only, so it never shows up in the process list.
+
 `bench` writes a reproducible JSON result under `~/.local/share/yonga/benchmarks/` recording the
 hardware, package versions, device properties, generation settings and their fingerprint, the exact
 prompt hashes, and per-run metrics with warmups excluded from the aggregates.

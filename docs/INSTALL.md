@@ -54,6 +54,7 @@ The extras map to what you intend to do:
 |---|---|---|
 | `openvino` | `openvino`, `openvino-genai`, `openvino-tokenizers` | `probe`, `chat`, `bench`, and the device/NPU sections of `doctor` |
 | `export` | `optimum-intel[openvino]`, `nncf` (pulling in `transformers` and `torch`) | `prepare` (download, convert, quantize) |
+| `serve` | `fastapi`, `uvicorn` | `serve` (the OpenAI-compatible HTTP API) |
 | `dev` | pytest, pytest-cov, pytest-mock, pytest-timeout, ruff, mypy | running the test suite |
 | `all` | all of the above | |
 

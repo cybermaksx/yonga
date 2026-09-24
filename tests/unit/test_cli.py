@@ -43,6 +43,7 @@ from tests.unit.test_prepare_planning import (
     make_snapshot,
     safetensors_metadata,
 )
+from yonga import cli as cli_module
 from yonga.adapters import (
     CommandRunner,
     Exporter,
@@ -62,7 +63,7 @@ from yonga.cli import app
 from yonga.config.settings import Settings
 from yonga.domain.artifacts import IRDescription, ProbeResult, assert_no_secrets
 from yonga.domain.benchmarks import GenerationSettings
-from yonga.domain.diagnostics import ExitCode
+from yonga.domain.diagnostics import ConfigurationError, ExitCode, FailureCategory, diagnostic
 from yonga.domain.hardware import (
     DeviceKind,
     FilesystemInfo,
@@ -527,9 +528,11 @@ def test_help_lists_every_documented_command(runner: CliRunner) -> None:
         "bench",
         "registry",
         "logs",
+        "search",
+        "env",
+        "serve",
     ):
         assert command in result.stdout
-    assert "serve" not in result.stdout
 
 
 def test_version_prints_the_product_name_and_version(runner: CliRunner) -> None:
@@ -1582,3 +1585,130 @@ def test_a_classified_probe_failure_keeps_its_own_exit_code(tmp_path: Path) -> N
     )
 
     assert _probe_exit(outcome) is classified.exit_code()
+
+
+# ======================================================================
+# serve
+# ======================================================================
+@pytest.fixture
+def served(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, object]]:
+    """Capture what ``serve`` would hand uvicorn, instead of opening a socket."""
+    pytest.importorskip("fastapi")
+    calls: list[dict[str, object]] = []
+
+    def run_http(app_instance: object, *, host: str, port: int, verbose: bool) -> None:
+        from fastapi.testclient import TestClient
+
+        client = TestClient(app_instance)  # type: ignore[arg-type]
+        calls.append(
+            {
+                "host": host,
+                "port": port,
+                "models": client.get("/v1/models").json(),
+                "health": client.get("/health").json(),
+            }
+        )
+
+    monkeypatch.setattr(cli_module, "_run_http", run_http)
+    monkeypatch.setattr(cli_module, "_require_port", lambda host, port: None)
+    return calls
+
+
+def test_serve_loads_the_model_once_and_binds_loopback_by_default(
+    runner: CliRunner, home: Path, tmp_path: Path, served: list[dict[str, object]]
+) -> None:
+    artifact = _staged_artifact(tmp_path)
+    factory = FakeRuntimeFactory()
+    result = invoke(
+        runner,
+        home,
+        ["serve", str(artifact), "--device", "cpu"],
+        factory=lambda settings: FakeWiring(settings, runtime_factory=factory),
+    )
+
+    assert result.exit_code == int(ExitCode.SUCCESS), result.stderr
+    (call,) = served
+    assert call["host"] == "127.0.0.1"
+    assert call["port"] == 8000
+    assert call["health"]["status"] == "ok"  # type: ignore[index]
+    assert len(factory.opened) == 1, "loaded before serving, and only once"
+    assert factory.runtimes[0].closed is True, "released when the server stops"
+    assert "http://127.0.0.1:8000/v1" in result.stdout
+    assert "warning" not in result.stderr
+
+
+def test_serve_warns_when_binding_beyond_loopback_without_a_key(
+    runner: CliRunner, home: Path, tmp_path: Path, served: list[dict[str, object]]
+) -> None:
+    artifact = _staged_artifact(tmp_path)
+    result = invoke(runner, home, ["serve", str(artifact), "--host", "0.0.0.0"])
+
+    assert result.exit_code == int(ExitCode.SUCCESS)
+    assert "reachable from other machines" in result.stderr
+    assert "YONGA_API_KEY" in result.stderr
+
+
+def test_serve_never_prints_the_api_key(
+    runner: CliRunner, home: Path, tmp_path: Path, served: list[dict[str, object]]
+) -> None:
+    artifact = _staged_artifact(tmp_path)
+    result = invoke(
+        runner,
+        home,
+        ["serve", str(artifact), "--host", "0.0.0.0"],
+        env={"YONGA_API_KEY": "k-9f8e7d6c"},
+    )
+
+    assert "API key required" in result.stdout
+    assert "k-9f8e7d6c" not in result.stdout + result.stderr
+    assert "No YONGA_API_KEY" not in result.stderr
+
+
+def test_serve_is_refused_in_json_mode(runner: CliRunner, home: Path, tmp_path: Path) -> None:
+    result = invoke(runner, home, ["serve", str(_staged_artifact(tmp_path)), "--json"])
+
+    assert one_document(result)["ok"] is False
+
+
+def test_serve_without_the_extra_names_the_install_command(
+    runner: CliRunner, home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def missing() -> object:
+        raise ConfigurationError(
+            diagnostic(
+                "serve.dependencies.missing",
+                FailureCategory.PACKAGE_ABI_MISMATCH,
+                "The serve extra is not installed",
+                "No module named 'fastapi'.",
+                remediation=["pip install 'yonga[serve]'"],
+            )
+        )
+
+    monkeypatch.setattr(cli_module, "_serve_dependencies", missing)
+    result = invoke(runner, home, ["serve", str(_staged_artifact(tmp_path))])
+
+    assert result.exit_code == int(ExitCode.ENVIRONMENT_UNUSABLE)
+    assert "yonga[serve]" in result.stderr
+
+
+def test_serve_refuses_a_port_in_use_before_loading_anything(
+    runner: CliRunner, home: Path, tmp_path: Path
+) -> None:
+    import socket
+
+    pytest.importorskip("fastapi")
+    factory = FakeRuntimeFactory()
+    with socket.socket() as taken:
+        taken.bind(("127.0.0.1", 0))
+        taken.listen()
+        port = taken.getsockname()[1]
+        result = invoke(
+            runner,
+            home,
+            ["serve", str(_staged_artifact(tmp_path)), "--port", str(port)],
+            factory=lambda settings: FakeWiring(settings, runtime_factory=factory),
+        )
+
+    assert result.exit_code == int(ExitCode.REGISTRY)
+    assert f"Cannot listen on 127.0.0.1:{port}" in result.stderr
+    assert factory.opened == []

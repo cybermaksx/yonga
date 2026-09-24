@@ -113,12 +113,17 @@ against the reference host's oldest logs found that a hostname embedding the log
 
 ## Phase 2 — serving and publication
 
-**2.1 — `yonga serve`. [L]**
-`SPEC.md` §22, `CLI_SPEC.md` §14. `GET /v1/models`, `POST /v1/chat/completions`, optional SSE, a
-health endpoint, bound to localhost by default. The runtime abstraction already exists and chat
-already goes through it, so this should be an adapter over the same `ChatRuntime` rather than a
-second preparation stack. Decide early between a small FastAPI layer and integrating OpenVINO Model
-Server; the second is less custom code but a much heavier dependency.
+**2.1 — `yonga serve`. [done]**
+A FastAPI layer (optional `serve` extra) over the same `ChatSession` `chat` uses, through a new
+stateless `ChatSession.respond`: `/health`, `/v1/models`, `/v1/chat/completions` with SSE, bound to
+loopback, optional bearer key from `YONGA_API_KEY`. Streaming goes through a `StreamingSanitizer`
+that only releases text no later chunk can turn into reasoning. Building it found that OpenVINO
+GenAI 2026.4's `VLMPipeline.generate` *does* accept a `ChatHistory`, contrary to the adapter's note;
+the VLM path is now stateless where the build allows it and falls back to the hidden
+`start_chat()` session otherwise. Verified on the reference host with the Qwen3.5-9B GPU artifact
+and the official `openai` Python client: plain, streamed and multi-turn completions, 404/400
+mapping, and a disconnected 1500-token stream releasing the GPU (the next request answered in
+0.43 s). Not done: images, tool calls, stop sequences, concurrent generation.
 
 **2.2 — `yonga publish`. [M]**
 `SPEC.md` §21. The manifest already carries everything a generated model card needs — source

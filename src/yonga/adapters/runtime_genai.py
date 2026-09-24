@@ -13,12 +13,14 @@ Two upstream details are hidden here on purpose:
 * ``start_chat()``/``finish_chat()`` are deprecated and must not appear in the
   domain interface. The LLM path does not use them at all: multi-turn state
   travels as an ``openvino_genai.ChatHistory`` passed to ``generate``. The VLM
-  path has no such overload in this build, so the adapter drives the deprecated
-  lifecycle internally and feeds the pipeline only the newest user turn. Because
-  that makes the VLM runtime stateful, the domain interface carries
-  :meth:`ChatRuntime.begin_conversation` — a caller's explicit statement that the
-  next history opens a new conversation. The adapter cannot infer that on its
-  own: two conversations may open with identical words.
+  path does the same wherever ``VLMPipeline.generate`` accepts a history, which
+  OpenVINO GenAI 2026.4 does. Older builds have no such overload, so there the
+  adapter falls back to driving the deprecated lifecycle internally and feeding
+  the pipeline only the newest user turn. Because that fallback is stateful,
+  the domain interface carries :meth:`ChatRuntime.begin_conversation` — a
+  caller's explicit statement that the next history opens a new conversation.
+  The adapter cannot infer that on its own: two conversations may open with
+  identical words.
 * Reasoning ("thinking") is switched off through the chat template variable via
   ``ChatHistory.set_extra_context``. The source repository's chat template is
   never rewritten. *Which* variable to send is decided from evidence: unless the
@@ -43,7 +45,7 @@ import json
 import math
 import re
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from pathlib import Path
 from typing import Any, Literal, Protocol, runtime_checkable
@@ -548,6 +550,32 @@ class ChatRuntime(Protocol):
         ...
 
 
+#: Receives each decoded text chunk as it is generated. Returning ``True`` asks
+#: the runtime to stop generating (the client went away, say); ``None`` or
+#: ``False`` lets it continue.
+TextCallback = Callable[[str], bool | None]
+
+
+@runtime_checkable
+class StreamingChatRuntime(ChatRuntime, Protocol):
+    """A :class:`ChatRuntime` that can also report text as it is generated.
+
+    Kept as its own protocol so every existing runtime stays a valid
+    :class:`ChatRuntime` without growing a method it has no use for; a caller
+    that wants streaming checks for this one and otherwise answers in one piece.
+    """
+
+    def generate_stream(
+        self, history: ChatHistory, config: GenerationSettings, on_text: TextCallback
+    ) -> GenerationResult:
+        """Generate like :meth:`ChatRuntime.generate`, calling ``on_text`` per chunk.
+
+        The returned result carries the whole raw text, exactly as ``generate``
+        would have returned it.
+        """
+        ...
+
+
 # --- lazy import ----------------------------------------------------------------------
 
 
@@ -743,6 +771,34 @@ def _leading_system(messages: Sequence[ChatMessage]) -> list[ChatMessage]:
     return leading
 
 
+def _streamer(on_text: TextCallback | None) -> tuple[Any, list[BaseException]]:
+    """Wrap ``on_text`` as a GenAI streamer, and a slot for anything it raised.
+
+    GenAI calls the streamer from native code, where a Python exception would be
+    reported as a generation failure. So a raising callback stops generation
+    instead, and the caller re-raises what it recorded.
+    """
+    errors: list[BaseException] = []
+    if on_text is None:
+        return None, errors
+
+    def stream(chunk: str) -> bool:
+        if errors:
+            return True
+        try:
+            return bool(on_text(chunk))
+        except BaseException as error:  # re-raised by the caller, after GenAI returns
+            errors.append(error)
+            return True
+
+    return stream, errors
+
+
+def _streamer_kwargs(streamer: Any) -> dict[str, Any]:
+    """``{"streamer": streamer}``, or nothing, so a non-streaming call is unchanged."""
+    return {} if streamer is None else {"streamer": streamer}
+
+
 # --- the runtime ----------------------------------------------------------------------
 
 
@@ -815,6 +871,9 @@ class GenAIChatRuntime:
         self._closed = False
         self._chat_started = False
         self._sent: list[ChatMessage] = []
+        # Whether VLMPipeline.generate takes a ChatHistory: learnt on the first
+        # VLM turn, since the answer depends on the installed GenAI build.
+        self._vlm_accepts_history: bool | None = None
         self._load_seconds = 0.0
         self._genai: Any = _require_genai()
         self._pipeline: Any = self._open_pipeline()
@@ -984,6 +1043,18 @@ class GenAIChatRuntime:
         Raises :class:`~yonga.domain.diagnostics.GenerationError` on failure, with
         the raw runtime text preserved for the classifier.
         """
+        return self._generate(history, config, None)
+
+    def generate_stream(
+        self, history: ChatHistory, config: GenerationSettings, on_text: TextCallback
+    ) -> GenerationResult:
+        """Generate one turn, handing each decoded chunk to ``on_text`` as it arrives."""
+        return self._generate(history, config, on_text)
+
+    def _generate(
+        self, history: ChatHistory, config: GenerationSettings, on_text: TextCallback | None
+    ) -> GenerationResult:
+        """Shared body of :meth:`generate` and :meth:`generate_stream`."""
         if self._closed:
             raise GenerationError(
                 diagnostic(
@@ -995,12 +1066,17 @@ class GenAIChatRuntime:
             )
         generation_config = build_generation_config(config)
         started = time.perf_counter()
+        streamer, callback_error = _streamer(on_text)
         try:
-            raw = self._generate_raw(history, generation_config)
+            raw = self._generate_raw(history, generation_config, streamer)
         except YongaError:
             raise
         except Exception as exc:
             raise GenerationError(self._generation_failed_diagnostic(exc), cause=exc) from exc
+        if callback_error:
+            # The consumer's own failure stopped generation; it is not a model failure,
+            # and the consumer is the one that has to hear about it.
+            raise callback_error[0]
         wall_seconds = time.perf_counter() - started
         text = _first_text(raw)
         metrics = collect_metrics(getattr(raw, "perf_metrics", None))
@@ -1021,19 +1097,27 @@ class GenAIChatRuntime:
             stop_reason=_finish_reason(raw),
         )
 
-    def _generate_raw(self, history: ChatHistory, generation_config: Any) -> Any:
+    def _generate_raw(
+        self, history: ChatHistory, generation_config: Any, streamer: Any = None
+    ) -> Any:
         """Dispatch to the LLM or VLM generation path."""
         if self._pipeline_kind is PipelineKind.VLM:
-            return self._generate_vlm(history, generation_config)
-        return self._generate_llm(history, generation_config)
+            return self._generate_vlm(history, generation_config, streamer)
+        return self._generate_llm(history, generation_config, streamer)
 
-    def _generate_llm(self, history: ChatHistory, generation_config: Any) -> Any:
+    def _generate_llm(self, history: ChatHistory, generation_config: Any, streamer: Any) -> Any:
         """Generate with an ``LLMPipeline`` using a GenAI ``ChatHistory``.
 
         Passing the history object is what replaces the deprecated
         ``start_chat()``/``finish_chat()`` lifecycle: the whole conversation is
         re-supplied each turn and the pipeline applies the chat template itself.
         """
+        return self._pipeline.generate(
+            self._genai_history(history), generation_config, **_streamer_kwargs(streamer)
+        )
+
+    def _genai_history(self, history: ChatHistory) -> Any:
+        """Our history as an ``openvino_genai.ChatHistory``, with the template variables."""
         genai_history = self._genai.ChatHistory()
         for message in history.messages:
             genai_history.append(message.as_payload())
@@ -1047,18 +1131,33 @@ class GenAIChatRuntime:
                 # The template variable is a best-effort hint; the chat service's
                 # sanitiser is the defence that actually hides reasoning text.
                 self._extra_context_error = redact_text(f"{type(exc).__name__}: {exc}")
-        return self._pipeline.generate(genai_history, generation_config)
+        return genai_history
 
-    def _generate_vlm(self, history: ChatHistory, generation_config: Any) -> Any:
-        """Generate with a ``VLMPipeline``.
+    def _generate_vlm(self, history: ChatHistory, generation_config: Any, streamer: Any) -> Any:
+        """Generate with a ``VLMPipeline``, statelessly where the build allows it.
 
-        ``VLMPipeline.generate`` does not accept a ``ChatHistory`` in this build,
-        so the deprecated chat lifecycle is driven here, entirely inside the
-        adapter: the pipeline keeps its own conversation state and is handed only
-        the turns it has not seen.
+        OpenVINO GenAI 2026.4 accepts a ``ChatHistory`` here, exactly as the LLM
+        pipeline does, and then the whole conversation travels with every turn.
+        A build without that overload rejects the call with ``TypeError`` before
+        generating anything; from then on the deprecated chat lifecycle is driven
+        instead, entirely inside the adapter, handing the pipeline only the turns
+        it has not seen.
         """
+        extra = _streamer_kwargs(streamer)
+        if self._vlm_accepts_history is not False:
+            try:
+                result = self._pipeline.generate(
+                    self._genai_history(history), generation_config=generation_config, **extra
+                )
+            except TypeError:
+                if self._vlm_accepts_history:
+                    raise
+                self._vlm_accepts_history = False
+            else:
+                self._vlm_accepts_history = True
+                return result
         prompt = self._vlm_turn_prompt(history)
-        return self._pipeline.generate(prompt, generation_config=generation_config)
+        return self._pipeline.generate(prompt, generation_config=generation_config, **extra)
 
     def _vlm_turn_prompt(self, history: ChatHistory) -> str:
         """Return the text to send to the VLM pipeline for this turn.

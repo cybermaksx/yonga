@@ -1111,6 +1111,158 @@ def _session_info(session: ChatSession) -> ChatSessionInfo:
     return ChatSessionInfo.model_validate(session.describe().model_dump())
 
 
+# ======================================================================
+# serve
+# ======================================================================
+#: Environment variable holding the bearer token ``serve`` requires, when set.
+#: Read from the environment only, never from an option: a token on the command
+#: line is visible to every user of the machine through the process list.
+API_KEY_ENV = "YONGA_API_KEY"
+
+
+@app.command()
+def serve(
+    ctx: typer.Context,
+    artifact: str = typer.Argument(..., metavar="MODEL_OR_ARTIFACT", help="Artifact id or path."),
+    host: str = typer.Option(
+        "127.0.0.1", "--host", help="Address to bind. Loopback unless you say otherwise."
+    ),
+    port: int = typer.Option(8000, "--port", min=1, max=65535, help="TCP port to listen on."),
+    device: str | None = typer.Option(None, "--device", help="auto, npu, gpu or cpu."),
+    max_new_tokens: int | None = typer.Option(
+        None, "--max-new-tokens", help="Default output token limit when a request sets none."
+    ),
+    show_reasoning: bool = typer.Option(
+        False, "--show-reasoning", help="Return reasoning blocks instead of hiding them."
+    ),
+    json_output: bool = typer.Option(
+        False, "--json", help="Not supported: a server is not one document."
+    ),
+) -> None:
+    """Serve a prepared artifact through an OpenAI-compatible HTTP API."""
+    state = cli_state(ctx, json_output=json_output)
+    options = ChatOptions(
+        device=_device(device),
+        max_new_tokens=max_new_tokens,
+        show_reasoning=True if show_reasoning else None,
+        display_name=artifact,
+    )
+    _dispatch(state, lambda: _serve(state, artifact, options=options, host=host, port=port))
+
+
+def _serve(
+    state: CliState, artifact: str, *, options: ChatOptions, host: str, port: int
+) -> ExitCode:
+    """Load the model once, then answer requests until interrupted."""
+    if state.json_mode:
+        raise ConfigurationError(
+            diagnostic(
+                "cli.serve.json_unsupported",
+                FailureCategory.CONFIGURATION_ERROR,
+                "serve is a long-running command",
+                "A server cannot be emitted as one JSON document.",
+                remediation=["Drop --json; GET /health reports the server state as JSON."],
+            )
+        )
+    create_app = _serve_dependencies()
+    _require_port(host, port)
+    api_key = os.environ.get(API_KEY_ENV) or None
+    console = state.console
+    if not _is_loopback(host):
+        warning = f"Binding {host} makes the model reachable from other machines."
+        if api_key is None:
+            warning += f" No {API_KEY_ENV} is set, so anyone who can reach it can use it."
+        console.print_error(f"[yellow]warning:[/] {warning}")
+
+    service: ChatService = state.graph.chat_service(progress=state.sink())
+    from yonga.application.serve import ModelServer
+
+    server = ModelServer(service.open_session(artifact, options=options), name=artifact)
+    try:
+        server.load()
+        url = f"http://{_url_host(host)}:{port}/v1"
+        console.print(
+            f"Serving [bold]{server.model.id}[/] on {server.model.device} at [cyan]{url}[/]"
+            + ("  (API key required)" if api_key else "")
+        )
+        console.print("[dim]Press Ctrl+C to stop.[/]")
+        app_instance = create_app(server, api_key=api_key)
+        _run_http(app_instance, host=host, port=port, verbose=state.settings.verbose)
+    finally:
+        server.close()
+    return ExitCode.SUCCESS
+
+
+def _serve_dependencies() -> Callable[..., object]:
+    """Import the optional web stack, or say exactly how to install it."""
+    try:
+        import uvicorn  # noqa: F401  (imported here only to prove it is installed)
+
+        from yonga.api.app import create_app
+    except ImportError as error:
+        raise ConfigurationError(
+            diagnostic(
+                "serve.dependencies.missing",
+                FailureCategory.PACKAGE_ABI_MISMATCH,
+                "The serve extra is not installed",
+                f"yonga serve needs FastAPI and uvicorn: {error}.",
+                remediation=["pip install 'yonga[serve]'"],
+            )
+        ) from error
+    return create_app
+
+
+def _run_http(app_instance: object, *, host: str, port: int, verbose: bool) -> None:
+    """Run uvicorn in the foreground. A seam, so tests never open a socket."""
+    import uvicorn
+
+    uvicorn.run(
+        app_instance,  # type: ignore[arg-type]
+        host=host,
+        port=port,
+        log_level="info" if verbose else "warning",
+        access_log=verbose,
+    )
+
+
+def _is_loopback(host: str) -> bool:
+    import ipaddress
+
+    if host.strip().lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host.strip("[]")).is_loopback
+    except ValueError:
+        return False
+
+
+def _url_host(host: str) -> str:
+    return f"[{host}]" if ":" in host and not host.startswith("[") else host
+
+
+def _require_port(host: str, port: int) -> None:
+    """Fail before loading a multi-gigabyte model when the port is not free."""
+    import socket
+
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    with socket.socket(family, socket.SOCK_STREAM) as probe:
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            probe.bind((host.strip("[]"), port))
+        except OSError as error:
+            raise ConfigurationError(
+                diagnostic(
+                    "serve.address_unavailable",
+                    FailureCategory.CONFIGURATION_ERROR,
+                    f"Cannot listen on {host}:{port}",
+                    f"Binding the address failed: {error.strerror or error}.",
+                    remediation=[
+                        "Pick another port with --port, or stop whatever is using this one.",
+                    ],
+                )
+            ) from error
+
+
 def _chat_loop(state: CliState, session: ChatSession, view: ChatView) -> ExitCode:
     """Read, dispatch and render until the user leaves."""
     console = state.console

@@ -1,6 +1,6 @@
 """Conversation-boundary tests for the stateful VLM runtime path.
 
-``VLMPipeline.generate`` takes no chat history in this build, so the adapter
+``VLMPipeline.generate`` takes no chat history before GenAI 2026.4, so there the adapter
 keeps a hidden ``start_chat()`` session and hands the pipeline only the turns it
 has not seen yet. That bookkeeping cannot, on its own, tell a *new* conversation
 from a continuation with nothing new in it: on real hardware,

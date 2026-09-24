@@ -128,9 +128,22 @@ class FakePipeline:
         self.chat_events: list[tuple[str, Any]] = []
 
     def generate(self, *args, **kwargs):
+        if (
+            self.kind == "vlm"
+            and args
+            and isinstance(args[0], FakeChatHistory)
+            and not self.module.vlm_accepts_history
+        ):
+            # What pybind11 raises for a missing overload, before anything runs.
+            raise TypeError("generate(): incompatible function arguments.")
         self.generate_calls.append((args, kwargs))
         if self.module.generate_error is not None:
             raise self.module.generate_error
+        streamer = kwargs.get("streamer")
+        if streamer is not None:
+            for chunk in self.module.stream_chunks:
+                if streamer(chunk):
+                    break
         return self.module.result
 
     def start_chat(self, system_message=None):
@@ -150,6 +163,10 @@ class FakeGenAI:
         self.load_error: BaseException | None = None
         self.generate_error: BaseException | None = None
         self.result = FakeResults(perf_metrics=FakePerfMetrics())
+        #: GenAI before 2026.4 has no ``VLMPipeline.generate(ChatHistory)`` overload;
+        #: the legacy-lifecycle tests run against that shape.
+        self.vlm_accepts_history = False
+        self.stream_chunks: list[str] = []
 
     def _make(self, kind: Any, path: Any, device: Any, properties: Any) -> FakePipeline:
         if self.load_error is not None:
@@ -845,3 +862,98 @@ def test_an_unparsable_integer_property_is_left_for_genai_to_reject() -> None:
     from yonga.adapters.runtime_genai import pipeline_kwargs
 
     assert pipeline_kwargs({"MAX_PROMPT_LEN": "lots"}) == {"MAX_PROMPT_LEN": "lots"}
+
+
+# --- stateless VLM and streaming ---------------------------------------------------------
+
+
+def test_vlm_sends_the_whole_history_when_the_pipeline_accepts_one(artifact, settings, genai):
+    """GenAI 2026.4 takes a ChatHistory on the VLM pipeline too: no hidden session."""
+    genai.vlm_accepts_history = True
+    runtime = make_runtime(artifact, settings, pipeline=PipelineKind.VLM)
+    pipeline = genai.pipelines[0]
+    history = ChatHistory()
+    history.add_system("You are terse.")
+    history.add_user("First")
+    history.add_assistant("hello there")
+    history.add_user("Second")
+
+    runtime.generate(history, GenerationSettings())
+
+    (args, kwargs) = pipeline.generate_calls[0]
+    assert [m["content"] for m in args[0].messages] == [
+        "You are terse.",
+        "First",
+        "hello there",
+        "Second",
+    ]
+    assert "generation_config" in kwargs
+    assert pipeline.chat_events == [], "the deprecated lifecycle is never touched"
+
+
+def test_vlm_falls_back_to_the_lifecycle_once_and_remembers(artifact, settings, genai):
+    runtime = make_runtime(artifact, settings, pipeline=PipelineKind.VLM)
+    pipeline = genai.pipelines[0]
+    history = ChatHistory()
+    history.add_user("First")
+
+    runtime.generate(history, GenerationSettings())
+    history.add_assistant("hello there")
+    history.add_user("Second")
+    runtime.generate(history, GenerationSettings())
+
+    assert [call[0][0] for call in pipeline.generate_calls] == ["First", "Second"]
+    assert runtime._vlm_accepts_history is False
+
+
+def test_generate_stream_hands_every_chunk_over(artifact, settings, genai):
+    genai.stream_chunks = ["hel", "lo ", "there"]
+    runtime = make_runtime(artifact, settings)
+    seen: list[str] = []
+    history = ChatHistory()
+    history.add_user("Hi")
+
+    result = runtime.generate_stream(history, GenerationSettings(), seen.append)
+
+    assert seen == ["hel", "lo ", "there"]
+    assert result.text == "hello there"
+
+
+def test_a_callback_asking_to_stop_stops_generation(artifact, settings, genai):
+    genai.stream_chunks = ["one", "two", "three"]
+    runtime = make_runtime(artifact, settings)
+    seen: list[str] = []
+    history = ChatHistory()
+    history.add_user("Hi")
+
+    def stop_after_first(chunk: str) -> bool:
+        seen.append(chunk)
+        return True
+
+    runtime.generate_stream(history, GenerationSettings(), stop_after_first)
+
+    assert seen == ["one"]
+
+
+def test_a_raising_callback_is_re_raised_not_reported_as_a_model_failure(artifact, settings, genai):
+    genai.stream_chunks = ["one", "two"]
+    runtime = make_runtime(artifact, settings)
+    history = ChatHistory()
+    history.add_user("Hi")
+
+    def broken(chunk: str) -> None:
+        raise BrokenPipeError("client went away")
+
+    with pytest.raises(BrokenPipeError):
+        runtime.generate_stream(history, GenerationSettings(), broken)
+
+
+def test_plain_generate_passes_no_streamer(artifact, settings, genai):
+    runtime = make_runtime(artifact, settings)
+    history = ChatHistory()
+    history.add_user("Hi")
+
+    runtime.generate(history, GenerationSettings())
+
+    assert "streamer" not in genai.pipelines[0].generate_calls[0][1]
+    assert isinstance(runtime, runtime_module.StreamingChatRuntime)

@@ -12,7 +12,7 @@ The tool is **NPU-first, not NPU-only**. If a model cannot compile on the NPU, `
 
 This is a 0.1.0 MVP. It prepares, validates, runs and benchmarks OpenVINO artifacts on one machine, and it is honest about the parts that do not exist yet:
 
-- **`serve` is not implemented.** `docs/CLI_SPEC.md` section 14 describes it as phase 2; there is no HTTP server, no OpenAI-compatible endpoint and no code for one.
+- **`serve` is deliberately small.** It serves one artifact, text only, one request at a time, and refuses what it cannot honour (`n` > 1, stop sequences, tools, JSON response formats, images) with a 400 rather than ignoring it.
 - **Not published on PyPI.** `pip install yonga` does not work yet; install from a clone (see below).
 - **Windows is not supported yet.** The architecture keeps the door open, but every device, driver and path probe is written and tested against Linux only.
 - The registry ships knowledge for a small number of architectures. Everything else resolves through generic rules, which is why `inspect` says `inferred` rather than `official` for most models.
@@ -40,7 +40,7 @@ The end-to-end path (`prepare` → `probe` → `chat` → `bench`) has been exer
 
 ## What works today
 
-Twelve commands; `registry` has three subcommands and `env` two:
+Thirteen commands; `registry` has three subcommands and `env` two:
 
 | Command | What it does |
 |---|---|
@@ -53,6 +53,7 @@ Twelve commands; `registry` has three subcommands and `env` two:
 | `yonga probe ARTIFACT --device D` | Compiles the artifact's submodels on a device and reports what worked, with timings. |
 | `yonga chat ARTIFACT` | A local chat session with slash commands, hidden reasoning by default, and a metrics footer. |
 | `yonga bench ARTIFACT` | Runs a prompt suite and writes a reproducible JSON result under the data directory. |
+| `yonga serve ARTIFACT` | An OpenAI-compatible HTTP API (`/v1/models`, `/v1/chat/completions` with SSE streaming, `/health`) over the same session `chat` uses, bound to `127.0.0.1` by default. |
 | `yonga env list` / `env remove KEY` | The isolated environments `prepare` builds when a model's exporter needs package versions other than the installed ones, and the disk they use. |
 | `yonga logs [JOB_ID]` | Lists job logs, prints one as a table, or `--raw` for the JSON Lines file. |
 | `yonga registry validate` | Loads every registry layer and checks it is internally consistent. |
@@ -75,6 +76,7 @@ The extras are separate because they cost very different amounts of disk:
 
 - **`openvino`** — `openvino`, `openvino-genai`, `openvino-tokenizers`. Needed by `probe`, `chat`, `bench` and by the device section of `doctor`.
 - **`export`** — `optimum-intel[openvino]`, `nncf` (which pull in `transformers` and `torch`). Needed by `prepare` to convert and quantize a model.
+- **`serve`** — FastAPI and uvicorn. Needed by `serve` only.
 - **`dev`** — pytest, ruff, mypy.
 
 Without the extras `yonga` still runs: `doctor`, `inspect`, `list`, `logs` and `registry` work, and `doctor` exits 10 and tells you which package is missing and which extra installs it. `yonga` never installs, upgrades or removes a package in the environment you installed it into; it prints the command for you to run. (When a model's exporter needs different package versions, `prepare` builds an isolated environment for that export instead — see `docs/INSTALL.md` section 6.)

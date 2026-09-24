@@ -33,7 +33,7 @@ does not appear here at all.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from enum import Enum
 from pathlib import Path
@@ -51,6 +51,7 @@ from yonga.adapters.runtime_genai import (
     ChatRuntime,
     GenerationResult,
     Role,
+    StreamingChatRuntime,
     read_chat_template,
     resolve_starts_in_reasoning,
     resolve_thinking_variable,
@@ -99,6 +100,8 @@ __all__ = [
     "Role",
     "RuntimeFactory",
     "SanitizedAnswer",
+    "StreamingSanitizer",
+    "TextSink",
     "chat_history_filename",
     "sanitize_answer",
     "sanitize_reasoning",
@@ -463,6 +466,86 @@ def sanitize_reasoning(
     """
     answer = sanitize_answer(text, wrappers, show=show, starts_in_reasoning=starts_in_reasoning)
     return answer.display_text, answer.reasoning_text
+
+
+class StreamingSanitizer:
+    """Apply the reasoning policy to text that arrives a chunk at a time.
+
+    What has been sent cannot be taken back, so a streamed answer may only ever
+    be *extended*. Each chunk re-runs :func:`sanitize_answer` over everything
+    received so far and releases only the part that can no longer change:
+
+    * a tail that could be the start of an opening wrapper (``<th`` of
+      ``<think>``) is held until the next chunk settles it;
+    * leading and trailing whitespace is held, because removing a block later
+      collapses the whitespace around it, and a space already sent would then
+      no longer be a prefix of the answer.
+
+    So nothing inside a reasoning block is ever released, an unterminated block
+    releases nothing after its opener, and the concatenated output equals the
+    final sanitised answer with its outer whitespace stripped.
+    """
+
+    def __init__(
+        self,
+        wrappers: Sequence[tuple[str, str]],
+        *,
+        show: bool = False,
+        starts_in_reasoning: bool = False,
+    ) -> None:
+        """Bind the sanitiser to one reply's reasoning policy."""
+        self._wrappers = list(wrappers)
+        self._openers = [opening for opening, _ in _normalise_wrappers(wrappers) if opening]
+        self._show = show
+        self._starts_in_reasoning = starts_in_reasoning
+        self._raw = ""
+        self._released = ""
+
+    @property
+    def raw_text(self) -> str:
+        """Everything received so far, unsanitised."""
+        return self._raw
+
+    def feed(self, chunk: str) -> str:
+        """Take one chunk; return the text that may be released now (possibly empty)."""
+        self._raw += chunk
+        if self._show:
+            return self._release(self._raw)
+        return self._release(self._without_partial_opener(self._display()))
+
+    def finish(self) -> str:
+        """Return whatever is still held once generation has ended."""
+        return self._release(self._raw if self._show else self._display())
+
+    def _display(self) -> str:
+        return sanitize_answer(
+            self._raw,
+            self._wrappers,
+            show=False,
+            starts_in_reasoning=self._starts_in_reasoning,
+        ).display_text
+
+    def _without_partial_opener(self, display: str) -> str:
+        for opener in self._openers:
+            for size in range(len(opener) - 1, 0, -1):
+                fragment = opener[:size]
+                if self._raw.endswith(fragment) and display.endswith(fragment):
+                    return display[: -len(fragment)]
+        return display
+
+    def _release(self, text: str) -> str:
+        settled = text.strip()
+        if not settled.startswith(self._released):
+            # Only reachable if the policy rewrote text already released; holding
+            # back is the one safe answer, since nothing sent can be retracted.
+            return ""
+        delta = settled[len(self._released) :]
+        self._released = settled
+        return delta
+
+
+#: Receives each piece of a streamed answer; returning ``True`` asks to stop.
+TextSink = Callable[[str], bool | None]
 
 
 # --------------------------------------------------------------------------------------
@@ -1192,6 +1275,70 @@ class ChatSession:
             return ChatTurn(diagnostic=report)
         self.history.add_assistant(display)
         return ChatTurn(result=result)
+
+    def respond(
+        self,
+        history: ChatHistory,
+        generation: GenerationSettings,
+        *,
+        on_text: TextSink | None = None,
+    ) -> ChatTurn:
+        """Answer one complete conversation without touching this session's own.
+
+        What an HTTP request needs: the client owns the conversation and sends
+        all of it every time, so this reads ``history`` and never records
+        anything. The loaded runtime, the chat profile and the reasoning policy
+        are the session's, exactly as :meth:`send` uses them.
+
+        With ``on_text`` the answer is streamed through a
+        :class:`StreamingSanitizer`, so no reasoning text is ever released; a
+        runtime that cannot stream answers in one piece through the same sink.
+        Failures come back as a :class:`ChatTurn` carrying a diagnostic, and an
+        exception raised by ``on_text`` itself propagates to the caller.
+        """
+        if not any(m.role == "user" and m.content.strip() for m in history.messages):
+            return ChatTurn(diagnostic=_empty_prompt_diagnostic())
+        streaming = StreamingSanitizer(
+            self._profile.reasoning_wrappers,
+            show=self._show_reasoning,
+            starts_in_reasoning=self._starts_in_reasoning,
+        )
+        try:
+            runtime = self.load()
+            if on_text is not None and isinstance(runtime, StreamingChatRuntime):
+
+                def forward(chunk: str) -> bool | None:
+                    released = streaming.feed(chunk)
+                    return on_text(released) if released else None
+
+                raw = runtime.generate_stream(history, generation, forward)
+            else:
+                raw = runtime.generate(history, generation)
+                released = streaming.feed(raw.text)
+                if on_text is not None and released:
+                    on_text(released)
+            answer = sanitize_answer(
+                raw.text,
+                self._profile.reasoning_wrappers,
+                show=self._show_reasoning,
+                starts_in_reasoning=self._starts_in_reasoning,
+            )
+        except YongaError as error:
+            return ChatTurn(diagnostic=error.diagnostic)
+        if on_text is not None:
+            rest = streaming.finish()
+            if rest:
+                on_text(rest)
+        return ChatTurn(
+            result=raw.model_copy(
+                update={
+                    "display_text": answer.display_text,
+                    "reasoning_text": answer.reasoning_text,
+                    "reasoning_hidden": answer.reasoning_hidden,
+                    "reasoning_unterminated": answer.reasoning_unterminated,
+                }
+            )
+        )
 
     def _rollback_user_turn(self) -> None:
         """Drop the user message that produced no answer, keeping the history consistent."""

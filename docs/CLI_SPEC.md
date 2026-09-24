@@ -332,10 +332,41 @@ state, artifact manifest and host report for attaching to a bug report.
 yonga serve MODEL_OR_ARTIFACT \
   [--host 127.0.0.1] \
   [--port 8000] \
-  [--device auto]
+  [--device auto] \
+  [--max-new-tokens N] \
+  [--show-reasoning]
 ```
 
-Default bind must be localhost, not `0.0.0.0`.
+Default bind must be localhost, not `0.0.0.0`. Requires the `serve` extra (FastAPI, uvicorn);
+without it `serve` exits 10 naming `pip install 'yonga[serve]'`.
+
+Endpoints:
+
+| Method and path | Answer |
+|---|---|
+| `GET /health` | `{"status": "ok", "model", "device", "pipeline", "uptime_seconds"}`. Never requires a key. |
+| `GET /v1/models`, `GET /v1/models/{id}` | The one served model, in OpenAI's model-object shape. |
+| `POST /v1/chat/completions` | OpenAI chat completions; `stream: true` sends server-sent events ending in `data: [DONE]`, and `stream_options.include_usage` adds a usage chunk. |
+
+The server opens the same `ChatSession` `chat` does (registry chat profile, device resolution,
+compile cache, reasoning policy) and loads the model before it starts listening, so a model that
+cannot load fails `serve` itself. A port already in use is refused before the model is loaded.
+Each request carries its whole conversation and nothing is kept between requests. Generation is
+serialised; a streaming client that disconnects stops its generation.
+
+`model` must be the name given to `serve`, the artifact id, or the source repository (404
+`model_not_found` otherwise). Accepted parameters: `max_tokens` / `max_completion_tokens`,
+`temperature` (0 is greedy), `top_p`, `top_k`, `seed`, `repetition_penalty`, validated with the same
+ranges as `chat`'s slash commands. Unknown fields are ignored. Parameters that would change the
+answer in a way yonga cannot honour are refused with 400 and `param` set: `n` other than 1,
+non-empty `stop`, non-zero `presence_penalty` / `frequency_penalty`, `tools` / `functions`, a
+`response_format` other than text, `logprobs`, non-text content parts, and a conversation whose
+last message is not from the user. A runtime failure is a 500 whose `error.code` is the diagnostic
+code.
+
+When `YONGA_API_KEY` is set in the environment, every endpoint except `/health` requires
+`Authorization: Bearer <key>` (401 otherwise). The key is never logged or echoed. Binding a
+non-loopback address prints a warning, a stronger one without a key.
 
 ## 15. Exit codes
 

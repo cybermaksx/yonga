@@ -51,6 +51,15 @@ manifest may change in any minor release.
   `yonga env list|remove` manage them and `doctor` reports their disk use. `--no-managed-env` restores
   the refusal; `--ignore-exporter-requirements` exports in the current environment and never builds
   one. Registry data can choose only a version for a package yonga lists, never a package of its own.
+- **`yonga serve MODEL_OR_ARTIFACT [--host] [--port] [--device]`**, an OpenAI-compatible HTTP API:
+  `GET /health`, `GET /v1/models`, `POST /v1/chat/completions` with SSE streaming. It serves the same
+  session `chat` opens, loads the model at startup, binds `127.0.0.1` by default, answers one
+  request at a time, stops a generation whose streaming client disconnects, hides reasoning while
+  streaming too, and refuses parameters it cannot honour with a 400. `YONGA_API_KEY` enables bearer
+  authentication. Needs the new `serve` extra (FastAPI, uvicorn).
+- **VLM generation is stateless where OpenVINO GenAI allows it.** GenAI 2026.4's `VLMPipeline`
+  accepts a `ChatHistory`, so the whole conversation now travels with every turn, as on the LLM
+  path. Builds without that overload still use the hidden `start_chat()` session.
 - **Reuse of a completed export after a failed job.** A successful export now writes a checkpoint
   (fingerprint of every input, plus each file's size, mtime and small-file digest) into staging. When
   a later stage fails, an identical `prepare` adopts the retained export, restoring repaired files
