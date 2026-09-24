@@ -27,7 +27,7 @@ Everything in this README was executed on one machine, and nothing here is a pro
 | GPU | Intel Arc iGPU (`Intel(R) Arc(TM) Graphics (iGPU)`, `GPU: vendor=0x8086 arch=v20.4.4`) |
 | NPU | Intel AI Boost, `/dev/accel/accel0`, `intel_vpu` kernel module, compiler-in-plugin |
 | OS | Ubuntu 26.04.1 LTS, kernel 7.2.6 |
-| Python | 3.14.4 |
+| Python | 3.14.4 (the test suite also passes on 3.11) |
 | OpenVINO | 2026.4.0 |
 | OpenVINO GenAI | 2026.4.0.0 |
 | OpenVINO Tokenizers | 2026.4.0.0 |
@@ -36,7 +36,33 @@ Everything in this README was executed on one machine, and nothing here is a pro
 | transformers | 5.2.0 |
 | huggingface_hub | 1.21.0 |
 
-The end-to-end path (`prepare` → `probe` → `chat` → `bench`) has been exercised on **CPU** with `Qwen/Qwen3-0.6B` quantized to INT4 asymmetric, group size 128, and on **GPU** with the Qwen3.5-9B VLM of the reference case quantized to INT4 asymmetric, group size 128. The same VLM has also been prepared, probed and benchmarked on the GPU under the channel-wise `npu-int4-sym-cw` profile, for the size-and-speed comparison in [`docs/PROFILE_COMPARISON.md`](docs/PROFILE_COMPARISON.md). On the **NPU**, `Qwen/Qwen3-0.6B` quantized to INT4 symmetric, group size 128 (`npu-int4-sym-g128`) has been prepared, chatted with and benchmarked end to end. The Qwen3.5-9B VLM does not run there: its NPU pipeline is rejected by the compiler (`OneShotBufferizeVPU2VPUIP failed : Only supports FP16.`), which yonga classifies and answers with a GPU recommendation rather than a driver complaint. Note that a *raw* compile of any LLM's language submodel fails on the NPU — that is a property of raw compiles, not of the model, and is why yonga lets the GenAI pipeline decide. No other CPU, GPU, NPU, distribution, Python version or OpenVINO release has been tested. Treat the version list as *what was verified*, not as a support matrix.
+The end-to-end path (`prepare` → `probe` → `chat` → `bench`) has been exercised on **CPU** with `Qwen/Qwen3-0.6B` quantized to INT4 asymmetric, group size 128, and on **GPU** with the Qwen3.5-9B VLM of the reference case quantized to INT4 asymmetric, group size 128. The same VLM has also been prepared, probed and benchmarked on the GPU under the channel-wise `npu-int4-sym-cw` profile, for the size-and-speed comparison in [`docs/PROFILE_COMPARISON.md`](docs/PROFILE_COMPARISON.md). On the **NPU**, `Qwen/Qwen3-0.6B` quantized to INT4 symmetric, group size 128 (`npu-int4-sym-g128`) has been prepared, chatted with and benchmarked end to end. The Qwen3.5-9B VLM does not run there: its NPU pipeline is rejected by the compiler (`OneShotBufferizeVPU2VPUIP failed : Only supports FP16.`), which yonga classifies and answers with a GPU recommendation rather than a driver complaint. Note that a *raw* compile of any LLM's language submodel fails on the NPU — that is a property of raw compiles, not of the model, and is why yonga lets the GenAI pipeline decide. No other CPU, GPU, NPU, distribution or OpenVINO release has been tested. Treat the version list as *what was verified*, not as a support matrix.
+
+#### Architecture families verified on that machine
+
+One small model per family, each prepared and probed with a generation smoke test on the GPU and
+on the NPU, and benchmarked on the CPU. The registry's device claims for these families are
+*tested* because of these runs.
+
+| Family | Model | CPU | GPU | NPU |
+|---|---|---|---|---|
+| qwen3 | `Qwen/Qwen3-0.6B` | ✓ | ✓ | ✓ 67.3 tok/s |
+| qwen2 | `Qwen/Qwen2.5-0.5B-Instruct` | ✓ 23.8 tok/s | ✓ | ✓ |
+| llama | `unsloth/Llama-3.2-1B-Instruct` | ✓ 12.6 tok/s | ✓ | ✓ |
+| gemma3 (text) | `unsloth/gemma-3-1b-it` | ✓ 15.3 tok/s | ✓ | ✓ |
+| gemma2 | `unsloth/gemma-2-2b-it` | ✓ 7.2 tok/s | ✓ | ✓ |
+| olmo2 | `allenai/OLMo-2-0425-1B-Instruct` | ✓ 13.9 tok/s | ✓ | ✓ |
+| granite | `ibm-granite/granite-3.3-2b-instruct` | ✓ 7.6 tok/s | ✓ | ✓ |
+| smollm3 | `HuggingFaceTB/SmolLM3-3B` | ✓ 6.2 tok/s | ✓ | ✓ |
+| lfm2 | `LiquidAI/LFM2-350M` | ✓ 21.8 tok/s | ✓ | ✓ |
+| qwen2.5-vl | `Qwen/Qwen2.5-VL-3B-Instruct` | ✓ 6.2 tok/s | ✓ | ✗ compiler refuses the graph |
+| qwen3.5 | the reference 9B VLM | ✓ | ✓ | ✗ compiler refuses the graph |
+| phi3 | `microsoft/Phi-4-mini-instruct` | — | — | — the optimum-intel 2.2.0 export fails |
+
+CPU figures are single-run INT4 throughput on the short prompt. Gemma, LFM2 and Qwen2.5-VL need an
+older Transformers than the one installed; `prepare` read that range from optimum-intel and
+exported them in managed environments. GGUF import is verified separately (see
+`docs/PROFILE_COMPARISON.md` §9).
 
 ## What works today
 

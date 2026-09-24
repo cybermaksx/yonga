@@ -29,6 +29,17 @@ manifest may change in any minor release.
   `yonga env list|remove` manage them and `doctor` reports their disk use. `--no-managed-env` restores
   the refusal; `--ignore-exporter-requirements` exports in the current environment and never builds
   one. Registry data can choose only a version for a package yonga lists, never a package of its own.
+- **Ten verified architecture families.** Registry rules with *tested* CPU, GPU and NPU claims for
+  qwen3, qwen2, llama, gemma3-text, gemma2, olmo2, granite, smollm3, lfm2 and qwen2.5-vl (NPU
+  refused), each measured on the reference host with a small model. phi3 is recorded as not yet
+  exportable with optimum-intel 2.2.0.
+- **optimum-intel's own Transformers ranges are honoured before the download.** Where the registry
+  pins nothing, the range optimum-intel's export config declares for the model type (for example
+  `<=5.0` for Gemma and Qwen2.5-VL) is read in a child process, cached, and satisfied with a
+  managed export environment instead of failing after the download.
+- **`export.native_implementation`** lets the registry declare that Transformers implements an
+  architecture itself. A repository's own modelling code (Phi-4-mini's `modeling_phi3.py`) is then
+  reported as not run, and remote code stays off.
 - **Direct GGUF import.** A GGUF-only repository with no usable declared derivative is imported
   with OpenVINO GenAI's own GGUF reader when a new registry `gguf` rule verifies the file's
   architecture (llama, qwen2, qwen3) and every tensor type in it (F32, F16, Q4_0, Q4_K, Q6_K, Q8_0).
@@ -98,6 +109,11 @@ manifest may change in any minor release.
 
 ### Fixed
 
+- **A text-generation model without a registry rule was exported stateless**, so GenAI could not run
+  it ("beam_idx was not found"). Plain `text-generation` is now exported as
+  `text-generation-with-past`.
+- **An HTTP 429 from the Hub was reported as a transient server error.** It now says the requests
+  are rate-limited and that logging in raises the limit (`hub.rate_limited`).
 - **`bench` did not classify a model that failed to load.** It wrote a result with empty metrics and
   exited 2, while `probe` and `chat` classified the same failure through the registry and exited
   51. It now does the same, and no empty result is saved.

@@ -171,8 +171,19 @@ infrastructure, not code.
   of about 0.03 nats against an optimum FP16 export even from an F16 GGUF
   (`PROFILE_COMPARISON.md` §9), whose cause was not isolated. The NPU cannot reshape a GGUF-built
   graph (`npu.pipeline.static_reshape_failed`).
-- **More architectures in the registry. [ongoing]** Two architecture rules ship today. Each new one
-  is data plus a test, not code — that was the point of the design.
+- **More architectures in the registry. [ongoing]** Twelve architecture rules now ship. Ten
+  families have device claims measured on the reference host with one small model each,
+  prepared and generating on GPU and NPU and benchmarked on the CPU: qwen3, qwen2, llama,
+  gemma3-text, gemma2, olmo2, granite, smollm3, lfm2 and qwen2.5-vl (whose NPU compile is refused).
+  Doing it found four defects, all fixed:
+  - models were exported stateless when no rule named a task (OLMo-2: "beam_idx was not found");
+  - optimum-intel's own per-architecture Transformers ranges were ignored until the export failed
+    (Gemma, LFM2, Qwen2.5-VL); they are now read and satisfied by a managed environment;
+  - a repository's own modelling code was treated as required even for architectures Transformers
+    implements natively (Phi-4-mini);
+  - an HTTP 429 from the Hub was reported as a transient 5xx.
+  phi3 still cannot be exported: optimum 2.3.0 and optimum-intel 2.2.0 fail inside optimum
+  (`export.optimum.normalized_config`). mistral remains covered only by the generic rule.
 - **A GUI or web frontend. [L]** Application services already emit structured `ProgressEvent`s and
   never import Rich, so a second frontend does not require touching the core.
 

@@ -168,6 +168,7 @@ CODE_REVISION_UNRESOLVED: Final[str] = "hub.revision.unresolved"
 CODE_OFFLINE_MISSING: Final[str] = "hub.offline.missing"
 CODE_FILE_NOT_FOUND: Final[str] = "hub.file.not_found"
 CODE_HTTP_ERROR: Final[str] = "hub.http.error"
+CODE_RATE_LIMITED: Final[str] = "hub.rate_limited"
 CODE_NETWORK_ERROR: Final[str] = "hub.network.error"
 CODE_INVALID_REPO_ID: Final[str] = "hub.repo.invalid_id"
 CODE_CANCELLED: Final[str] = "hub.download.cancelled"
@@ -438,6 +439,25 @@ def translate_hub_error(
                 model=model,
                 operation=operation,
                 remediation=["Inspect the repository's file list on its Hub page."],
+            ),
+            cause=error,
+        )
+
+    if isinstance(error, HfHubHTTPError) and status == 429:
+        return SourceResolutionError(
+            _hub_diagnostic(
+                CODE_RATE_LIMITED,
+                FailureCategory.DOWNLOAD_FAILURE,
+                "The Hugging Face Hub is rate-limiting these requests",
+                f"The Hub answered HTTP 429 (too many requests) while performing {operation} "
+                f"for {ref}. Anonymous requests have a much lower limit than logged-in ones.",
+                error=error,
+                model=model,
+                operation=operation,
+                remediation=[
+                    "Log in so requests count against your account: hf auth login",
+                    "Or wait a few minutes and run the same command again.",
+                ],
             ),
             cause=error,
         )

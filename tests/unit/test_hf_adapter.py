@@ -24,6 +24,7 @@ from yonga.adapters.hf import (
     CODE_INVALID_REPO_ID,
     CODE_NETWORK_ERROR,
     CODE_OFFLINE_MISSING,
+    CODE_RATE_LIMITED,
     CODE_REPO_NOT_FOUND,
     CODE_REVISION_NOT_FOUND,
     CODE_REVISION_UNRESOLVED,
@@ -933,6 +934,14 @@ def hub_errors() -> list[Any]:
             id="http-503",
         ),
         pytest.param(
+            HfHubHTTPError(message, response=hub_response(429)),
+            CODE_RATE_LIMITED,
+            FailureCategory.DOWNLOAD_FAILURE,
+            ExitCode.SOURCE_RESOLUTION,
+            SourceResolutionError,
+            id="http-429-rate-limited",
+        ),
+        pytest.param(
             ConnectionError(message),
             CODE_NETWORK_ERROR,
             FailureCategory.DOWNLOAD_FAILURE,
@@ -1281,3 +1290,14 @@ def test_auth_info_offline_does_not_call_whoami(monkeypatch):
     assert info.offline is True
     assert info.logged_in is True
     assert info.user is None
+
+
+def test_a_rate_limit_says_to_log_in_not_to_wait_for_a_5xx() -> None:
+    from huggingface_hub.errors import HfHubHTTPError
+
+    error = HfHubHTTPError("429 Too Many Requests", response=hub_response(429))
+
+    translated = translate_hub_error(error, model=ModelIdentity(repo_id="acme/model"))
+
+    assert "hf auth login" in " ".join(translated.diagnostic.remediation)
+    assert "5xx" not in " ".join(translated.diagnostic.remediation)

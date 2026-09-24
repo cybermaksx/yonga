@@ -141,6 +141,429 @@ architectures:
           Family-level fallback so unknown members of well-known decoder-only
           families still get a usable CPU/GPU plan.
 
+  - id: arch-qwen3
+    schema_version: 1
+    status: active
+    priority: 100
+    summary: Qwen3 decoder-only family
+    match:
+      model_types:
+        - qwen3
+      architectures:
+        - Qwen3ForCausalLM
+      # The same family as GGUF headers name it.
+      aliases:
+        - qwen3
+    export:
+      pipeline: llm
+      task: text-generation-with-past
+      trust_remote_code: false
+    devices:
+      cpu:
+        status: supported
+        evidence: tested
+      gpu:
+        status: supported
+        evidence: tested
+      npu:
+        status: supported
+        evidence: tested
+        notes:
+          - npu-int4-sym-g128; 67.3 tok/s on the reference host
+    recommended_device: gpu
+    profiles:
+      gpu: gpu-int4-asym-g128
+      cpu: cpu-int4-asym-g128
+      npu: npu-int4-sym-g128
+    sources:
+      - kind: tested
+        note: >-
+          Qwen/Qwen3-0.6B on the Lunar Lake reference host, OpenVINO 2026.4,
+          optimum-intel 2.2.0: prepared, probed and generating on CPU, GPU, NPU;
+          chat and bench on the NPU at 67.3 tok/s.
+
+  - id: arch-qwen2
+    schema_version: 1
+    status: active
+    priority: 100
+    summary: Qwen2 / Qwen2.5 decoder-only family
+    match:
+      model_types:
+        - qwen2
+      architectures:
+        - Qwen2ForCausalLM
+      # The same family as GGUF headers name it.
+      aliases:
+        - qwen2
+    export:
+      pipeline: llm
+      task: text-generation-with-past
+      trust_remote_code: false
+    devices:
+      cpu:
+        status: supported
+        evidence: tested
+        notes:
+          - 23.8 tok/s, INT4 g128 artifact
+      gpu:
+        status: supported
+        evidence: tested
+      npu:
+        status: supported
+        evidence: tested
+        notes:
+          - npu-int4-sym-cw
+    recommended_device: gpu
+    profiles:
+      gpu: gpu-int4-asym-g128
+      cpu: cpu-int4-asym-g128
+      npu: npu-int4-sym-cw
+    sources:
+      - kind: tested
+        note: >-
+          Qwen/Qwen2.5-0.5B-Instruct on the Lunar Lake reference host, OpenVINO 2026.4,
+          optimum-intel 2.2.0: prepared, probed and generating on CPU, GPU, NPU.
+
+  - id: arch-llama
+    schema_version: 1
+    status: active
+    priority: 100
+    summary: Llama 3 family (and llama-architecture models such as SmolLM2)
+    match:
+      model_types:
+        - llama
+      architectures:
+        - LlamaForCausalLM
+      # The same family as GGUF headers name it.
+      aliases:
+        - llama
+    export:
+      pipeline: llm
+      task: text-generation-with-past
+      trust_remote_code: false
+    devices:
+      cpu:
+        status: supported
+        evidence: tested
+        notes:
+          - 12.6 tok/s
+      gpu:
+        status: supported
+        evidence: tested
+      npu:
+        status: supported
+        evidence: tested
+        notes:
+          - npu-int4-sym-cw
+    recommended_device: gpu
+    profiles:
+      gpu: gpu-int4-asym-g128
+      cpu: cpu-int4-asym-g128
+      npu: npu-int4-sym-cw
+    sources:
+      - kind: tested
+        note: >-
+          unsloth/Llama-3.2-1B-Instruct on the Lunar Lake reference host, OpenVINO
+          2026.4, optimum-intel 2.2.0: prepared, probed and generating on CPU, GPU, NPU.
+
+  - id: arch-gemma3-text
+    schema_version: 1
+    status: active
+    priority: 100
+    summary: Gemma 3 text-only decoder (270M and 1B)
+    match:
+      model_types:
+        - gemma3_text
+      architectures:
+        - Gemma3ForCausalLM
+      # No GGUF alias: llama.cpp names both the text-only and the multimodal
+      # Gemma 3 models `gemma3`, so the header cannot tell them apart.
+    export:
+      pipeline: llm
+      task: text-generation-with-past
+      trust_remote_code: false
+    devices:
+      cpu:
+        status: supported
+        evidence: tested
+        notes:
+          - 15.3 tok/s
+      gpu:
+        status: supported
+        evidence: tested
+      npu:
+        status: supported
+        evidence: tested
+        notes:
+          - npu-int4-sym-cw
+    recommended_device: gpu
+    profiles:
+      gpu: gpu-int4-asym-g128
+      cpu: cpu-int4-asym-g128
+      npu: npu-int4-sym-cw
+    sources:
+      - kind: tested
+        note: >-
+          unsloth/gemma-3-1b-it on the Lunar Lake reference host, OpenVINO 2026.4,
+          optimum-intel 2.2.0: prepared, probed and generating on CPU, GPU, NPU.
+          optimum-intel declares transformers <=5.0 for gemma3_text; the export runs in
+          a managed environment when a newer release is installed.
+
+  - id: arch-gemma2
+    schema_version: 1
+    status: active
+    priority: 100
+    summary: Gemma 2 decoder-only family
+    match:
+      model_types:
+        - gemma2
+      architectures:
+        - Gemma2ForCausalLM
+      # The same family as GGUF headers name it.
+      aliases:
+        - gemma2
+    export:
+      pipeline: llm
+      task: text-generation-with-past
+      trust_remote_code: false
+    devices:
+      cpu:
+        status: supported
+        evidence: tested
+        notes:
+          - 7.2 tok/s
+      gpu:
+        status: supported
+        evidence: tested
+      npu:
+        status: supported
+        evidence: tested
+        notes:
+          - npu-int4-sym-cw
+    recommended_device: gpu
+    profiles:
+      gpu: gpu-int4-asym-g128
+      cpu: cpu-int4-asym-g128
+      npu: npu-int4-sym-cw
+    sources:
+      - kind: tested
+        note: >-
+          unsloth/gemma-2-2b-it on the Lunar Lake reference host, OpenVINO 2026.4,
+          optimum-intel 2.2.0: prepared, probed and generating on CPU, GPU, NPU.
+          optimum-intel declares transformers <=5.0 for gemma2; verified exporting in a
+          managed environment with 5.0.0.
+
+  - id: arch-olmo2
+    schema_version: 1
+    status: active
+    priority: 100
+    summary: OLMo 2 decoder-only family
+    match:
+      model_types:
+        - olmo2
+      architectures:
+        - Olmo2ForCausalLM
+      # The same family as GGUF headers name it.
+      aliases:
+        - olmo2
+    export:
+      pipeline: llm
+      task: text-generation-with-past
+      trust_remote_code: false
+    devices:
+      cpu:
+        status: supported
+        evidence: tested
+        notes:
+          - 13.9 tok/s
+      gpu:
+        status: supported
+        evidence: tested
+      npu:
+        status: supported
+        evidence: tested
+        notes:
+          - npu-int4-sym-cw
+    recommended_device: gpu
+    profiles:
+      gpu: gpu-int4-asym-g128
+      cpu: cpu-int4-asym-g128
+      npu: npu-int4-sym-cw
+    sources:
+      - kind: tested
+        note: >-
+          allenai/OLMo-2-0425-1B-Instruct on the Lunar Lake reference host, OpenVINO
+          2026.4, optimum-intel 2.2.0: prepared, probed and generating on CPU, GPU, NPU.
+
+  - id: arch-smollm3
+    schema_version: 1
+    status: active
+    priority: 100
+    summary: SmolLM3 decoder-only family
+    match:
+      model_types:
+        - smollm3
+      architectures:
+        - SmolLM3ForCausalLM
+      # The same family as GGUF headers name it.
+      aliases:
+        - smollm3
+    export:
+      pipeline: llm
+      task: text-generation-with-past
+      trust_remote_code: false
+    devices:
+      cpu:
+        status: supported
+        evidence: tested
+        notes:
+          - 6.2 tok/s
+      gpu:
+        status: supported
+        evidence: tested
+      npu:
+        status: supported
+        evidence: tested
+        notes:
+          - npu-int4-sym-cw
+    recommended_device: gpu
+    profiles:
+      gpu: gpu-int4-asym-g128
+      cpu: cpu-int4-asym-g128
+      npu: npu-int4-sym-cw
+    sources:
+      - kind: tested
+        note: >-
+          HuggingFaceTB/SmolLM3-3B on the Lunar Lake reference host, OpenVINO 2026.4,
+          optimum-intel 2.2.0: prepared, probed and generating on CPU, GPU, NPU.
+
+  - id: arch-lfm2
+    schema_version: 1
+    status: active
+    priority: 100
+    summary: Liquid LFM2 hybrid convolution/attention family
+    match:
+      model_types:
+        - lfm2
+      architectures:
+        - Lfm2ForCausalLM
+      # The same family as GGUF headers name it.
+      aliases:
+        - lfm2
+    export:
+      pipeline: llm
+      task: text-generation-with-past
+      trust_remote_code: false
+    devices:
+      cpu:
+        status: supported
+        evidence: tested
+        notes:
+          - 21.8 tok/s
+      gpu:
+        status: supported
+        evidence: tested
+      npu:
+        status: supported
+        evidence: tested
+        notes:
+          - npu-int4-sym-cw
+    recommended_device: gpu
+    profiles:
+      gpu: gpu-int4-asym-g128
+      cpu: cpu-int4-asym-g128
+      npu: npu-int4-sym-cw
+    sources:
+      - kind: tested
+        note: >-
+          LiquidAI/LFM2-350M on the Lunar Lake reference host, OpenVINO 2026.4, optimum-
+          intel 2.2.0: prepared, probed and generating on CPU, GPU, NPU. optimum-intel
+          declares transformers <=5.4.0 for lfm2; verified exporting in a managed
+          environment.
+
+  - id: arch-granite
+    schema_version: 1
+    status: active
+    priority: 100
+    summary: IBM Granite 3 decoder-only family
+    match:
+      model_types:
+        - granite
+      architectures:
+        - GraniteForCausalLM
+      # The same family as GGUF headers name it.
+      aliases:
+        - granite
+    export:
+      pipeline: llm
+      task: text-generation-with-past
+      trust_remote_code: false
+    devices:
+      cpu:
+        status: supported
+        evidence: tested
+        notes:
+          - 7.6 tok/s
+      gpu:
+        status: supported
+        evidence: tested
+      npu:
+        status: supported
+        evidence: tested
+        notes:
+          - npu-int4-sym-cw
+    recommended_device: gpu
+    profiles:
+      gpu: gpu-int4-asym-g128
+      cpu: cpu-int4-asym-g128
+      npu: npu-int4-sym-cw
+    sources:
+      - kind: tested
+        note: >-
+          ibm-granite/granite-3.3-2b-instruct on the Lunar Lake reference host, OpenVINO
+          2026.4, optimum-intel 2.2.0: prepared, probed and generating on CPU, GPU, NPU.
+
+  - id: arch-qwen2_5_vl
+    schema_version: 1
+    status: active
+    priority: 100
+    summary: Qwen2.5-VL vision-language family
+    match:
+      model_types:
+        - qwen2_5_vl
+      architectures:
+        - Qwen2_5_VLForConditionalGeneration
+    export:
+      pipeline: vlm
+      task: image-text-to-text
+      trust_remote_code: false
+    devices:
+      cpu:
+        status: supported
+        evidence: tested
+        notes:
+          - 6.2 tok/s (text turns through the VLM pipeline)
+      gpu:
+        status: supported
+        evidence: tested
+      npu:
+        status: unsupported
+        evidence: tested
+        reason: npu_compiler_rejects_graph
+        notes:
+          - 'The NPU compiler refuses the graph: npu.compiler.pass_failed.'
+    recommended_device: gpu
+    profiles:
+      gpu: gpu-int4-asym-g128
+      cpu: cpu-int4-asym-g128
+    sources:
+      - kind: tested
+        note: >-
+          Qwen/Qwen2.5-VL-3B-Instruct on the Lunar Lake reference host, OpenVINO 2026.4,
+          optimum-intel 2.2.0: prepared, probed and generating on CPU, GPU, NPU; the NPU
+          refused it. optimum-intel declares transformers <=5.0 for qwen2_5_vl; verified
+          exporting in a managed environment.
+
   - id: arch-phi3
     schema_version: 1
     status: active
@@ -173,6 +596,18 @@ architectures:
     profiles:
       gpu: gpu-int4-asym-g128
       cpu: cpu-int4-asym-g128
+    known_limitations:
+      - >-
+        With optimum 2.3.0 and optimum-intel 2.2.0 (the pair optimum-intel
+        requires) the export of microsoft/Phi-4-mini-instruct fails inside
+        optimum ("NormalizedConfig.__init__() got multiple values for argument
+        'allow_new'"). The failure is in the exporter, not in yonga or the model;
+        device support stays unknown until an exporter release converts it.
     sources:
       - kind: official_docs
         url: https://huggingface.co/docs/transformers/model_doc/phi3
+      - kind: tested
+        note: >-
+          microsoft/Phi-4-mini-instruct on the Lunar Lake reference host: remote
+          code correctly not required; the optimum-intel 2.2.0 export then failed
+          with the NormalizedConfig 'allow_new' TypeError.

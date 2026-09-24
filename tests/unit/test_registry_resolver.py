@@ -127,9 +127,17 @@ def test_qwen35_architecture_requires_transformers_5_2():
     assert isinstance(explanation, ResolutionExplanation)
 
 
-def test_generic_family_rule_covers_unlisted_llama_models():
+def test_generic_family_rule_covers_unmeasured_families():
+    """Families with a measured rule (llama, qwen2, qwen3) resolve to it; mistral does not."""
     resolver = builtin_resolver()
-    rule, _explanation = resolver.resolve_architecture(llama_metadata())
+    llama, _ = resolver.resolve_architecture(llama_metadata())
+    assert llama is not None and llama.id == "arch-llama"
+    mistral = ModelMetadata(
+        identity=ModelIdentity(repo_id="acme/mistral-ish"),
+        model_type="mistral",
+        architectures=["MistralForCausalLM"],
+    )
+    rule, _explanation = resolver.resolve_architecture(mistral)
     assert rule is not None
     assert rule.id == "arch-generic-text-generation"
     cpu = rule.device_support("CPU")
@@ -599,9 +607,10 @@ def test_a_catch_all_architecture_rule_does_not_hide_the_family_chat_profile():
         model_type="qwen3",
         architectures=["Qwen3ForCausalLM"],
     )
-    arch, _ = resolver.resolve_architecture(metadata)
+    # Qwen3 now has its own measured rule; the catch-all is taken directly, since
+    # the property under test is what happens whenever a catch-all is the winner.
+    arch = resolver.registry.architecture("arch-generic-text-generation")
     assert arch is not None
-    assert arch.id == "arch-generic-text-generation"
     assert arch.chat_profile == "chat-default"
 
     rule, explanation = resolver.resolve_chat_profile(arch_rule=arch, meta=metadata)

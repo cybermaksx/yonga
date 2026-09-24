@@ -62,7 +62,7 @@ reason's code: the NNCF group-size failure in section 5.4 exits **70**, not 40.
 
 ## 3. Registry issue codes
 
-Twelve rules ship today.
+Fifteen rules ship today.
 
 | Code | Rule id | Category | Exit | Means | Do this |
 |---|---|---|---|---|---|
@@ -77,6 +77,8 @@ Twelve rules ship today.
 | `storage.insufficient_disk` | `storage-no-space-left` | `insufficient_disk` | 30 | A write failed because the filesystem is full (including OpenVINO's `basic_ios::clear: iostream error`). | Free space, or point `YONGA_CACHE_DIR` at a bigger disk. |
 | `export.quantization.group_size_mismatch` | `nncf-group-size-not-divisible` | `configuration_error` | 70 | The profile's group size does not divide the model's channel sizes. | `--profile npu-int4-sym-cw` (channel-wise, group size -1), or a profile with a smaller group size. |
 | `export.transformers.symbol_missing.qwen35` | `qwen35-exporter-transformers-symbol-mismatch` | `package_abi_mismatch` | 10 | The exporter's Qwen3.5 patcher imports `Qwen3_5DynamicCache` and the installed Transformers does not define it. Nothing is broken; the two releases disagree about the Qwen3.5 modelling code. | Install the release the registry pins: `pip install "transformers==5.2.*"`. `yonga inspect MODEL` prints the requirement and what is installed. |
+| `export.transformers.out_of_range` | `exporter-transformers-version-range` | `package_abi_mismatch` | 10 | optimum-intel's export config for this architecture declares a Transformers range the installed release is outside. `prepare` normally reads that range first and builds a managed environment; you see this only when that was turned off. | Drop `--no-managed-env`, or install a release in the range the message names. |
+| `export.optimum.normalized_config` | `optimum-normalized-config-allow-new` | `package_abi_mismatch` | 10 | optimum failed building the export configuration (`got multiple values for argument 'allow_new'`), before conversion began. An exporter defect, seen for phi3. | Try a newer optimum-intel release. |
 | `export.transformers.symbol_missing` | `exporter-transformers-symbol-mismatch` | `package_abi_mismatch` | 10 | Generic form of the above: `optimum/exporters/openvino/model_patcher.py` looked for something the installed Transformers does not provide, for any architecture. | Install the Transformers release the architecture requires; the failing import is in `yonga logs JOB_ID --raw`. |
 
 The last two are a backstop, not the usual path. When the registry declares the architecture's

@@ -459,12 +459,13 @@ def test_compatibility_is_reported_per_device_with_its_evidence(
 
 def test_a_present_npu_is_never_reported_as_supported_without_a_claim() -> None:
     """ "The NPU exists" is not evidence. An unclaimed device stays unknown."""
+    # mistral: covered only by the generic rule, which claims nothing about the NPU.
     metadata = build_metadata(
         "acme/llama-ish",
         (("config.json", 2_000), ("model.safetensors", 4_000_000_000)),
         resolved_revision="a" * 40,
-        architectures=["LlamaForCausalLM"],
-        model_type="llama",
+        architectures=["MistralForCausalLM"],
+        model_type="mistral",
     )
 
     report = build_service(FakeHub({"acme/llama-ish": metadata})).inspect("acme/llama-ish")

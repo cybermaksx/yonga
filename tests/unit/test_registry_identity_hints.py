@@ -257,10 +257,10 @@ def test_a_gguf_header_never_overrides_a_contradicting_config_json() -> None:
 
     rule, explanation = builtin_resolver().resolve_architecture(metadata)
 
-    assert rule is None
-    assert explanation.winner_id is None
-    assert all(not candidate.matched for candidate in explanation.candidates)
+    # config.json's own identity decides: the Gemma 3 rule, never Qwen3.5's.
+    assert rule is not None and rule.id == "arch-gemma3-text"
     qwen = next(item for item in explanation.candidates if item.rule_id == "arch-qwen3_5")
+    assert not qwen.matched
     assert not any("matched alias" in reason for reason in qwen.reasons)
 
 
