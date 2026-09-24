@@ -11,6 +11,10 @@ manifest may change in any minor release.
 
 ### Fixed
 
+- **GGUF-only repositories were described as unreadable by OpenVINO GenAI.** The code assumed the
+  2026.4 build had no GGUF reader; it has one, verified above.
+- **A GGUF-only repository's architecture was reported as the first model type of the matching
+  family rule** (`llama` for a Qwen2.5 file). `inspect` now names the one the file declares.
 - **A cancelled job looked like it was still running for 24 hours.** Ctrl-C (or any exception a
   service did not record) left the job state at its last stage, so the sweep and export reuse both
   treated its staging directory as live. The job now records `job.cancelled` or `job.aborted`.
@@ -51,6 +55,16 @@ manifest may change in any minor release.
   `yonga env list|remove` manage them and `doctor` reports their disk use. `--no-managed-env` restores
   the refusal; `--ignore-exporter-requirements` exports in the current environment and never builds
   one. Registry data can choose only a version for a package yonga lists, never a package of its own.
+- **Direct GGUF import.** A GGUF-only repository with no usable declared derivative is imported
+  with OpenVINO GenAI's own GGUF reader when a new registry `gguf` rule verifies the file's
+  architecture (llama, qwen2, qwen3) and every tensor type in it (F32, F16, Q4_0, Q4_K, Q6_K, Q8_0).
+  Both are read from the file header over HTTP range requests before anything is downloaded, so a
+  `Q4_K_M` file carrying `Q5_0` tensors is passed over with the reason in the plan. Only the chosen
+  file is fetched. The import runs in a child process from a symlink in staging, never writing to
+  the Hub cache, and the result is validated, repaired and probed like any artifact. It is named by
+  the file's quantization (`gguf-q4_0-gpu`). `--gguf-file` picks the file;
+  `eval --allow-different-sources` compares a GGUF import with the original weights. A new issue
+  rule classifies the NPU's refusal of GGUF-built graphs (`npu.pipeline.static_reshape_failed`).
 - **`yonga eval CANDIDATE --reference REF`** measures what a quantization cost. It compares the
   two artifacts' next-token distributions, teacher-forced, over a shipped corpus of original text
   in eight domains (including Python and Turkish), and reports mean KL divergence, top-1 agreement

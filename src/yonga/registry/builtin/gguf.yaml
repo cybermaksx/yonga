@@ -1,0 +1,44 @@
+# What OpenVINO GenAI reads directly from GGUF files.
+#
+# Two things decide it, both read from the file's header by `yonga inspect`
+# and `yonga prepare` before anything is downloaded: the file's
+# `general.architecture`, and the type of every tensor in it. Only verified
+# entries belong here. The GenAI library also carries Q4_1 and BF16
+# dequantisers; they stay out until a file using them has been imported and
+# run on real hardware.
+schema_version: 1
+
+gguf:
+  - id: gguf-openvino-genai-2026
+    schema_version: 1
+    status: active
+    priority: 100
+    summary: OpenVINO GenAI 2026.4 imports llama, qwen2 and qwen3 GGUF files directly
+    header_architectures:
+      - llama
+      - qwen2
+      - qwen3
+    tensor_types:
+      - F32
+      - F16
+      - Q4_0
+      - Q4_K
+      - Q6_K
+      - Q8_0
+    preferred_files:
+      - Q4_K_M
+      - Q4_0
+      - Q6_K
+      - Q8_0
+    constraints:
+      openvino_genai: ">=2026.4,<2027"
+    sources:
+      - kind: tested
+        note: >-
+          Reference host, OpenVINO GenAI 2026.4.0, CPU and Arc GPU: imported and
+          generated correctly from Qwen/Qwen2.5-0.5B-Instruct-GGUF Q4_0, Q6_K,
+          Q8_0 and FP16, Qwen/Qwen3-0.6B-GGUF Q8_0 and unsloth/Llama-3.2-1B-Instruct-GGUF
+          Q4_K_M. Refused with "gguf_tensor_to_f16 failed" by every file holding
+          Q5_0, Q5_1, Q5_K or IQ4_NL tensors (Qwen2.5 Q4_K_M and Q3_K_M, Qwen3.5
+          Q4_K_M); refused with "Unsupported model architecture" for gemma3 and an
+          internal lookup failure for qwen35, even at Q8_0.

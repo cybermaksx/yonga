@@ -966,6 +966,46 @@ class DerivativeRule(BaseRule):
         return repo_id.strip().casefold() == self.requested_repo.casefold()
 
 
+class GGUFRule(BaseRule):
+    """What the installed OpenVINO GenAI can read directly from a GGUF file.
+
+    Two facts decide it, both read from the file's own header, never from its
+    name: ``general.architecture`` must be one the GenAI GGUF model builder
+    implements, and every tensor must be of a type its reader can convert. A
+    ``Q4_K_M`` label says nothing reliable -- one such file is all ``Q4_K`` and
+    ``Q6_K``, another carries ``Q5_0`` tensors the reader rejects.
+
+    ``tensor_types`` and ``header_architectures`` list what was *verified*, not
+    what the library might support: a type with a dequantiser that was never
+    tested stays out until it has been.
+    """
+
+    kind: ClassVar[str] = "gguf"
+
+    header_architectures: list[str] = Field(default_factory=list)
+    """``general.architecture`` values the GenAI GGUF builder accepts."""
+    tensor_types: list[str] = Field(default_factory=list)
+    """GGUF tensor type names (``Q4_K``, ``Q8_0``, ...) the reader converts."""
+    preferred_files: list[str] = Field(default_factory=list)
+    """Quantization labels to pick from, in order, when the user names no file."""
+
+    @field_validator("header_architectures")
+    @classmethod
+    def _casefold_architectures(cls, value: list[str]) -> list[str]:
+        return [item.strip().casefold() for item in value if item.strip()]
+
+    @field_validator("tensor_types", "preferred_files")
+    @classmethod
+    def _upper_types(cls, value: list[str]) -> list[str]:
+        return [item.strip().upper() for item in value if item.strip()]
+
+    def reads_architecture(self, name: str | None) -> bool:
+        """Whether the GGUF builder accepts ``general.architecture`` ``name``."""
+        if not name:
+            return False
+        return name.strip().casefold() in self.header_architectures
+
+
 class ArtifactSpec(BaseModel):
     """What a specific repository already contains."""
 
@@ -1156,6 +1196,7 @@ AnyRule = (
     | DerivativeRule
     | ModelRule
     | ChatProfileRule
+    | GGUFRule
 )
 
 
@@ -1176,6 +1217,7 @@ class RegistryDocument(BaseModel):
         default_factory=list,
         validation_alias=AliasChoices("chat", "chat_profiles"),
     )
+    gguf: list[GGUFRule] = Field(default_factory=list)
 
     def rules(self) -> list[AnyRule]:
         """Every rule in this document, in section order."""
@@ -1187,6 +1229,7 @@ class RegistryDocument(BaseModel):
         collected.extend(self.derivatives)
         collected.extend(self.models)
         collected.extend(self.chat)
+        collected.extend(self.gguf)
         return collected
 
 
@@ -1203,6 +1246,7 @@ class Registry(BaseModel):
     derivatives: list[DerivativeRule] = Field(default_factory=list)
     models: list[ModelRule] = Field(default_factory=list)
     chat: list[ChatProfileRule] = Field(default_factory=list)
+    gguf: list[GGUFRule] = Field(default_factory=list)
     #: Rule id -> human readable origin of the layer that supplied it.
     origins: dict[str, str] = Field(default_factory=dict)
     #: Human readable origins of every layer that was merged, in order.
@@ -1227,6 +1271,7 @@ class Registry(BaseModel):
         collected.extend(self.derivatives)
         collected.extend(self.models)
         collected.extend(self.chat)
+        collected.extend(self.gguf)
         return collected
 
     @property
@@ -1296,6 +1341,7 @@ class Registry(BaseModel):
             "derivatives": len(self.derivatives),
             "models": len(self.models),
             "chat": len(self.chat),
+            "gguf": len(self.gguf),
         }
 
 

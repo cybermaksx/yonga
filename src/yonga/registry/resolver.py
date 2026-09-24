@@ -56,6 +56,7 @@ from yonga.registry.schema import (
     ChatProfileRule,
     DerivativeCandidate,
     DerivativeRule,
+    GGUFRule,
     IssueRule,
     MatchSubject,
     ModelRule,
@@ -660,6 +661,30 @@ class RegistryResolver:
         return profile
 
     # ------------------------------------------------------------------
+    # GGUF
+    # ------------------------------------------------------------------
+    def resolve_gguf(self) -> tuple[GGUFRule | None, list[str]]:
+        """The GGUF support rule for the installed GenAI, and why others lost.
+
+        Rules are ranked by priority among those whose version constraints the
+        host satisfies. A rule whose constraints cannot be *verified* (GenAI
+        not installed) does not count: direct GGUF import needs GenAI itself,
+        so "unknown" is not support.
+        """
+        notes: list[str] = []
+        best: GGUFRule | None = None
+        for rule in self.registry.gguf:
+            if not rule.status.is_usable:
+                continue
+            satisfied, reasons = self._constraints_ok(rule.constraints)
+            unverified = any("not verified" in reason for reason in reasons)
+            if not satisfied or unverified:
+                notes.append(f"{rule.id}: " + "; ".join(reasons))
+                continue
+            if best is None or rule.priority > best.priority:
+                best = rule
+        return best, notes
+
     # derivatives
     # ------------------------------------------------------------------
     def resolve_derivatives(

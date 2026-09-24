@@ -157,8 +157,20 @@ infrastructure, not code.
 
 - **Windows support. [L]** The adapter boundary was built for it; `system_linux.py` has a sibling's
   worth of work in it and every path assumption needs auditing.
-- **GGUF execution. [M]** Today GGUF is detected and explicitly refused as a conversion source.
-  If OpenVINO GenAI gains architecture support, the resolver already has the branch for it.
+- **GGUF execution. [done]** OpenVINO GenAI 2026.4 turned out to carry a GGUF reader, contrary
+  to what the code assumed. `prepare` now imports a GGUF file directly when a registry `gguf` rule
+  verifies both its `general.architecture` and every tensor type in it. Both are read from the
+  file's own header over HTTP range requests (about 10 MB, even for a 9 GB file) before anything is
+  downloaded. The import runs in a child process from a symlink in staging, so the Hub cache is
+  never written, although GenAI saves its IR next to the path it is given by default. The result
+  is an ordinary artifact: validated, repaired (it carries the same `STRiNG` tokenizer defect),
+  probed, and usable by `chat`, `bench`, `serve`, `eval` and `publish`. Verified on the reference
+  host: llama, qwen2 and qwen3 with F32, F16, Q4_0, Q4_K, Q6_K and Q8_0 tensors. It fails, as
+  predicted by the header, on every file holding Q5_0, Q5_1, Q5_K or IQ4_NL tensors (which is most
+  `Q4_K_M` Qwen files), and on the gemma3 and qwen35 architectures. `eval` found a divergence floor
+  of about 0.03 nats against an optimum FP16 export even from an F16 GGUF
+  (`PROFILE_COMPARISON.md` §9), whose cause was not isolated. The NPU cannot reshape a GGUF-built
+  graph (`npu.pipeline.static_reshape_failed`).
 - **More architectures in the registry. [ongoing]** Two architecture rules ship today. Each new one
   is data plus a test, not code — that was the point of the design.
 - **A GUI or web frontend. [L]** Application services already emit structured `ProgressEvent`s and

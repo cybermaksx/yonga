@@ -692,6 +692,14 @@ def prepare(
             "packages cannot meet the exporter requirements."
         ),
     ),
+    gguf_file: str | None = typer.Option(
+        None,
+        "--gguf-file",
+        help=(
+            "For a GGUF repository, the file to import. By default yonga picks the first "
+            "preferred quantization whose tensor types OpenVINO GenAI can read."
+        ),
+    ),
     fresh_export: bool = typer.Option(
         False,
         "--fresh-export",
@@ -725,6 +733,7 @@ def prepare(
             # regardless; building a managed one would make the flag meaningless.
             managed_env=not no_managed_env and not ignore_exporter_requirements,
             reuse_export=not fresh_export,
+            gguf_file=gguf_file,
         ),
     )
 
@@ -744,6 +753,7 @@ def _prepare(
     no_repair: bool,
     managed_env: bool = True,
     reuse_export: bool = True,
+    gguf_file: str | None = None,
 ) -> ExitCode:
     """Run the seven preparation stages (``docs/CLI_SPEC.md`` section 6)."""
     target = _device(device)
@@ -774,6 +784,7 @@ def _prepare(
             job=job,
             managed_env=managed_env,
             reuse_export=reuse_export,
+            gguf_file=gguf_file,
         )
         console.print(tables.preparation_plan(plan))
         with _quiet_native_stdout(state.json_mode):
@@ -1207,6 +1218,11 @@ def eval_command(
     corpus: Path | None = typer.Option(
         None, "--corpus", help="Text to read instead of the shipped corpus (.json or .txt)."
     ),
+    allow_different_sources: bool = typer.Option(
+        False,
+        "--allow-different-sources",
+        help="Compare artifacts converted from different repositories (e.g. GGUF vs original).",
+    ),
     json_output: bool = typer.Option(False, "--json", help="Emit the result as JSON."),
 ) -> None:
     """Measure how far CANDIDATE's predictions move from REFERENCE's (KL, top-1, perplexity)."""
@@ -1219,7 +1235,13 @@ def eval_command(
         chosen = _device(device)
         target = "CPU" if chosen in (None, "auto") else str(chosen)
         text = load_corpus(corpus) if corpus is not None else None
-        result = service.evaluate(candidate, reference, device=target, corpus=text)
+        result = service.evaluate(
+            candidate,
+            reference,
+            device=target,
+            corpus=text,
+            allow_different_sources=allow_different_sources,
+        )
         if state.json_mode:
             state.emit(result_payload(result))
         else:

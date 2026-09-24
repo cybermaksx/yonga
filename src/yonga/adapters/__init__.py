@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
+    from yonga.adapters.gguf_header import GGUFHeader
     from yonga.application.jobs import JobContext
     from yonga.domain.artifacts import IRDescription, ProbeResult
     from yonga.domain.environments import EnvironmentSpec, ExportEnvironment
@@ -32,6 +33,8 @@ __all__ = [
     "ExportEnvironments",
     "Exporter",
     "FilesystemProbe",
+    "GGUFImport",
+    "GGUFInspector",
     "HardwareProbe",
     "HubClient",
     "HubPublisher",
@@ -97,6 +100,24 @@ class HubSearch(Protocol):
 
     def search(self, query: str, *, limit: int = 20) -> list[ModelMetadata]:
         """Return metadata for the best matches, from the search response alone."""
+        ...
+
+
+@runtime_checkable
+class GGUFInspector(Protocol):
+    """Reads a GGUF file's header -- metadata and tensor types -- without its weights."""
+
+    def gguf_header(self, model: ModelIdentity, filename: str) -> GGUFHeader:
+        """The header of ``filename`` in ``model`` (pinned to a revision)."""
+        ...
+
+
+@runtime_checkable
+class GGUFImport(Protocol):
+    """Turns a GGUF file into OpenVINO IR in a directory yonga owns."""
+
+    def import_file(self, gguf: Path, output_dir: Path, ctx: JobContext) -> ExportResult:
+        """Import ``gguf`` into ``output_dir``; never writes next to ``gguf`` itself."""
         ...
 
 

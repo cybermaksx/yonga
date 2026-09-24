@@ -128,6 +128,23 @@ download → convert → validate/repair → probe.
 Useful flags: `--device auto|npu|gpu|cpu`, `--profile ID`, `--source REPO`, `--revision REV`,
 `--force`, `--no-repair`, `--yes`, `--trust-remote-code`, `--ignore-exporter-requirements`.
 
+### A GGUF-only model
+
+```bash
+yonga inspect Qwen/Qwen2.5-0.5B-Instruct-GGUF          # "Direct GGUF conversion  yes"
+yonga prepare Qwen/Qwen2.5-0.5B-Instruct-GGUF --device gpu --yes
+yonga prepare Qwen/Qwen2.5-0.5B-Instruct-GGUF --device gpu --gguf-file qwen2.5-0.5b-instruct-q8_0.gguf --yes
+```
+
+OpenVINO GenAI imports llama, qwen2 and qwen3 GGUF files directly. yonga reads each candidate
+file's header first (about 10 MB) and picks the first whose tensor types the reader can convert.
+Here the `Q4_K_M` file is passed over because it holds `Q5_0` tensors, and `Q4_0` is used. The
+plan says so. Only that one file is downloaded, and the result is a normal artifact
+(`gguf-q4_0-gpu`) for `chat`, `bench`, `serve` and `eval`. The weights keep the GGUF's own
+quantization. On this host a GGUF import measured slightly further from the original weights than
+an optimum export at the same precision (`PROFILE_COMPARISON.md` §9), and it does not run on the
+NPU.
+
 ### The full reference case
 
 ```bash

@@ -172,6 +172,28 @@ sources:
 
 MVP should use `suggest` for all third-party derivatives.
 
+## 8a. GGUF rule
+
+What the installed OpenVINO GenAI can import directly from a GGUF file. Both conditions are read
+from the file's own header, never from its name:
+
+```yaml
+gguf:
+  - id: gguf-openvino-genai-2026
+    header_architectures: [llama, qwen2, qwen3]    # general.architecture values
+    tensor_types: [F32, F16, Q4_0, Q4_K, Q6_K, Q8_0]
+    preferred_files: [Q4_K_M, Q4_0, Q6_K, Q8_0]    # labels tried, in order, when no file is named
+    constraints:
+      openvino_genai: ">=2026.4,<2027"
+```
+
+A file qualifies only when its architecture is listed **and** every one of its tensors is of a
+listed type. A `Q4_K_M` label is not enough: one such file holds only `Q4_K` and `Q6_K`, another
+also holds `Q5_0`, which the reader cannot convert. List only what has been verified by importing
+and running a file on real hardware. A rule whose constraint cannot be checked (GenAI not
+installed) does not count, because unknown is not support. The highest-priority usable rule wins;
+a remote bundle or a user override can extend support without a code change.
+
 ## 9. Exact model rules
 
 Use exact model rules only for behavior that genuinely differs from its architecture. Avoid filling the registry with model-name-specific duplicates.

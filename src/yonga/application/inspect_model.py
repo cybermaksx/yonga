@@ -300,7 +300,10 @@ class InspectService:
         )
 
         candidates, _derivative_explanation = self._registry.resolve_derivatives(requested)
-        source_options = describe_source_options(metadata, candidates, policy=self._source_policy)
+        gguf_rule, _gguf_notes = self._registry.resolve_gguf()
+        source_options = describe_source_options(
+            metadata, candidates, policy=self._source_policy, gguf_rule=gguf_rule
+        )
 
         report = InspectReport(
             requested=requested,
@@ -382,9 +385,15 @@ class InspectService:
             return metadata.architectures[0]
         if metadata.model_type:
             return metadata.model_type
-        if architecture_rule is not None and architecture_rule.match.model_types:
-            return architecture_rule.match.model_types[0]
-        return None
+        if architecture_rule is None or not architecture_rule.match.model_types:
+            return None
+        declared = architecture_rule.match.model_types
+        hint = str((metadata.gguf_metadata or {}).get("architecture") or "").strip()
+        # A family rule covers several model types; name the one the weight file
+        # itself declared, rather than whichever the rule happens to list first.
+        if hint and hint.casefold() in {name.casefold() for name in declared}:
+            return hint
+        return declared[0]
 
     @staticmethod
     def _pipeline(metadata: ModelMetadata, spec: ExportSpec | None) -> PipelineKind:

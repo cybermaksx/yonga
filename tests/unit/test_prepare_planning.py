@@ -26,6 +26,7 @@ from yonga.adapters import (
     ExportEnvironments,
     Exporter,
     FilesystemProbe,
+    GGUFImport,
     HardwareProbe,
     HubClient,
     RuntimeProbe,
@@ -663,6 +664,7 @@ def build_service(
     resolver: RegistryResolver | None = None,
     smoke: SmokeTester | None = None,
     environments: ExportEnvironments | None = None,
+    gguf_importer: GGUFImport | None = None,
 ) -> PrepareService:
     """Assemble a :class:`PrepareService` from fakes, with sensible defaults."""
     return PrepareService(
@@ -680,6 +682,7 @@ def build_service(
         settings=settings,
         smoke_tester=smoke if smoke is not None else FakeSmokeTester(),
         export_environments=environments,
+        gguf_importer=gguf_importer,
     )
 
 
@@ -870,7 +873,9 @@ def test_plan_refuses_to_guess_when_no_source_is_declared(
         service.plan(orphan, device="gpu")
 
     assert caught.value.exit_code() is ExitCode.SOURCE_RESOLUTION
-    assert caught.value.diagnostic.code == "source.format_unsupported"
+    # GGUF-only, so the refusal says which GGUF step failed, not just "no source".
+    assert caught.value.diagnostic.code == "source.gguf_unsupported"
+    assert "cannot be imported directly" in caught.value.diagnostic.message
 
 
 def test_plan_uses_published_openvino_ir_without_re_exporting(

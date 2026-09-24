@@ -29,8 +29,6 @@ from yonga.application.resolve import (
     CODE_NO_USABLE_SOURCE,
     CODE_REVISION_UNPINNED,
     CONFIRMATION_EXPLICIT_SOURCE,
-    DEFAULT_SOURCE_POLICY,
-    GGUF_BACKEND_ARCHITECTURES,
     OPTION_DERIVATIVE,
     OPTION_GGUF,
     OPTION_OPENVINO,
@@ -594,43 +592,9 @@ def test_gguf_only_without_derivative_stops_with_source_format_unsupported(
     failure = caught.value.diagnostic
     assert failure.category is FailureCategory.SOURCE_FORMAT_UNSUPPORTED
     assert failure.code == CODE_GGUF_UNSUPPORTED
-    assert "no direct GGUF reader" in failure.message
+    assert "cannot be imported directly" in failure.message
     assert "not evidence" in failure.message
     assert any("--source" in line for line in failure.remediation)
-
-
-def test_the_shipped_backend_declares_no_gguf_architecture() -> None:
-    """The GGUF support list is empty, and that is the point of the constant."""
-    assert GGUF_BACKEND_ARCHITECTURES == ()
-    assert DEFAULT_SOURCE_POLICY.gguf_architectures == ()
-
-
-def test_gguf_is_used_only_when_the_policy_declares_the_architecture() -> None:
-    """Step 5 exists, but only a data declaration can unlock it."""
-    metadata = build_metadata(
-        REQUESTED_REPO,
-        GGUF_FILES,
-        resolved_revision=REQUESTED_SHA,
-        model_type="qwen3_5",
-    )
-    policy = SourcePolicy(gguf_architectures=("qwen3_5",))
-
-    resolved = SourceResolver(FakeHub()).resolve(
-        metadata, registry_resolver=empty_resolver(), policy=policy
-    )
-
-    assert resolved.format is ModelFormat.GGUF
-    assert resolved.relationship is SourceRelationship.ORIGINAL
-
-
-def test_unknown_architecture_never_matches_gguf_support(gguf_only: ModelMetadata) -> None:
-    """A repository with no declared architecture cannot match a support entry."""
-    policy = SourcePolicy(gguf_architectures=("qwen3_5",))
-
-    with pytest.raises(SourceResolutionError):
-        SourceResolver(FakeHub()).resolve(
-            gguf_only, registry_resolver=empty_resolver(), policy=policy
-        )
 
 
 # --------------------------------------------------------------------------- #

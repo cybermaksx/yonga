@@ -64,6 +64,7 @@ from yonga.adapters import (
     ExportEnvironments,
     Exporter,
     FilesystemProbe,
+    GGUFImport,
     HardwareProbe,
     HubClient,
     RuntimeProbe,
@@ -79,6 +80,7 @@ from yonga.application import export_reuse
 from yonga.application.artifacts import ArtifactStore
 from yonga.application.jobs import JobContext, new_job_id
 from yonga.application.progress import ProgressKind
+from yonga.application.resolve import SourcePolicy, SourceResolver, gguf_quant_label
 from yonga.config.settings import DevicePolicy, Settings
 from yonga.domain.artifacts import (
     MANIFEST_SCHEMA_VERSION,
@@ -252,6 +254,9 @@ _PASSTHROUGH_BACKEND: str = "openvino-ir-passthrough"
 #: Backend recorded for a normal Optimum Intel conversion.
 _EXPORT_BACKEND: str = "optimum-intel"
 
+#: Recorded as the export backend of an artifact imported from a GGUF file.
+_GGUF_BACKEND: str = "openvino-genai-gguf"
+
 #: Distributions whose versions are reported in the validation record.
 _OPENVINO_DISTRIBUTION: str = "openvino"
 _TOKENIZERS_DISTRIBUTION: str = "openvino-tokenizers"
@@ -367,6 +372,18 @@ class _ExportOutcome:
     record: ExportRecord
     result: ExportResult | None = None
     notes: list[str] = field(default_factory=list)
+
+
+def _artifact_key(resolved: ResolvedSource, profile: ConversionProfile) -> str:
+    """What names an artifact: its profile, or for a GGUF import the file's quantization.
+
+    A GGUF import keeps the file's own quantization, so naming it after the
+    profile would describe weights it does not have; and one repository
+    publishes several files, which must not share an artifact directory.
+    """
+    if resolved.gguf_file is None:
+        return profile.id
+    return f"gguf-{gguf_quant_label(resolved.gguf_file)}-{profile.device.lower()}"
 
 
 def _now() -> datetime:
@@ -503,6 +520,7 @@ class PrepareService:
         settings: Settings,
         smoke_tester: SmokeTester | None = None,
         export_environments: ExportEnvironments | None = None,
+        gguf_importer: GGUFImport | None = None,
     ) -> None:
         """Wire the service to its adapters.
 
@@ -523,6 +541,7 @@ class PrepareService:
         # Optional: without it an unmet exporter pin blocks at preflight, exactly
         # as it did before managed export environments existed.
         self._environments = export_environments
+        self._gguf_importer = gguf_importer
 
     # ==================================================================
     # planning
@@ -541,6 +560,7 @@ class PrepareService:
         job: JobContext | None = None,
         managed_env: bool = True,
         reuse_export: bool = True,
+        gguf_file: str | None = None,
     ) -> PreparationPlan:
         """Decide everything, change nothing.
 
@@ -568,7 +588,7 @@ class PrepareService:
         if requested.revision is None:
             requested = self._pin_from_hub(requested)
 
-        resolved_source = self._resolve_source(requested, metadata, explicit_source)
+        resolved_source = self._resolve_source(requested, metadata, explicit_source, gguf_file)
         source_meta = resolved_source.metadata or metadata
 
         inventory = self._hardware.inventory()
@@ -597,16 +617,22 @@ class PrepareService:
         )
 
         source_sha = source_meta.resolved_revision or resolved_source.source.revision
+        artifact_key = _artifact_key(resolved_source, profile)
         artifact_dir = self._artifacts.artifact_dir(
-            resolved_source.source.repo_id, source_sha, profile.id
+            resolved_source.source.repo_id, source_sha, artifact_key
         )
         staging_dir = self._artifacts.staging_model_dir(job_id)
 
         download_bytes = sum(entry.size or 0 for entry in source_meta.files)
+        weight_bytes = source_meta.weight_bytes
+        if resolved_source.gguf_file is not None:
+            # One file of the repository's many quantizations is downloaded and imported.
+            download_bytes = resolved_source.gguf_file_bytes or 0
+            weight_bytes = resolved_source.gguf_file_bytes or weight_bytes
         disk = plan_disk_usage(
             job_temp_dir=paths.job_tmp_dir(job_id),
             artifact_dir=artifact_dir,
-            source_weight_bytes=source_meta.weight_bytes,
+            source_weight_bytes=weight_bytes,
             settings=self._settings,
             expected_download_bytes=download_bytes,
             download_dir=inventory.hf_auth.cache_dir if inventory.hf_auth is not None else None,
@@ -633,6 +659,18 @@ class PrepareService:
         # unreachable. A user asking for `--profile npu-int4-sym-cw --device gpu`
         # gets told, in the plan, before anything is downloaded.
         known_limitations.extend(profile_explanation.notes)
+        if resolved_source.gguf_file is not None:
+            types = ", ".join(
+                f"{name} x{count}" for name, count in resolved_source.gguf_tensor_types.items()
+            )
+            known_limitations.extend(
+                reason for reason in resolved_source.reasons if reason.startswith("Passed over")
+            )
+            known_limitations.append(
+                f"{resolved_source.gguf_file} is imported directly by OpenVINO GenAI and keeps "
+                f"its own quantization ({types}); the {profile.id} profile's quantization "
+                "settings do not apply, only its runtime properties."
+            )
         export_environment = self._plan_export_environment(
             exporter_requirements, resolved_source=resolved_source, allowed=managed_env
         )
@@ -656,7 +694,7 @@ class PrepareService:
             f"Exporter requirement could not be checked: {note}" for note in exporter_unverifiable
         )
 
-        reuse = None if force else self._reusable_artifact(artifact_dir, source_sha, profile.id)
+        reuse = None if force else self._reusable_artifact(artifact_dir, source_sha, artifact_key)
         confirmations = self._confirmations(
             resolved_source=resolved_source,
             remote_code_required=remote_code_required,
@@ -720,7 +758,11 @@ class PrepareService:
         setting, or a service built without an environment manager -- and then
         preflight blocks on the pin as before.
         """
-        if not requirements.problems or resolved_source.already_openvino:
+        if (
+            not requirements.problems
+            or resolved_source.already_openvino
+            or resolved_source.format is ModelFormat.GGUF
+        ):
             return None
         if not allowed or not self._settings.managed_export_envs or self._environments is None:
             return None
@@ -751,6 +793,7 @@ class PrepareService:
         requested: ModelIdentity,
         metadata: ModelMetadata,
         explicit_source: ModelIdentity | str | None,
+        gguf_file: str | None = None,
     ) -> ResolvedSource:
         """Decide which repository will actually be converted, and record why.
 
@@ -778,7 +821,7 @@ class PrepareService:
                 metadata=metadata,
             )
 
-        return self._derivative_source(requested, metadata)
+        return self._derivative_source(requested, metadata, gguf_file)
 
     def _explicit_source(
         self,
@@ -835,6 +878,7 @@ class PrepareService:
         self,
         requested: ModelIdentity,
         metadata: ModelMetadata,
+        gguf_file: str | None = None,
     ) -> ResolvedSource:
         """Fall back to a registry-declared derivative, or refuse to guess."""
         candidates, _explanation = self._registry.resolve_derivatives(requested)
@@ -870,6 +914,21 @@ class PrepareService:
                 reasons=reasons,
                 metadata=candidate_meta,
             )
+
+        if metadata.primary_format is ModelFormat.GGUF:
+            # Step 5 of SPEC.md section 8.1, only once no declared derivative is usable:
+            # the resolver reads candidate file headers and imports one directly, or
+            # refuses with the tensor types and architecture that ruled each file out.
+            resolved = SourceResolver(self._hub).resolve_gguf(
+                metadata,
+                registry_resolver=self._registry,
+                policy=SourcePolicy(gguf_file=gguf_file),
+            )
+            if rejected:
+                resolved.reasons.append(
+                    "Declared derivatives were unusable: " + "; ".join(rejected)
+                )
+            return resolved
 
         message = (
             f"{requested.repo_id} publishes {metadata.primary_format.value} weights, which "
@@ -1866,7 +1925,12 @@ class PrepareService:
             f"Fetching {source} ({format_bytes(plan.disk.expected_download_bytes)})",
             status="started",
         )
-        snapshot = self._hub.download(source, ctx=ctx)
+        gguf_file = plan.resolved_source.gguf_file
+        if gguf_file is not None:
+            # A GGUF repository publishes one file per quantization; fetch only ours.
+            snapshot = self._hub.download(source, ctx=ctx, allow_patterns=[gguf_file])
+        else:
+            snapshot = self._hub.download(source, ctx=ctx)
         ctx.logger.info("download.complete", "source snapshot ready", path=str(snapshot))
         return snapshot
 
@@ -1956,7 +2020,69 @@ class PrepareService:
         mark_incomplete(staging, job_id=ctx.job_id)
         if plan.resolved_source.already_openvino:
             return self._copy_openvino_source(plan, snapshot, staging, ctx)
+        if plan.resolved_source.gguf_file is not None:
+            return self._import_gguf(plan, snapshot, staging, ctx)
         return self._export(plan, snapshot, staging, ctx, environment=environment)
+
+    def _import_gguf(
+        self,
+        plan: PreparationPlan,
+        snapshot: Path,
+        staging: Path,
+        ctx: JobContext,
+    ) -> _ExportOutcome:
+        """Import the chosen GGUF file into staging with OpenVINO GenAI's reader.
+
+        The Hub cache is only read: the importer links the file into staging and
+        GenAI writes the IR beside the link. What comes out is validated,
+        repaired and probed exactly like an optimum-intel export.
+        """
+        source = plan.resolved_source
+        assert source.gguf_file is not None  # guarded by the caller
+        if self._gguf_importer is None:
+            raise ExportError(
+                diagnostic(
+                    "export.gguf_unavailable",
+                    FailureCategory.CONFIGURATION_ERROR,
+                    "GGUF import is unavailable",
+                    "This preparation service was built without a GGUF importer.",
+                )
+            )
+        started = _now()
+        result = self._gguf_importer.import_file(snapshot / source.gguf_file, staging, ctx)
+        if staging.is_dir():
+            mark_incomplete(staging, job_id=ctx.job_id)
+        record = ExportRecord(
+            backend=_GGUF_BACKEND,
+            profile=_artifact_key(source, plan.profile),
+            arguments={
+                "gguf_file": source.gguf_file,
+                "gguf_architecture": source.gguf_architecture,
+                "tensor_types": dict(source.gguf_tensor_types),
+                "task": plan.task,
+                "weight_format": "gguf",
+            },
+            argv=redact_argv(result.argv),
+            package_versions=result.package_versions,
+            duration_seconds=result.duration_seconds,
+            started_at=started,
+        )
+        if not result.success:
+            report = result.diagnostic or diagnostic(
+                "export.gguf_import_failed",
+                FailureCategory.UNKNOWN_RUNTIME_ERROR,
+                "The GGUF import failed",
+                "OpenVINO GenAI did not produce an OpenVINO model.",
+            )
+            ctx.logger.error("export.failed", report.message, raw=report.raw_excerpt or "")
+            raise ExportError(report)
+        ctx.logger.info(
+            "export.complete",
+            "GGUF import finished",
+            gguf_file=source.gguf_file,
+            duration_seconds=result.duration_seconds,
+        )
+        return _ExportOutcome(record=record, result=result)
 
     def _copy_openvino_source(
         self,
@@ -2792,7 +2918,9 @@ class PrepareService:
         )
         return ArtifactManifest(
             schema_version=MANIFEST_SCHEMA_VERSION,
-            artifact_id=self._artifact_id(source.repo_id, source_sha, plan.profile.id),
+            artifact_id=self._artifact_id(
+                source.repo_id, source_sha, _artifact_key(plan.resolved_source, plan.profile)
+            ),
             created_at=_now(),
             tool_version=__version__,
             requested_model=ManifestModelRef(

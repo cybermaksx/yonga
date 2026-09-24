@@ -123,6 +123,45 @@ issues:
           Generic form of the Qwen3.5 bufferization failure, kept less specific
           so a family-scoped rule always wins where one exists.
 
+  - id: npu-static-reshape-broadcast
+    schema_version: 1
+    status: active
+    priority: 60
+    summary: The NPU pipeline could not reshape this graph to static shapes
+    match:
+      device: npu
+      case_sensitive: true
+      exception_contains:
+        - "Broadcast incorrect target shape"
+    classification:
+      code: npu.pipeline.static_reshape_failed
+      category: compiler_unsupported_graph
+      environment_broken: false
+      retry_same_device: false
+    recommendation:
+      title: The NPU cannot run this graph at static shapes
+      message: >-
+        The OpenVINO GenAI NPU pipeline reshapes a model to MAX_PROMPT_LEN and
+        MIN_RESPONSE_LEN before compiling it, and shape inference rejected one
+        of this graph's Broadcast operations while doing so. The NPU, its
+        driver and its compiler are fine. Observed for a model OpenVINO GenAI
+        built from a GGUF file.
+      fallback_devices:
+        - gpu
+        - cpu
+      remediation:
+        - "Prepare it for the GPU or the CPU: yonga prepare MODEL --device gpu"
+        - >-
+          An optimum-intel export of the same model from its safetensors
+          repository builds a different graph; prepare that with an NPU
+          profile and let the probe decide.
+    sources:
+      - kind: tested
+        note: >-
+          Qwen/Qwen2.5-0.5B-Instruct-GGUF Q4_0 imported by OpenVINO GenAI
+          2026.4 and loaded on a Lunar Lake NPU: "Broadcast incorrect target
+          shape. Expecting either 1 or 1024. Got 0".
+
   # Lower priority than every rule above it, so a named compiler pass failure is
   # only ever the answer when nothing more specific recognised the text. It exists
   # because the "generic" rule above is not generic: it matches one bufferization

@@ -38,6 +38,12 @@ from huggingface_hub.errors import (
 )
 from huggingface_hub.utils.tqdm import tqdm as hf_tqdm
 
+from yonga.adapters.gguf_header import (
+    GGUFFormatError,
+    GGUFHeader,
+    parse_gguf_header,
+    read_local_header,
+)
 from yonga.application.progress import ProgressKind
 from yonga.config.settings import Settings
 from yonga.domain.diagnostics import (
@@ -1386,6 +1392,71 @@ class HuggingFaceAdapter:
         return snapshot
 
     # --- authentication ------------------------------------------------
+
+    def gguf_header(self, model: ModelIdentity, filename: str) -> GGUFHeader:
+        """Read one GGUF file's header -- metadata and tensor types -- not its weights.
+
+        A copy already in the Hub cache is read locally. Otherwise only the
+        header is fetched, with HTTP range requests of a few megabytes, so
+        deciding whether a 9 GB file can be imported costs about 10 MB. Offline,
+        an uncached file raises ``hub.offline.missing``.
+        """
+        revision = model.revision
+        cached = huggingface_hub.try_to_load_from_cache(
+            model.repo_id, filename, revision=revision, cache_dir=self._cache_dir()
+        )
+        if isinstance(cached, str) and Path(cached).is_file():
+            try:
+                return read_local_header(Path(cached))
+            except (OSError, GGUFFormatError) as error:
+                raise self._gguf_unreadable(model, filename, error) from error
+        if self.offline:
+            raise translate_hub_error(
+                FileNotFoundError(filename),
+                model=model,
+                operation=f"reading the header of {filename}",
+                offline=True,
+            )
+        url = huggingface_hub.hf_hub_url(model.repo_id, filename, revision=revision)
+        session = huggingface_hub.get_session()
+        headers = huggingface_hub.utils.build_hf_headers()  # type: ignore[attr-defined]
+
+        def read(offset: int, length: int) -> bytes:
+            response = session.get(
+                url,
+                headers={**headers, "Range": f"bytes={offset}-{offset + length - 1}"},
+                follow_redirects=True,
+                timeout=60.0,
+            )
+            response.raise_for_status()
+            content: bytes = response.content
+            # A server that ignores Range sends the whole file; keep only the slice.
+            return content[:length] if response.status_code == 200 and offset == 0 else content
+
+        try:
+            return parse_gguf_header(read)
+        except GGUFFormatError as error:
+            raise self._gguf_unreadable(model, filename, error) from error
+        except Exception as error:
+            raise translate_hub_error(
+                error, model=model, operation=f"reading the header of {filename}"
+            ) from error
+
+    def _cache_dir(self) -> str | None:
+        home = getattr(self._settings, "hf_home", None)
+        return str(Path(home) / "hub") if home else None
+
+    @staticmethod
+    def _gguf_unreadable(model: ModelIdentity, filename: str, error: BaseException) -> YongaError:
+        return SourceResolutionError(
+            diagnostic(
+                "source.gguf_header_unreadable",
+                FailureCategory.SOURCE_FORMAT_UNSUPPORTED,
+                "The GGUF file's header could not be read",
+                redact_text(f"{model.repo_id}/{filename}: {error}"),
+                remediation=["The file may be damaged or not GGUF; try another file."],
+            )
+        )
 
     def auth_info(self) -> HuggingFaceAuthInfo:
         """Report authentication state without ever handling the token value.

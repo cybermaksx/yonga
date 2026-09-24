@@ -445,3 +445,34 @@ yonga eval 197ef1cdb734bd80 --reference 3904983a446e705e --device cpu
 yonga eval 289ede59ae155cd8 --reference 3904983a446e705e --device cpu
 ```
 
+
+## 9. GGUF imports against the original weights
+
+Added with direct GGUF import. `Qwen/Qwen2.5-0.5B-Instruct` was exported from its safetensors with
+optimum-intel at FP16 (the reference, 962 MiB), INT8 and INT4. The same model's official GGUF release,
+`Qwen/Qwen2.5-0.5B-Instruct-GGUF`, was imported at Q4_0, Q6_K, Q8_0 and FP16. Every artifact was
+compared with the FP16 export on the CPU at f32, over `yonga-eval-v1`, with
+`--allow-different-sources`. The two repositories hold the same model, and their tokenizers agreed
+on every token of the corpus, which `yonga eval` checks.
+
+| Artifact | Route | Size | Mean KL | Top-1 agreement | Perplexity change |
+|---|---|---|---|---|---|
+| `cpu-int8-asym-ref` | optimum-intel export | 493 MiB | 0.0062 | 95.42 % | +0.54 % |
+| `gguf-fp16-cpu` | GGUF import, unquantized | 952 MiB | 0.0281 | 90.69 % | +3.46 % |
+| `gguf-q8_0-cpu` | GGUF import | 515 MiB | 0.0308 | 90.64 % | +3.94 % |
+| `gguf-q6_k-cpu` | GGUF import | 522 MiB | 0.0326 | 90.18 % | +3.80 % |
+| `gguf-q4_0-cpu` | GGUF import | 419 MiB | 0.1994 | 78.20 % | +19.58 % |
+| `cpu-int4-asym-g128` | optimum-intel export | 328 MiB | 0.2896 | 71.62 % | +30.01 % |
+
+Two findings, and one thing not found:
+
+- **GGUF imports have a divergence floor of about 0.03 nats**, even from the unquantized FP16 file,
+  where an optimum INT8 export reaches 0.006. Q8_0 and Q6_K sit on that floor, so at those
+  precisions the quantization adds almost nothing measurable; the floor comes from the route. Its
+  cause was not isolated. It is either the published GGUF weights themselves or how OpenVINO GenAI
+  builds the model from a GGUF file.
+- **The GGUF Q4_0 file is closer to the reference than yonga's default INT4 export** (KL 0.199
+  against 0.290). The file keeps one tensor at Q8_0 (the output layer). That is the same lesson as
+  section 8.5: at this size, what stays at 8 bits matters more than the 4-bit format.
+- **Not measured:** GGUF files of other architectures, and any GPU comparison of GGUF imports; the
+  CPU was used so the arithmetic would not blur the comparison.

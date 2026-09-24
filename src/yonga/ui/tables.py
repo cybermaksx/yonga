@@ -407,22 +407,38 @@ def preparation_plan(plan: PreparationPlan) -> RenderableType:
         device_line = Text.assemble(device_line, ("  ", ""), (decision.reasons[0], "dim"))
     body.add_row(Text("Device decision"), device_line)
 
-    body.add_row(Text("Profile"), _text(plan.profile.id))
-    if plan.profile.summary:
-        body.add_row(Text(""), Text(plan.profile.summary, style="dim"))
-    quantization = plan.profile.quantization
-    quant_parts: list[str] = [quantization.weight_format]
-    if quantization.group_size is not None:
-        quant_parts.append(f"group size {quantization.group_size}")
-    if quantization.ratio is not None:
-        quant_parts.append(f"ratio {quantization.ratio:g}")
-    if quantization.symmetric is not None:
-        quant_parts.append("symmetric" if quantization.symmetric else "asymmetric")
-    if quantization.awq:
-        quant_parts.append("AWQ")
-    if quantization.scale_estimation:
-        quant_parts.append("scale estimation")
-    body.add_row(Text("Quantization"), _text(", ".join(quant_parts)))
+    gguf = plan.resolved_source.gguf_file
+    if gguf is not None:
+        # Imported as-is: the file decides the weights, the profile only the runtime.
+        body.add_row(
+            Text("GGUF file"),
+            Text.assemble((gguf, "bold"), ("  imported directly by OpenVINO GenAI", "dim")),
+        )
+        types = ", ".join(
+            f"{name} x{count}" for name, count in plan.resolved_source.gguf_tensor_types.items()
+        )
+        body.add_row(Text("Quantization"), _text(f"the file's own: {types}"))
+        body.add_row(
+            Text("Runtime profile"),
+            Text.assemble((plan.profile.id, ""), ("  runtime properties only", "dim")),
+        )
+    else:
+        body.add_row(Text("Profile"), _text(plan.profile.id))
+        if plan.profile.summary:
+            body.add_row(Text(""), Text(plan.profile.summary, style="dim"))
+        quantization = plan.profile.quantization
+        quant_parts: list[str] = [quantization.weight_format]
+        if quantization.group_size is not None:
+            quant_parts.append(f"group size {quantization.group_size}")
+        if quantization.ratio is not None:
+            quant_parts.append(f"ratio {quantization.ratio:g}")
+        if quantization.symmetric is not None:
+            quant_parts.append("symmetric" if quantization.symmetric else "asymmetric")
+        if quantization.awq:
+            quant_parts.append("AWQ")
+        if quantization.scale_estimation:
+            quant_parts.append("scale estimation")
+        body.add_row(Text("Quantization"), _text(", ".join(quant_parts)))
 
     disk = plan.disk
     body.add_row(Text("Expected download"), _text(human_bytes(disk.expected_download_bytes)))

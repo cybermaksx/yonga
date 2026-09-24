@@ -29,6 +29,7 @@ from yonga.adapters import (
     CommandRunner,
     Exporter,
     FilesystemProbe,
+    GGUFImport,
     HardwareProbe,
     HubClient,
     HubPublisher,
@@ -517,7 +518,14 @@ class Wiring:
             settings=self._settings,
             smoke_tester=self.smoke_tester(),
             export_environments=self.export_environments(),
+            gguf_importer=self.gguf_importer(),
         )
+
+    def gguf_importer(self) -> GGUFImport:
+        """Return the GGUF importer; it runs GenAI in a child process."""
+        from yonga.adapters.gguf_import import GGUFImporter
+
+        return GGUFImporter(self.command_runner())
 
     def export_environments(self) -> ExportEnvironmentManager:
         """Return the manager of isolated export environments."""

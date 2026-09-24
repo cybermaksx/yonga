@@ -25,6 +25,7 @@ from yonga.registry.schema import (
     ArchitectureRule,
     ChatProfileRule,
     DerivativeRule,
+    GGUFRule,
     IssueRule,
     ModelRule,
     ProfileRule,
@@ -50,6 +51,7 @@ BUILTIN_FILENAMES: tuple[str, ...] = (
     "derivatives.yaml",
     "repairs.yaml",
     "chat.yaml",
+    "gguf.yaml",
 )
 #: File suffixes treated as registry documents inside an override directory.
 REGISTRY_SUFFIXES: tuple[str, ...] = (".yaml", ".yml")
@@ -288,6 +290,7 @@ class _Merger:
         derivatives: list[DerivativeRule] = []
         models: list[ModelRule] = []
         chat: list[ChatProfileRule] = []
+        gguf: list[GGUFRule] = []
         for rule_id in self._order:
             rule = self._rules[rule_id]
             if isinstance(rule, ArchitectureRule):
@@ -302,6 +305,8 @@ class _Merger:
                 derivatives.append(rule)
             elif isinstance(rule, ModelRule):
                 models.append(rule)
+            elif isinstance(rule, GGUFRule):
+                gguf.append(rule)
             else:
                 chat.append(rule)
         return Registry(
@@ -313,6 +318,7 @@ class _Merger:
             derivatives=derivatives,
             models=models,
             chat=chat,
+            gguf=gguf,
             origins=dict(self._origins),
             layers=list(self.layers),
         )

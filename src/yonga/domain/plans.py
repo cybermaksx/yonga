@@ -309,6 +309,7 @@ class PreparationPlan(BaseModel):
         return (
             bool(self.exporter.problems)
             and not self.resolved_source.already_openvino
+            and self.resolved_source.gguf_file is None
             and self.export_environment is None
         )
 

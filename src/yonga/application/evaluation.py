@@ -164,8 +164,15 @@ class EvaluationService:
         device: str = "CPU",
         corpus: Corpus | None = None,
         save: bool = True,
+        allow_different_sources: bool = False,
     ) -> EvaluationResult:
-        """Compare ``candidate`` against ``reference`` over ``corpus``."""
+        """Compare ``candidate`` against ``reference`` over ``corpus``.
+
+        ``allow_different_sources`` accepts artifacts converted from different
+        repositories -- a GGUF release against the original weights, say --
+        on the caller's word that they hold the same model. The tokenizer check
+        still applies, and the result records the assertion.
+        """
         started = time.perf_counter()
         target = device.upper()
         text = corpus or load_corpus()
@@ -179,10 +186,11 @@ class EvaluationService:
                 "The candidate is the reference",
                 "Comparing an artifact with itself measures nothing.",
             )
-        if (reference_side.source_repo_id, reference_side.source_revision) != (
+        different = (reference_side.source_repo_id, reference_side.source_revision) != (
             candidate_side.source_repo_id,
             candidate_side.source_revision,
-        ):
+        )
+        if different and not allow_different_sources:
             raise _refusal(
                 "eval.different_sources",
                 "The two artifacts were converted from different weights",
@@ -191,6 +199,8 @@ class EvaluationService:
                 f"{_short(candidate_side.source_revision)}: the difference would be between "
                 "two models, not two quantizations of one.",
                 "Prepare the reference from the same source and revision.",
+                "If both hold the same model in different formats (a GGUF release and the "
+                "original weights), pass --allow-different-sources.",
             )
 
         spill_dir = self._settings.paths.tmp_dir
@@ -228,7 +238,17 @@ class EvaluationService:
             notes=[
                 f"Differences are relative to {reference_side.artifact_id} "
                 f"({reference_side.weight_format or 'unknown format'}), not to the original "
-                "weights."
+                "weights.",
+                *(
+                    [
+                        f"The two were converted from different repositories "
+                        f"({candidate_side.source_repo_id} and {reference_side.source_repo_id}); "
+                        "that they hold the same model was asserted with "
+                        "--allow-different-sources. Their tokenizers agreed on every token."
+                    ]
+                    if different
+                    else []
+                ),
             ],
         )
         if save:
@@ -319,6 +339,13 @@ class EvaluationService:
                 lp = scorer.log_probs(tokens)[:-1]
                 count = int(reference["count"])
                 ref = np.asarray(spill[reference["offset"] : reference["offset"] + count])
+                if lp.shape != ref.shape:
+                    raise _refusal(
+                        "eval.vocab_mismatch",
+                        "The two artifacts predict over different vocabularies",
+                        f"The candidate scores {lp.shape[-1]} tokens per position and the "
+                        f"reference {ref.shape[-1]}; their distributions cannot be compared.",
+                    )
                 kl = _kl_rows(ref, lp)
                 targets = tokens[1:]
                 passages.append(

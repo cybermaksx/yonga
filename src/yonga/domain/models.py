@@ -422,6 +422,13 @@ class ResolvedSource(BaseModel):
     reasons: list[str] = Field(default_factory=list)
     rule_id: str | None = None
     metadata: ModelMetadata | None = None
+    gguf_file: str | None = None
+    """For a GGUF source, the one file that is imported."""
+    gguf_architecture: str | None = None
+    """Its ``general.architecture``, read from its own header."""
+    gguf_tensor_types: dict[str, int] = Field(default_factory=dict)
+    """Its tensor types and how many tensors have each, read from its header."""
+    gguf_file_bytes: int | None = None
 
     @model_validator(mode="after")
     def _sync_openvino_flag(self) -> ResolvedSource:

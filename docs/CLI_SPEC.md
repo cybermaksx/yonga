@@ -136,6 +136,7 @@ yonga prepare MODEL \
   [--ignore-exporter-requirements] \
   [--no-managed-env] \
   [--fresh-export] \
+  [--gguf-file FILE] \
   [--yes] \
   [--force] \
   [--no-repair]
@@ -158,6 +159,18 @@ every file has been shown to be what the exporter wrote, with repaired files res
 backups first. Anything that does not check out is discarded and the export runs normally. The
 manifest records `export.reused_from_job`. `--fresh-export` always exports again. An export that was
 itself interrupted is never reused.
+
+A GGUF-only repository with no usable declared derivative is **imported** instead of exported,
+when a registry `gguf` rule covers the installed OpenVINO GenAI (`REGISTRY_SPEC.md` section 8a).
+Candidate files are the rule's preferred quantization labels in order, or the one `--gguf-file`
+names. Each candidate's header is read from the Hub, and the first whose architecture and every
+tensor type the rule verifies is chosen; the plan lists the files passed over and why. Only that
+file is downloaded. The plan shows it under **GGUF file**, its tensor mix as its **Quantization**
+(the profile's quantization settings do not apply), and the profile as **Runtime profile**. The
+artifact is named `<revision>--gguf-<label>-<device>` and records `export.backend:
+openvino-genai-gguf`. Refusals: `source.gguf_unsupported` (no verified rule, or an architecture it
+does not list), `source.gguf_no_importable_file` (every candidate holds an unreadable tensor type,
+named), `source.gguf_file_not_found`; all exit 20.
 
 Stages displayed:
 
@@ -395,7 +408,8 @@ non-loopback address prints a warning, a stronger one without a key.
 ## 13a. `eval`
 
 ```bash
-yonga eval CANDIDATE --reference REFERENCE [--device cpu|gpu] [--corpus FILE] [--json]
+yonga eval CANDIDATE --reference REFERENCE [--device cpu|gpu] [--corpus FILE]
+           [--allow-different-sources] [--json]
 ```
 
 Teacher-forced quality comparison of two artifacts of the same weights. Both read the same text. At
@@ -416,7 +430,10 @@ deleted afterwards.
 
 Refusals (exit 70): `eval.artifact_not_found`; `eval.same_artifact`; `eval.different_sources` (the
 two were converted from different repositories or revisions); `eval.tokenizer_mismatch` (the
-corpus tokenises differently, so the vocabularies differ). The shipped corpus is `yonga-eval-v1`:
+corpus tokenises differently, so the vocabularies differ); `eval.vocab_mismatch`.
+`--allow-different-sources` accepts two repositories holding the same model in different formats,
+such as a GGUF release and the original weights. It relies on your word for the lineage, which the
+result records. The tokenizer and vocabulary checks still apply. The shipped corpus is `yonga-eval-v1`:
 eight passages of original, CC0 text across prose, technical writing, Python, arithmetic,
 dialogue, procedure, encyclopedic writing and Turkish, 1955 tokens with the Qwen3.5 tokenizer.
 `--corpus` takes a `.json` of the same shape, or plain text split on blank lines. Results are

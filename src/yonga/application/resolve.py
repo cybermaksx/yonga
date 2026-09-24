@@ -19,10 +19,11 @@ verbatim:
    :class:`~yonga.domain.plans.ConfirmationReason` with code
    ``third_party_derivative``; ``never_auto`` candidates are informational and
    are never selected automatically at all;
-5. direct GGUF conversion only when the backend explicitly declares support for
-   the architecture. :data:`GGUF_BACKEND_ARCHITECTURES` is empty on every build
-   shipped so far, so this path currently fails with a clear explanation instead
-   of pretending that "a GGUF file exists" means "OpenVINO GenAI can read it";
+5. direct GGUF import only when a registry ``gguf`` rule covers the installed
+   OpenVINO GenAI, and only for a file whose own header shows an architecture
+   and tensor types that rule lists as verified. Every candidate file's header
+   is read before choosing, because "a GGUF file exists" -- or even "a Q4_K_M
+   file exists" -- is not evidence that GenAI can read it;
 6. otherwise :class:`~yonga.domain.diagnostics.SourceResolutionError`, listing
    the choices that would actually help.
 
@@ -46,13 +47,14 @@ renderer, no Hub library and no inference stack.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from collections.abc import Sequence
 from typing import Final
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from yonga.adapters import HubClient
+from yonga.adapters import GGUFInspector, HubClient
 from yonga.application.progress import ProgressEvent, ProgressKind, ProgressSink, null_sink
 from yonga.domain.diagnostics import (
     CancelledError,
@@ -74,7 +76,7 @@ from yonga.domain.models import (
 )
 from yonga.domain.plans import CONFIRMATION_THIRD_PARTY_DERIVATIVE, ConfirmationReason
 from yonga.registry.resolver import RegistryResolver
-from yonga.registry.schema import DerivativeCandidate, ModelRule, TrustPolicy
+from yonga.registry.schema import DerivativeCandidate, GGUFRule, ModelRule, TrustPolicy
 
 __all__ = [
     "CODE_GGUF_UNSUPPORTED",
@@ -83,7 +85,7 @@ __all__ = [
     "CONFIRMATION_EXPLICIT_SOURCE",
     "CONVERSION_FORMAT_PREFERENCE",
     "DEFAULT_SOURCE_POLICY",
-    "GGUF_BACKEND_ARCHITECTURES",
+    "MAX_GGUF_HEADER_CHECKS",
     "OPTION_DERIVATIVE",
     "OPTION_GGUF",
     "OPTION_OPENVINO",
@@ -94,6 +96,8 @@ __all__ = [
     "SourceResolution",
     "SourceResolver",
     "describe_source_options",
+    "gguf_model_files",
+    "gguf_quant_label",
     "is_pinned_revision",
 ]
 
@@ -102,15 +106,9 @@ __all__ = [
 # Constants
 # --------------------------------------------------------------------------- #
 
-GGUF_BACKEND_ARCHITECTURES: Final[tuple[str, ...]] = ()
-"""Architectures the bundled OpenVINO GenAI build can consume *directly* from GGUF.
-
-Empty on purpose. OpenVINO GenAI 2026.4 — the stack this release is tested
-against — has no GGUF reader for any architecture yonga supports, so no model
-qualifies for step 5 of the preference order. The tuple exists so that support,
-when it lands, is a data change backed by evidence rather than an optimistic
-branch. The presence of ``.gguf`` files in a repository is never evidence.
-"""
+#: Checking a GGUF file costs one header read (about 5-10 MB); a repository
+#: publishing a dozen quantizations is not read end to end.
+MAX_GGUF_HEADER_CHECKS: Final[int] = 6
 
 CONVERSION_FORMAT_PREFERENCE: Final[tuple[ModelFormat, ...]] = (
     ModelFormat.OPENVINO_IR,
@@ -165,8 +163,9 @@ _FORMAT_REASONS: Final[dict[ModelFormat, str]] = {
         "(PyTorch .bin); no safetensors were available."
     ),
     ModelFormat.GGUF: (
-        "The backend declares direct GGUF support for this architecture, so the "
-        "requested repository is read as-is."
+        "OpenVINO GenAI imports this GGUF file directly: its header shows an architecture "
+        "and tensor types the registry lists as verified. The weights keep the file's own "
+        "quantization."
     ),
 }
 
@@ -213,8 +212,8 @@ class SourcePolicy(BaseModel):
     confirmation"; it never promotes one.
     """
 
-    gguf_architectures: tuple[str, ...] = GGUF_BACKEND_ARCHITECTURES
-    """Architectures the backend can read directly from GGUF, case-insensitively."""
+    gguf_file: str | None = None
+    """The GGUF file to import, when the user named one (``--gguf-file``)."""
 
 
 DEFAULT_SOURCE_POLICY: Final[SourcePolicy] = SourcePolicy()
@@ -317,20 +316,63 @@ def _architecture_tokens(metadata: ModelMetadata) -> list[str]:
     return tokens
 
 
-def _supported_gguf_architecture(metadata: ModelMetadata, policy: SourcePolicy) -> str | None:
-    """Return the architecture the backend can read from GGUF, or ``None``.
+def _gguf_architecture(metadata: ModelMetadata) -> str | None:
+    """``general.architecture`` as the Hub reports it for the repository's GGUF files."""
+    value = (metadata.gguf_metadata or {}).get("architecture")
+    text = str(value).strip() if value is not None else ""
+    return text or None
 
-    Matching is an exact, casefolded comparison against
-    :attr:`SourcePolicy.gguf_architectures`. A repository whose architecture is
-    unknown never matches: "we could not tell" is not support.
+
+_GGUF_SPLIT = re.compile(r"-\d{5}-of-\d{5}\.gguf$", re.IGNORECASE)
+
+
+def gguf_model_files(files: Sequence[str]) -> list[str]:
+    """The runnable GGUF files: no ``mmproj`` side-cars and no split parts.
+
+    GenAI loads one file; a model split across ``-00001-of-00003`` parts is
+    not a single file it can read.
     """
-    supported = {name.strip().casefold() for name in policy.gguf_architectures if name.strip()}
-    if not supported:
-        return None
-    for token in _architecture_tokens(metadata):
-        if token in supported:
-            return token
-    return None
+    found: list[str] = []
+    for name in files:
+        base = name.rsplit("/", 1)[-1]
+        if not base.lower().endswith(".gguf") or base.lower().startswith("mmproj"):
+            continue
+        if _GGUF_SPLIT.search(base):
+            continue
+        found.append(name)
+    return found
+
+
+_QUANT_LABEL = re.compile(
+    r"(?:^|[-_.])((?:UD-)?(?:IQ\d_[A-Z0-9]+|Q\d_K(?:_[A-Z]+)?|Q\d_\d|BF16|FP16|F16|FP32|F32))$",
+    re.IGNORECASE,
+)
+
+
+def gguf_quant_label(filename: str) -> str:
+    """The quantization label at the end of a GGUF file name, lower-cased.
+
+    ``qwen2.5-0.5b-instruct-q4_k_m.gguf`` gives ``q4_k_m``. A name without a
+    recognisable label falls back to a short digest of the name, so two files
+    of one repository never share an artifact directory.
+    """
+    stem = filename.rsplit("/", 1)[-1].removesuffix(".gguf")
+    found = _QUANT_LABEL.search(stem)
+    if found:
+        return found.group(1).lower()
+    return "f" + hashlib.sha256(filename.encode()).hexdigest()[:8]
+
+
+def _gguf_label_order(files: Sequence[str], preferred: Sequence[str]) -> list[str]:
+    """Files carrying a preferred quantization label, in preference order."""
+    ordered: list[str] = []
+    for label in preferred:
+        pattern = re.compile(rf"(^|[-_.]){re.escape(label)}([-_.]|$)", re.IGNORECASE)
+        for name in files:
+            base = name.rsplit("/", 1)[-1].removesuffix(".gguf")
+            if name not in ordered and pattern.search(base):
+                ordered.append(name)
+    return ordered
 
 
 def _architecture_label(metadata: ModelMetadata) -> str:
@@ -357,6 +399,7 @@ def describe_source_options(
     candidates: Sequence[DerivativeCandidate] = (),
     *,
     policy: SourcePolicy | None = None,
+    gguf_rule: GGUFRule | None = None,
 ) -> list[SourceOption]:
     """Describe every preparation route for a repository, without any I/O.
 
@@ -425,19 +468,30 @@ def describe_source_options(
 
     gguf = _observation(metadata, ModelFormat.GGUF)
     if gguf is not None:
-        architecture = _supported_gguf_architecture(metadata, active)
+        architecture = _gguf_architecture(metadata)
+        readable = gguf_rule is not None and gguf_rule.reads_architecture(architecture)
+        if readable:
+            detail = (
+                f"GenAI imports {architecture} GGUF files; each file's tensor types are "
+                "checked from its header when one is chosen."
+            )
+        elif gguf_rule is None:
+            detail = (
+                "No verified direct GGUF support for the installed OpenVINO GenAI; the "
+                "presence of GGUF files is not evidence that it can read them."
+            )
+        else:
+            detail = (
+                f"OpenVINO GenAI cannot import {architecture or 'this architecture'} from GGUF "
+                f"(verified: {', '.join(gguf_rule.header_architectures)}); the presence of "
+                "GGUF files is not evidence that it can."
+            )
         options.append(
             SourceOption(
                 label=OPTION_GGUF,
-                available=architecture is not None,
+                available=readable,
                 repo_id=metadata.identity.repo_id,
-                detail=None
-                if architecture is not None
-                else (
-                    "OpenVINO GenAI cannot read GGUF for "
-                    f"{_architecture_label(metadata)}; the presence of GGUF files is "
-                    "not evidence that it can."
-                ),
+                detail=detail,
             )
         )
 
@@ -447,6 +501,49 @@ def describe_source_options(
 # --------------------------------------------------------------------------- #
 # The resolver
 # --------------------------------------------------------------------------- #
+
+
+class _GGUFChoice(BaseModel):
+    """The GGUF file chosen for import, and what its header showed."""
+
+    model_config = ConfigDict(frozen=True)
+
+    filename: str
+    architecture: str | None
+    tensor_types: dict[str, int]
+    size: int | None
+    rule_id: str
+    passed_over: tuple[str, ...] = ()
+    """Files checked first and rejected, each with why."""
+
+    def apply(self, resolved: ResolvedSource) -> ResolvedSource:
+        """``resolved`` with this choice recorded: the file, its header, and why."""
+        reasons = [
+            *resolved.reasons,
+            *(f"Passed over {reason}." for reason in self.passed_over),
+        ]
+        evidence = [
+            *resolved.evidence,
+            SourceEvidence(
+                kind="gguf_header",
+                note=(
+                    f"{self.filename}: architecture {self.architecture}, tensor types "
+                    + ", ".join(f"{name} x{count}" for name, count in self.tensor_types.items())
+                    + f"; every one verified by registry rule {self.rule_id}."
+                ),
+            ),
+        ]
+        return resolved.model_copy(
+            update={
+                "gguf_file": self.filename,
+                "gguf_architecture": self.architecture,
+                "gguf_tensor_types": dict(self.tensor_types),
+                "gguf_file_bytes": self.size,
+                "reasons": reasons,
+                "evidence": evidence,
+                "rule_id": self.rule_id,
+            }
+        )
 
 
 class SourceResolver:
@@ -499,7 +596,8 @@ class SourceResolver:
     ) -> list[SourceOption]:
         """Describe the routes available for a repository without resolving one."""
         candidates, _explanation = registry_resolver.resolve_derivatives(metadata.identity)
-        return describe_source_options(metadata, candidates, policy=policy)
+        gguf_rule, _notes = registry_resolver.resolve_gguf()
+        return describe_source_options(metadata, candidates, policy=policy, gguf_rule=gguf_rule)
 
     def resolve_detailed(
         self,
@@ -514,7 +612,8 @@ class SourceResolver:
         requested = metadata.identity
         candidates, derivative_explanation = registry_resolver.resolve_derivatives(requested)
         model_rule, _model_explanation = registry_resolver.resolve_model_rule(metadata)
-        options = describe_source_options(metadata, candidates, policy=active)
+        gguf_rule, gguf_notes = registry_resolver.resolve_gguf()
+        options = describe_source_options(metadata, candidates, policy=active, gguf_rule=gguf_rule)
         self._emit(
             ProgressKind.STAGE,
             f"Resolving a conversion source for {requested.repo_id}",
@@ -529,6 +628,7 @@ class SourceResolver:
                 rule_id=derivative_explanation.winner_id,
                 options=options,
                 policy=active,
+                gguf_rule=gguf_rule,
             )
 
         problems: list[str] = []
@@ -576,12 +676,18 @@ class SourceResolver:
 
         gguf = _observation(metadata, ModelFormat.GGUF)
         if gguf is not None:
-            architecture = _supported_gguf_architecture(metadata, active)
-            if architecture is not None:
-                return self._in_repo(metadata, gguf, options=options, model_rule=model_rule)
-            raise SourceResolutionError(
-                self._gguf_diagnostic(metadata, candidates=candidates, problems=problems)
+            choice = self._choose_gguf(
+                metadata,
+                gguf,
+                gguf_rule,
+                active,
+                notes=gguf_notes,
+                candidates=candidates,
+                problems=problems,
             )
+            resolution = self._in_repo(metadata, gguf, options=options, model_rule=model_rule)
+            resolution.resolved = choice.apply(resolution.resolved)
+            return resolution
 
         raise SourceResolutionError(
             self._unresolved_diagnostic(metadata, candidates=candidates, problems=problems)
@@ -753,6 +859,7 @@ class SourceResolver:
         rule_id: str | None,
         options: Sequence[SourceOption],
         policy: SourcePolicy,
+        gguf_rule: GGUFRule | None = None,
     ) -> SourceResolution:
         """Honour a user-chosen ``--source``, recording the lineage it asserts.
 
@@ -772,15 +879,23 @@ class SourceResolver:
         same_repo = identity.repo_id == requested.repo_id
         source_metadata = metadata if same_repo else self._hub.inspect(identity)
         observation = self._conversion_observation(source_metadata)
+        gguf_choice: _GGUFChoice | None = None
         if observation is None:
             gguf = _observation(source_metadata, ModelFormat.GGUF)
-            if gguf is not None and _supported_gguf_architecture(source_metadata, policy) is None:
+            if gguf is None:
                 raise SourceResolutionError(
-                    self._gguf_diagnostic(source_metadata, candidates=candidates, problems=[])
+                    self._unresolved_diagnostic(source_metadata, candidates=candidates, problems=[])
                 )
-            raise SourceResolutionError(
-                self._unresolved_diagnostic(source_metadata, candidates=candidates, problems=[])
+            gguf_choice = self._choose_gguf(
+                source_metadata,
+                gguf,
+                gguf_rule,
+                policy,
+                notes=[],
+                candidates=candidates,
+                problems=[],
             )
+            observation = gguf
         pinned, sha = self._pin(identity, source_metadata)
 
         declared = self._declared_candidate(identity, candidates)
@@ -854,6 +969,8 @@ class SourceResolver:
             rule_id=rule_id if declared is not None else None,
             metadata=source_metadata.model_copy(update={"resolved_revision": sha}),
         )
+        if gguf_choice is not None:
+            resolved = gguf_choice.apply(resolved)
         return SourceResolution(
             resolved=resolved,
             confirmations=confirmations,
@@ -861,6 +978,158 @@ class SourceResolver:
             lineage_warnings=lineage_warnings,
             explicit=True,
             derivative_confirmation_satisfied=True,
+        )
+
+    # -- GGUF ------------------------------------------------------------ #
+
+    def resolve_gguf(
+        self,
+        metadata: ModelMetadata,
+        *,
+        registry_resolver: RegistryResolver,
+        policy: SourcePolicy | None = None,
+    ) -> ResolvedSource:
+        """Resolve the requested repository's own GGUF file as the source, or refuse.
+
+        Step 5 of the preference order on its own, for a caller that has already
+        ruled out steps 1 to 4: ``prepare`` tries declared derivatives itself.
+        """
+        active = policy or DEFAULT_SOURCE_POLICY
+        observation = _observation(metadata, ModelFormat.GGUF)
+        if observation is None:
+            raise SourceResolutionError(
+                self._unresolved_diagnostic(metadata, candidates=(), problems=[])
+            )
+        rule, notes = registry_resolver.resolve_gguf()
+        candidates, _explanation = registry_resolver.resolve_derivatives(metadata.identity)
+        choice = self._choose_gguf(
+            metadata, observation, rule, active, notes=notes, candidates=candidates, problems=[]
+        )
+        resolution = self._in_repo(
+            metadata,
+            observation,
+            options=describe_source_options(metadata, candidates, policy=active, gguf_rule=rule),
+            model_rule=None,
+        )
+        return choice.apply(resolution.resolved)
+
+    def _choose_gguf(
+        self,
+        metadata: ModelMetadata,
+        observation: FormatObservation,
+        rule: GGUFRule | None,
+        policy: SourcePolicy,
+        *,
+        notes: Sequence[str],
+        candidates: Sequence[DerivativeCandidate],
+        problems: Sequence[str],
+    ) -> _GGUFChoice:
+        """Pick the GGUF file to import, reading candidate headers, or refuse with why.
+
+        Architecture first, from the Hub's report, because it rules the whole
+        repository out without reading a single header. Then each candidate
+        file -- the one the user named, or the registry's preferred
+        quantization labels in order -- has its header read, and the first
+        whose architecture and every tensor type the rule verifies is chosen.
+        """
+        if rule is None:
+            raise SourceResolutionError(
+                self._gguf_diagnostic(
+                    metadata,
+                    candidates=candidates,
+                    problems=[*problems, *notes],
+                    reason=(
+                        "no registry gguf rule covers the installed OpenVINO GenAI, so no GGUF "
+                        "file is known to be importable"
+                    ),
+                )
+            )
+        architecture = _gguf_architecture(metadata)
+        if architecture is not None and not rule.reads_architecture(architecture):
+            raise SourceResolutionError(
+                self._gguf_diagnostic(
+                    metadata,
+                    candidates=candidates,
+                    problems=problems,
+                    reason=(
+                        f"its GGUF architecture is {architecture}, and the GenAI GGUF importer "
+                        f"is verified only for {', '.join(rule.header_architectures)}"
+                    ),
+                )
+            )
+        files = gguf_model_files(observation.files)
+        if policy.gguf_file is not None:
+            wanted = policy.gguf_file.strip()
+            matching = [name for name in files if name == wanted or name.endswith("/" + wanted)]
+            if not matching:
+                raise SourceResolutionError(
+                    diagnostic(
+                        "source.gguf_file_not_found",
+                        FailureCategory.CONFIGURATION_ERROR,
+                        "That GGUF file is not in the repository",
+                        f"{wanted!r} is not one of {metadata.identity.repo_id}'s model files.",
+                        remediation=[f"Available: {', '.join(files) or 'none'}"],
+                    )
+                )
+            ordered = matching
+        else:
+            ordered = _gguf_label_order(files, rule.preferred_files)
+        inspector = self._hub if isinstance(self._hub, GGUFInspector) else None
+        if inspector is None:
+            raise SourceResolutionError(
+                self._gguf_diagnostic(
+                    metadata,
+                    candidates=candidates,
+                    problems=problems,
+                    reason="this Hub client cannot read GGUF headers",
+                )
+            )
+        pinned, _sha = self._pin(metadata.identity, metadata)
+        supported = frozenset(rule.tensor_types)
+        rejected: list[str] = []
+        for name in ordered[:MAX_GGUF_HEADER_CHECKS]:
+            self._emit(ProgressKind.STAGE, f"Reading the header of {name}", repo_id=pinned.repo_id)
+            header = inspector.gguf_header(pinned, name)
+            if not rule.reads_architecture(header.architecture):
+                rejected.append(f"{name}: architecture {header.architecture or 'unknown'}")
+                continue
+            unsupported = header.unsupported_types(supported)
+            if unsupported:
+                rejected.append(f"{name}: holds {', '.join(unsupported)} tensors")
+                continue
+            size = next((entry.size for entry in metadata.files if entry.path == name), None)
+            return _GGUFChoice(
+                filename=name,
+                architecture=header.architecture,
+                tensor_types=dict(header.tensor_types),
+                size=size,
+                rule_id=rule.id,
+                passed_over=tuple(rejected),
+            )
+        if not ordered:
+            rejected.append(
+                "no file carries a preferred quantization label ("
+                + ", ".join(rule.preferred_files)
+                + "); name one with --gguf-file"
+            )
+        raise SourceResolutionError(
+            diagnostic(
+                "source.gguf_no_importable_file",
+                FailureCategory.SOURCE_FORMAT_UNSUPPORTED,
+                "No GGUF file in this repository can be imported",
+                (
+                    f"The GenAI GGUF importer reads {', '.join(rule.tensor_types)} tensors. "
+                    "Every candidate file holds a type it cannot convert: "
+                    + "; ".join(rejected)
+                    + "."
+                ),
+                remediation=[
+                    "Name a file of another quantization with --gguf-file (Q8_0 files hold "
+                    "only Q8_0 and F32 tensors).",
+                    *SourceResolver._choices(metadata, candidates, problems),
+                ],
+                context={"repo_id": metadata.identity.repo_id, "format": ModelFormat.GGUF.value},
+            )
         )
 
     # -- shared mechanism ------------------------------------------------ #
@@ -981,18 +1250,18 @@ class SourceResolver:
         *,
         candidates: Sequence[DerivativeCandidate],
         problems: Sequence[str],
+        reason: str,
     ) -> Diagnostic:
-        """Explain that GGUF weights exist but cannot be read for this architecture."""
+        """Explain that GGUF weights exist but cannot be imported, and why."""
         return diagnostic(
             CODE_GGUF_UNSUPPORTED,
             FailureCategory.SOURCE_FORMAT_UNSUPPORTED,
             "This repository publishes GGUF weights only",
             (
-                f"{metadata.identity.repo_id} publishes GGUF weights only. The OpenVINO GenAI "
-                f"build yonga is running has no direct GGUF reader for "
-                f"{_architecture_label(metadata)}, and the presence of .gguf files is not "
-                f"evidence that it has one. yonga stops here rather than start a conversion "
-                f"that cannot succeed."
+                f"{metadata.identity.repo_id} publishes GGUF weights only, and they cannot be "
+                f"imported directly: {reason}. The presence of .gguf files is not evidence "
+                f"that OpenVINO GenAI can read them, so yonga stops here rather than start a "
+                f"conversion that cannot succeed."
             ),
             remediation=SourceResolver._choices(metadata, candidates, problems),
             context={"repo_id": metadata.identity.repo_id, "format": ModelFormat.GGUF.value},

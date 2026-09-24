@@ -196,9 +196,12 @@ The tool never silently substitutes an unrelated model. A derivative source may 
 Known derivative        yes  nDimensional/Qwen3.5-9B-Uncensored-Safetensors — declared
                         lossless_conversion; trust suggest; The requested repository publishes GGUF
                         weights only, which the OpenVINO exporter cannot read. — approval required
-Direct GGUF conversion  no   OpenVINO GenAI cannot read GGUF for this architecture; the presence of
-                        GGUF files is not evidence that it can.
+Direct GGUF conversion  no   OpenVINO GenAI cannot import qwen35 from GGUF (verified: llama, qwen2,
+                        qwen3); the presence of GGUF files is not evidence that it can.
 ```
+
+For llama, qwen2 and qwen3 GGUF files it can: `prepare` reads each candidate file's header, imports
+the first whose every tensor type OpenVINO GenAI can read, and produces an ordinary artifact.
 
 ## Repository documentation
 

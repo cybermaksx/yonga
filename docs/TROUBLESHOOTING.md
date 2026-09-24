@@ -62,13 +62,14 @@ reason's code: the NNCF group-size failure in section 5.4 exits **70**, not 40.
 
 ## 3. Registry issue codes
 
-Eleven rules ship today.
+Twelve rules ship today.
 
 | Code | Rule id | Category | Exit | Means | Do this |
 |---|---|---|---|---|---|
 | `npu.compiler.unsupported_graph.qwen35` | `qwen35-npu-fp16-bufferize` | `compiler_unsupported_graph` | 51 | The NPU compiler refused a Qwen3.5 graph: an operation is implemented only for FP16 on the NPU. | Prepare for the GPU: `yonga prepare MODEL --device gpu`. The NPU is not broken. |
 | `npu.compiler.dynamic_shape` | `npu-compiler-dynamic-shape` | `compiler_unsupported_graph` | 51 | A raw compile kept the IR's dynamic dimensions; the NPU compiler needs static shapes. The rule is `defer_to_pipeline`: yonga records the raw failure as `deferred` and lets the GenAI pipeline, which reshapes to `MAX_PROMPT_LEN`/`MIN_RESPONSE_LEN`, decide. You see this code only when that pipeline could not be built either. | Read the pipeline error in `yonga logs JOB_ID --raw`; if it names a compiler pass, the model is not NPU-compatible — use the GPU. |
 | `npu.compiler.unsupported_graph` | `npu-compiler-unsupported-graph-generic` | `compiler_unsupported_graph` | 51 | The NPU compiler refused the graph, and no family-specific rule applies. | Use GPU or CPU; re-check after an OpenVINO/NPU compiler update. |
+| `npu.pipeline.static_reshape_failed` | `npu-static-reshape-broadcast` | `compiler_unsupported_graph` | 51 | The GenAI NPU pipeline could not reshape the graph to static shapes (`Broadcast incorrect target shape`). Seen for a model GenAI built from a GGUF file. | Use the GPU or CPU; for the NPU, prepare the same model from its safetensors repository with an NPU profile and let the probe decide. |
 | `npu.compiler.pass_failed` | `npu-compiler-pass-failed` | `compiler_unsupported_graph` | 51 | A named NPU compiler pass failed, and the compiler answered — so the driver is working. | Use the GPU; the failing pass is in `yonga logs JOB_ID --raw`. |
 | `tokenizer.ir.string_precision` | `tokenizer-string-precision-read` | `tokenizer_ir_incompatible` | 41 | The exported tokenizer XML writes `precision="STRiNG"`, which OpenVINO cannot read. | `yonga prepare MODEL --force`; the repair is applied automatically during validation. |
 | `npu.device.permission_denied` | `npu-permission-denied` | `permission_denied` | 10 | The kernel refused access to the NPU node. | Join the `render` group (see `docs/INSTALL.md` section 3). No device fallback is offered on purpose. |
@@ -379,6 +380,22 @@ torch had come from the CPU index. The two cannot load together. yonga now insta
 torch-built package (`torch`, `torchvision`) from the same CPU index. If you see this error in an
 environment of your own, install both from one index:
 `pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu`.
+
+### 5.8 A GGUF repository cannot be imported
+
+```text
+✗ No GGUF file in this repository can be imported
+The GenAI GGUF importer reads F32, F16, Q4_0, Q4_K, Q6_K, Q8_0 tensors. Every candidate file holds
+a type it cannot convert: qwen2.5-0.5b-instruct-q4_k_m.gguf: holds Q5_0 tensors.
+```
+
+A GGUF file's name gives its *nominal* quantization. Its header lists what every tensor actually
+is, and yonga reads that before downloading anything. `Q4_K_M` files often carry `Q5_0` or `Q5_K`
+tensors, which the OpenVINO GenAI 2026.4 reader rejects (`[load_gguf] gguf_tensor_to_f16 failed`).
+Name a different file with `--gguf-file`: `Q8_0` files hold only `Q8_0` and `F32` tensors, and
+`Q4_0` files usually add a single `Q8_0`. `source.gguf_unsupported` means the architecture itself
+cannot be imported, for example gemma3 or qwen35. There, a safetensors repository of the same
+model is the route, declared as a derivative or named with `--source`.
 
 ## 6. Reading a job log
 
