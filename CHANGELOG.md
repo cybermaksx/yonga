@@ -51,6 +51,15 @@ manifest may change in any minor release.
   `yonga env list|remove` manage them and `doctor` reports their disk use. `--no-managed-env` restores
   the refusal; `--ignore-exporter-requirements` exports in the current environment and never builds
   one. Registry data can choose only a version for a package yonga lists, never a package of its own.
+- **`yonga eval CANDIDATE --reference REF`** measures what a quantization cost. It compares the
+  two artifacts' next-token distributions, teacher-forced, over a shipped corpus of original text
+  in eight domains (including Python and Turkish), and reports mean KL divergence, top-1 agreement
+  and perplexity, in total and per passage. It runs the IR directly through `openvino.Core`, on the
+  CPU at f32 by default, with one model loaded at a time. It refuses artifacts of different weights
+  or vocabularies. New `cpu-int8-asym-ref` and `cpu-fp16-ref` profiles prepare references and are
+  never a device's default. On Qwen3.5-9B, `npu-int4-sym-cw` diverges from INT8 2.5 times as much as
+  `gpu-int4-asym-g128` (KL 0.197 vs 0.080, perplexity +22 % vs +7 %): see `PROFILE_COMPARISON.md`
+  section 8.
 - **Signed remote registry bundles:** `yonga registry update [--url | --file]`, `status`, `reset`.
   A bundle is verified against Ed25519 keys the user trusts (yonga ships none) and refused when
   expired, older than the installed one, or naming a path outside it. Every repair rule must name a

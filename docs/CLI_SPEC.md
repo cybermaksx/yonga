@@ -392,6 +392,39 @@ When `YONGA_API_KEY` is set in the environment, every endpoint except `/health` 
 `Authorization: Bearer <key>` (401 otherwise). The key is never logged or echoed. Binding a
 non-loopback address prints a warning, a stronger one without a key.
 
+## 13a. `eval`
+
+```bash
+yonga eval CANDIDATE --reference REFERENCE [--device cpu|gpu] [--corpus FILE] [--json]
+```
+
+Teacher-forced quality comparison of two artifacts of the same weights. Both read the same text. At
+every position the candidate's next-token distribution is compared with the reference's:
+
+- mean `KL(reference || candidate)` in nats, the figure to rank by;
+- top-1 agreement;
+- each artifact's perplexity, and the candidate's change against the reference.
+
+Nothing is sampled, so a result is deterministic for a pair of artifacts, a device and a corpus.
+
+The logits come straight from the IR through `openvino.Core` (GenAI does not expose them),
+tokenised by the artifact's own `openvino_tokenizer.xml`. `--device cpu`, the default, runs at
+`INFERENCE_PRECISION_HINT=f32`, so the measured difference is the quantization's and not the
+arithmetic's. `--device gpu` measures what the GPU actually computes. One model is loaded at a time;
+the reference's log-probabilities are spilled to a memory-mapped file under the managed cache and
+deleted afterwards.
+
+Refusals (exit 70): `eval.artifact_not_found`; `eval.same_artifact`; `eval.different_sources` (the
+two were converted from different repositories or revisions); `eval.tokenizer_mismatch` (the
+corpus tokenises differently, so the vocabularies differ). The shipped corpus is `yonga-eval-v1`:
+eight passages of original, CC0 text across prose, technical writing, Python, arithmetic,
+dialogue, procedure, encyclopedic writing and Turkish, 1955 tokens with the Qwen3.5 tokenizer.
+`--corpus` takes a `.json` of the same shape, or plain text split on blank lines. Results are
+saved under `<data>/evaluations/`.
+
+The result is relative to the reference, which is itself an artifact. The `cpu-int8-asym-ref` and
+`cpu-fp16-ref` registry profiles exist to prepare one, and never become a device's default.
+
 ## 14a. `publish`
 
 ```bash

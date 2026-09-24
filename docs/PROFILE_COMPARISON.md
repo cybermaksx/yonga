@@ -3,10 +3,12 @@
 Two INT4 quantizations of the same Qwen3.5-9B weights, converted and measured on one machine in one
 session.
 
-**This measures size and speed only. Output quality was not evaluated at all.** Nothing here says
-that either artifact answers better, and neither a smaller file nor a higher tok/s is evidence that
-it does. Weight quantization changes what the model computes; the only measurements below are of
-bytes on disk and of how fast tokens came out. Do not read a ranking into them.
+Sections 4 to 6 measure size and speed; **section 8 measures output quality**, which was added
+later with `yonga eval`. The two kinds of result must not be confused: neither a smaller file nor a
+higher tok/s is evidence of better output, and in this comparison they point in opposite
+directions. The speed difference is within noise. The quality difference is not: the group-wise
+asymmetric artifact B stays about 2.5 times closer to an INT8 reference than the channel-wise
+symmetric A, on every passage.
 
 ## 1. What this document is, and what asked for it
 
@@ -311,15 +313,117 @@ Established, on this host, in this session:
 - At 3 runs per prompt the generation-speed difference between them is smaller than the run-to-run
   variation within either one.
 
+- Measured against an INT8 reference of the same weights (section 8), B's predictions stay much
+  closer: mean KL 0.080 against 0.197, 86.8 % against 81.8 % top-1 agreement, and perplexity +7.1 %
+  against +22.4 %, on every one of eight passages and on both CPU and GPU.
+
 Not established, and not attempted:
 
-- **Output quality.** Nothing here evaluated correctness, coherence, instruction-following,
-  hallucination, refusal behaviour, vision-input handling or any benchmark of capability. The two
-  artifacts quantize the same weights differently, which by construction changes what the model
-  computes. A size or throughput number is not evidence about any of that, and no conclusion about
-  which artifact is *better* follows from this document.
+- **Task-level capability.** Section 8 measures how far each artifact's next-token predictions
+  move from a reference. That is not a measurement of correctness, instruction-following,
+  hallucination, refusal behaviour or vision-input handling, and no benchmark of capability was
+  run. Closer to the reference is strong evidence of less damage from quantization. It does not
+  prove that any particular answer is better.
 - **Which profile to use on the NPU.** Neither artifact compiled on the NPU; A never got that far,
   which is why it exists on the GPU at all.
 - **Anything about another machine.** One CPU, one iGPU, one driver, one OpenVINO release, one
   session, one thermal state. `yonga` records the whole identity in section 3 precisely so that a
   reader can tell how narrow that is.
+
+## 8. Output quality
+
+Measured after the rest of this document, with `yonga eval` (`CLI_SPEC.md` section 13a). The
+measurement is teacher-forced: each artifact reads the same text and, at every position, its
+next-token distribution is compared with a reference's. No text is generated, so nothing depends on
+sampling, and the numbers are deterministic for a given pair, device and corpus.
+
+### 8.1 The reference, and why it can stand in for the original weights
+
+An FP16 IR of Qwen3.5-9B is about 18 GB and does not fit this host alongside the evaluation. The
+reference is therefore `3904983a446e705e`, prepared from the same source and revision with the
+`cpu-int8-asym-ref` profile: 8-bit asymmetric per-channel weights, 8.8 GiB. Every figure below is
+relative to it, not to the original weights.
+
+Whether INT8 is close enough to stand in for FP16 was measured on a model where FP16 fits,
+`Qwen/Qwen3-0.6B` (CPU, f32 inference, same corpus):
+
+| Candidate | Reference | Mean KL | Top-1 agreement | Perplexity change |
+|---|---|---|---|---|
+| `cpu-int8-asym-ref` | `cpu-fp16-ref` | 0.0074 | 95.42 % | +0.33 % |
+| `cpu-int4-asym-g128` | `cpu-fp16-ref` | 0.3563 | 70.18 % | +32.83 % |
+| `cpu-int4-asym-g128` | `cpu-int8-asym-ref` | 0.3552 | 70.13 % | +32.39 % |
+| `npu-int4-sym-g128` | `cpu-fp16-ref` | 0.3884 | 69.20 % | +33.42 % |
+| `npu-int4-sym-g128` | `cpu-int8-asym-ref` | 0.3849 | 69.77 % | +32.98 % |
+
+INT8's own divergence from FP16 is about 48 times smaller than INT4's, and measuring the INT4
+artifacts against INT8 instead of FP16 changes their KL by less than 1 %. On this model family,
+INT8 is a sound proxy. (The same table records that INT4 at ratio 1.0 costs a 0.6B model a third of
+its perplexity; small models quantize badly, see the roadmap.)
+
+### 8.2 The corpus
+
+`yonga-eval-v1`, shipped with yonga: eight passages of original CC0 text, 1955 tokens with this
+tokenizer, 1947 scored positions (the first token of each passage has no prediction). There is one
+passage per domain: narrative prose, technical explanation, Python, arithmetic reasoning, dialogue,
+Turkish prose, a procedure and encyclopedic writing. Both artifacts tokenise it identically, which
+`yonga eval` checks before comparing anything.
+
+### 8.3 Results
+
+Candidate against the INT8 reference, on the CPU at `INFERENCE_PRECISION_HINT=f32`, so the
+difference is the quantization's and not the arithmetic's:
+
+| | A `npu-int4-sym-cw` | B `gpu-int4-asym-g128` |
+|---|---|---|
+| Mean KL (nats) | 0.1972 | 0.0799 |
+| Top-1 agreement | 81.82 % | 86.80 % |
+| Perplexity (reference 4.655) | 5.700 (+22.44 %) | 4.983 (+7.05 %) |
+
+Per passage, mean KL (lower is closer):
+
+| Passage | A | B | A / B |
+|---|---|---|---|
+| narrative | 0.2030 | 0.0948 | 2.1 |
+| technical | 0.2316 | 0.1103 | 2.1 |
+| code | 0.0790 | 0.0247 | 3.2 |
+| arithmetic | 0.1205 | 0.0541 | 2.2 |
+| dialogue | 0.1921 | 0.0614 | 3.1 |
+| turkish | 0.3774 | 0.1421 | 2.7 |
+| instructions | 0.2362 | 0.0917 | 2.6 |
+| facts | 0.1553 | 0.0739 | 2.1 |
+
+The same comparison on the GPU, where both artifacts actually run (FP16 arithmetic on the device):
+
+| | A `npu-int4-sym-cw` | B `gpu-int4-asym-g128` |
+|---|---|---|
+| Mean KL | 0.1997 | 0.0822 |
+| Top-1 agreement | 81.51 % | 86.75 % |
+| Perplexity (reference 4.649) | 5.710 (+22.83 %) | 4.977 (+7.07 %) |
+
+The GPU figures agree with the CPU ones to within 3 %. The device's arithmetic adds little to what
+the quantization already took. On this host a GPU evaluation took about 60 s and 3 GB of host
+memory per pair, against about 900 s and 17 to 19 GB on the CPU.
+
+### 8.4 What this establishes
+
+- B's predictions are measurably closer to the reference than A's: 2.5 times lower mean KL, five
+  points more top-1 agreement, and a perplexity increase of 7 % against 22 %. This is not an
+  average hiding a mixed picture: B is closer on every passage, by a factor of 2.1 to 3.2.
+- The ordering is the same on the CPU and on the GPU.
+- Both artifacts lose most on Turkish and least on Python, so the cost of quantization is uneven
+  across domains, and an evaluation on English prose alone would understate it.
+
+Read together with sections 4 and 5: A saves 2.2 % of disk and its speed is within the run-to-run
+noise of B's, while its output diverges from the reference 2.5 times as much. On this GPU, B is the
+better artifact. The channel-wise symmetric format exists because the NPU needs it for larger
+models; that is a reason to use it on the NPU, and on this evidence not a reason to use it anywhere
+else.
+
+Reproduce:
+
+```bash
+yonga prepare HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive --device gpu --profile cpu-int8-asym-ref --yes
+yonga eval 197ef1cdb734bd80 --reference 3904983a446e705e --device cpu
+yonga eval 289ede59ae155cd8 --reference 3904983a446e705e --device cpu
+```
+

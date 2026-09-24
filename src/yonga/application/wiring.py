@@ -42,6 +42,7 @@ from yonga.application.benchmark import RuntimeFactory as BenchmarkRuntimeFactor
 from yonga.application.chat import ChatService
 from yonga.application.chat import RuntimeFactory as ChatRuntimeFactory
 from yonga.application.doctor import DoctorService
+from yonga.application.evaluation import EvaluationService, LogitsScorer
 from yonga.application.inspect_model import InspectService
 from yonga.application.prepare import PrepareService, SmokeTester
 from yonga.application.probe import LocalArtifactStore, ProbeService
@@ -342,6 +343,24 @@ class Wiring:
     def search_service(self) -> SearchService:
         """Build the ``yonga search`` service. It needs the Hub, never the hardware."""
         return SearchService(self.hub_search(), self.registry_resolver())
+
+    def evaluation_service(self, *, progress: ProgressSink | None = None) -> EvaluationService:
+        """Build the ``yonga eval`` service. OpenVINO is imported only when it scores."""
+
+        def scorer(path: Path, device: str) -> LogitsScorer:
+            from yonga.adapters.openvino_logits import LogitsModel
+
+            return LogitsModel(path, device=device)
+
+        return EvaluationService(
+            self.artifact_store(),
+            scorer,
+            self._settings,
+            progress=progress,
+            package_versions=lambda: {
+                name: version for name, version in installed_registry_versions().items() if version
+            },
+        )
 
     def hub_publisher(self) -> HubPublisher:
         """Return the Hub writer. Built only by ``publish``; nothing else uploads."""

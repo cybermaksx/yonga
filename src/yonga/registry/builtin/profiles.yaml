@@ -109,3 +109,45 @@ profiles:
     sources:
       - kind: model_card
         url: https://huggingface.co/OpenVINO/Qwen3.5-9B-int4-ov
+
+  # Reference profiles. Never a device's default (low priority); they exist so
+  # `yonga eval` has a higher-precision artifact to measure an INT4 one against.
+  - id: cpu-int8-asym-ref
+    schema_version: 1
+    status: active
+    priority: 10
+    summary: INT8 asymmetric per-channel reference for quality evaluation
+    device: cpu
+    format: openvino_ir
+    quantization:
+      weight_format: int8
+      symmetric: false
+    constraints:
+      openvino: ">=2026.2,<2027"
+    rationale: >-
+      8-bit weight-only compression is the usual near-lossless reference when the
+      model is too large to evaluate at 16 bits on the host. It is still a
+      quantization: `yonga eval` reports differences relative to it, not to the
+      original weights, and says so.
+    sources:
+      - kind: official_docs
+        url: https://docs.openvino.ai/2026/openvino-workflow/model-optimization-guide/weight-compression.html
+
+  - id: cpu-fp16-ref
+    schema_version: 1
+    status: active
+    priority: 5
+    summary: Uncompressed FP16 reference for quality evaluation
+    device: cpu
+    format: openvino_ir
+    quantization:
+      weight_format: fp16
+    constraints:
+      openvino: ">=2026.2,<2027"
+    rationale: >-
+      The closest an OpenVINO IR gets to the source weights. Twice the size of
+      INT8 and four times INT4, so practical as a reference only for models
+      that fit the host's memory at 16 bits.
+    sources:
+      - kind: official_docs
+        url: https://docs.openvino.ai/2026/openvino-workflow/model-optimization-guide/weight-compression.html

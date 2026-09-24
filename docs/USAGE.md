@@ -199,6 +199,22 @@ yonga remove ARTIFACT               # artifact + its compile cache, nothing else
 TTFT 276 ms • 18.2 tok/s • TPOT 55.0 ms/token • 20 → 159 tokens
 ```
 
+### Measure what the quantization cost
+
+`bench` says how fast an artifact is; `eval` says how much its quantization changed the model. It
+needs a higher-precision artifact of the same weights to compare against:
+
+```bash
+yonga prepare MODEL --device cpu --profile cpu-int8-asym-ref --yes   # near-lossless reference
+yonga eval ARTIFACT --reference REF_ARTIFACT                         # CPU, full precision
+yonga eval ARTIFACT --reference REF_ARTIFACT --device gpu            # what the GPU computes
+```
+
+It reports mean KL divergence (lower is closer; 0 is identical), top-1 agreement and perplexity,
+in total and per passage (prose, code, arithmetic, Turkish, and more). Use `cpu-fp16-ref` as the
+reference when the model fits in memory at 16 bits. On `Qwen/Qwen3-0.6B`, INT8 against FP16 measured
+KL 0.0074, so INT8 is a fair stand-in when FP16 does not fit.
+
 ### Publish it
 
 ```bash

@@ -1194,6 +1194,42 @@ def _serve(
 
 
 # ======================================================================
+# eval
+# ======================================================================
+@app.command("eval")
+def eval_command(
+    ctx: typer.Context,
+    candidate: str = typer.Argument(..., metavar="CANDIDATE", help="Artifact to evaluate."),
+    reference: str = typer.Option(
+        ..., "--reference", help="Higher-precision artifact of the same weights to compare to."
+    ),
+    device: str = typer.Option("cpu", "--device", help="cpu (full precision) or gpu."),
+    corpus: Path | None = typer.Option(
+        None, "--corpus", help="Text to read instead of the shipped corpus (.json or .txt)."
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Emit the result as JSON."),
+) -> None:
+    """Measure how far CANDIDATE's predictions move from REFERENCE's (KL, top-1, perplexity)."""
+    state = cli_state(ctx, json_output=json_output)
+
+    def run() -> ExitCode:
+        from yonga.application.evaluation import load_corpus, result_payload
+
+        service = state.graph.evaluation_service(progress=state.sink())
+        chosen = _device(device)
+        target = "CPU" if chosen in (None, "auto") else str(chosen)
+        text = load_corpus(corpus) if corpus is not None else None
+        result = service.evaluate(candidate, reference, device=target, corpus=text)
+        if state.json_mode:
+            state.emit(result_payload(result))
+        else:
+            state.console.print(tables.evaluation_result(result))
+        return ExitCode.SUCCESS
+
+    _dispatch(state, run)
+
+
+# ======================================================================
 # publish
 # ======================================================================
 @app.command()

@@ -31,6 +31,7 @@ from yonga.domain.compatibility import (
     ResolutionExplanation,
 )
 from yonga.domain.diagnostics import HealthSection, Severity
+from yonga.domain.evaluation import EvaluationResult
 from yonga.domain.models import ModelMetadata
 from yonga.domain.plans import PreparationPlan
 from yonga.domain.publication import PublishPlan
@@ -1082,6 +1083,58 @@ def publication_plan(plan: PublishPlan) -> RenderableType:
     return Panel(
         Group(*blocks),
         title="Publication plan",
+        border_style="cyan",
+        box=ROUNDED,
+        padding=(1, 2),
+    )
+
+
+def evaluation_result(result: EvaluationResult) -> RenderableType:
+    """Render one ``yonga eval`` comparison: the totals, then every passage."""
+    summary = result.summary
+    head = _grid()
+    head.add_row(
+        Text("Candidate"),
+        Text.assemble(
+            (result.candidate.artifact_id, "bold"), (f"  {result.candidate.profile}", "dim")
+        ),
+    )
+    head.add_row(
+        Text("Reference"),
+        Text.assemble(
+            (result.reference.artifact_id, "bold"), (f"  {result.reference.profile}", "dim")
+        ),
+    )
+    precision = result.runtime_properties.get("INFERENCE_PRECISION_HINT", "device default")
+    head.add_row(Text("Device"), _text(f"{result.device} (inference precision {precision})"))
+    head.add_row(Text("Corpus"), _text(f"{result.corpus_id}, {summary.positions} scored tokens"))
+    head.add_row(Text("Mean KL"), Text(f"{summary.kl_mean:.4f} nats", style="bold"))
+    agreement = f"{100 * summary.top1_agreement:.2f} %"
+    head.add_row(Text("Top-1 agreement"), Text(agreement, style="bold"))
+    head.add_row(
+        Text("Perplexity"),
+        _text(
+            f"{summary.candidate_perplexity:.3f} against {summary.reference_perplexity:.3f} "
+            f"({summary.perplexity_change_pct:+.2f} %)"
+        ),
+    )
+    table = Table(box=SIMPLE, show_edge=False, pad_edge=False)
+    for column in ("Passage", "Tokens", "Mean KL", "Max KL", "Top-1", "PPL ref", "PPL cand"):
+        table.add_column(column, justify="left" if column == "Passage" else "right")
+    for passage in result.passages:
+        table.add_row(
+            passage.passage_id,
+            str(passage.positions),
+            f"{passage.kl_mean:.4f}",
+            f"{passage.kl_max:.3f}",
+            f"{100 * passage.top1_agreement:.1f} %",
+            f"{passage.reference_perplexity:.2f}",
+            f"{passage.candidate_perplexity:.2f}",
+        )
+    notes = [Text(note, style="dim") for note in result.notes]
+    return Panel(
+        Group(head, Text(""), table, *notes),
+        title="Quality evaluation",
         border_style="cyan",
         box=ROUNDED,
         padding=(1, 2),

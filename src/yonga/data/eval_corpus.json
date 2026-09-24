@@ -1,0 +1,47 @@
+{
+  "id": "yonga-eval-v1",
+  "description": "Original text written for yonga's quality evaluation, one passage per domain. Each passage is evaluated on its own, from an empty context.",
+  "license": "CC0-1.0",
+  "passages": [
+    {
+      "id": "narrative",
+      "genre": "prose",
+      "text": "The ferry left the harbour an hour late, as it did every Thursday in winter, and Mira stood at the rail watching the lights of the town fold themselves into the fog. She had made this crossing so many times that she no longer noticed the smell of diesel or the way the deck shuddered when the engines changed pitch. What she noticed instead was the silence of the other passengers. Nobody spoke on the winter ferry. People sat with their hands around paper cups of tea, looking at nothing, as if the grey water had asked them a question they were still thinking about. Halfway across, the fog thinned and the island appeared all at once: the long black ridge, the white lighthouse, the scatter of houses along the shore. Her grandmother's house was the last one before the rocks, the one with the green door that had not been painted since the summer her grandfather died. Mira had come to sort through the rooms and decide what to keep. She already knew the answer would be almost nothing, and she already knew she would keep it anyway."
+    },
+    {
+      "id": "technical",
+      "genre": "explanation",
+      "text": "A write-ahead log makes a database durable by recording every change before the change is applied to the data files. When a transaction commits, the database appends a description of the change to the log and forces that record to stable storage; only then does it report success to the client. The data pages themselves can be written later, in any order, because if the machine loses power the log still holds everything needed to repeat the work. Recovery reads the log from the last checkpoint forward and replays each committed change whose effects might not have reached the disk. Two details make this efficient. First, appending to a log is sequential, and sequential writes are far cheaper than scattered updates to pages spread across a large file. Second, many small commits can share a single flush, a technique called group commit, so the cost of forcing data to disk is divided among every transaction waiting at that moment. The price of this design is that the log grows without bound unless the system periodically writes a checkpoint and discards the records that no longer need to be replayed."
+    },
+    {
+      "id": "code",
+      "genre": "python",
+      "text": "from collections import deque\n\n\ndef shortest_path(grid, start, goal):\n    \"\"\"Return the length of the shortest path through open cells, or -1.\n\n    ``grid`` is a list of strings in which '#' marks a wall. Moves are\n    horizontal or vertical, one cell at a time.\n    \"\"\"\n    rows, cols = len(grid), len(grid[0])\n    seen = {start}\n    queue = deque([(start, 0)])\n    while queue:\n        (row, col), distance = queue.popleft()\n        if (row, col) == goal:\n            return distance\n        for d_row, d_col in ((1, 0), (-1, 0), (0, 1), (0, -1)):\n            nxt = (row + d_row, col + d_col)\n            if not (0 <= nxt[0] < rows and 0 <= nxt[1] < cols):\n                continue\n            if grid[nxt[0]][nxt[1]] == '#' or nxt in seen:\n                continue\n            seen.add(nxt)\n            queue.append((nxt, distance + 1))\n    return -1\n\n\nif __name__ == '__main__':\n    maze = [\n        '..#....',\n        '.##.##.',\n        '....#..',\n        '#.#...#',\n    ]\n    print(shortest_path(maze, (0, 0), (3, 5)))\n"
+    },
+    {
+      "id": "arithmetic",
+      "genre": "reasoning",
+      "text": "A bakery sells bread rolls in bags of six and in bags of four. On Monday it sold 17 bags in total and 86 rolls. How many bags of each size did it sell? Let x be the number of bags of six and y the number of bags of four. Then x + y = 17 and 6x + 4y = 86. Multiplying the first equation by four gives 4x + 4y = 68. Subtracting this from the second equation leaves 2x = 18, so x = 9. Substituting back, y = 17 - 9 = 8. Check: nine bags of six hold 54 rolls, eight bags of four hold 32 rolls, and 54 + 32 = 86. So the bakery sold nine bags of six and eight bags of four. On Tuesday it sold the same number of bags but four more rolls. Because swapping one bag of four for one bag of six adds exactly two rolls without changing the number of bags, the bakery must have sold two more bags of six and two fewer bags of four: eleven bags of six and six bags of four, which is 66 + 24 = 90 rolls."
+    },
+    {
+      "id": "dialogue",
+      "genre": "conversation",
+      "text": "\"You're sure it was the blue one?\" asked the inspector.\n\"Completely sure. I remember because the blue one has a cracked handle, and I thought at the time that someone ought to replace it.\"\n\"And you left the kitchen at what time?\"\n\"Just after nine. The clock over the door was running slow, but the radio had started the news, so it can't have been later than five past.\"\n\"Did anyone see you leave?\"\n\"The gardener was outside. He waved. At least, I think he waved. He might have been swatting at a wasp.\"\nThe inspector wrote something in his notebook and underlined it twice. \"When you came back, was the blue jug still on the table?\"\n\"No. That's what I'm telling you. It was on the windowsill, and it was full of water, and nobody in this house ever fills that jug, because of the crack.\"\n\"Then somebody who doesn't live here filled it.\"\n\"Or somebody who wanted us to think exactly that.\""
+    },
+    {
+      "id": "turkish",
+      "genre": "prose-tr",
+      "text": "Kasabanın eski çarşısı sabahın erken saatlerinde bambaşka bir yer olurdu. Dükkânların kepenkleri henüz yarıya kadar kalkmış, fırının önünde sıcak ekmek bekleyenler sessizce sıraya girmiş olurdu. Çaycı Hasan Efendi ilk demliği her zaman aynı saatte ocağa koyar, ilk bardağı da kimseye söylemeden köşedeki saatçiye götürürdü. Saatçi ise yıllardır tek bir saati onarmaya çalışıyordu: babasından kalan, kırk yıl önce durmuş bir cep saati. Müşteriler bu saati sorduğunda gülümser, \"Acelesi yok, o zaten zamanı biliyor\" derdi. Öğleye doğru çarşı kalabalıklaşır, pazarlık sesleri, çekiç tıkırtıları ve radyodan gelen eski şarkılar birbirine karışırdı. Akşamüstü ise herkes işini toplar, kepenkler yeniden iner, sokakta yalnızca kediler ve rüzgârın savurduğu birkaç kâğıt parçası kalırdı. Ertesi sabah her şey yeniden, aynı sırayla başlardı; kasabada kimse bunun sıkıcı olduğunu düşünmezdi."
+    },
+    {
+      "id": "instructions",
+      "genre": "procedure",
+      "text": "To replace a bicycle inner tube, first shift the chain onto the smallest rear sprocket so the wheel comes out easily. Open the brake quick release if your bike has rim brakes, then open the wheel's quick release or loosen the axle nuts and lift the wheel free. Let out any remaining air by pressing the valve core. Starting opposite the valve, hook a tyre lever under the bead of the tyre and pull it over the rim; clip the lever to a spoke, insert a second lever a few centimetres away, and slide it around the rim until one side of the tyre is completely free. Pull out the old tube. Before fitting the new one, run your fingers carefully around the inside of the tyre to find whatever caused the puncture, because a thorn left in place will puncture the new tube within minutes. Inflate the new tube just enough to give it shape, push the valve through the rim hole, and tuck the tube inside the tyre. Work the bead back onto the rim with your thumbs, finishing at the valve. Inflate to the pressure printed on the tyre wall, refit the wheel, and close the brake."
+    },
+    {
+      "id": "facts",
+      "genre": "encyclopedic",
+      "text": "Honey bees live in colonies that may contain tens of thousands of workers, a single queen and, in the warmer months, a few hundred males called drones. Workers are female and change jobs as they age: the youngest clean cells and feed larvae, older bees build comb from wax secreted by glands on the abdomen, and the oldest forage outside the hive for nectar, pollen, water and plant resins. A forager that finds a rich source of food returns and performs a waggle dance on the vertical surface of the comb. The angle of the straight run relative to vertical indicates the direction of the food relative to the sun, and the duration of the run indicates its distance. Nectar is stored in cells and concentrated by evaporation until it becomes honey, which keeps for a very long time because its low water content and acidity prevent the growth of most microorganisms. In winter the colony forms a tight cluster and generates heat by shivering its flight muscles, keeping the centre of the cluster warm enough for the queen to survive until spring."
+    }
+  ]
+}

@@ -58,7 +58,9 @@ from yonga.adapters.runtime_genai import ChatHistory, ChatProfileLike, ChatRunti
 from yonga.application.artifacts import ArtifactStore
 from yonga.application.benchmark import RuntimeFactory as BenchmarkRuntimeFactory
 from yonga.application.chat import RuntimeFactory as ChatRuntimeFactory
+from yonga.application.evaluation import EvaluationService
 from yonga.application.prepare import SmokeTester
+from yonga.application.progress import ProgressSink
 from yonga.application.wiring import Wiring
 from yonga.cli import app
 from yonga.config.settings import Settings
@@ -533,6 +535,7 @@ def test_help_lists_every_documented_command(runner: CliRunner) -> None:
         "env",
         "serve",
         "publish",
+        "eval",
     ):
         assert command in result.stdout
 
@@ -1898,3 +1901,56 @@ def test_registry_status_reports_a_bundle_that_stopped_verifying(
     assert "Not in use" in result.stdout
     reset = invoke(runner, home, ["registry", "reset"])
     assert "Removed the remote registry bundle." in reset.stdout
+
+
+# ======================================================================
+# eval
+# ======================================================================
+class EvaluatingWiring(FakeWiring):
+    """A FakeWiring whose evaluation service scores with hand-made distributions."""
+
+    def __init__(self, settings: Settings, root: Path) -> None:
+        super().__init__(settings)
+        self._root = root
+
+    def evaluation_service(self, *, progress: ProgressSink | None = None) -> EvaluationService:
+        from tests.unit.test_evaluation import FakeScorer, FakeStore, manifest
+
+        manifests = {"ref": manifest("ref", weight="int8"), "cand": manifest("cand", weight="int4")}
+        scorers = {"ref": FakeScorer("ref"), "cand": FakeScorer("cand", perturb=1.0)}
+        return EvaluationService(
+            FakeStore(self._root, manifests),
+            lambda path, device: scorers[path.name],
+            self._settings,
+            progress=progress,
+        )
+
+
+def test_eval_prints_the_comparison_and_saves_it(
+    runner: CliRunner, home: Path, tmp_path: Path
+) -> None:
+    result = invoke(
+        runner,
+        home,
+        ["eval", "cand", "--reference", "ref"],
+        factory=lambda settings: EvaluatingWiring(settings, tmp_path),
+    )
+
+    assert result.exit_code == int(ExitCode.SUCCESS), result.stderr
+    assert "Quality evaluation" in result.stdout
+    assert "Mean KL" in result.stdout
+    assert "not to the original weights" in result.stdout
+    assert list((home / "data" / "evaluations").glob("*.json"))
+
+
+def test_eval_json_is_one_document(runner: CliRunner, home: Path, tmp_path: Path) -> None:
+    result = invoke(
+        runner,
+        home,
+        ["eval", "cand", "--reference", "ref", "--json"],
+        factory=lambda settings: EvaluatingWiring(settings, tmp_path),
+    )
+
+    payload = one_document(result)
+    assert payload["summary"]["kl_mean"] > 0  # type: ignore[index]
+    assert payload["device"] == "CPU"

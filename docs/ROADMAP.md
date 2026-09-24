@@ -166,13 +166,20 @@ infrastructure, not code.
 
 ---
 
+**Resolved: output quality was never evaluated.** `PROFILE_COMPARISON.md` measured only size and
+speed. `yonga eval` now measures the rest: teacher-forced KL divergence, top-1 agreement and
+perplexity against a higher-precision artifact of the same weights, over a shipped multi-domain
+corpus. It shows that the channel-wise symmetric Qwen3.5 artifact diverges 2.5 times as much as the
+group-wise asymmetric one, on every passage (`PROFILE_COMPARISON.md` section 8). INT8 was validated
+as a reference against FP16 on Qwen3-0.6B.
+
 ## Known defects still open
 
 Small, real, and worth clearing before the next feature.
 
 | Where | What |
 |---|---|
-| `docs/PROFILE_COMPARISON.md` | Measures size and speed only. Output quality was never evaluated, and that gap is the interesting one — a symmetric channel-wise INT4 artifact and an asymmetric group-128 one are not expected to be equally accurate. |
+| Default INT4 profiles on small models | `yonga eval` measured `Qwen/Qwen3-0.6B` at ratio 1.0 INT4 losing about a third of its perplexity against FP16 (KL 0.36, 70 % top-1 agreement), where the 9B model loses 7 %. A registry rule giving sub-2B models a mixed INT4/INT8 ratio (optimum-intel's own default for small models is below 1.0) should be measured with `eval` and then added as data. |
 
 ---
 
