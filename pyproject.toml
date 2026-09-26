@@ -87,11 +87,11 @@ all = [
 yonga = "yonga.cli:app"
 
 [project.urls]
-Homepage = "https://github.com/yonga-project/yonga"
-Documentation = "https://github.com/yonga-project/yonga/tree/main/docs"
-Repository = "https://github.com/yonga-project/yonga"
-Issues = "https://github.com/yonga-project/yonga/issues"
-Changelog = "https://github.com/yonga-project/yonga/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/ooguz/yonga"
+Documentation = "https://github.com/ooguz/yonga/tree/main/docs"
+Repository = "https://github.com/ooguz/yonga"
+Issues = "https://github.com/ooguz/yonga/issues"
+Changelog = "https://github.com/ooguz/yonga/blob/main/CHANGELOG.md"
 
 [tool.setuptools]
 include-package-data = true

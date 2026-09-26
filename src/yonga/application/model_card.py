@@ -111,7 +111,7 @@ def render_model_card(
     if supported:
         lines.append(f"Tested on: **{', '.join(supported)}** (see below for the evidence).")
     lines.append("")
-    lines.append(f"Prepared with [yonga](https://github.com/yonga-project/yonga) {__version__}.")
+    lines.append(f"Prepared with [yonga](https://github.com/ooguz/yonga) {__version__}.")
     lines.append("")
 
     lines += [

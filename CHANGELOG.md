@@ -247,5 +247,6 @@ printing compiler tracebacks. Linux x86_64 only.
 - `yonga` never installs, upgrades or removes packages, and never runs `sudo`. When
   the environment is wrong it prints the command for you to run.
 
-[Unreleased]: https://github.com/yonga-project/yonga/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/yonga-project/yonga/releases/tag/v0.1.0
+[Unreleased]: https://github.com/ooguz/yonga/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/ooguz/yonga/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/ooguz/yonga/releases/tag/v0.1.0
