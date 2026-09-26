@@ -40,7 +40,7 @@ import pytest
 from typer.testing import CliRunner
 from typer.testing import Result as CliResult
 
-from tests.support import RefusingRunner, SimulatedPipRunner
+from tests.support import RefusingRunner, SimulatedPipRunner, plain_text
 from tests.unit.test_prepare_planning import (
     INSTALLED_EXPORT_VERSIONS,
     MISMATCHED_EXPORT_VERSIONS,
@@ -635,7 +635,7 @@ def test_prepare_help_offers_the_flag_separately_from_yes(home: Path, tmp_path: 
     hub = FakeHub()
     result = invoke_prepare(home, ["prepare", "--help"], hub=hub, exporter=FakeExporter())
 
-    text = " ".join(result.stdout.split())
+    text = plain_text(result.stdout)
     assert IGNORE_EXPORTER_REQUIREMENTS_FLAG in text
     assert "--yes never enables it" in text
 

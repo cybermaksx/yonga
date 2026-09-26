@@ -139,3 +139,16 @@ def _satisfying(specifier: str) -> str:
     if specifier.startswith("=="):
         return specifier[2:].replace(".*", ".0")
     return "1.0.0"
+
+
+_ANSI = __import__("re").compile(r"\x1b\[[0-9;]*m")
+
+
+def plain_text(text: str) -> str:
+    """``text`` without ANSI styling and with whitespace collapsed.
+
+    Typer forces coloured help output under GitHub Actions (it checks
+    ``GITHUB_ACTIONS``), which splits ``--repo`` into separately styled ``-``
+    and ``-repo`` runs; assertions about what help *says* must not depend on it.
+    """
+    return " ".join(_ANSI.sub("", text).split())

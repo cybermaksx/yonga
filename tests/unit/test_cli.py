@@ -29,7 +29,7 @@ import pytest
 # annotation tracks whichever version is installed.
 from typer.testing import CliRunner, Result
 
-from tests.support import RefusingRunner
+from tests.support import RefusingRunner, plain_text
 from tests.unit.test_prepare_planning import (
     GGUF_REPO,
     SAFETENSORS_REPO,
@@ -1817,7 +1817,7 @@ def test_publish_requires_a_destination(runner: CliRunner, home: Path) -> None:
     result = invoke(runner, home, ["publish", "anything"])
 
     assert result.exit_code != 0
-    assert "--repo" in result.stderr
+    assert "--repo" in plain_text(result.stderr)
 
 
 # ======================================================================
