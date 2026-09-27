@@ -1,0 +1,12 @@
+#!/bin/sh
+# Entry point of the yonga AppImage: the bundled CPython runs `python -m yonga`.
+#
+# Nothing from the host's Python leaks in: PYTHONHOME and PYTHONPATH are
+# dropped, and the user site directory is ignored (also by the child processes
+# yonga starts with the same interpreter, such as the GGUF import). The image
+# is read-only, so the main process does not try to write bytecode into it.
+HERE="$(dirname "$(readlink -f "$0")")"
+export APPDIR="${APPDIR:-$HERE}"
+unset PYTHONHOME PYTHONPATH
+export PYTHONNOUSERSITE=1
+exec "$HERE/usr/python/bin/python3" -B -m yonga "$@"

@@ -13,7 +13,7 @@ The tool is **NPU-first, not NPU-only**. If a model cannot compile on the NPU, `
 This is the 0.2.0 release. It prepares, validates, runs and benchmarks OpenVINO artifacts on one machine, and it is honest about the parts that do not exist yet:
 
 - **`serve` is deliberately small.** It serves one artifact, text only, one request at a time, and refuses what it cannot honour (`n` > 1, stop sequences, tools, JSON response formats, images) with a 400 rather than ignoring it.
-- **Not published on PyPI.** `pip install yonga` does not work yet; install from a clone (see below).
+- **Not on PyPI yet.** Publishing is set up and runs when the repository goes public; until then, use the AppImage from a GitHub release or install from a clone (see below).
 - **Windows is not supported yet.** The architecture keeps the door open, but every device, driver and path probe is written and tested against Linux only.
 - The registry ships knowledge for a small number of architectures. Everything else resolves through generic rules, which is why `inspect` says `inferred` rather than `official` for most models.
 
@@ -93,7 +93,20 @@ Global flags: `--json`, `--verbose`, `--debug`, `--offline`, `--config`, `--data
 
 ## Installation
 
-Requires Linux x86_64 and Python 3.11-3.14. From a clone of this repository:
+### AppImage: one file, nothing else to install
+
+Each GitHub release carries `yonga-X.Y.Z-x86_64.AppImage`: yonga, its own Python and the OpenVINO runtime in a single file, for x86_64 Linux with glibc 2.28 or newer.
+
+```bash
+chmod +x yonga-0.2.0-x86_64.AppImage
+./yonga-0.2.0-x86_64.AppImage doctor
+```
+
+Rename it to `yonga` somewhere on your `PATH` to use it like the installed command. Without FUSE, set `APPIMAGE_EXTRACT_AND_RUN=1`. The GPU and NPU still need the host's Intel drivers, which no package can carry (`doctor` says what is missing). The conversion toolchain is not in the file, because it is about 1.5 GB and depends on the model: the first `prepare` that converts a model builds a managed export environment for it under `~/.cache/yonga/envs` and reuses it afterwards.
+
+### pip
+
+Requires Linux x86_64 and Python 3.11-3.14. From a clone of this repository (or, once it is published, `pip install "yonga[openvino,export]"` from PyPI):
 
 ```bash
 python3 -m venv .venv
@@ -104,7 +117,7 @@ pip install -e ".[openvino,export]"
 The extras are separate because they cost very different amounts of disk:
 
 - **`openvino`** — `openvino`, `openvino-genai`, `openvino-tokenizers`. Needed by `probe`, `chat`, `bench` and by the device section of `doctor`.
-- **`export`** — `optimum-intel[openvino]`, `nncf` (which pull in `transformers` and `torch`). Needed by `prepare` to convert and quantize a model.
+- **`export`** — `optimum-intel[openvino]`, `nncf` (which pull in `transformers` and `torch`). Used by `prepare` to convert and quantize a model. Without it, `prepare` converts in a managed export environment instead, built on first use with the toolchain yonga is tested with.
 - **`serve`** — FastAPI and uvicorn. Needed by `serve` only.
 - **`dev`** — pytest, ruff, mypy.
 

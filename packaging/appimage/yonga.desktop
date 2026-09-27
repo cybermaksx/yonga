@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=yonga
+GenericName=Local AI model manager
+Comment=Prepare, run and serve AI models on Intel CPUs, GPUs and NPUs
+Exec=yonga
+Icon=yonga
+Terminal=true
+Categories=Development;Utility;
+NoDisplay=true

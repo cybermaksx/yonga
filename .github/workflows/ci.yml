@@ -189,3 +189,45 @@ jobs:
         with:
           name: dist
           path: dist/
+
+  appimage:
+    name: AppImage (build from the wheel, smoke test)
+    needs: package
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      # The same script the release runs, from the wheel `package` just built.
+      # It pins and checksums every download and fails if a bundled library
+      # needs a newer glibc than the image supports.
+      - name: Build the AppImage
+        run: tools/build_appimage.sh --wheel dist/yonga-*.whl
+
+      # Outside the checkout, so nothing can resolve against the source tree.
+      # Runners have no FUSE; extract-and-run is how the image starts there.
+      # doctor exits 2 on a host without a GPU or NPU; what must hold is that the
+      # bundled OpenVINO runtime is usable.
+      - name: Smoke-test the image
+        working-directory: /tmp
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: |
+          app="$(ls "$GITHUB_WORKSPACE"/dist/yonga-*-x86_64.AppImage)"
+          "$app" --version
+          "$app" registry validate
+          "$app" doctor --json > doctor.json || true
+          python3 -c "import json; d = json.load(open('doctor.json')); assert d['runtime_usable'], d"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: appimage
+          path: |
+            dist/*.AppImage
+            dist/*.AppImage.sha256
+          retention-days: 14

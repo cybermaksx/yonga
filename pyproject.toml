@@ -21,8 +21,8 @@ keywords = [
     "model-manager",
     "ai-pc",
 ]
-authors = [{ name = "yonga contributors" }]
-maintainers = [{ name = "yonga contributors" }]
+authors = [{ name = "Özcan Oğuz" }]
+maintainers = [{ name = "Özcan Oğuz" }]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
@@ -92,6 +92,7 @@ Documentation = "https://github.com/ooguz/yonga/tree/main/docs"
 Repository = "https://github.com/ooguz/yonga"
 Issues = "https://github.com/ooguz/yonga/issues"
 Changelog = "https://github.com/ooguz/yonga/blob/main/CHANGELOG.md"
+Funding = "https://github.com/sponsors/ooguz"
 
 [tool.setuptools]
 include-package-data = true

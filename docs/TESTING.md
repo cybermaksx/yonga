@@ -262,12 +262,15 @@ typing         mypy src tests, Python 3.11-3.14, with the serve extra and no Ope
 tests          unit and integration, Python 3.11-3.14, full toolchain (OpenVINO CPU plugin)
 base-install   unit and integration with no OpenVINO or export extras, Python 3.11 and 3.14
 package        build, twine check --strict, and a smoke test of the wheel in a clean venv
+appimage       the AppImage built from that wheel, then --version, registry validate and a
+               doctor whose OpenVINO runtime must be usable, run outside the checkout
 ```
 
 No job passes `-m`: the default `addopts` deselect `network`, `intel_gpu`, `intel_npu`,
 `large_model` and `slow`, and overriding that is how a CI run would start depending on hardware or
-a network it does not have. `.github/workflows/release.yml` publishes a tagged version
-(`docs/RELEASING.md`).
+a network it does not have. The `appimage` job is the exception to "no network in CI": building
+the image downloads its pinned, checksummed inputs. `.github/workflows/release.yml` publishes a
+tagged version (`docs/RELEASING.md`).
 
 Hardware CI can be self-hosted later and must not block ordinary contributor PRs unless specifically required.
 

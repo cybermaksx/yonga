@@ -9,7 +9,7 @@ manifest may change in any minor release.
 
 ## [Unreleased]
 
-## [0.2.0] - 2026-09-24
+## [0.2.0] - 2026-09-28
 
 ### Added
 
@@ -109,6 +109,35 @@ manifest may change in any minor release.
   output quality was not evaluated, and the two profiles differ in pipeline properties
   as well as in quantization, so the timings are not a clean comparison of the two
   quantizations.
+- **AppImage.** Every release carries `yonga-X.Y.Z-x86_64.AppImage`: yonga, a relocatable CPython
+  3.14 and the `openvino` and `serve` extras in one 135 MB file, for x86_64 Linux with glibc 2.28 or
+  newer and nothing else installed. `tools/build_appimage.sh` builds it with every download pinned
+  and checksummed, chooses wheels for glibc 2.28 rather than the build host, and fails if a bundled
+  library needs anything newer. CI builds and smoke-tests it on every push. Verified on the
+  reference host from the image: `doctor`, `bench` on the GPU and the NPU, a GGUF import, a full
+  conversion through managed environments, and `serve`.
+- **Conversion without an export toolchain.** When no optimum-intel sits beside yonga -- a plain
+  `pip install yonga`, or the AppImage -- `prepare` builds a managed export environment with the
+  toolchain yonga is tested with instead of failing at the export. Once it exists, the Transformers
+  range optimum-intel declares for the model type is read inside it, and an environment within the
+  range replaces one outside it, still before the download (Gemma-3: `<=5.0`). Inside an AppImage,
+  environments are made from a copy of the bundled interpreter kept under the environments
+  directory, because a virtual environment made from the image's own mount would break when it
+  exits.
+- **PyPI publishing** through trusted publishing, from `release.yml`, running only while the
+  repository is public, with a manual run to publish an earlier tag (`docs/RELEASING.md`).
+- `.github/FUNDING.yml`, and a `Funding` project URL.
+
+### Changed
+
+- `python -m yonga` names itself `yonga` in help and usage text.
+- `doctor` says that `prepare` builds a managed export environment when the export toolchain is
+  missing, and inside an AppImage no longer suggests a `pip install` that cannot apply.
+
+### Removed
+
+- `AGENT_PROMPT.md`, the internal brief the MVP was built from; references to it now point at the
+  matching `SPEC.md` sections.
 
 ### Fixed
 
@@ -251,5 +280,5 @@ printing compiler tracebacks. Linux x86_64 only.
   the environment is wrong it prints the command for you to run.
 
 [Unreleased]: https://github.com/ooguz/yonga/compare/v0.2.0...HEAD
-[0.2.0]: https://github.com/ooguz/yonga/compare/v0.1.0...v0.2.0
+[0.2.0]: https://github.com/ooguz/yonga/releases/tag/v0.2.0
 [0.1.0]: https://github.com/ooguz/yonga/releases/tag/v0.1.0
