@@ -400,7 +400,7 @@ def _abbreviate_revision(revision: str | None, *, length: int = 12) -> str | Non
 
 
 def startup_panel(info: ChatSessionInfo) -> RenderableType:
-    """Render the panel shown when a chat session opens (``AGENT_PROMPT`` 22)."""
+    """Render the panel shown when a chat session opens (``SPEC.md`` section 6.4)."""
     grid = Table.grid(padding=(0, 2))
     grid.add_column(no_wrap=True, style="dim")
     grid.add_column(overflow="fold")

@@ -3,7 +3,7 @@
 Conversion needs a specific set of packages, and the set differs by model
 family: Qwen3.5 exports only with ``transformers==5.2.*``, which cannot coexist
 with the newer Transformers another model needs. Rather than asking the user to
-reshape their own environment -- ``AGENT_PROMPT.md`` section 13.2 forbids yonga
+reshape their own environment -- ``SPEC.md`` section 18.5 forbids yonga
 installing into it -- yonga builds an isolated virtual environment used only by
 the export subprocess.
 

@@ -15,9 +15,9 @@ that state arrives as ``starts_in_reasoning``, established by
 artifact's own chat template.
 
 *The session.* :class:`ChatSession` owns one conversation: the pipeline is built
-once by the injected ``runtime_factory`` and reused for every turn (AGENT_PROMPT
-section 34), generation defaults come from the registry chat profile for the
-model's architecture rather than from global constants (AGENT_PROMPT section 22),
+once by the injected ``runtime_factory`` and reused for every turn, generation
+defaults come from the registry chat profile for the model's architecture
+rather than from global constants (``SPEC.md`` section 6.4),
 and a failed turn returns a typed :class:`~yonga.domain.diagnostics.Diagnostic`
 instead of raising, so the prompt comes back.
 
@@ -1160,7 +1160,7 @@ class ChatSession:
         """Build the runtime if it does not exist yet, and return it.
 
         Calling this repeatedly is free: the pipeline is created exactly once per
-        session and reused for every turn (AGENT_PROMPT section 34).
+        session and reused for every turn.
         """
         if self._closed:
             raise YongaError(

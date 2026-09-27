@@ -831,8 +831,8 @@ class GenAIChatRuntime:
     """An OpenVINO GenAI pipeline kept alive across turns.
 
     The pipeline object is created once, in the constructor, and reused for every
-    turn: reloading per prompt would pay the compile/load cost again and again
-    (AGENT_PROMPT section 34). Call :meth:`close` (or use the runtime as a context
+    turn: reloading per prompt would pay the compile/load cost again and again.
+    Call :meth:`close` (or use the runtime as a context
     manager) to release it.
     """
 

@@ -239,7 +239,7 @@ def exit_code_for(error: YongaError) -> ExitCode:
 
 
 def error_document(item: Diagnostic, *, exit_code: ExitCode) -> dict[str, object]:
-    """Build the stable ``--json`` failure document (``AGENT_PROMPT.md`` section 26)."""
+    """Build the stable ``--json`` failure document."""
     return {
         "ok": False,
         "exit_code": int(exit_code),

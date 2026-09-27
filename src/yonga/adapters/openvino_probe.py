@@ -323,7 +323,7 @@ def compile_cache_dir(paths: Paths, key: str) -> Path:
 def artifact_fingerprint(artifact_dir: Path) -> str:
     """Return a cheap, stable fingerprint of a prepared artifact directory.
 
-    Weight bytes are never read (see AGENT_PROMPT section 34): the manifest's
+    Weight bytes are never read : the manifest's
     ``artifact_id`` is used when present, otherwise the sorted list of top-level
     file names and sizes. That is enough to notice a re-export while staying
     O(number of files).

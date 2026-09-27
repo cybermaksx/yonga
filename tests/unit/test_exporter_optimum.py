@@ -39,7 +39,7 @@ from yonga.util.versions import installed_version
 
 LAUNCHER = ["/usr/bin/python3", "-m", OPTIMUM_CLI_MODULE]
 
-# --- profile fixtures matching SPEC.md section 9 / AGENT_PROMPT section 13.1 ---
+# --- profile fixtures matching SPEC.md section 9 ---
 
 PROFILE_FLAGS: dict[str, list[str]] = {
     "npu-int4-sym-cw": ["--weight-format", "int4", "--sym", "--ratio", "1.0", "--group-size=-1"],

@@ -240,7 +240,6 @@ Read these documents before implementation:
 - [`docs/MODEL_PIPELINE.md`](docs/MODEL_PIPELINE.md) — inspect/download/convert/repair/probe/run pipeline.
 - [`docs/TESTING.md`](docs/TESTING.md) — unit, integration, fixture, and hardware testing strategy.
 - [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md) — ordered milestones and acceptance criteria.
-- [`AGENT_PROMPT.md`](AGENT_PROMPT.md) — detailed prompt for a coding agent implementing the project.
 
 User-facing documentation:
 

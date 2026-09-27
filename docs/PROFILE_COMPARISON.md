@@ -12,26 +12,20 @@ symmetric A, on every passage.
 
 ## 1. What this document is, and what asked for it
 
-A note on provenance, because the honest answer matters more than a tidy citation: **`SPEC.md` has
-no section 24.6.** Section 24 is "Success criteria for MVP", thirteen numbered acceptance items, and
-none of them asks for a profile comparison. What the specification actually provides is the material
-for one:
+The comparison is derived from what `SPEC.md` provides, not demanded by any one section of it:
 
 - **§20 "Qwen3.5 reference case"** names the NPU-oriented export — INT4 symmetric, ratio 1.0,
   group_size -1 — and records that it failed to compile on this host's NPU while the same submodels
   compiled on the Arc GPU.
 - **§25 "Reference implementation facts"** records that the official OpenVINO Qwen3.5-9B INT4
   artifact uses INT4 asymmetric, group size 128, ratio 1.0.
-- **§6** sets the only comparison rule the specification does state: *"Do not compare different
+- **§6** sets the only comparison rule the specification states: *"Do not compare different
   devices using different prompt/generation settings."*
 - **§21 "Publication support"** lists what a published artifact must disclose — tested
   hardware/software matrix, unsupported devices, quantization properties, repairs, and no claim that
-  is not true. This document follows that list, although §21 is about a future `yonga publish`
-  command and not about this file.
+  is not true. This document follows that list.
 
-So the comparison is derived from the specification rather than demanded by it, and the "superiority
-must not be inferred from size or tok/s" rule is asserted here on its own merits rather than quoted
-from §24.6.
+The rule that superiority must not be inferred from size or tok/s is asserted here on its own merits.
 
 ## 2. The two artifacts
 

@@ -189,7 +189,7 @@ def test_the_diagnostic_names_both_versions_and_the_pip_command(
     assert "5.5.4 is installed" in report.message
     remediation = " ".join(report.remediation)
     assert "pip install 'transformers==5.2.*'" in remediation
-    # AGENT_PROMPT.md 13.2: yonga diagnoses and instructs, it never installs.
+    # SPEC.md 18.5: yonga diagnoses and instructs, it never installs.
     assert "never installs" in remediation
     assert "isolated environment" in remediation and "--no-managed-env" in remediation
     assert IGNORE_EXPORTER_REQUIREMENTS_FLAG in remediation

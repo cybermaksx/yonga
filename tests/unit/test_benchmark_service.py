@@ -273,7 +273,7 @@ def test_the_shipped_prompts_have_exact_stable_hashes() -> None:
 
 
 def test_the_library_has_a_short_a_medium_and_a_long_prompt() -> None:
-    """AGENT_PROMPT 23 requires all three shapes, each with a stable id and category."""
+    """SPEC.md section 6.5 requires all three shapes, each with a stable id and category."""
     library = load_prompt_library()
     by_id = {prompt.id: prompt for prompt in library.prompts}
 

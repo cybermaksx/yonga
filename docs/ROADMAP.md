@@ -27,7 +27,7 @@ reference host. The NPU generation tests need `python tools/make_test_artifact.p
 skip with that instruction otherwise. `slow` and `large_model` still select nothing.
 
 **0.2 — Reconcile the NPU acceptance signature. [done]**
-The signature `AGENT_PROMPT.md` §18 pins does reproduce — on the pipeline path, not on a raw
+The signature `SPEC.md` §20 records does reproduce — on the pipeline path, not on a raw
 compile. A raw `Core.compile_model` of Qwen3.5 on the NPU fails first on dynamic shapes; through
 `VLMPipeline`, which reshapes to a static budget, the compiler reaches the real rejection:
 `OneShotBufferizeVPU2VPUIP failed : Only supports FP16.` Two further things were needed before yonga

@@ -10,8 +10,8 @@ back. That is what makes the ``TMPDIR`` redirection, the argv recording, the
 redaction and the atomic publication real assertions rather than assertions about
 a stub.
 
-The module-level ``if __name__`` guard requirement from ``AGENT_PROMPT.md``
-section 16.4 applies to the fixture script, which carries one.
+OpenVINO's multiprocessing needs a module-level ``if __name__`` guard in any
+script it runs; the fixture script carries one.
 """
 
 from __future__ import annotations

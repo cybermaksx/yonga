@@ -5,6 +5,4 @@ recursive-include docs *.md
 recursive-include tests *.py *.xml *.json *.yaml *.yml *.txt *.bin *.jinja
 recursive-include tools *.py
 recursive-include registry *.yaml *.yml
-# The prompt the project was built from is not project documentation.
-exclude AGENT_PROMPT.md
 global-exclude __pycache__ *.py[cod]

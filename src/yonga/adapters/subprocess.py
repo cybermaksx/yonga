@@ -79,8 +79,8 @@ def default_line_selector(line: str) -> ProgressKind | None:
     for a warning/error worth showing, and ``None`` for the overwhelming
     majority of lines, which belong in the log file and nowhere else.
 
-    ``AGENT_PROMPT.md`` section 13.3 is explicit that parsing every progress bar
-    is not required: an indeterminate status plus selected lines is enough.
+    Parsing every progress bar is not required: an indeterminate status plus
+    selected lines is enough.
     """
     text = line.strip()
     if not text:

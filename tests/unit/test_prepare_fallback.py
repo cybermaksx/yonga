@@ -1,7 +1,7 @@
 """Device policy, validation, repair and probing behaviour of ``PrepareService``.
 
-The rules under test are the ones ``SPEC.md`` section 7 and ``AGENT_PROMPT.md``
-section 19 spell out and that are easy to get subtly wrong:
+The rules under test are the ones ``SPEC.md`` section 7 spells out and that are
+easy to get subtly wrong:
 
 * an explicitly requested device that fails stops the job — no silent switch;
 * ``--device auto`` falls back only when the classifier says the environment is
