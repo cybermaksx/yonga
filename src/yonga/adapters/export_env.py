@@ -27,7 +27,9 @@ console scripts, whose shebangs would pin an absolute build path.
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
+import os
 import shutil
 import sys
 from collections.abc import Iterator, Mapping, Sequence
@@ -47,6 +49,8 @@ from yonga.domain.diagnostics import (
 from yonga.domain.environments import (
     ENVIRONMENT_PACKAGES,
     ESTIMATED_ENVIRONMENT_BYTES,
+    REFERENCE_TOOLCHAIN,
+    RUNTIME_PACKAGES,
     TORCH_CPU_INDEX,
     TORCH_INDEX_PACKAGES,
     EnvironmentSpec,
@@ -126,6 +130,7 @@ class ExportEnvironmentManager:
         self._paths = paths
         self._runner = runner
         self._offline = offline
+        self._explicit_base = base_python is not None
         self._base_python = base_python or Path(sys.executable)
         self._torch_index = torch_index
 
@@ -149,18 +154,29 @@ class ExportEnvironmentManager:
         requirement (or none is declared), so the environment differs from the
         one yonga is known to export with only where it must. A package that is
         not installed at all takes the declared specifier, or the latest release.
+
+        Without optimum-intel there is no export toolchain to mirror -- a plain
+        ``pip install yonga``, or the AppImage -- and a stray torch installed
+        for something else is no evidence of what exports. Then everything but
+        the :data:`RUNTIME_PACKAGES` comes from :data:`REFERENCE_TOOLCHAIN`,
+        still under any declared requirement.
         """
         declared = requirement_specifiers(requirements)
         if installed is None:
             installed = {package: installed_version(package) for package in ENVIRONMENT_PACKAGES}
+        no_toolchain = not installed.get("optimum-intel")
         packages: dict[str, str] = {}
         for package in ENVIRONMENT_PACKAGES:
             version = installed.get(package)
+            if no_toolchain and package not in RUNTIME_PACKAGES:
+                version = None
             specifier = declared.get(package)
             if version and (specifier is None or satisfies(version, specifier)):
                 packages[package] = f"=={version}"
             elif specifier is not None:
                 packages[package] = specifier
+            elif no_toolchain:
+                packages[package] = REFERENCE_TOOLCHAIN.get(package, "")
             else:
                 packages[package] = ""
         python = f"{sys.version_info.major}.{sys.version_info.minor}"
@@ -257,8 +273,9 @@ class ExportEnvironmentManager:
             packages=dict(spec.packages),
         )
         python = path / "bin" / "python"
+        base = self._base_python if self._explicit_base else self._lasting_interpreter(ctx)
         steps: Sequence[tuple[str, list[str]]] = (
-            ("creating the virtual environment", [str(self._base_python), "-m", "venv", str(path)]),
+            ("creating the virtual environment", [str(base), "-m", "venv", str(path)]),
             (
                 "installing torch and torchvision (CPU builds)",
                 [
@@ -312,6 +329,45 @@ class ExportEnvironmentManager:
             installed=installed,
         )
         return environment
+
+    def _lasting_interpreter(self, ctx: JobContext) -> Path:
+        """An interpreter that outlives this process, to create environments from.
+
+        A virtual environment records its base interpreter's directory and
+        breaks when that directory goes away. Inside an AppImage, yonga's own
+        interpreter lives on a mount that exists only while the AppImage runs,
+        at a new path every time, so an environment made from it would work for
+        exactly one job. There the bundled interpreter -- without yonga's own
+        site-packages -- is copied once under the environments directory, and
+        environments are made from the copy.
+        """
+        running = Path(sys.executable)
+        appdir = os.environ.get("APPDIR")
+        if not appdir or not running.resolve().is_relative_to(Path(appdir).resolve()):
+            return running
+        prefix = Path(sys.base_prefix)
+        version = f"{sys.version_info.major}.{sys.version_info.minor}"
+        digest = hashlib.sha256(sys.version.encode("utf-8")).hexdigest()[:12]
+        release = ".".join(str(part) for part in sys.version_info[:3])
+        target = self.root / f"python-{release}-{digest}"
+        interpreter = target / "bin" / f"python{version}"
+        if interpreter.is_file():
+            return interpreter
+        self.root.mkdir(parents=True, exist_ok=True)
+        with (self.root / f"{target.name}.lock").open("a") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            try:
+                if not interpreter.is_file():
+                    ctx.emit(
+                        ProgressKind.LOG, "Export environment: keeping a copy of the bundled Python"
+                    )
+                    _copy_interpreter(prefix, target, version=version, root=self.root)
+                    ctx.logger.info(
+                        "export.env.base_copied", "bundled interpreter copied", path=str(target)
+                    )
+            finally:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+        return interpreter
 
     def _verify(self, python: Path, spec: EnvironmentSpec, ctx: JobContext) -> dict[str, str]:
         """Import the export entry point inside the environment and check every pin."""
@@ -414,6 +470,22 @@ def _write_marker(path: Path, environment: ExportEnvironment) -> None:
     temporary = path.with_suffix(".tmp")
     temporary.write_text(environment.model_dump_json(indent=2), encoding="utf-8")
     temporary.replace(path)
+
+
+def _copy_interpreter(prefix: Path, target: Path, *, version: str, root: Path) -> None:
+    """Copy a relocatable Python install to ``target``, leaving out its site-packages."""
+    partial = target.with_name(f"{target.name}.partial")
+    if partial.exists():
+        _remove_owned(partial, root)
+    site = prefix / "lib" / f"python{version}" / "site-packages"
+
+    def skip(directory: str, names: list[str]) -> set[str]:
+        if Path(directory) == site:
+            return set(names)
+        return {name for name in names if name == "__pycache__"}
+
+    shutil.copytree(prefix, partial, symlinks=True, ignore=skip)
+    partial.rename(target)
 
 
 def _tree_size(path: Path) -> int:

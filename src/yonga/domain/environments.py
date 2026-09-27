@@ -29,6 +29,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 __all__ = [
     "ENVIRONMENT_PACKAGES",
     "ESTIMATED_ENVIRONMENT_BYTES",
+    "REFERENCE_TOOLCHAIN",
+    "RUNTIME_PACKAGES",
     "TORCH_CPU_INDEX",
     "TORCH_INDEX_PACKAGES",
     "EnvironmentSpec",
@@ -61,6 +63,25 @@ TORCH_CPU_INDEX: str = "https://download.pytorch.org/whl/cpu"
 #: torch ("operator torchvision::nms does not exist"), after which Transformers
 #: could not even import ``PreTrainedModel``. Observed on the reference host.
 TORCH_INDEX_PACKAGES: tuple[str, ...] = ("torch", "torchvision")
+
+#: Packages the runtime reads the export with. An environment pins them to the
+#: versions yonga itself runs, whatever else it changes: the IR the export
+#: writes has to load in *this* process.
+RUNTIME_PACKAGES: tuple[str, ...] = ("openvino", "openvino-tokenizers")
+
+#: The toolchain yonga exports with on the reference host, used when yonga's own
+#: environment has no export toolchain at all (a plain ``pip install yonga``, or
+#: the AppImage) and so has nothing to mirror. Only the packages that are not
+#: :data:`RUNTIME_PACKAGES` are listed; an architecture's declared requirement
+#: still overrides any of them.
+REFERENCE_TOOLCHAIN: dict[str, str] = {
+    "torch": "==2.14.0",
+    "torchvision": "==0.29.0",
+    "transformers": "==5.5.4",
+    "optimum": "==2.3.0",
+    "optimum-intel": "==2.2.0",
+    "nncf": "==3.4.0",
+}
 
 #: A deliberately generous estimate of one environment on disk (CPU torch,
 #: Transformers, OpenVINO, NNCF and their dependencies), used by preflight.

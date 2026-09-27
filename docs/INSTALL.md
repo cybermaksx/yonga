@@ -30,8 +30,39 @@ section 3.
 
 ## 2. Install yonga
 
-`yonga` is **not published on PyPI yet**, so `pip install yonga` does not work. Install from a clone
-of this repository, into a virtual environment:
+There are two ways: the AppImage, one file with nothing else to install, or `pip` into a virtual
+environment.
+
+### The AppImage
+
+Every GitHub release carries `yonga-X.Y.Z-x86_64.AppImage` and its `.sha256`. It holds yonga, a
+relocatable CPython ([python-build-standalone](https://github.com/astral-sh/python-build-standalone))
+and the `openvino` and `serve` extras, and runs on x86_64 Linux with glibc 2.28 or newer (Ubuntu
+20.04, Debian 11, Fedora 29 and later). The build fails if any bundled library needs a newer glibc.
+
+```bash
+sha256sum --check yonga-0.2.0-x86_64.AppImage.sha256
+chmod +x yonga-0.2.0-x86_64.AppImage
+mv yonga-0.2.0-x86_64.AppImage ~/.local/bin/yonga
+yonga doctor
+```
+
+- **FUSE.** The image mounts itself with FUSE. Without it (containers, some minimal installs),
+  `APPIMAGE_EXTRACT_AND_RUN=1 yonga ...` unpacks it to a temporary directory instead.
+- **Drivers.** The Intel GPU and NPU drivers belong to the host (section 3 covers the NPU); an AppImage
+  cannot carry kernel drivers or the compute runtime, and `doctor` reports what is missing.
+- **Conversion.** The export toolchain (`optimum-intel`, `nncf`, `transformers`, `torch`) is not in
+  the image: it is about 1.5 GB and the right Transformers depends on the model. The first `prepare`
+  that converts builds a managed export environment for it (section 6), from a copy of the image's
+  Python kept under `~/.cache/yonga/envs`, because the image's own mount point changes every time it
+  runs. Prepared OpenVINO and GGUF models need no toolchain at all.
+
+It is built by `tools/build_appimage.sh`, which pins and checksums every download.
+
+### pip
+
+`yonga` is **not on PyPI yet**; publishing is set up and runs once the repository is public. Until
+then, install from a clone of this repository, into a virtual environment:
 
 ```bash
 python3 -m venv .venv
@@ -301,6 +332,14 @@ Confirmation required
    ~/.cache/yonga/envs: up to about 3.0 GiB of packages from PyPI and the
    PyTorch CPU index. [...]
 ```
+
+The same happens when there is no export toolchain beside yonga at all — a `pip install` without
+the `export` extra, or the AppImage. The environment then gets the toolchain yonga is tested with
+(optimum-intel 2.2.0, optimum 2.3.0, nncf 3.4.0, transformers 5.5.4, torch 2.14.0 CPU), still under
+any requirement the registry declares. Once it is built, the Transformers range optimum-intel itself
+declares for the model type is read *inside* it; when the environment falls outside that range —
+Gemma-3 allows at most 5.0 — a second environment inside the range is built instead, still before
+the download.
 
 What goes into it:
 

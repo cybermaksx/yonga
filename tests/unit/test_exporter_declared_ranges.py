@@ -23,6 +23,7 @@ from tests.unit.test_prepare_planning import (
     FakeHub,
     build_service,
     make_snapshot,
+    run_prepare,
     safetensors_metadata,
     settings_for,
 )
@@ -127,6 +128,136 @@ def test_the_registry_pin_wins_and_the_exporter_is_not_asked(
     assert plan.exporter.transformers == "==5.2.*"
 
 
+# --- no export toolchain beside yonga -------------------------------------------------
+
+NO_TOOLCHAIN: dict[str, str | None] = {
+    **MISMATCHED_EXPORT_VERSIONS,
+    "optimum": None,
+    "optimum-intel": None,
+    "nncf": None,
+    "transformers": None,
+    "torch": None,
+}
+
+
+class NoToolchainExporter(FakeExporter):
+    """An exporter with nothing to convert with: no optimum-intel, no optimum-cli."""
+
+    def __init__(self) -> None:
+        super().__init__(versions=dict(NO_TOOLCHAIN))
+
+    def toolchain_available(self) -> bool:
+        return False
+
+
+class EnvironmentAskingExporter(NoToolchainExporter):
+    """No optimum-intel beside yonga; the environment's own one declares a range."""
+
+    def __init__(self, declared: str | None) -> None:
+        super().__init__()
+        self.declared = declared
+        self.asked_in: list[tuple[Path, str, str]] = []
+
+    def declared_requirements(
+        self, model_type: str, task: str | None
+    ) -> DeclaredRequirement | None:
+        return None  # nothing installed to ask
+
+    def declared_requirements_in(
+        self, python: Path, optimum_intel: str, model_type: str, task: str | None
+    ) -> DeclaredRequirement | None:
+        self.asked_in.append((python, optimum_intel, model_type))
+        if self.declared is None:
+            return None
+        return DeclaredRequirement(
+            transformers=self.declared, source=f"optimum-intel {optimum_intel} Gemma3 config"
+        )
+
+
+def test_without_a_toolchain_the_export_gets_a_managed_environment(
+    settings: Settings, tmp_path: Path
+) -> None:
+    envs = FakeEnvironments(tmp_path / "envs")
+    service = build_service(
+        settings=settings,
+        hub=hub_for(tmp_path),
+        exporter=NoToolchainExporter(),
+        environments=envs,
+    )
+
+    plan = service.plan(REPO, device="gpu")
+
+    assert plan.export_environment is not None
+    assert any("not installed alongside yonga" in p for p in plan.exporter.problems)
+    assert not plan.exporter_requirements_block
+
+
+def test_without_a_toolchain_or_managed_environments_preflight_blocks(
+    settings: Settings, tmp_path: Path
+) -> None:
+    service = build_service(
+        settings=settings,
+        hub=hub_for(tmp_path),
+        exporter=NoToolchainExporter(),
+    )
+
+    plan = service.plan(REPO, device="gpu", managed_env=False)
+
+    assert plan.exporter_requirements_block, "refused before the download, not at the export"
+
+
+def test_the_environments_own_range_replaces_an_environment_outside_it(
+    settings: Settings, tmp_path: Path
+) -> None:
+    """The fake environment holds transformers 5.2.0; Gemma-3's config allows <=5.0."""
+    envs = FakeEnvironments(tmp_path / "envs")
+    exporter = EnvironmentAskingExporter(">=4.57,<=5.0")
+    service = build_service(
+        settings=settings, hub=hub_for(tmp_path), exporter=exporter, environments=envs
+    )
+    plan = service.plan(REPO, device="gpu")
+
+    run_prepare(service, plan, settings)
+
+    first, second = envs.ensured
+    assert first.packages["transformers"] == ""
+    assert second.packages["transformers"] == ">=4.57,<=5.0"
+    assert exporter.asked_in[0][1:] == ("2.2.0", "gemma3_text")
+    (request,) = exporter.requests
+    assert request.interpreter == tmp_path / "envs" / second.name / "bin" / "python"
+
+
+def test_an_environment_inside_the_range_is_kept(settings: Settings, tmp_path: Path) -> None:
+    envs = FakeEnvironments(tmp_path / "envs")
+    exporter = EnvironmentAskingExporter(">=4.57")
+    service = build_service(
+        settings=settings, hub=hub_for(tmp_path), exporter=exporter, environments=envs
+    )
+
+    run_prepare(service, service.plan(REPO, device="gpu"), settings)
+
+    assert len(envs.ensured) == 1
+
+
+def test_a_configured_launcher_is_a_toolchain(tmp_path: Path) -> None:
+    """The integration tests' fake optimum-cli must not trigger a managed environment."""
+    runner = BoundsRunner({})
+
+    assert OptimumExporter(runner, launcher=["python", "fake-cli"]).toolchain_available()
+
+
+def test_the_adapter_asks_the_environments_interpreter(tmp_path: Path) -> None:
+    runner = BoundsRunner({"min": "4.57", "max": "5.0", "config": "Gemma3OpenVINOConfig"})
+    python = tmp_path / "env" / "bin" / "python"
+
+    found = OptimumExporter(runner, cache_dir=tmp_path).declared_requirements_in(
+        python, "2.2.0", "gemma3_text", None
+    )
+
+    assert found is not None and found.transformers == ">=4.57,<=5.0"
+    assert runner.argv[0] == str(python)
+
+
 @pytest.mark.parametrize(
     ("hub_task", "exported"),
     [
@@ -150,6 +281,7 @@ class BoundsRunner:
     def __init__(self, payload: dict[str, str | None]) -> None:
         self.payload = payload
         self.calls = 0
+        self.argv: list[str] = []
 
     def run(
         self,
@@ -161,6 +293,7 @@ class BoundsRunner:
         ctx: JobContext | None = None,
     ) -> CompletedCommand:
         self.calls += 1
+        self.argv = list(argv)
         return CompletedCommand(
             argv=list(argv),
             returncode=0,

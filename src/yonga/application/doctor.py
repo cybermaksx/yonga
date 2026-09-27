@@ -26,6 +26,7 @@ Intel accelerator by handing it fake probes.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -101,6 +102,12 @@ OPENVINO_INSTALL_HINT: str = "Install the runtime extras: pip install 'yonga[ope
 
 #: How to obtain the conversion toolchain. Printed, never executed.
 EXPORT_INSTALL_HINT: str = "Install the conversion extras: pip install 'yonga[export]'"
+
+#: What happens without the conversion toolchain: conversion still works.
+MANAGED_EXPORT_NOTE: str = (
+    "Without it, 'prepare' converts in a managed export environment it builds under the "
+    "cache directory on first use (about 3 GiB), leaving this environment untouched."
+)
 
 #: yonga changes nothing about the Python environment; say so next to every hint.
 NEVER_INSTALLS_NOTE: str = (
@@ -789,13 +796,20 @@ def _package_check(
     package = inventory.package(dist_name)
     hint = OPENVINO_INSTALL_HINT if dist_name in ABI_PACKAGES else EXPORT_INSTALL_HINT
     if package is None or package.version is None:
+        if dist_name in ABI_PACKAGES:
+            remediation = [hint, NEVER_INSTALLS_NOTE]
+        elif os.environ.get("APPIMAGE"):
+            # Nothing can be installed into an AppImage; the managed environment is the way.
+            remediation = [MANAGED_EXPORT_NOTE]
+        else:
+            remediation = [MANAGED_EXPORT_NOTE, hint, NEVER_INSTALLS_NOTE]
         return _check(
             check_id,
             label,
             missing_status,
             value="not installed",
             detail=f"{dist_name} was not found in this environment.",
-            remediation=[hint, NEVER_INSTALLS_NOTE],
+            remediation=remediation,
         )
     if not package.importable:
         return _check(

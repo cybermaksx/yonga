@@ -318,6 +318,16 @@ class OptimumExporter:
 
     # --- requirements --------------------------------------------------
 
+    def toolchain_available(self) -> bool:
+        """Whether the Optimum CLI can be launched from here: configured, importable or on PATH."""
+        if self._launcher is not None:
+            return True
+        try:
+            resolve_launcher()
+        except ConfigurationError:
+            return False
+        return True
+
     def requirements(self) -> dict[str, str | None]:
         """Return installed versions of every package the export depends on."""
         return {name: installed_version(name) for name in EXPORT_PACKAGES}
@@ -341,13 +351,26 @@ class OptimumExporter:
         ``None`` when optimum-intel is absent or declares nothing usable.
         """
         version = installed_version("optimum-intel")
-        if version is None or not model_type:
+        if version is None:
+            return None
+        return self.declared_requirements_in(Path(sys.executable), version, model_type, task)
+
+    def declared_requirements_in(
+        self, python: Path, optimum_intel: str, model_type: str, task: str | None
+    ) -> DeclaredRequirement | None:
+        """:meth:`declared_requirements`, asked of the optimum-intel under ``python``.
+
+        The answer depends only on the optimum-intel version, so it shares the
+        same cache whichever interpreter gave it.
+        """
+        version = optimum_intel
+        if not model_type:
             return None
         key = f"{version}|{model_type}|{task or ''}"
         cached = self._read_bounds_cache()
         entry = cached.get(key)
         if entry is None:
-            entry = self._lookup_bounds(model_type, task)
+            entry = self._lookup_bounds(python, model_type, task)
             if entry is None:
                 return None
             cached[key] = entry
@@ -362,7 +385,9 @@ class OptimumExporter:
             source=f"optimum-intel {version} {config or 'export config'} for {model_type}",
         )
 
-    def _lookup_bounds(self, model_type: str, task: str | None) -> dict[str, str | None] | None:
+    def _lookup_bounds(
+        self, python: Path, model_type: str, task: str | None
+    ) -> dict[str, str | None] | None:
         script = (
             "import json, sys\n"
             "import optimum.exporters.openvino\n"
@@ -378,7 +403,7 @@ class OptimumExporter:
             "                  'max': text(getattr(cls, 'MAX_TRANSFORMERS_VERSION', None)),\n"
             "                  'config': cls.__name__}))\n"
         )
-        result = self._runner.run([sys.executable, "-c", script, model_type, task or ""])
+        result = self._runner.run([str(python), "-c", script, model_type, task or ""])
         if result.returncode != 0:
             return None
         for line in reversed(list(result.stdout_lines)):

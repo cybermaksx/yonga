@@ -567,6 +567,31 @@ def test_missing_openvino_package_is_an_error_and_missing_nncf_a_warning(tmp_pat
     assert "yonga[export]" in " ".join(require(report, "openvino.nncf").remediation)
 
 
+def test_a_missing_export_package_names_the_managed_environment(tmp_path, monkeypatch):
+    monkeypatch.delenv("APPIMAGE", raising=False)
+    settings = make_settings(tmp_path)
+    inventory = healthy_inventory(settings, packages=packages({"optimum-intel": None}))
+    service, _, _, _ = build(settings, inventory)
+
+    remediation = " ".join(require(service.run(), "openvino.optimum_intel").remediation)
+
+    assert "managed export environment" in remediation
+    assert "yonga[export]" in remediation
+
+
+def test_inside_an_appimage_no_pip_install_is_suggested_for_export(tmp_path, monkeypatch):
+    """Nothing can be installed into the image; the managed environment is the answer."""
+    monkeypatch.setenv("APPIMAGE", "/home/user/yonga.AppImage")
+    settings = make_settings(tmp_path)
+    inventory = healthy_inventory(settings, packages=packages({"optimum-intel": None}))
+    service, _, _, _ = build(settings, inventory)
+
+    remediation = " ".join(require(service.run(), "openvino.optimum_intel").remediation)
+
+    assert "managed export environment" in remediation
+    assert "pip install" not in remediation
+
+
 # --- NPU permissions ------------------------------------------------------------------
 
 

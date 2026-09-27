@@ -61,12 +61,14 @@ from pydantic import BaseModel, ConfigDict, Field
 from yonga import __version__
 from yonga.adapters import (
     DeclaresRequirements,
+    DeclaresRequirementsIn,
     ExportEnvironments,
     Exporter,
     FilesystemProbe,
     GGUFImport,
     HardwareProbe,
     HubClient,
+    ReportsToolchain,
     RuntimeProbe,
 )
 from yonga.adapters.filesystem import (
@@ -1048,6 +1050,19 @@ class PrepareService:
                 f" (declared by {declared_by})" if name == "transformers" and declared_by else ""
             )
             problems.append(f"{name} {specifier} is required{origin}, but {installed_text}")
+        if (
+            not skip_exporter
+            and isinstance(self._exporter, ReportsToolchain)
+            and not self._exporter.toolchain_available()
+            and not any(problem.startswith("optimum-intel ") for problem in problems)
+        ):
+            # No export toolchain beside yonga at all: a plain install, or the
+            # AppImage. A managed environment can supply one; without it the
+            # export could only fail, so preflight says so before the download.
+            problems.append(
+                "optimum-intel is required to convert this model, but optimum-intel is not "
+                "installed alongside yonga"
+            )
         return (
             requirements.model_copy(update={"problems": problems, "satisfied": not problems}),
             unverifiable,
@@ -2028,12 +2043,56 @@ class PrepareService:
         if not plan.export_environment_ready:
             self._require_environment_space(plan)
         environment = self._environments.ensure(spec, ctx)
+        environment = self._within_declared_range(plan, environment, ctx)
         ctx.emit(
             ProgressKind.LOG,
             f"Exporting in managed environment {environment.spec.name}",
             key=environment.key,
         )
         return environment
+
+    def _within_declared_range(
+        self, plan: PreparationPlan, environment: ExportEnvironment, ctx: JobContext
+    ) -> ExportEnvironment:
+        """Swap in an environment whose Transformers the exporter will accept.
+
+        Planning reads optimum-intel's Transformers range for the model type
+        from the optimum-intel installed beside yonga. With none installed there
+        was nobody to ask, so the range is read from the environment just built
+        and, if its Transformers falls outside, one satisfying the range is
+        built instead -- still before the download, where refusing is cheap.
+        """
+        optimum_intel = environment.installed.get("optimum-intel")
+        if (
+            plan.exporter.transformers is not None
+            or not plan.architecture
+            or not optimum_intel
+            or not isinstance(self._exporter, DeclaresRequirementsIn)
+            or self._environments is None
+        ):
+            return environment
+        declared = self._exporter.declared_requirements_in(
+            environment.python, optimum_intel, plan.architecture, plan.task
+        )
+        if declared is None or satisfies(
+            environment.installed.get("transformers"), declared.transformers
+        ):
+            return environment
+        requirements = plan.exporter.model_copy(update={"transformers": declared.transformers})
+        spec = self._environments.spec_for(
+            requirements,
+            reason=f"transformers {declared.transformers} (declared by {declared.source})",
+        )
+        ctx.logger.info(
+            "export.env.declared_range",
+            "the environment's transformers is outside the exporter's declared range",
+            installed=environment.installed.get("transformers"),
+            declared=declared.transformers,
+            key=spec.key,
+        )
+        if self._environments.find(spec) is None:
+            self._require_environment_space(plan)
+        return self._environments.ensure(spec, ctx)
 
     def _require_environment_space(self, plan: PreparationPlan) -> None:
         """Refuse to build an environment the cache filesystem cannot also hold.

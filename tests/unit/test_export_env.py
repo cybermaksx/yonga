@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 
@@ -14,7 +15,12 @@ from yonga.application.jobs import JobContext
 from yonga.config.paths import Paths, default_paths
 from yonga.config.settings import Settings
 from yonga.domain.diagnostics import ConfigurationError, FailureCategory, PreflightError
-from yonga.domain.environments import TORCH_CPU_INDEX, EnvironmentSpec
+from yonga.domain.environments import (
+    ENVIRONMENT_PACKAGES,
+    REFERENCE_TOOLCHAIN,
+    TORCH_CPU_INDEX,
+    EnvironmentSpec,
+)
 from yonga.domain.plans import ExporterRequirements
 from yonga.util.jsonlog import null_logger
 
@@ -137,14 +143,31 @@ def test_the_spec_mirrors_what_is_installed_and_changes_only_the_failing_pin(
 
 
 def test_a_missing_package_takes_the_declared_specifier_or_the_latest(paths: Paths) -> None:
-    installed = {**INSTALLED, "optimum-intel": None, "nncf": None}
-    requirements = ExporterRequirements(transformers="==5.2.*", optimum_intel=">=2.1")
+    installed = {**INSTALLED, "optimum": None, "nncf": None}
+    requirements = ExporterRequirements(transformers="==5.2.*", nncf=">=3.0")
 
     spec = manager(paths, FakeRunner()).spec_for(requirements, installed=installed)
 
-    assert spec.packages["optimum-intel"] == ">=2.1"
-    assert spec.packages["nncf"] == ""
-    assert spec.requirement("nncf") == "nncf"
+    assert spec.packages["nncf"] == ">=3.0"
+    assert spec.packages["optimum"] == ""
+    assert spec.requirement("optimum") == "optimum"
+
+
+def test_without_a_toolchain_the_reference_one_is_used_under_the_runtime(paths: Paths) -> None:
+    """A plain install or the AppImage: a stray torch says nothing about exporting."""
+    installed: dict[str, str | None] = {
+        name: None for name in INSTALLED if name not in {"openvino", "openvino-tokenizers"}
+    }
+    installed |= {"torch": "2.3.0", "openvino": "2026.4.0", "openvino-tokenizers": "2026.4.0.0"}
+    requirements = ExporterRequirements(transformers="==5.2.*")
+
+    spec = manager(paths, FakeRunner()).spec_for(requirements, installed=installed)
+
+    assert spec.packages["transformers"] == "==5.2.*", "a declared requirement still wins"
+    assert spec.packages["torch"] == REFERENCE_TOOLCHAIN["torch"]
+    assert spec.packages["optimum-intel"] == REFERENCE_TOOLCHAIN["optimum-intel"]
+    assert spec.packages["openvino"] == "==2026.4.0", "the runtime still reads the IR"
+    assert set(spec.packages) == set(ENVIRONMENT_PACKAGES)
 
 
 def test_the_key_identifies_the_package_set() -> None:
@@ -191,6 +214,50 @@ def test_a_build_runs_venv_then_cpu_torch_then_the_pins_then_verifies(
     assert verify[:2] == [python, "-c"]
     assert environment.installed["transformers"] == "5.2.0"
     assert (environment.path / MARKER_FILENAME).is_file()
+
+
+def test_inside_an_appimage_environments_are_made_from_a_lasting_copy(
+    paths: Paths, ctx: JobContext, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The AppImage's mount vanishes on exit; a venv made from it would break."""
+    version = f"{sys.version_info.major}.{sys.version_info.minor}"
+    appdir = tmp_path / "mount"
+    prefix = appdir / "usr" / "python"
+    running = prefix / "bin" / f"python{version}"
+    running.parent.mkdir(parents=True)
+    running.write_text("#!/bin/sh\n")
+    (prefix / "lib" / f"python{version}" / "os.py").parent.mkdir(parents=True)
+    (prefix / "lib" / f"python{version}" / "os.py").write_text("")
+    site = prefix / "lib" / f"python{version}" / "site-packages" / "openvino"
+    site.mkdir(parents=True)
+    (site / "big.so").write_text("weights")
+    monkeypatch.setenv("APPDIR", str(appdir))
+    monkeypatch.setattr(sys, "executable", str(running))
+    monkeypatch.setattr(sys, "base_prefix", str(prefix))
+    runner = FakeRunner()
+    envs = ExportEnvironmentManager(paths, runner)
+
+    envs.ensure(envs.spec_for(QWEN35, installed=INSTALLED), ctx)
+
+    base = Path(runner.calls[0][0])
+    assert not base.is_relative_to(appdir), "the venv would point into the mount"
+    assert base.is_file() and base.is_relative_to(paths.envs_dir)
+    copy = base.parents[1]
+    assert (copy / "lib" / f"python{version}" / "os.py").is_file()
+    assert list((copy / "lib" / f"python{version}" / "site-packages").iterdir()) == []
+    assert not list(paths.envs_dir.glob("*.partial"))
+
+
+def test_outside_an_appimage_the_running_interpreter_is_used(
+    paths: Paths, ctx: JobContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("APPDIR", raising=False)
+    runner = FakeRunner()
+    envs = ExportEnvironmentManager(paths, runner)
+
+    envs.ensure(envs.spec_for(QWEN35, installed=INSTALLED), ctx)
+
+    assert runner.calls[0][0] == sys.executable
 
 
 def test_a_built_environment_is_reused_without_running_anything(

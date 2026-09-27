@@ -36,6 +36,7 @@ __all__ = [
     "CommandResult",
     "CommandRunner",
     "DeclaresRequirements",
+    "DeclaresRequirementsIn",
     "ExportEnvironments",
     "Exporter",
     "FilesystemProbe",
@@ -45,6 +46,7 @@ __all__ = [
     "HubClient",
     "HubPublisher",
     "HubSearch",
+    "ReportsToolchain",
     "RuntimeProbe",
 ]
 
@@ -126,6 +128,30 @@ class DeclaresRequirements(Protocol):
         self, model_type: str, task: str | None
     ) -> DeclaredRequirement | None:
         """The range the exporter declares for ``model_type``, or ``None``."""
+        ...
+
+
+@runtime_checkable
+class ReportsToolchain(Protocol):
+    """An exporter that can say whether it has anything to convert with at all."""
+
+    def toolchain_available(self) -> bool:
+        """Whether an export could start here, without a managed environment."""
+        ...
+
+
+@runtime_checkable
+class DeclaresRequirementsIn(Protocol):
+    """An exporter that can ask another environment's optimum-intel the same question.
+
+    Used once a managed export environment exists for a host with no export
+    toolchain of its own, where :class:`DeclaresRequirements` has nobody to ask.
+    """
+
+    def declared_requirements_in(
+        self, python: Path, optimum_intel: str, model_type: str, task: str | None
+    ) -> DeclaredRequirement | None:
+        """The range optimum-intel ``optimum_intel`` under ``python`` declares, or ``None``."""
         ...
 
 
