@@ -131,3 +131,42 @@ def test_the_probe_service_passes_an_npu_llm_through_the_pipeline(tmp_path: Path
     language = [r for r in report.submodels if r.role is SubmodelRole.LANGUAGE]
     assert language and language[0].status is ProbeStatus.DEFERRED
     assert report.smoke_test is not None and report.smoke_test.status is ProbeStatus.OK
+
+
+def test_an_npu_llm_streams_and_keeps_its_history_across_turns(tmp_path: Path) -> None:
+    """Chunks add up to the answer, and a second turn reuses the NPU pipeline.
+
+    ``serve`` and the chat TUI both stream, and the NPU pipeline is the one
+    whose static prompt budget a second turn could overrun; two short turns on
+    one runtime prove neither breaks the other.
+    """
+    from yonga.adapters.runtime_genai import ChatHistory, StreamingChatRuntime, open_runtime
+    from yonga.domain.benchmarks import GenerationSettings
+    from yonga.domain.models import PipelineKind
+
+    runtime = open_runtime(
+        npu_artifact(tmp_path),
+        device="NPU",
+        pipeline=PipelineKind.LLM,
+        properties={"MAX_PROMPT_LEN": "1024", "MIN_RESPONSE_LEN": "128"},
+        settings=isolated_settings(tmp_path),
+    )
+    config = GenerationSettings(max_new_tokens=16, do_sample=False)
+    chunks: list[str] = []
+
+    def collect(text: str) -> None:
+        chunks.append(text)
+
+    try:
+        assert isinstance(runtime, StreamingChatRuntime)
+        history = ChatHistory()
+        history.add_user("What is the capital of France? One word.")
+        first = runtime.generate_stream(history, config, collect)
+        history.add_assistant(first.text)
+        history.add_user("And of Italy? One word.")
+        second = runtime.generate(history, config)
+    finally:
+        runtime.close()
+
+    assert chunks and "".join(chunks) == first.text
+    assert second.output_tokens is not None and second.output_tokens > 0

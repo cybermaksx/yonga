@@ -13,9 +13,12 @@ manifest may change in any minor release.
 
 ### Added
 
-- **Hardware tests.** `pytest -m intel_gpu` (3 tests) and `pytest -m intel_npu` (5 tests) run on a
-  real Intel GPU and NPU; they were empty markers before. `tools/make_test_artifact.py --npu`
-  builds the small real LLM the NPU generation tests need.
+- **Hardware tests.** `pytest -m intel_gpu` and `pytest -m intel_npu` run on a real Intel GPU and
+  NPU; they were empty markers before. They cover generation, compile-cache reuse, probing,
+  streaming, `serve` over the real runtime, GPU logits against CPU, a real GGUF import (GPU
+  generation, and the NPU refusal the registry names), and, opt-in with
+  `YONGA_TEST_VLM_ARTIFACT`, multi-turn VLM chat. `tools/make_test_artifact.py --npu` builds the
+  small real LLM the NPU generation tests need.
 - NPU profiles carry `MAX_PROMPT_LEN=1024` / `MIN_RESPONSE_LEN=128`, so the manifest records the
   static-shape budget an NPU artifact was probed with.
 - `ProbeStatus.DEFERRED`, for a raw compile the pipeline was asked to settle.

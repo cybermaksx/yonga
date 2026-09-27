@@ -176,6 +176,27 @@ Acceptance test:
 4. profile properties accepted;
 5. explicit unsupported fixture returns diagnostic rather than false driver error.
 
+### What the hardware suites run
+
+The tests live in `tests/hardware/` and never download anything; a missing
+input skips the test with the command that produces it.
+
+| Marker | File | Covers | Input |
+|---|---|---|---|
+| `intel_gpu` | `test_intel_gpu.py` | generation and metrics, compile-cache reuse, probe, streaming, `serve` (plain and SSE, real runtime), GPU logits against CPU f32 | tiny artifact (`tools/make_test_artifact.py`) |
+| `intel_npu` | `test_intel_npu.py` | device access, deferred raw compiles, typed pipeline failures, generation with manifest-shaped properties, probe, streaming and a second turn | NPU artifact (`tools/make_test_artifact.py --npu`) |
+| `intel_gpu`, `intel_npu`, `slow` | `test_gguf_import.py` | the real GGUF import child process, GPU generation from its IR, and the NPU refusal named by `npu-static-reshape-broadcast` | a cached `Qwen/Qwen2.5-0.5B-Instruct-GGUF` Q4_0 file, or `YONGA_TEST_GGUF` |
+| `intel_gpu`, `large_model` | `test_vlm.py` | text chat through the VLM pipeline, with history | `YONGA_TEST_VLM_ARTIFACT` |
+
+On a host with both devices:
+
+```bash
+pytest -m "openvino or intel_gpu or intel_npu or slow or large_model"
+```
+
+`YONGA_TEST_BROKEN_ARTIFACT` and `YONGA_TEST_NPU_ARTIFACT` override the
+generated artifacts' locations.
+
 ## 7. Qwen3.5 acceptance fixture
 
 Large-model test, opt-in only.
