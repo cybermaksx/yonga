@@ -151,30 +151,39 @@ Prepare a model, then use it. `prepare` prints the plan (source, revision, devic
 ```console
 $ yonga prepare Qwen/Qwen3-0.6B --device cpu
 ...
-7/7 Artifact ready at ~/.local/share/yonga/artifacts/Qwen--Qwen3-0.6B/c1899de289a0--cpu-int4-asym-g128
+  Chosen because  751.6M parameters (Hugging Face Hub count from safetensors headers) is below 5B:
+                  cpu-int4-asym-g128-r08 is the CPU profile for that size (evidence: tested).
+...
+7/7 Artifact ready at ~/.local/share/yonga/artifacts/Qwen--Qwen3-0.6B/c1899de289a0--cpu-int4-asym-g128-r08
 
 $ yonga list
-Artifact          Model            Revision  Profile             Dev     Size  Created           Benchmark         Ready
-────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-7bd72baf64957953  Qwen/Qwen3-0.6B  c1899de2  cpu-int4-asym-g128  CPU  389 MiB  2026-09-22 20:40  2026-09-22 21:11  ✓ yes
+Artifact          Model            Revision  Profile                 Dev     Size  Benchmark   Ready
+────────────────────────────────────────────────────────────────────────────────────────────────────
+780ff69f5ac67fb5  Qwen/Qwen3-0.6B  c1899de2  cpu-int4-asym-g128-r08  CPU  430 MiB  2026-10-08  ✓ yes
 
-$ yonga probe 7bd72baf64957953 --device cpu
+$ yonga probe 780ff69f5ac67fb5 --device cpu
 CPU  ✓ ok
-✓  language   ok  1.2 s
-✓  tokenizer  ok  35 ms
+✓  language   ok  1.1 s
+✓  tokenizer  ok  29 ms
 
-$ yonga chat 7bd72baf64957953 --device cpu
+$ yonga chat 780ff69f5ac67fb5 --device cpu
 ...
-│  Hello! It seems like there's no specific task mentioned here. Could you clarify what you need
-│  assistance with? Let me know how I can help!
-TTFT 601 ms • 93.1 tok/s • TPOT 10.7 ms/token • 9 → 116 tokens
+│  Hello! How can I help you today? Let me know what you need! 😊
+TTFT 380 ms • 101.3 tok/s • TPOT 9.9 ms/token • 13 → 19 tokens
 
-$ yonga bench 7bd72baf64957953 --device cpu --suite quick --runs 2 --warmups 1
+$ yonga bench 780ff69f5ac67fb5 --device cpu --suite quick --runs 2 --warmups 1
 Prompt              In tok   Out tok      TTFT   tok/s      TPOT    Wall
 ────────────────────────────────────────────────────────────────────────
-short-instruction       31       256   42.8 ms    91.7   11.2 ms   2.9 s
-Saved: ~/.local/share/yonga/benchmarks/20260922T174651Z-cpu-quick-8d8afeef.json
+short-instruction       31       213   41.7 ms    98.1   10.2 ms   2.2 s
+Saved: ~/.local/share/yonga/benchmarks/20261008T174148Z-cpu-quick-54fb2207.json
 ```
+
+Below 5B parameters each device's default profile keeps a fifth of the layers at INT8 (on the NPU,
+group-wise INT4), because measured over twelve models that loses far less quality for 9-18 % more
+disk; larger models, models whose size is unknown and the VLM families keep plain INT4, and the
+NPU keeps channel-wise INT4 for the families never tried with group-wise. `--profile` overrides
+either way, and [`docs/PROFILE_COMPARISON.md`](docs/PROFILE_COMPARISON.md) section 10 has the
+numbers.
 
 Those numbers are one real run of one small model on this host's CPU. They are an illustration of the output, not a performance claim.
 
@@ -209,15 +218,19 @@ Resolved source             hf-internal-testing/tiny-random-LlamaForCausalLM
 Revision                    9fb191250dd5
 Relationship                original
 Source format               safetensors
-Architecture                llama  rule arch-generic-text-generation
+Architecture                llama  rule arch-llama
 Task                        text-generation-with-past
-Device decision             CPU  supported (inferred)  CPU was requested explicitly; yonga
-                            never switches device on its own.
-Profile                     cpu-int4-asym-g128
-                            CPU asymmetric group-wise INT4 profile
-Quantization                int4, group size 128, ratio 1, asymmetric
+Device decision             CPU  supported (tested)  CPU was requested explicitly; yonga never
+                            switches device on its own.
+Profile                     cpu-int4-asym-g128-r08
+                            CPU INT4 asymmetric group-128 with 20% of layers at INT8; the CPU
+                            default below 5B parameters
+Quantization                int4, group size 128, ratio 0.8, asymmetric
+Chosen because              1.03M parameters (Hugging Face Hub count from safetensors headers)
+                            is below 5B: cpu-int4-asym-g128-r08 is the CPU profile for that
+                            size (evidence: tested).
 Expected download           14 MiB
-Estimated temp requirement  25 GiB  free 738 GiB in ~/.cache/yonga/tmp/<job-id>
+Estimated temp requirement  25 GiB  free 230 GiB in ~/.cache/yonga/tmp/<job-id>
 Estimated artifact          3.9 MiB
 Remote code                 not required
 

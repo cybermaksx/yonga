@@ -2,14 +2,21 @@
 #
 # Profiles are data, not branches. The exporter turns `quantization` into
 # optimum-cli flags; `runtime` holds OpenVINO GenAI pipeline properties.
-schema_version: 1
+#
+# Each device has one unbanded default at priority 100 and, where it pays, a
+# profile for models below 5B parameters at priority 110 (`applies_to:
+# parameter_count`). The band filters and the priority ranks, so a model of
+# unknown size always gets the default. Evidence for the 5B threshold:
+# docs/PROFILE_COMPARISON.md section 10, measured with tools/measure_profiles.py.
+schema_version: 2
 
 profiles:
   - id: npu-int4-sym-cw
-    schema_version: 1
+    schema_version: 2
     status: active
     priority: 100
-    summary: NPU channel-wise INT4 profile for larger supported LLMs
+    evidence: official
+    summary: NPU channel-wise INT4; the NPU default at 5B parameters and above, and for unknown sizes
     device: npu
     format: openvino_ir
     quantization:
@@ -29,17 +36,25 @@ profiles:
       openvino: ">=2026.2,<2027"
     rationale: >-
       The NPU documentation recommends symmetric channel-wise INT4 weights for
-      models above roughly 4-5B parameters; group-wise quantization costs more
-      than it gains at that size.
+      models above roughly 4-5B parameters, for speed. Measured on the reference
+      host it is the faster NPU format at 4B and 8B (Qwen3: 25 against 17 tok/s
+      at 4B, 14 against 11 at 8B) but the much less accurate one at every size
+      (Qwen3-8B: perplexity +42.7 % against +9.4 % for group-wise, both against
+      INT8). Choose npu-int4-sym-g128 with --profile when quality matters more
+      than speed.
     sources:
       - kind: official_docs
         url: https://docs.openvino.ai/2026/openvino-workflow-generative/inference-with-genai/inference-with-genai-on-npu.html
 
   - id: npu-int4-sym-g128
-    schema_version: 1
+    schema_version: 2
     status: active
-    priority: 90
-    summary: NPU group-wise INT4 profile for smaller supported LLMs
+    priority: 110
+    evidence: tested
+    summary: NPU group-wise INT4; the NPU default below 5B parameters
+    applies_to:
+      parameter_count:
+        below: 5B
     device: npu
     format: openvino_ir
     quantization:
@@ -58,17 +73,29 @@ profiles:
     constraints:
       openvino: ">=2026.2,<2027"
     rationale: >-
-      Group-wise INT4 keeps more accuracy on smaller models, where the extra
-      scales are affordable on the NPU.
+      Group-wise INT4 keeps far more accuracy than channel-wise on every model
+      measured: the divergence from INT8 is roughly halved or better on all twelve, 350M
+      to 8B, and Qwen2.5-0.5B's perplexity increase drops from +107 % to +38 %.
+      The speed cost grows with size: Qwen3-0.6B 67 against 77 tok/s, 1.7B on
+      par, 4B 16.5 against 24.6 tok/s with twice the time to first token. The
+      5B threshold follows the documentation's "roughly 4-5B" and accepts that
+      4B cost for the accuracy (perplexity +12.7 % against +25.7 % at 4B).
     sources:
       - kind: official_docs
         url: https://docs.openvino.ai/2026/openvino-workflow-generative/inference-with-genai/inference-with-genai-on-npu.html
+      - kind: tested
+        note: >-
+          Prepared, probed on the NPU and evaluated against cpu-int8-asym-ref for
+          LFM2-350M, Qwen2.5-0.5B, Qwen3 0.6B/1.7B/4B/8B, gemma-3-1b, Llama-3.2-1B,
+          OLMo-2-1B, granite-3.3-2b, gemma-2-2b and SmolLM3-3B; benchmarked on
+          the NPU for the Qwen3 sizes. Lunar Lake reference host, OpenVINO
+          2026.4, optimum-intel 2.2.0, NNCF 3.4.0, October 2026.
 
   - id: gpu-int4-asym-g128
     schema_version: 1
     status: active
     priority: 100
-    summary: GPU asymmetric group-wise INT4 profile
+    summary: GPU asymmetric group-wise INT4; the GPU default at 5B parameters and above, and for unknown sizes
     device: gpu
     format: openvino_ir
     quantization:
@@ -88,11 +115,51 @@ profiles:
       - kind: model_card
         url: https://huggingface.co/OpenVINO/Qwen3.5-9B-int4-ov
 
+  - id: gpu-int4-asym-g128-r08
+    schema_version: 2
+    status: active
+    priority: 110
+    evidence: tested
+    summary: GPU INT4 asymmetric group-128 with 20% of layers at INT8; the GPU default below 5B parameters
+    device: gpu
+    format: openvino_ir
+    applies_to:
+      parameter_count:
+        below: 5B
+    quantization:
+      weight_format: int4
+      symmetric: false
+      ratio: 0.8
+      group_size: 128
+    runtime:
+      ATTENTION_BACKEND: SDPA
+    constraints:
+      openvino: ">=2026.2,<2027"
+    rationale: >-
+      Same weights as cpu-int4-asym-g128-r08. Evaluated on the GPU itself, it
+      cuts Qwen3-1.7B's perplexity increase from +24.4 % to +10.8 % and
+      Qwen3-4B's from +27.1 % to +9.8 %, for 9-18 % more disk. Speed on the
+      reference host: without the SDPA property it cost 10-18 % of the tokens
+      per second below 5B and 22 % at 8B; with this profile's runtime the
+      difference stayed within the host's run-to-run spread of about 20 %. At
+      8B the quality gain shrinks to almost nothing (+7.2 % against +6.8 % on
+      the CPU), so larger models keep gpu-int4-asym-g128.
+    sources:
+      - kind: official_docs
+        url: https://docs.openvino.ai/2026/openvino-workflow/model-optimization-guide/weight-compression.html
+      - kind: tested
+        note: >-
+          yonga eval on the GPU for Qwen3-1.7B and 4B; bench on the GPU for
+          Qwen3 0.6B/1.7B/4B/8B with the CPU-profile artifacts (no SDPA) and
+          alternated A/B runs of this profile against gpu-int4-asym-g128 at 1.7B
+          and 4B; quality on the CPU for the twelve models listed under
+          cpu-int4-asym-g128-r08. Lunar Lake reference host, October 2026.
+
   - id: cpu-int4-asym-g128
     schema_version: 1
     status: active
     priority: 100
-    summary: CPU asymmetric group-wise INT4 profile
+    summary: CPU asymmetric group-wise INT4; the CPU default at 5B parameters and above, and for unknown sizes
     device: cpu
     format: openvino_ir
     quantization:
@@ -111,12 +178,16 @@ profiles:
         url: https://huggingface.co/OpenVINO/Qwen3.5-9B-int4-ov
 
   - id: cpu-int4-asym-g128-r08
-    schema_version: 1
+    schema_version: 2
     status: active
-    priority: 50
-    summary: INT4 asymmetric group-128 with 20% of layers kept at INT8, for small models
+    priority: 110
+    evidence: tested
+    summary: CPU INT4 asymmetric group-128 with 20% of layers at INT8; the CPU default below 5B parameters
     device: cpu
     format: openvino_ir
+    applies_to:
+      parameter_count:
+        below: 5B
     quantization:
       weight_format: int4
       symmetric: false
@@ -125,15 +196,24 @@ profiles:
     constraints:
       openvino: ">=2026.2,<2027"
     rationale: >-
-      Opt-in, never a default. Measured with `yonga eval` on Qwen/Qwen3-0.6B
-      against FP16: mean KL 0.245 against 0.356 for the ratio-1.0 profile
-      (perplexity +22.0 % against +32.8 %) for 10.5 % more disk. Ratio 0.6 was
-      measured too and bought little more for twice the extra size. One model
-      measured is not a rule for every small model, so no model is switched
-      to it automatically.
+      INT4 at ratio 1.0 costs small models a lot: against INT8, Qwen3-0.6B's
+      perplexity rises 32 %, gemma-3-1b's 32 %, Qwen3-4B's 19 %. Keeping 20 % of
+      the layers at INT8 lowers the divergence on every one of the twelve
+      models measured (16-42 %, 350M to 8B, nine families) and the perplexity
+      increase on eleven, for 9-18 % more disk; on the CPU the speed cost is
+      at most 12 %. Below 5B the perplexity gain is large (Qwen3-1.7B +23.7 %
+      to +8.5 %); at 8B it is not (+7.2 % to +6.8 %), so larger models keep
+      cpu-int4-asym-g128.
     sources:
       - kind: official_docs
         url: https://docs.openvino.ai/2026/openvino-workflow/model-optimization-guide/weight-compression.html
+      - kind: tested
+        note: >-
+          yonga eval on the CPU (f32) against cpu-int8-asym-ref for LFM2-350M,
+          Qwen2.5-0.5B, Qwen3 0.6B/1.7B/4B/8B, gemma-3-1b, Llama-3.2-1B,
+          OLMo-2-1B, granite-3.3-2b, gemma-2-2b and SmolLM3-3B, and bench on
+          the CPU for the Qwen3 sizes. Lunar Lake reference host, OpenVINO
+          2026.4, optimum-intel 2.2.0, NNCF 3.4.0, October 2026.
 
   # Reference profiles. Never a device's default (low priority); they exist so
   # `yonga eval` has a higher-precision artifact to measure an INT4 one against.

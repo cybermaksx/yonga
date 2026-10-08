@@ -16,6 +16,7 @@ from pathlib import Path, PurePosixPath
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic import ValidationError as PydanticValidationError
 
+from yonga.domain.compatibility import ProfileSelection
 from yonga.domain.diagnostics import Diagnostic, FailureCategory, ValidationError, diagnostic
 from yonga.domain.hardware import normalise_device
 from yonga.domain.models import PipelineKind, SourceRelationship
@@ -438,6 +439,8 @@ class ExportRecord(BaseModel):
     reused_from_job: str | None = None
     """The failed job whose completed export this artifact reused, or ``None`` when
     this job ran the export itself. See :class:`ExportCheckpoint`."""
+    profile_selection: ProfileSelection | None = None
+    """Why the profile was chosen, as the plan showed it. Absent in older manifests."""
 
 
 #: File name, inside :data:`MANIFEST_DIRNAME`, of an export's completion checkpoint.

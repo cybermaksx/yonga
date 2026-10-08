@@ -107,6 +107,41 @@ class RuleCandidate(BaseModel):
     reasons: list[str] = Field(default_factory=list)
 
 
+class ProfileSelection(BaseModel):
+    """Why a conversion profile was chosen, in one record the plan, explain and manifest share.
+
+    :attr:`sentence` is rendered once, by the resolver, so the three places
+    that show it cannot word the same decision differently.
+
+    It is persisted in the artifact manifest, so it is read the way the rest of
+    the manifest is: unknown keys are ignored and :attr:`basis` and
+    :attr:`band_evidence` are plain strings. A newer yonga that adds a basis
+    or a field must not make this build lose sight of the whole artifact.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    basis: str
+    """``explicit``, ``named_by_model_rule``, ``named_by_architecture_rule``,
+    ``size_band`` or ``device_default`` in this build."""
+    profile_id: str
+    rule_id: str | None = None
+    """The model or architecture rule that named the profile, for the ``named_*`` bases."""
+    parameter_count: int | None = None
+    parameter_count_basis: str | None = None
+    band: str | None = None
+    """The winning profile's band, described (``below 2B``), when it has one."""
+    band_evidence: str | None = None
+    """The winning band's :class:`EvidenceLevel` value."""
+    automatic_profile_id: str | None = None
+    """For an explicit profile: what would have been chosen automatically, when different."""
+    skipped: list[str] = Field(default_factory=list)
+    """One sentence per size-banded profile that lost because of the model's size."""
+    applies: bool = True
+    """False when no profile decides the quantization (a GGUF import, an OpenVINO copy)."""
+    sentence: str = ""
+
+
 class ResolutionExplanation(BaseModel):
     """Audit trail of a registry resolution: candidates, winner and notes."""
 
@@ -116,6 +151,7 @@ class ResolutionExplanation(BaseModel):
     candidates: list[RuleCandidate] = Field(default_factory=list)
     winner_id: str | None = None
     notes: list[str] = Field(default_factory=list)
+    profile_selection: ProfileSelection | None = None
 
     @property
     def rejected(self) -> list[RuleCandidate]:

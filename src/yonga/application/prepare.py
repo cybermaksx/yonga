@@ -105,6 +105,7 @@ from yonga.domain.compatibility import (
     DeviceCompatibility,
     DeviceStatus,
     EvidenceLevel,
+    ProfileSelection,
 )
 from yonga.domain.diagnostics import (
     CancelledError,
@@ -155,7 +156,13 @@ from yonga.domain.plans import (
     PreparationPlan,
 )
 from yonga.registry.resolver import RegistryResolver
-from yonga.registry.schema import ArchitectureRule, ChatProfileRule, ModelRule, RepairRule
+from yonga.registry.schema import (
+    ArchitectureRule,
+    ChatProfileRule,
+    ModelRule,
+    ProfileRule,
+    RepairRule,
+)
 from yonga.repairs import Repair, RepairContext, RepairMatch, apply_repairs
 from yonga.util.hashing import sha256_text, short_hash
 from yonga.util.redaction import redact_argv, redact_text
@@ -623,13 +630,21 @@ class PrepareService:
         )
         target_device = compatibility.selected_device or requested_device or "CPU"
 
+        # A GGUF import keeps the file's own quantization and an OpenVINO source
+        # is copied as published, so the model's size must not pick a profile
+        # whose quantization would never be applied.
+        size_applies = resolved_source.gguf_file is None and not resolved_source.already_openvino
         profile, profile_explanation = self._registry.resolve_profile(
             device=target_device,
             arch_rule=arch_rule,
             meta=source_meta,
             model_rule=model_rule,
             explicit_profile_id=profile_id,
+            size_applies=size_applies,
         )
+        profile_selection = profile_explanation.profile_selection
+        if profile_selection is not None and not size_applies:
+            profile_selection = profile_selection.model_copy(update={"applies": False})
         task = self._task(source_meta, arch_rule, model_rule)
         exporter_requirements, exporter_unverifiable = self._exporter_requirements(
             arch_rule,
@@ -724,6 +739,10 @@ class PrepareService:
         )
 
         reuse = None if force else self._reusable_artifact(artifact_dir, source_sha, artifact_key)
+        if reuse is None and profile_selection is not None and profile_selection.applies:
+            known_limitations.extend(
+                self._existing_under_other_profiles(artifact_dir, profile, profile_selection)
+            )
         confirmations = self._confirmations(
             resolved_source=resolved_source,
             remote_code_required=remote_code_required,
@@ -762,6 +781,7 @@ class PrepareService:
             force=force,
             export_environment=export_environment,
             export_environment_ready=environment_ready,
+            profile_selection=profile_selection,
         )
         if not reuse_export or reuse is not None or resolved_source.already_openvino:
             return plan
@@ -1241,6 +1261,69 @@ class PrepareService:
         """
         return self._registry.repairs_for(files=EXPECTED_EXPORT_FILES, contents_probe=None)
 
+    def _existing_under_other_profiles(
+        self,
+        artifact_dir: Path,
+        profile: ConversionProfile,
+        selection: ProfileSelection,
+    ) -> list[str]:
+        """Say so when this revision is already prepared for the device under another profile.
+
+        A changed default -- a new size band, a re-prioritised profile --
+        produces a new artifact identity, never a silent replacement, so the
+        old artifact stays and a fresh export starts. That is right, but a user
+        who ran the same ``prepare`` last week deserves to hear it before the
+        download, with the flag that keeps the old one.
+        """
+        if selection.basis == "explicit" or not artifact_dir.parent.is_dir():
+            return []
+        prefix = artifact_dir.name.split("--", 1)[0] + "--"
+        notes: list[str] = []
+        for sibling in sorted(artifact_dir.parent.iterdir()):
+            if sibling == artifact_dir or not sibling.name.startswith(prefix):
+                continue
+            manifest = self._artifacts.manifest_for(sibling)
+            if manifest is None or not manifest.ready or manifest.export.profile == profile.id:
+                continue
+            other = self._registry.registry.profile(manifest.export.profile)
+            if other is None or other.device != profile.device:
+                continue
+            if not self._could_be_automatic(other):
+                continue  # an eval reference, never a substitute for the default
+            if not self._artifacts.is_ready(sibling):
+                continue
+            notes.append(
+                f"This revision is already prepared as {other.id} ({sibling}). This plan exports "
+                f"{profile.id} instead: {selection.sentence} Pass --profile {other.id} to use "
+                "the existing artifact."
+            )
+        return notes
+
+    def _could_be_automatic(self, rule: ProfileRule) -> bool:
+        """Whether ``rule`` can be chosen without ``--profile`` for some model.
+
+        True for a banded profile, for one an architecture or model rule names,
+        and for an unbanded profile ranking at least with its device's
+        unconditional default. The reference profiles (``cpu-int8-asym-ref``,
+        ``cpu-fp16-ref``) sit far below that on purpose and are excluded.
+        """
+        registry = self._registry.registry
+        if not rule.status.is_usable:
+            return False
+        if rule.applies_to.parameter_count is not None:
+            return True
+        carriers: list[ArchitectureRule | ModelRule] = [*registry.architectures, *registry.models]
+        if any(rule.id in carrier.profiles.values() for carrier in carriers):
+            return True
+        defaults = [
+            other.priority
+            for other in registry.profiles
+            if other.device == rule.device
+            and other.status.is_usable
+            and other.applies_to.is_generic
+        ]
+        return bool(defaults) and rule.priority >= max(defaults)
+
     def _reusable_artifact(
         self,
         artifact_dir: Path,
@@ -1478,7 +1561,7 @@ class PrepareService:
         self._stage(ctx, 5)
         tracker.stage = JobStage.EXPORTED
         if adopted is not None or snapshot is None:
-            export = self._reused_export_outcome(adopted)
+            export = self._reused_export_outcome(adopted, plan.profile_selection)
             ctx.emit(
                 ProgressKind.EXPORT,
                 f"Reusing the completed export of job {export.record.reused_from_job}",
@@ -1982,10 +2065,19 @@ class PrepareService:
         return adopted
 
     @staticmethod
-    def _reused_export_outcome(checkpoint: ExportCheckpoint | None) -> _ExportOutcome:
-        """The export stage's result when an earlier job's export was adopted."""
+    def _reused_export_outcome(
+        checkpoint: ExportCheckpoint | None, selection: ProfileSelection | None
+    ) -> _ExportOutcome:
+        """The export stage's result when an earlier job's export was adopted.
+
+        The weights are the earlier job's, but why the profile was chosen is
+        this job's decision: the earlier job may have named the same profile
+        with --profile where this one reached it by its size band.
+        """
         assert checkpoint is not None  # guarded by the caller: no snapshot means adopted
-        record = checkpoint.record.model_copy(update={"reused_from_job": checkpoint.job_id})
+        record = checkpoint.record.model_copy(
+            update={"reused_from_job": checkpoint.job_id, "profile_selection": selection}
+        )
         finished = checkpoint.completed_at.strftime("%Y-%m-%d %H:%M UTC")
         return _ExportOutcome(
             record=record,
@@ -2175,6 +2267,7 @@ class PrepareService:
         if staging.is_dir():
             mark_incomplete(staging, job_id=ctx.job_id)
         record = ExportRecord(
+            profile_selection=plan.profile_selection,
             backend=_GGUF_BACKEND,
             profile=_artifact_key(source, plan.profile),
             arguments={
@@ -2244,6 +2337,7 @@ class PrepareService:
         if not marker.exists():
             mark_incomplete(staging, job_id=ctx.job_id)
         record = ExportRecord(
+            profile_selection=plan.profile_selection,
             backend=_PASSTHROUGH_BACKEND,
             profile=plan.profile.id,
             arguments={
@@ -2293,6 +2387,7 @@ class PrepareService:
         if staging.is_dir():
             mark_incomplete(staging, job_id=ctx.job_id)
         record = ExportRecord(
+            profile_selection=plan.profile_selection,
             backend=_EXPORT_BACKEND,
             profile=plan.profile.id,
             arguments=self._export_arguments(plan),
@@ -3035,6 +3130,9 @@ class PrepareService:
         manifest_notes = list(notes)
         if arch_rule is not None:
             manifest_notes.extend(arch_explanation.notes)
+        selection = plan.profile_selection
+        if selection is not None and selection.applies and selection.sentence:
+            manifest_notes.append(f"Profile {selection.profile_id}: {selection.sentence}")
         chat_rule = self._registry.chat_profile(
             arch_rule=arch_rule, repo_id=source.repo_id, meta=source_meta
         )

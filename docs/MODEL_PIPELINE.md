@@ -265,6 +265,6 @@ On failure:
 
 ## 15. Re-preparation
 
-If exact source revision + profile + tool-relevant versions already has a ready artifact, `prepare` should return it without re-exporting unless `--force`.
+If the exact source revision already has a ready artifact under the chosen profile id, `prepare` returns it without re-exporting unless `--force`. Reuse is keyed by revision and profile id only, which is why a profile id never changes its quantization: a different quantization is a new id, so a changed default (a new size band, a re-prioritised profile) produces a new artifact next to the old one instead of silently reusing it. The plan says so when the revision is already prepared for the device under another profile, and names the `--profile` that would reuse it.
 
 If OpenVINO runtime changes, existing IR may remain usable but compile cache must be invalidated/re-keyed. Validation state should record which runtime version last validated the artifact.

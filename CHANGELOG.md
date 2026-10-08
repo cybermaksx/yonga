@@ -9,6 +9,63 @@ manifest may change in any minor release.
 
 ## [Unreleased]
 
+### Changed
+
+- **Small models get a more accurate default quantization.** Below 5B parameters, `prepare`
+  now chooses `cpu-int4-asym-g128-r08` on the CPU, the new `gpu-int4-asym-g128-r08` on the GPU
+  (both INT4 with a fifth of the layers at INT8) and `npu-int4-sym-g128` on the NPU. Measured
+  against INT8 on twelve models from nine families, 350M to 8B: ratio 0.8 lowers the divergence on
+  every one by 16-42 % for 9-18 % more disk and up to about a fifth of the GPU's tokens per second (Qwen3-1.7B's perplexity increase goes
+  from +23.7 % to +8.5 %), and group-wise INT4 on the NPU roughly halves channel-wise's divergence
+  or better (Qwen2.5-0.5B: +107 % perplexity to +38 %). Models of 5B and above and models whose
+  size is unknown get the unbanded defaults. `docs/PROFILE_COMPARISON.md` section 10 has the
+  tables, and `tools/measure_profiles.py` reproduces them.
+- **Exceptions, kept on purpose.** The VLM families (Qwen3.5, Qwen2.5-VL) keep their CPU and GPU
+  pins to ratio 1.0: no VLM was measured. The generic rule (Mistral and other unrecognised members
+  of common families) and Phi-3 keep the NPU on channel-wise INT4: group-wise was never probed on
+  the NPU for them.
+- **Qwen3 on the NPU at 5B and above now uses channel-wise INT4.** It was group-wise for every
+  size, from a test of the 0.6B model only. At 8B channel-wise is a third faster (13.9 against
+  10.6 tok/s) and much less accurate (+42.7 % against +9.4 % perplexity); the default follows the
+  NPU documentation, and `--profile npu-int4-sym-g128` keeps the accurate one. A Qwen3 OpenVINO
+  copy for the NPU is now stored under `npu-int4-sym-cw` too, so it is copied again once.
+- A changed default is a new artifact, never a replacement. Preparing a model already prepared
+  under the old default exports again under the new profile id, keeps the old artifact, and the
+  plan says so beforehand with the `--profile` that would reuse it. `chat`, `bench` and `probe` given
+  a model id use the newest ready artifact.
+- A profile named by an architecture or model rule is now a preference, not an override: it must
+  be usable, satisfy its constraints and match its own `applies_to`, or resolution falls through to
+  scoring. Before, a deprecated profile named by a rule was used anyway.
+- The text-model architecture rules no longer name the CPU and GPU profiles (they named the
+  defaults), and the measured families no longer pin the NPU, so the size bands decide.
+- **Upgrading with registry overrides.** The banded profiles sit at priority 110. An override
+  profile on the same device at exactly 110 now ties with them for models below 5B, and `prepare`
+  stops with `registry.ambiguous_rules` (`yonga registry validate` names the pair): raise it above
+  110. One between 101 and 110 still beats the unbanded default but now loses to the band below
+  5B. One above 110 wins for every family that does not name a profile.
+
+### Added
+
+- **Registry size bands (schema version 2).** A conversion profile can apply to a range of model
+  sizes: `applies_to: parameter_count: {below: 5B}`, in the Hugging Face Hub's parameter count. An
+  unknown size (no safetensors metadata, packed GPTQ/AWQ weights, a `quantization_config`) is
+  outside every band, and a GGUF import or an OpenVINO copy never chooses a profile by size.
+  Validation requires an unbanded fallback per device and reports a band that can never win.
+  `docs/REGISTRY_SPEC.md` section 5.1.
+- **"Chosen because".** The plan, `registry explain` and the artifact manifest
+  (`export.profile_selection`) say why the profile was chosen: the size band, the device default,
+  a rule naming it, or `--profile`. `inspect` shows what the parameter count includes, or why it
+  is not used.
+- `tools/measure_profiles.py`, which prepares and evaluates profiles across many models,
+  resumably.
+- `tools/registry_bundle.py` fills `min_tool_version` from the registry schema a bundle uses
+  (`--min-tool-version` to raise it), so an older yonga refuses a bundle it cannot parse.
+
+### Fixed
+
+- A registry file declaring a schema version newer than this build reports "too new" instead of a
+  schema violation.
+
 ## [0.2.0] - 2026-09-28
 
 ### Added

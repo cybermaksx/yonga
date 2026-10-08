@@ -304,9 +304,16 @@ Profiles are data, not branches spread throughout code.
 
 Initial profiles:
 
+Each device has a default for every model and, below 5B parameters, a more accurate default chosen
+by a registry size band (`docs/REGISTRY_SPEC.md` section 5.1; evidence in
+`docs/PROFILE_COMPARISON.md` section 10). A model of unknown size gets the unbanded default, and
+`--profile` overrides either. An architecture rule can still name a profile for its family: the VLM
+families keep ratio 1.0 on the CPU and GPU, and the generic rule and Phi-3 keep the NPU on
+channel-wise INT4.
+
 ### `npu-int4-sym-cw`
 
-Use for NPU-oriented LLMs above roughly 4–5B when registry supports it:
+NPU default at 5B parameters and above, and for models of unknown size:
 
 ```text
 --weight-format int4
@@ -317,7 +324,7 @@ Use for NPU-oriented LLMs above roughly 4–5B when registry supports it:
 
 ### `npu-int4-sym-g128`
 
-Use for supported smaller models where group-wise quantization is appropriate:
+NPU default below 5B parameters:
 
 ```text
 --weight-format int4
@@ -328,7 +335,7 @@ Use for supported smaller models where group-wise quantization is appropriate:
 
 ### `gpu-int4-asym-g128`
 
-Default initial GPU profile for large text/VLM models when architecture has no stronger override:
+GPU default at 5B parameters and above, for models of unknown size, and for the VLM families:
 
 ```text
 --weight-format int4
@@ -340,7 +347,18 @@ Default initial GPU profile for large text/VLM models when architecture has no s
 
 ### `cpu-int4-asym-g128`
 
-May initially reuse GPU conversion properties but remain a distinct profile ID to permit later CPU-specific tuning.
+CPU counterpart of `gpu-int4-asym-g128`, with the same weights but without GPU pipeline properties.
+
+### `cpu-int4-asym-g128-r08` and `gpu-int4-asym-g128-r08`
+
+CPU and GPU defaults below 5B parameters (except the VLM families): the same INT4 format with a
+fifth of the layers kept at INT8:
+
+```text
+--weight-format int4
+--ratio 0.8
+--group-size 128
+```
 
 Each profile must include version constraints, intended device classes, and a rationale.
 

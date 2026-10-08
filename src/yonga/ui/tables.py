@@ -240,7 +240,14 @@ def inspect_report(
     facts.add_row(Text("Formats"), _text(formats or None))
     facts.add_row(Text("Size"), _size_row(metadata))
     if metadata.parameter_count:
-        facts.add_row(Text("Parameters"), _text(f"{metadata.parameter_count:,}"))
+        sized, basis = metadata.size_for_matching()
+        parameters = Text(f"{metadata.parameter_count:,}")
+        if sized is None:
+            # Said here because nothing else will: a size band would quietly not apply.
+            parameters.append(f"  not used to choose a profile: {basis}", style="dim")
+        else:
+            parameters.append("  Hub count; includes embeddings and any vision tower", style="dim")
+        facts.add_row(Text("Parameters"), parameters)
     if metadata.gated or metadata.private:
         flags = ", ".join(
             label for label, on in (("gated", metadata.gated), ("private", metadata.private)) if on
@@ -439,6 +446,9 @@ def preparation_plan(plan: PreparationPlan) -> RenderableType:
         if quantization.scale_estimation:
             quant_parts.append("scale estimation")
         body.add_row(Text("Quantization"), _text(", ".join(quant_parts)))
+        selection = plan.profile_selection
+        if selection is not None and selection.applies and selection.sentence:
+            body.add_row(Text("Chosen because"), Text(selection.sentence, style="dim"))
 
     disk = plan.disk
     body.add_row(Text("Expected download"), _text(human_bytes(disk.expected_download_bytes)))
@@ -975,6 +985,12 @@ def registry_explanation(explanation: RegistryExplanation) -> RenderableType:
             continue
         blocks.extend((Text(""), Text(title, style="bold")))
         blocks.append(_resolution_table(resolution, winner_id))
+        if resolution.profile_selection is not None and resolution.profile_selection.sentence:
+            blocks.append(
+                Text.assemble(
+                    ("Chosen because  ", "bold"), (resolution.profile_selection.sentence, "dim")
+                )
+            )
 
     if explanation.derivatives:
         blocks.extend((Text(""), Text("Derivative candidates", style="bold")))

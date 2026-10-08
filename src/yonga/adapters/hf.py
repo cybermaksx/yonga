@@ -276,6 +276,7 @@ def _search_hit_metadata(info: Any) -> ModelMetadata:
         architectures=architectures,
         model_type=model_type,
         parameter_count=_parameter_count(info),
+        parameter_dtypes=_parameter_dtypes(info),
         gguf_metadata=_compact_gguf_metadata(getattr(info, "gguf", None)),
         downloads=_optional_int(getattr(info, "downloads", None)),
         likes=_optional_int(getattr(info, "likes", None)),
@@ -1259,6 +1260,7 @@ class HuggingFaceAdapter:
             requires_remote_code=requires_remote_code,
             remote_code_files=remote_code_files,
             parameter_count=_parameter_count(info),
+            parameter_dtypes=_parameter_dtypes(info),
             gguf_metadata=gguf_metadata,
             downloads=_optional_int(getattr(info, "downloads", None)),
             likes=_optional_int(getattr(info, "likes", None)),
@@ -1635,6 +1637,22 @@ def _parameter_count(info: object) -> int | None:
     if isinstance(gguf, Mapping):
         return _optional_int(gguf.get("total"))
     return None
+
+
+def _parameter_dtypes(info: object) -> dict[str, int]:
+    """Parameter count per stored dtype, from the safetensors metadata, if reported."""
+    safetensors = getattr(info, "safetensors", None)
+    raw = getattr(safetensors, "parameters", None) if safetensors is not None else None
+    if raw is None and isinstance(safetensors, Mapping):
+        raw = safetensors.get("parameters")
+    if not isinstance(raw, Mapping):
+        return {}
+    found: dict[str, int] = {}
+    for dtype, count in raw.items():
+        value = _optional_int(count)
+        if isinstance(dtype, str) and value is not None and value >= 0:
+            found[dtype] = value
+    return found
 
 
 def _token_source() -> str:

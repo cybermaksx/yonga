@@ -27,7 +27,7 @@ from __future__ import annotations
 import platform
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, TypeVar
+from typing import TYPE_CHECKING, Literal, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -35,6 +35,7 @@ from yonga.domain.compatibility import (
     DeviceCompatibility,
     DeviceStatus,
     EvidenceLevel,
+    ProfileSelection,
     ResolutionExplanation,
     RuleCandidate,
 )
@@ -47,6 +48,7 @@ from yonga.domain.diagnostics import (
     diagnostic,
 )
 from yonga.domain.hardware import normalise_device
+from yonga.domain.models import ModelFormat
 from yonga.domain.plans import ConversionProfile
 from yonga.registry.schema import (
     IDENTITY_HINT_SOURCE,
@@ -63,6 +65,7 @@ from yonga.registry.schema import (
     ProfileRule,
     Registry,
     RepairRule,
+    format_parameter_count,
     subject_from_metadata,
 )
 from yonga.util.redaction import redact_text
@@ -73,6 +76,24 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from yonga.domain.models import ModelIdentity, ModelMetadata
 
 RuleT = TypeVar("RuleT", bound=BaseRule)
+
+#: How a conversion profile was chosen; see :class:`ProfileSelection`.
+ProfileBasis = Literal[
+    "explicit",
+    "named_by_model_rule",
+    "named_by_architecture_rule",
+    "size_band",
+    "device_default",
+]
+
+
+def _size_phrase(subject: MatchSubject) -> str:
+    """``has 8.19B parameters`` or ``has an unknown size (<basis>)``."""
+    if subject.parameter_count is None:
+        basis = subject.parameter_count_basis or "no parameter count is known"
+        return f"has an unknown size ({basis})"
+    return f"has {format_parameter_count(subject.parameter_count)} parameters"
+
 
 #: Constraint key -> distribution name used to look the installed version up.
 VERSION_DISTRIBUTIONS: Mapping[str, str] = {
@@ -486,10 +507,11 @@ class RegistryResolver:
         *,
         device: str | None = None,
         host_tags: Sequence[str] | None = None,
+        size_applies: bool = True,
     ) -> MatchSubject:
         """Build a match subject from meta plus this resolver's host facts."""
         tags = self.host_tags if host_tags is None else tuple(host_tags)
-        return subject_from_metadata(meta, device=device, host_tags=tags)
+        return subject_from_metadata(meta, device=device, host_tags=tags, size_applies=size_applies)
 
     # ------------------------------------------------------------------
     # architecture and exact-model rules
@@ -544,19 +566,84 @@ class RegistryResolver:
         meta: ModelMetadata | None = None,
         model_rule: ModelRule | None = None,
         explicit_profile_id: str | None = None,
+        size_applies: bool = True,
     ) -> tuple[ConversionProfile, ResolutionExplanation]:
         """Resolve the conversion profile to use for ``device``.
 
         An explicit profile id always wins. Otherwise a profile named by the
         exact-model rule is preferred, then one named by the architecture rule,
-        then the best-scoring profile that targets the device.
+        then the best-scoring profile that targets the device. A named profile
+        is a preference, not an override: it must itself be usable, satisfy its
+        version constraints and match its own ``applies_to`` (a size band
+        included), or resolution falls through to scoring.
+
+        ``size_applies=False`` keeps the model's size out of the decision, for
+        sources whose quantization no profile decides (a GGUF import, an
+        OpenVINO copy). The explanation's ``profile_selection`` says why the
+        winner won, in the sentence the plan and the manifest print.
         """
         target = normalise_device(device)
+        subject = self._subject(meta, device=target, size_applies=size_applies)
         explanation = ResolutionExplanation(subject=f"conversion profile for {target}")
         if explicit_profile_id is not None:
             profile = self._explicit_profile(explicit_profile_id, target, explanation)
+            if not profile.status.is_usable:
+                explanation.notes.append(
+                    f"Profile {profile.id} is {profile.status.value}; it is used because it was "
+                    "requested explicitly."
+                )
+            band = profile.applies_to.parameter_count
+            if (
+                band is not None
+                and size_applies
+                and band.verdict(subject.parameter_count) != "inside"
+            ):
+                explanation.notes.append(
+                    f"Profile {profile.id} is meant for models {band.describe()}; this model "
+                    f"{_size_phrase(subject)}. It is used because it was requested explicitly."
+                )
+            automatic: str | None = None
+            try:
+                scratch = ResolutionExplanation(subject=explanation.subject)
+                automatic_rule, _basis, _rule_id = self._automatic_profile(
+                    target, arch_rule, model_rule, subject, scratch
+                )
+                automatic = automatic_rule.id
+            except RegistryError:
+                automatic = None
+            explanation.profile_selection = self._profile_selection(
+                "explicit",
+                profile,
+                subject,
+                automatic_profile_id=automatic if automatic != profile.id else None,
+            )
             return profile.to_conversion_profile(), explanation
 
+        winner, basis, rule_id = self._automatic_profile(
+            target, arch_rule, model_rule, subject, explanation
+        )
+        explanation.winner_id = winner.id
+        # Only scoring can lose a profile to the model's size; a named
+        # preference wins before any band is weighed.
+        scored = basis in ("size_band", "device_default")
+        explanation.profile_selection = self._profile_selection(
+            basis,
+            winner,
+            subject,
+            rule_id=rule_id,
+            skipped=self._size_skipped(target, subject, winner) if scored else (),
+        )
+        return winner.to_conversion_profile(), explanation
+
+    def _automatic_profile(
+        self,
+        target: str,
+        arch_rule: ArchitectureRule | None,
+        model_rule: ModelRule | None,
+        subject: MatchSubject,
+        explanation: ResolutionExplanation,
+    ) -> tuple[ProfileRule, ProfileBasis, str | None]:
+        """The profile chosen without ``--profile``: a named preference, else scoring."""
         for source_rule in (model_rule, arch_rule):
             if source_rule is None:
                 continue
@@ -569,25 +656,24 @@ class RegistryResolver:
                     f"{source_rule.kind} rule {source_rule.id} names unknown profile {named!r}"
                 )
                 continue
-            constraints_ok, reasons = self._constraints_ok(preferred.constraints)
-            explanation.candidates.append(
-                RuleCandidate(
-                    rule_id=preferred.id,
-                    kind=preferred.kind,
-                    specificity=preferred.match_block.static_specificity(),
-                    priority=preferred.priority,
-                    matched=constraints_ok,
-                    reasons=[
-                        f"named by {source_rule.kind} rule {source_rule.id}",
-                        *reasons,
-                    ],
+            candidate, matched = self._evaluate(preferred, subject)
+            candidate.reasons.insert(0, f"named by {source_rule.kind} rule {source_rule.id}")
+            explanation.candidates.append(candidate)
+            if matched:
+                basis: ProfileBasis = (
+                    "named_by_model_rule"
+                    if source_rule.kind == "model"
+                    else "named_by_architecture_rule"
                 )
-            )
-            if constraints_ok:
-                explanation.winner_id = preferred.id
-                return preferred.to_conversion_profile(), explanation
+                return preferred, basis, source_rule.id
+            if not preferred.status.is_usable:
+                explanation.notes.append(
+                    f"{source_rule.kind} rule {source_rule.id} names {preferred.status.value} "
+                    f"profile {named}; the {target} profiles were ranked instead."
+                )
+            # A band or a version constraint that rules the named profile out is
+            # normal, not an anomaly: the candidate's reasons already say why.
 
-        subject = self._subject(meta, device=target)
         scored: list[tuple[ProfileRule, RuleCandidate]] = []
         for rule in self.registry.profiles:
             if rule.device != target:
@@ -614,8 +700,78 @@ class RegistryResolver:
                     context={"device": target},
                 )
             )
-        explanation.winner_id = winner.id
-        return winner.to_conversion_profile(), explanation
+        basis = "size_band" if winner.applies_to.parameter_count is not None else "device_default"
+        return winner, basis, None
+
+    def _size_skipped(self, target: str, subject: MatchSubject, winner: ProfileRule) -> list[str]:
+        """One sentence per usable size-banded profile the model's size kept out.
+
+        Only a profile that would have won without its band counts: one that
+        loses to the winner anyway did not lose because of the size.
+        """
+        winner_rank = winner.applies_to.evaluate(subject).specificity
+        skipped: list[str] = []
+        for rule in self.registry.profiles:
+            band = rule.applies_to.parameter_count
+            if rule.device != target or band is None or rule.id == winner.id:
+                continue
+            if not rule.status.is_usable or not self._constraints_ok(rule.constraints)[0]:
+                continue
+            if band.verdict(subject.parameter_count) == "inside":
+                continue
+            outcome = rule.applies_to.model_copy(update={"parameter_count": None}).evaluate(subject)
+            if not outcome.matched:
+                continue  # it lost for another reason than size
+            if (outcome.specificity, rule.priority) < (winner_rank, winner.priority):
+                continue  # it would have lost to the winner at any size
+            skipped.append(
+                f"{rule.id} is for models {band.describe()}; this model {_size_phrase(subject)}"
+            )
+        return skipped
+
+    def _profile_selection(
+        self,
+        basis: ProfileBasis,
+        profile: ProfileRule,
+        subject: MatchSubject,
+        *,
+        rule_id: str | None = None,
+        automatic_profile_id: str | None = None,
+        skipped: Sequence[str] = (),
+    ) -> ProfileSelection:
+        """Record why ``profile`` won, with the one sentence every surface prints."""
+        band = profile.applies_to.parameter_count
+        device = profile.device
+        if basis == "explicit":
+            sentence = "Requested with --profile."
+            if automatic_profile_id is not None:
+                sentence += f" The automatic choice would be {automatic_profile_id}."
+        elif basis == "size_band":
+            assert band is not None and subject.parameter_count is not None
+            sentence = (
+                f"{format_parameter_count(subject.parameter_count)} parameters "
+                f"({subject.parameter_count_basis}) is {band.predicate()}: {profile.id} is the "
+                f"{device} profile for that size (evidence: {profile.evidence.value})."
+            )
+        elif basis == "device_default":
+            sentence = f"Highest-priority {device} profile."
+        else:
+            kind = "model" if basis == "named_by_model_rule" else "architecture"
+            sentence = f"Named by {kind} rule {rule_id} for {device}."
+        if skipped and basis != "explicit":
+            sentence += " " + "; ".join(skipped) + "."
+        return ProfileSelection(
+            basis=basis,
+            profile_id=profile.id,
+            rule_id=rule_id,
+            parameter_count=subject.parameter_count,
+            parameter_count_basis=subject.parameter_count_basis,
+            band=band.describe() if band is not None else None,
+            band_evidence=profile.evidence.value if band is not None else None,
+            automatic_profile_id=automatic_profile_id,
+            skipped=list(skipped),
+            sentence=sentence,
+        )
 
     def _explicit_profile(
         self,
@@ -1210,12 +1366,17 @@ class RegistryResolver:
         profile_explanation: ResolutionExplanation | None = None
         profile_id: str | None = None
         if target:
+            # As prepare decides it: a GGUF or OpenVINO repository keeps its own
+            # quantization, so its size must not choose a profile here either.
+            primary = meta.primary_format if meta is not None else None
+            size_applies = primary not in (ModelFormat.GGUF, ModelFormat.OPENVINO_IR)
             try:
                 profile, profile_explanation = self.resolve_profile(
                     device=target,
                     arch_rule=arch_rule,
                     meta=meta,
                     model_rule=model_rule,
+                    size_applies=size_applies,
                 )
                 profile_id = profile.id
             except RegistryError as error:

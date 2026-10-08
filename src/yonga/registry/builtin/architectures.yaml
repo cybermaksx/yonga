@@ -47,6 +47,8 @@ architectures:
             The NPU plugin compiles the graph and then rejects it. The driver and
             the compiler are healthy; the graph is what is unsupported.
     recommended_device: gpu
+    # Pinned to ratio 1.0: the size-banded small-model profiles were measured
+    # on text models only, and a VLM's Hub count includes its vision tower.
     profiles:
       gpu: gpu-int4-asym-g128
       cpu: cpu-int4-asym-g128
@@ -129,8 +131,6 @@ architectures:
             before claiming support.
     recommended_device: gpu
     profiles:
-      gpu: gpu-int4-asym-g128
-      cpu: cpu-int4-asym-g128
       npu: npu-int4-sym-cw
     chat_profile: chat-default
     sources:
@@ -169,12 +169,8 @@ architectures:
         status: supported
         evidence: tested
         notes:
-          - npu-int4-sym-g128; 67.3 tok/s on the reference host
+          - npu-int4-sym-g128 at 0.6B, 66.6 tok/s on the reference host; cw and g128 both prepared, probed and evaluated at 0.6B, 1.7B, 4B and 8B
     recommended_device: gpu
-    profiles:
-      gpu: gpu-int4-asym-g128
-      cpu: cpu-int4-asym-g128
-      npu: npu-int4-sym-g128
     sources:
       - kind: tested
         note: >-
@@ -212,12 +208,8 @@ architectures:
         status: supported
         evidence: tested
         notes:
-          - npu-int4-sym-cw
+          - npu-int4-sym-cw and npu-int4-sym-g128 both prepared, probed and evaluated
     recommended_device: gpu
-    profiles:
-      gpu: gpu-int4-asym-g128
-      cpu: cpu-int4-asym-g128
-      npu: npu-int4-sym-cw
     sources:
       - kind: tested
         note: >-
@@ -254,12 +246,8 @@ architectures:
         status: supported
         evidence: tested
         notes:
-          - npu-int4-sym-cw
+          - npu-int4-sym-cw and npu-int4-sym-g128 both prepared, probed and evaluated
     recommended_device: gpu
-    profiles:
-      gpu: gpu-int4-asym-g128
-      cpu: cpu-int4-asym-g128
-      npu: npu-int4-sym-cw
     sources:
       - kind: tested
         note: >-
@@ -295,12 +283,8 @@ architectures:
         status: supported
         evidence: tested
         notes:
-          - npu-int4-sym-cw
+          - npu-int4-sym-cw and npu-int4-sym-g128 both prepared, probed and evaluated
     recommended_device: gpu
-    profiles:
-      gpu: gpu-int4-asym-g128
-      cpu: cpu-int4-asym-g128
-      npu: npu-int4-sym-cw
     sources:
       - kind: tested
         note: >-
@@ -339,12 +323,8 @@ architectures:
         status: supported
         evidence: tested
         notes:
-          - npu-int4-sym-cw
+          - npu-int4-sym-cw and npu-int4-sym-g128 both prepared, probed and evaluated
     recommended_device: gpu
-    profiles:
-      gpu: gpu-int4-asym-g128
-      cpu: cpu-int4-asym-g128
-      npu: npu-int4-sym-cw
     sources:
       - kind: tested
         note: >-
@@ -383,12 +363,8 @@ architectures:
         status: supported
         evidence: tested
         notes:
-          - npu-int4-sym-cw
+          - npu-int4-sym-cw and npu-int4-sym-g128 both prepared, probed and evaluated
     recommended_device: gpu
-    profiles:
-      gpu: gpu-int4-asym-g128
-      cpu: cpu-int4-asym-g128
-      npu: npu-int4-sym-cw
     sources:
       - kind: tested
         note: >-
@@ -425,12 +401,8 @@ architectures:
         status: supported
         evidence: tested
         notes:
-          - npu-int4-sym-cw
+          - npu-int4-sym-cw and npu-int4-sym-g128 both prepared, probed and evaluated
     recommended_device: gpu
-    profiles:
-      gpu: gpu-int4-asym-g128
-      cpu: cpu-int4-asym-g128
-      npu: npu-int4-sym-cw
     sources:
       - kind: tested
         note: >-
@@ -467,12 +439,8 @@ architectures:
         status: supported
         evidence: tested
         notes:
-          - npu-int4-sym-cw
+          - npu-int4-sym-cw and npu-int4-sym-g128 both prepared, probed and evaluated
     recommended_device: gpu
-    profiles:
-      gpu: gpu-int4-asym-g128
-      cpu: cpu-int4-asym-g128
-      npu: npu-int4-sym-cw
     sources:
       - kind: tested
         note: >-
@@ -511,12 +479,8 @@ architectures:
         status: supported
         evidence: tested
         notes:
-          - npu-int4-sym-cw
+          - npu-int4-sym-cw and npu-int4-sym-g128 both prepared, probed and evaluated
     recommended_device: gpu
-    profiles:
-      gpu: gpu-int4-asym-g128
-      cpu: cpu-int4-asym-g128
-      npu: npu-int4-sym-cw
     sources:
       - kind: tested
         note: >-
@@ -553,6 +517,8 @@ architectures:
         notes:
           - 'The NPU compiler refuses the graph: npu.compiler.pass_failed.'
     recommended_device: gpu
+    # Pinned to ratio 1.0: the size-banded small-model profiles were measured
+    # on text models only, and a VLM's Hub count includes its vision tower.
     profiles:
       gpu: gpu-int4-asym-g128
       cpu: cpu-int4-asym-g128
@@ -594,8 +560,7 @@ architectures:
         evidence: unknown
     recommended_device: gpu
     profiles:
-      gpu: gpu-int4-asym-g128
-      cpu: cpu-int4-asym-g128
+      npu: npu-int4-sym-cw
     known_limitations:
       - >-
         With optimum 2.3.0 and optimum-intel 2.2.0 (the pair optimum-intel

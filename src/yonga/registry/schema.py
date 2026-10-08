@@ -67,9 +67,11 @@ that had to fall back on a hint found outside ``config.json``.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable, Mapping, Sequence
+from decimal import Decimal, InvalidOperation
 from enum import Enum
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from pydantic import (
@@ -88,7 +90,19 @@ from yonga.domain.models import ModelFormat, PipelineKind, SourceEvidence, Sourc
 from yonga.domain.plans import ConversionProfile, QuantizationSettings
 
 #: Schema version understood by this build of the loader.
-SCHEMA_VERSION: int = 1
+#:
+#: Version 2 added :attr:`RuleMatch.parameter_count` (a profile's model-size
+#: band) and :attr:`ProfileRule.evidence`. A version-1 file still loads
+#: unchanged: every new field defaults to "no constraint".
+SCHEMA_VERSION: int = 2
+
+#: Oldest yonga release that understands each registry schema version, written
+#: into a remote bundle as ``min_tool_version`` so an older yonga refuses the
+#: bundle at ``registry update`` instead of failing to parse it.
+SCHEMA_MIN_TOOL_VERSION: dict[int, str] = {2: "0.3.0"}
+
+#: The schema version a rule must declare to use a parameter-count band.
+PARAMETER_BAND_SCHEMA_VERSION: int = 2
 
 #: Specificity of a rule that names an exact repository id.
 SPECIFICITY_REPO_ID: int = 100
@@ -260,12 +274,144 @@ class MatchSubject(BaseModel):
     module docstring for why repository tags are not hints.
     """
 
+    parameter_count: int | None = Field(default=None, ge=1)
+    """The model's parameter count as the Hub reports it, or ``None`` when unusable.
+
+    Only :attr:`RuleMatch.parameter_count` reads it. ``None`` means the size is
+    unknown, or known but not a fair basis for choosing a quantization (the
+    weights are already packed integers, or the source keeps its own
+    quantization); :attr:`parameter_count_basis` says which.
+    """
+
+    parameter_count_basis: str | None = None
+    """Where :attr:`parameter_count` came from, or why it is missing. Printed verbatim."""
+
     @field_validator("device")
     @classmethod
     def _normalise_device_name(cls, value: str | None) -> str | None:
         if value is None:
             return None
         return normalise_device(value) or None
+
+
+_COUNT_SUFFIXES: dict[str, int] = {"k": 10**3, "m": 10**6, "b": 10**9, "t": 10**12}
+_COUNT_PATTERN = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([kmbt])\s*$", re.IGNORECASE)
+_COUNT_HINT = "write 2000000000, 2_000_000_000 or 2B (YAML reads 2e9 as text)"
+
+
+def _parse_count(value: object) -> object:
+    """Accept an integer, or a decimal with a K/M/B/T suffix; refuse everything else.
+
+    A float is refused on purpose: ``yaml.safe_load`` reads ``2e9`` as the
+    *string* ``"2e9"`` but ``2.0e+9`` as a float, and a threshold that silently
+    depended on how it was spelled is not a threshold.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"a parameter count cannot be a boolean; {_COUNT_HINT}")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        stripped = value.strip().replace("_", "")
+        if stripped.isdigit():
+            return int(stripped)
+        found = _COUNT_PATTERN.match(value.replace("_", ""))
+        if found is not None:
+            try:
+                amount = Decimal(found.group(1)) * _COUNT_SUFFIXES[found.group(2).lower()]
+            except InvalidOperation as error:  # pragma: no cover - the pattern prevents it
+                raise ValueError(f"unreadable parameter count {value!r}") from error
+            if amount != amount.to_integral_value():
+                raise ValueError(f"parameter count {value!r} is not a whole number")
+            return int(amount)
+    raise ValueError(f"unreadable parameter count {value!r}; {_COUNT_HINT}")
+
+
+def format_parameter_count(count: int) -> str:
+    """A short human spelling of a parameter count: ``752M``, ``1.24B``, ``8B``."""
+    for suffix, scale in (("T", 10**12), ("B", 10**9), ("M", 10**6), ("K", 10**3)):
+        if count >= scale:
+            # Truncated, never rounded: 1,996,000,000 must not read as "2B" next
+            # to a threshold of 2B it is below.
+            precision = 2 if count < 10 * scale else 1
+            step = scale // 10**precision
+            whole, rest = divmod(count // step, 10**precision)
+            text = f"{whole}.{rest:0{precision}d}".rstrip("0").rstrip(".")
+            return f"{text}{suffix}"
+    return str(count)
+
+
+class CountRange(BaseModel):
+    """A half-open range of parameter counts: ``at_least`` <= count < ``below``.
+
+    The unit is parameters as the Hugging Face Hub counts them from the
+    safetensors headers: embeddings, an untied output layer and any vision
+    tower included. Half-open so that adjacent bands never overlap: a model
+    exactly at a threshold belongs to the upper band.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    at_least: int | None = Field(default=None, ge=1)
+    below: int | None = Field(default=None, ge=1)
+
+    @field_validator("at_least", "below", mode="before")
+    @classmethod
+    def _read_count(cls, value: object) -> object:
+        return _parse_count(value)
+
+    @model_validator(mode="after")
+    def _bounded_and_ordered(self) -> CountRange:
+        if self.at_least is None and self.below is None:
+            raise ValueError("a parameter_count band needs at_least, below, or both")
+        if self.at_least is not None and self.below is not None and self.at_least >= self.below:
+            raise ValueError("parameter_count at_least must be smaller than below")
+        return self
+
+    def verdict(self, count: int | None) -> Literal["inside", "outside", "unknown"]:
+        """Where ``count`` falls: inside the band, outside it, or unknown."""
+        if count is None:
+            return "unknown"
+        if self.at_least is not None and count < self.at_least:
+            return "outside"
+        if self.below is not None and count >= self.below:
+            return "outside"
+        return "inside"
+
+    def intersects(self, other: CountRange | None) -> bool:
+        """True when one parameter count could fall inside both bands."""
+        return _ranges_intersect(self, other)
+
+    def predicate(self) -> str:
+        """The band after "is": ``below 2B``, ``8B or more``, ``in the range 2B to below 8B``."""
+        if self.at_least is None and self.below is not None:
+            return f"below {format_parameter_count(self.below)}"
+        if self.below is None and self.at_least is not None:
+            return f"{format_parameter_count(self.at_least)} or more"
+        return f"in the range {self.describe().removeprefix('of ')}"
+
+    def describe(self) -> str:
+        """The band after "models": ``below 2B``, ``of 8B or more``, ``of 2B to below 8B``."""
+        if self.at_least is None and self.below is not None:
+            return f"below {format_parameter_count(self.below)}"
+        if self.below is None and self.at_least is not None:
+            return f"of {format_parameter_count(self.at_least)} or more"
+        assert self.at_least is not None and self.below is not None
+        return (
+            f"of {format_parameter_count(self.at_least)} to below "
+            f"{format_parameter_count(self.below)}"
+        )
+
+
+def _ranges_intersect(left: CountRange | None, right: CountRange | None) -> bool:
+    """True when some count satisfies both bands; ``None`` is unbounded."""
+    if left is None or right is None:
+        return True
+    lows = [value for value in (left.at_least, right.at_least) if value is not None]
+    highs = [value for value in (left.below, right.below) if value is not None]
+    low = max(lows) if lows else 0
+    return not highs or low < min(highs)
 
 
 class RuleMatch(BaseModel):
@@ -295,6 +441,14 @@ class RuleMatch(BaseModel):
         validation_alias=AliasChoices("devices", "device"),
     )
     host_tags: list[str] = Field(default_factory=list)
+
+    parameter_count: CountRange | None = None
+    """The model sizes this rule applies to. Only conversion profiles may set it.
+
+    It filters and never ranks: a band adds no specificity rung, so among
+    profiles that match, priority decides. A model whose size is unknown is
+    outside every band.
+    """
 
     @field_validator("devices", mode="before")
     @classmethod
@@ -334,6 +488,7 @@ class RuleMatch(BaseModel):
             or self.aliases
             or self.tasks
             or self.host_tags
+            or self.parameter_count is not None
         )
 
     def static_specificity(self) -> int:
@@ -443,6 +598,29 @@ class RuleMatch(BaseModel):
                 )
             reasons.append(f"host tag {overlap[0]} is present")
 
+        if self.parameter_count is not None:
+            band = self.parameter_count
+            verdict = band.verdict(subject.parameter_count)
+            if verdict == "unknown":
+                basis = subject.parameter_count_basis or "no parameter count is known"
+                return MatchOutcome(
+                    matched=False,
+                    specificity=self.static_specificity(),
+                    reasons=[
+                        f"parameter count unknown ({basis}); this applies only to models "
+                        f"{band.describe()}"
+                    ],
+                )
+            assert subject.parameter_count is not None
+            size = format_parameter_count(subject.parameter_count)
+            if verdict == "outside":
+                return MatchOutcome(
+                    matched=False,
+                    specificity=self.static_specificity(),
+                    reasons=[f"{size} parameters is not {band.predicate()}"],
+                )
+            reasons.append(f"{size} parameters is {band.predicate()}")
+
         if not reasons:
             reasons.append("generic rule, no constraints")
         return MatchOutcome(
@@ -505,6 +683,7 @@ class RuleMatch(BaseModel):
             and _tokens_overlap(_casefold_all(self.tasks), _casefold_all(other.tasks))
             and _tokens_overlap(self.devices, other.devices)
             and _tokens_overlap(_casefold_all(self.host_tags), _casefold_all(other.host_tags))
+            and _ranges_intersect(self.parameter_count, other.parameter_count)
         )
 
     def _identity_overlaps(self, other: RuleMatch) -> bool:
@@ -651,6 +830,21 @@ class BaseRule(BaseModel):
         """The rule's match criteria; generic when the rule has none."""
         return RuleMatch()
 
+    @model_validator(mode="after")
+    def _band_only_on_profiles(self) -> BaseRule:
+        """A size band is a statement about quantization, so only profiles may carry one.
+
+        Every rule kind shares :class:`RuleMatch`, so without this an
+        architecture, issue or chat rule would accept ``parameter_count`` and
+        silently mean something no resolver implements for it.
+        """
+        if self.kind != "profile" and self.match_block.parameter_count is not None:
+            raise ValueError(
+                f"{self.kind} rule {self.id}: parameter_count is only honoured in a "
+                "conversion profile's applies_to"
+            )
+        return self
+
     def source_mappings(self) -> list[dict[str, str]]:
         """Provenance entries as flat string mappings."""
         return [source.as_mapping() for source in self.sources]
@@ -712,6 +906,12 @@ class ProfileRule(BaseRule):
     export_extra_args: list[str] = Field(default_factory=list)
     applies_to: RuleMatch = Field(default_factory=RuleMatch)
     rationale: str | None = None
+    evidence: EvidenceLevel = EvidenceLevel.UNKNOWN
+    """How strong the evidence is that this profile is the right automatic choice.
+
+    Required on a profile with a size band, because the band is a claim that
+    models in it are better served by this quantization than by the default.
+    """
 
     @field_validator("device")
     @classmethod
@@ -720,6 +920,28 @@ class ProfileRule(BaseRule):
         if not name:
             raise ValueError("profile device must not be empty")
         return name
+
+    @model_validator(mode="after")
+    def _band_needs_schema_and_evidence(self) -> ProfileRule:
+        if (
+            "evidence" in self.model_fields_set
+            and self.schema_version < PARAMETER_BAND_SCHEMA_VERSION
+        ):
+            # A schema-1 reader rejects the unknown key, so a schema-1 file must not carry it.
+            raise ValueError(
+                f"profile {self.id}: evidence needs schema_version {PARAMETER_BAND_SCHEMA_VERSION}"
+            )
+        band = self.applies_to.parameter_count
+        if band is None:
+            return self
+        if self.schema_version < PARAMETER_BAND_SCHEMA_VERSION:
+            raise ValueError(
+                f"profile {self.id}: parameter_count needs schema_version "
+                f"{PARAMETER_BAND_SCHEMA_VERSION}"
+            )
+        if self.evidence is EvidenceLevel.UNKNOWN:
+            raise ValueError(f"profile {self.id}: a size-banded profile must state its evidence")
+        return self
 
     @field_validator("runtime")
     @classmethod
@@ -1216,6 +1438,20 @@ AnyRule = (
 )
 
 
+#: Every section of a registry document that holds a list of rules.
+_RULE_SECTIONS: tuple[str, ...] = (
+    "architectures",
+    "profiles",
+    "issues",
+    "repairs",
+    "derivatives",
+    "models",
+    "chat",
+    "chat_profiles",
+    "gguf",
+)
+
+
 class RegistryDocument(BaseModel):
     """One parsed registry YAML file, before merging."""
 
@@ -1234,6 +1470,42 @@ class RegistryDocument(BaseModel):
         validation_alias=AliasChoices("chat", "chat_profiles"),
     )
     gguf: list[GGUFRule] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _rules_inherit_the_document_version(cls, data: object) -> object:
+        """A rule that does not state its schema_version has the document's.
+
+        Without this a rule would default to the *build's* version, so a band
+        in a file declaring ``schema_version: 1`` would pass the band's own
+        version check, and a bundle built from that file would carry no
+        ``min_tool_version`` -- an older yonga would install data it cannot
+        parse. A rule declaring a newer version than its document is refused
+        for the same reason.
+        """
+        if not isinstance(data, dict):
+            return data
+        declared = data.get("schema_version", SCHEMA_VERSION)
+        if not isinstance(declared, int) or isinstance(declared, bool):
+            return data
+        updated = dict(data)
+        for section in _RULE_SECTIONS:
+            items = updated.get(section)
+            if not isinstance(items, list):
+                continue
+            rules: list[object] = []
+            for item in items:
+                if isinstance(item, dict):
+                    version = item.get("schema_version", declared)
+                    if isinstance(version, int) and version > declared:
+                        raise ValueError(
+                            f"rule {item.get('id', '<no id>')!r} declares schema_version "
+                            f"{version} but its document declares {declared}"
+                        )
+                    item = {**item, "schema_version": version}
+                rules.append(item)
+            updated[section] = rules
+        return updated
 
     def rules(self) -> list[AnyRule]:
         """Every rule in this document, in section order."""
@@ -1361,11 +1633,16 @@ class Registry(BaseModel):
         }
 
 
+#: Why a source that keeps its own quantization has no size for matching.
+SIZE_NOT_APPLICABLE: str = "the source keeps its own quantization"
+
+
 def subject_from_metadata(
     metadata: object,
     *,
     device: str | None = None,
     host_tags: Sequence[str] = (),
+    size_applies: bool = True,
 ) -> MatchSubject:
     """Build a :class:`MatchSubject` from a ``ModelMetadata``-like object.
 
@@ -1377,6 +1654,10 @@ def subject_from_metadata(
     ``gguf_metadata["architecture"]`` — the identifier stored inside the weight
     file — and from nothing else. ``tags`` are read by no branch here on
     purpose: see the module docstring.
+
+    The parameter count comes from ``metadata.size_for_matching()`` when the
+    object has one. ``size_applies=False`` leaves it unknown on purpose, for a
+    GGUF import or an OpenVINO copy, whose quantization no profile decides.
     """
     repo_id: str | None = None
     model_type: str | None = None
@@ -1402,6 +1683,20 @@ def subject_from_metadata(
             raw_hint = raw_gguf.get("architecture")
             if isinstance(raw_hint, str) and raw_hint.strip():
                 identity_hints = (raw_hint.strip(),)
+    parameter_count: int | None = None
+    count_basis: str | None = None
+    if not size_applies:
+        count_basis = SIZE_NOT_APPLICABLE
+    elif metadata is not None:
+        sizer = getattr(metadata, "size_for_matching", None)
+        if callable(sizer):
+            found = sizer()
+            if isinstance(found, tuple) and len(found) == 2:
+                raw_count, raw_basis = found
+                if isinstance(raw_count, int) and not isinstance(raw_count, bool):
+                    parameter_count = raw_count if raw_count > 0 else None
+                if isinstance(raw_basis, str):
+                    count_basis = raw_basis
     return MatchSubject(
         repo_id=repo_id,
         model_type=model_type,
@@ -1410,6 +1705,8 @@ def subject_from_metadata(
         device=device,
         host_tags=tuple(host_tags),
         identity_hints=identity_hints,
+        parameter_count=parameter_count,
+        parameter_count_basis=count_basis,
     )
 
 

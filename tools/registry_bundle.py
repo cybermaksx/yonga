@@ -8,6 +8,12 @@
         --version 7 --expires-days 90 --output bundle.json
         writes bundle.json and bundle.json.sig from every *.yaml under DIR
 
+A bundle carrying registry schema 2 or later gets ``min_tool_version`` filled in
+from ``SCHEMA_MIN_TOOL_VERSION``, so an older yonga refuses it at
+``registry update`` ("needs a newer yonga") and keeps the bundle it has,
+instead of installing data it cannot parse. Keep remote bundles at schema 1
+while older releases still need remote issue and repair updates.
+
 The bundle is verified with the same code ``yonga registry update`` uses
 before it is written, so a bundle this tool produces is one yonga accepts.
 Users trust the key by copying the ``.pub`` file into their registry-keys
@@ -26,6 +32,7 @@ from pathlib import Path
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+from yonga.registry.loader import parse_document
 from yonga.registry.remote import (
     BUNDLE_FORMAT,
     TrustedKey,
@@ -33,6 +40,37 @@ from yonga.registry.remote import (
     sign_bundle,
     verify_bundle,
 )
+from yonga.registry.schema import SCHEMA_MIN_TOOL_VERSION
+from yonga.util.versions import parse_version
+
+
+def schema_versions(files: dict[str, str]) -> set[int]:
+    """Every schema version the files use, as the loader reads them.
+
+    Parsed with the loader itself rather than by looking for the key, because
+    the loader decides what an omitted ``schema_version`` means: a file that
+    declares none is read at the build's own version, and a rule inherits its
+    document's. Counting only the keys written down would call such a file
+    schema 1 and ship a bundle older releases cannot parse.
+    """
+    found: set[int] = set()
+    for name, text in files.items():
+        document = parse_document(text, origin=name)
+        found.add(document.schema_version)
+        found.update(rule.schema_version for rule in document.rules())
+    return found or {1}
+
+
+def required_tool_version(files: dict[str, str], requested: str | None) -> str | None:
+    """The min_tool_version the bundle must carry: the schema's floor, or higher."""
+    floor = SCHEMA_MIN_TOOL_VERSION.get(max(schema_versions(files)))
+    if requested is None:
+        return floor
+    if floor is not None:
+        wanted, needed = parse_version(requested), parse_version(floor)
+        if wanted is None or needed is None or wanted < needed:
+            sys.exit(f"--min-tool-version {requested} is below {floor}, which this schema needs")
+    return requested
 
 
 def keygen(output: Path) -> None:
@@ -55,7 +93,13 @@ def keygen(output: Path) -> None:
 
 
 def build(
-    directory: Path, key: Path, version: int, expires_days: int, output: Path, note: str
+    directory: Path,
+    key: Path,
+    version: int,
+    expires_days: int,
+    output: Path,
+    note: str,
+    min_tool_version: str | None = None,
 ) -> None:
     private = serialization.load_pem_private_key(key.read_bytes(), password=None)
     if not isinstance(private, Ed25519PrivateKey):
@@ -66,7 +110,7 @@ def build(
         if path.suffix in (".yaml", ".yml") and path.is_file()
     }
     now = datetime.now(UTC).replace(microsecond=0)
-    bundle = {
+    bundle: dict[str, object] = {
         "format": BUNDLE_FORMAT,
         "version": version,
         "created_at": now.isoformat(),
@@ -74,16 +118,27 @@ def build(
         "description": note,
         "files": files,
     }
+    needed = required_tool_version(files, min_tool_version)
+    if needed is not None:
+        bundle["min_tool_version"] = needed
     payload = json.dumps(bundle, indent=2, sort_keys=True).encode()
     signature = sign_bundle(payload, private)
     raw = private.public_key().public_bytes_raw()
     verified = verify_bundle(
-        payload, signature, [TrustedKey(key_id=key_id(raw), public_key=raw, source=key)]
+        payload,
+        signature,
+        [TrustedKey(key_id=key_id(raw), public_key=raw, source=key)],
+        # Check the bundle as the oldest yonga it admits will see it.
+        **({"tool_version": needed} if needed is not None else {}),
     )
     output.write_bytes(payload)
     output.with_name(output.name + ".sig").write_bytes(signature)
     rules = sum(len(document.rules()) for document in verified.documents)
-    print(f"{output}: version {version}, {len(files)} file(s), {rules} rule(s), key {key_id(raw)}")
+    floor = f", needs yonga {needed}+" if needed is not None else ""
+    print(
+        f"{output}: version {version}, {len(files)} file(s), {rules} rule(s), "
+        f"key {key_id(raw)}{floor}"
+    )
 
 
 def main() -> None:
@@ -98,6 +153,11 @@ def main() -> None:
     make.add_argument("--expires-days", type=int, default=90)
     make.add_argument("--output", type=Path, required=True)
     make.add_argument("--description", default="")
+    make.add_argument(
+        "--min-tool-version",
+        default=None,
+        help="oldest yonga that may install the bundle (default: what its schema needs)",
+    )
     arguments = parser.parse_args()
     if arguments.command == "keygen":
         keygen(arguments.output)
@@ -109,6 +169,7 @@ def main() -> None:
             arguments.expires_days,
             arguments.output,
             arguments.description,
+            arguments.min_tool_version,
         )
 
 

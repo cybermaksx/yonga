@@ -12,7 +12,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from yonga.domain.compatibility import CompatibilityDecision
+from yonga.domain.compatibility import CompatibilityDecision, ProfileSelection
 from yonga.domain.diagnostics import Diagnostic
 from yonga.domain.environments import EnvironmentSpec
 from yonga.domain.hardware import FilesystemInfo, HardwareInventory, normalise_device
@@ -285,6 +285,9 @@ class PreparationPlan(BaseModel):
     reusable_export: ReusableExport | None = None
     """A completed export, left by a failed job, that this plan will adopt instead
     of exporting again. ``None`` when there is none or reuse was declined."""
+    profile_selection: ProfileSelection | None = None
+    """Why :attr:`profile` was chosen; ``applies`` is False when no profile decides
+    the quantization (a GGUF import or an OpenVINO copy)."""
 
     @field_validator("target_device")
     @classmethod

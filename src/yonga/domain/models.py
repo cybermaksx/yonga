@@ -252,6 +252,14 @@ class FormatObservation(BaseModel):
         return self
 
 
+#: Safetensors dtypes that hold integers. Model weights stored this way are packed
+#: quantized weights (several values per element), so the element count understates
+#: the model; a small integer share is just buffers such as position ids.
+_INTEGER_DTYPES: frozenset[str] = frozenset({"I8", "U8", "I16", "U16", "I32", "U32", "I64", "U64"})
+#: Above this share of integer elements a checkpoint is treated as packed.
+_PACKED_SHARE: float = 0.01
+
+
 class ModelMetadata(BaseModel):
     """Low-cost repository metadata gathered before any large download."""
 
@@ -275,6 +283,8 @@ class ModelMetadata(BaseModel):
     requires_remote_code: bool = False
     remote_code_files: list[str] = Field(default_factory=list)
     parameter_count: int | None = None
+    parameter_dtypes: dict[str, int] = Field(default_factory=dict)
+    """Parameter count per stored dtype (``BF16``, ``I32``…), as the Hub reports it."""
     gguf_metadata: dict[str, object] = Field(default_factory=dict)
     downloads: int | None = None
     likes: int | None = None
@@ -298,6 +308,36 @@ class ModelMetadata(BaseModel):
         if self.task is None and self.pipeline_tag is not None:
             self.task = self.pipeline_tag
         return self
+
+    def size_for_matching(self) -> tuple[int | None, str]:
+        """The parameter count a profile's size band is judged on, and where it came from.
+
+        ``None`` when there is no count, or when the count would mislead: a
+        checkpoint storing packed integer weights (GPTQ, AWQ, bitsandbytes) is
+        reported by the Hub as far fewer parameters than the model has, which
+        is the unsafe direction for a "small model" band. The rules look only
+        at dtypes and ``config.json`` keys, never at a model family. There is no
+        fallback from bytes to parameters: bytes depend on the dtype.
+        """
+        if self.parameter_count is None or self.parameter_count <= 0:
+            return None, "the Hub reports no safetensors or GGUF parameter total"
+        packed = {
+            dtype: count
+            for dtype, count in self.parameter_dtypes.items()
+            if dtype.upper() in _INTEGER_DTYPES
+        }
+        packed_total = sum(packed.values())
+        if packed_total > self.parameter_count * _PACKED_SHARE:
+            dtype, count = max(packed.items(), key=lambda item: item[1])
+            return None, (
+                f"the checkpoint stores packed integer weights ({dtype}: {count:,}), "
+                "so the Hub count understates the model"
+            )
+        if "quantization_config" in self.config:
+            return None, "the checkpoint is already quantized (quantization_config in config.json)"
+        if not self.parameter_dtypes and self.gguf_metadata:
+            return self.parameter_count, "Hugging Face Hub count from GGUF metadata"
+        return self.parameter_count, "Hugging Face Hub count from safetensors headers"
 
     def _observation(self, fmt: ModelFormat) -> FormatObservation | None:
         """Return the strongest observation recorded for *fmt*, if any."""

@@ -198,11 +198,11 @@ as a reference against FP16 on Qwen3-0.6B.
 
 ## Known defects still open
 
-Small, real, and worth clearing before the next feature.
-
-| Where | What |
-|---|---|
-| Default INT4 profiles on small models | Measured on `Qwen/Qwen3-0.6B` (`PROFILE_COMPARISON.md` §8.5): ratio 1.0 INT4 costs +32.8 % perplexity against FP16, and ratio 0.8 cuts the KL divergence by 31 % for 10.5 % more disk. The ratio-0.8 profile ships opt-in as `cpu-int4-asym-g128-r08`. Making it a default needs two things: a registry match condition on model size (the schema has none), and `yonga eval` measurements on more than one small model. |
+None at the moment. The last one, the default INT4 profiles on small models, is resolved: below 5B
+parameters every device now defaults to the more accurate profile, from a registry size condition
+and measurements on twelve models (`PROFILE_COMPARISON.md` section 10). What it leaves open is
+listed there: no VLM was measured, so the VLM families keep ratio 1.0, and nothing was measured
+between 4B and 8B.
 
 ---
 

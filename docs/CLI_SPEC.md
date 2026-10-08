@@ -172,6 +172,15 @@ openvino-genai-gguf`. Refusals: `source.gguf_unsupported` (no verified rule, or 
 does not list), `source.gguf_no_importable_file` (every candidate holds an unreadable tensor type,
 named), `source.gguf_file_not_found`; all exit 20.
 
+Under **Quantization** the plan prints **Chosen because**: one sentence saying why the profile won
+(its size band, the device default, the architecture or model rule that names it, or `--profile`),
+with the parameter count and where it came from, and any size-banded profile the model's size kept
+out. The same sentence goes into the manifest (`export.profile_selection`). It is absent for a GGUF
+import or an OpenVINO copy, whose quantization no profile decides. When the revision is already
+prepared for the device under another profile id (a default that changed since), the plan's known
+limitations name that artifact and the `--profile` that would reuse it; the new export never
+replaces it.
+
 Stages displayed:
 
 ```text

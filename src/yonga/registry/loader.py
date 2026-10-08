@@ -32,6 +32,7 @@ from yonga.registry.schema import (
     Registry,
     RegistryDocument,
     RepairRule,
+    RuleMatch,
     RuleStatus,
     constraint_problems,
 )
@@ -131,6 +132,12 @@ def parse_document(text: str, *, origin: str) -> RegistryDocument:
             remediation=["Wrap the rules in top-level sections such as 'architectures:'."],
             context={"origin": origin},
         )
+    declared = raw.get("schema_version")
+    if isinstance(declared, int) and not isinstance(declared, bool) and declared > SCHEMA_VERSION:
+        # Checked before the schema: a newer file is expected to carry fields
+        # this build does not know, and "does not match the schema" would send
+        # the user looking for a typo instead of an upgrade.
+        raise _too_new(origin, declared)
     payload: dict[str, object] = {str(key): value for key, value in raw.items()}
     payload["origin"] = origin
     try:
@@ -145,17 +152,21 @@ def parse_document(text: str, *, origin: str) -> RegistryDocument:
             cause=error,
         ) from error
     if document.schema_version > SCHEMA_VERSION:
-        raise _registry_error(
-            "registry.schema_version_unsupported",
-            "Registry file is too new",
-            (
-                f"{origin} declares schema_version {document.schema_version}, but this build "
-                f"understands version {SCHEMA_VERSION}."
-            ),
-            remediation=["Upgrade yonga, or pin the registry file to a supported version."],
-            context={"origin": origin},
-        )
+        raise _too_new(origin, document.schema_version)
     return document
+
+
+def _too_new(origin: str, declared: int) -> RegistryError:
+    return _registry_error(
+        "registry.schema_version_unsupported",
+        "Registry file is too new",
+        (
+            f"{origin} declares schema_version {declared}, but this build "
+            f"understands version {SCHEMA_VERSION}."
+        ),
+        remediation=["Upgrade yonga, or pin the registry file to a supported version."],
+        context={"origin": origin},
+    )
 
 
 def load_document(path: Path) -> RegistryDocument:
@@ -525,6 +536,92 @@ def _validate_conflicts(registry: Registry, problems: list[str]) -> None:
                 )
 
 
+def _layer(registry: Registry, rule_id: str) -> str:
+    """The layer a rule came from (``builtin``, a bundle, an override file), or ``""``."""
+    origin = registry.origins.get(rule_id) or ""
+    return origin.split(":", 1)[0] if origin.startswith(f"{_BUILTIN_LAYER}:") else origin
+
+
+def _beats_everywhere(rival: RuleMatch, banded: RuleMatch) -> bool:
+    """True when ``rival`` matches every subject ``banded`` matches, on the same rung.
+
+    Ranking is by specificity before priority, so a rival on another rung never
+    beats the band "for every size" (a more specific band wins outright, a more
+    specific rival only covers some models). On the same rung the rival must
+    carry no band of its own and accept everything the band's other criteria
+    accept: each of its lists is empty or contains the band's whole list.
+    """
+    if rival.parameter_count is not None:
+        return False
+    if rival.static_specificity() != banded.static_specificity():
+        return False
+    pairs = (
+        (rival.repo_ids, banded.repo_ids),
+        (rival.identity_tokens, banded.identity_tokens),
+        (rival.alias_tokens, banded.alias_tokens),
+        (rival.tasks, banded.tasks),
+        (rival.devices, banded.devices),
+        (rival.host_tags, banded.host_tags),
+    )
+    for theirs, ours in pairs:
+        if not theirs:
+            continue
+        if not ours or not {item.casefold() for item in ours} <= {
+            item.casefold() for item in theirs
+        }:
+            return False
+    return True
+
+
+def _validate_size_bands(registry: Registry, problems: list[str]) -> None:
+    """Check that size bands leave every model a profile and can actually win.
+
+    A model's size can always be unknown (no safetensors metadata, packed
+    weights), and an unknown size is outside every band. So a device whose
+    profiles all carry a band would have nothing to offer such a model.
+
+    A band can also be dead data: an unbanded profile with a higher priority
+    beats it for every size, unless an architecture or model rule names the
+    banded profile directly. That is almost always an override that raised the
+    default's priority without noticing the band.
+    """
+    usable = [rule for rule in registry.profiles if rule.status.is_usable]
+    carriers: list[ArchitectureRule | ModelRule] = [*registry.architectures, *registry.models]
+    named = {
+        profile_id
+        for carrier in carriers
+        if carrier.status.is_usable
+        for profile_id in carrier.profiles.values()
+    }
+    for device in sorted({rule.device for rule in usable}):
+        on_device = [rule for rule in usable if rule.device == device]
+        banded = [rule for rule in on_device if rule.applies_to.parameter_count is not None]
+        if not banded:
+            continue
+        if not any(rule.applies_to.is_generic for rule in on_device):
+            problems.append(
+                f"no conversion profile for {device} applies to models of unknown size; "
+                f"every {device} profile with no other condition carries a parameter band"
+            )
+        for band_rule in banded:
+            if band_rule.id in named:
+                continue
+            for other in on_device:
+                if _layer(registry, other.id) != _layer(registry, band_rule.id):
+                    # An override outranking a shipped band is a choice, and the
+                    # CHANGELOG documents it; only a layer contradicting itself
+                    # is a data error.
+                    continue
+                if other.priority > band_rule.priority and _beats_everywhere(
+                    other.applies_to, band_rule.applies_to
+                ):
+                    problems.append(
+                        f"{_describe_rule(band_rule)}: its band can never win automatically; "
+                        f"{other.id} has a higher priority ({other.priority}) for every size"
+                    )
+                    break
+
+
 def validate_registry(
     registry: Registry,
     *,
@@ -560,4 +657,5 @@ def validate_registry(
     _validate_categories(registry, problems)
     _validate_repairs(registry, implementations, problems)
     _validate_conflicts(registry, problems)
+    _validate_size_bands(registry, problems)
     return problems

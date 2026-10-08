@@ -27,7 +27,7 @@ All rules have:
 
 ```yaml
 id: unique-stable-id
-schema_version: 1
+schema_version: 2        # 1 still loads; 2 adds profile size bands (section 5.1)
 status: active           # active | deprecated | experimental
 summary: short text
 sources:
@@ -101,7 +101,53 @@ constraints:
 priority: 100
 ```
 
-Profiles may contain runtime properties separately from export properties.
+Profiles may contain runtime properties separately from export properties: `runtime` holds
+OpenVINO GenAI pipeline properties (`ATTENTION_BACKEND`, `MAX_PROMPT_LEN`), and
+`export_extra_args` extra `optimum-cli` arguments. `rationale` says why the profile exists.
+
+### 5.1 Model-size bands (schema version 2)
+
+A profile can apply to a range of model sizes only. The band is part of `applies_to` and filters,
+it never ranks: among the profiles that match, priority decides, so a banded profile is given a
+higher priority than the device's default to win inside its band.
+
+```yaml
+schema_version: 2
+profiles:
+  - id: cpu-int4-asym-g128-r08
+    schema_version: 2
+    device: cpu
+    priority: 110          # above the unbanded default (100), so it wins inside the band
+    evidence: tested       # required on a banded profile
+    applies_to:
+      parameter_count:
+        below: 5B          # also: at_least: 600M; both: [at_least, below)
+    quantization: {weight_format: int4, symmetric: false, ratio: 0.8, group_size: 128}
+```
+
+- **Unit.** Parameters as the Hugging Face Hub counts them from the safetensors headers
+  (`yonga inspect` shows the number): embeddings, an untied output layer and any vision tower
+  included.
+- **Spelling.** An integer (`2000000000`, `2_000_000_000`) or a decimal with a `K`, `M`, `B` or `T`
+  suffix (`600M`, `1.5B`). Floats are refused: YAML reads `2e9` as text and `2.0e+9` as a float, and
+  a threshold must not depend on which one was typed.
+- **Interval.** Half-open, `at_least <= count < below`, so a model exactly at a threshold belongs to
+  the upper band and adjacent bands never overlap.
+- **Unknown size.** A model whose size is unknown is outside every band. That includes a repository
+  with no safetensors metadata, a checkpoint that stores packed integer weights (more than 1 % of its
+  elements in an integer dtype: GPTQ, AWQ, bitsandbytes, whose element count understates the model)
+  and one whose `config.json` declares a `quantization_config`. A GGUF import and an OpenVINO copy
+  keep their own quantization, so their size never chooses a profile either.
+- **Only profiles.** Every other rule kind refuses `parameter_count`.
+- **Evidence.** `evidence` (`official`, `tested`, `reported`, `inferred`) states how well the band
+  is supported; a banded profile must set it.
+- **Version.** A banded profile needs `schema_version: 2`. A rule without its own
+  `schema_version` takes its document's, and no rule may declare a newer version than its document.
+
+Validation adds two checks. Every device that has a banded profile must also have a usable profile
+with no condition at all, for models of unknown size. And a band that can never win is reported:
+when an unbanded profile on the same specificity rung matches everything the band's other criteria
+match, at a higher priority, and no architecture or model rule names the banded profile.
 
 ## 6. Issue/signature rule
 
@@ -239,6 +285,16 @@ Rung 4 sits below every declared-identity rung on purpose: a rule that recognise
 
 Then apply version constraints and explicit `priority`.
 
+Profiles are resolved in this order: an explicit `--profile` always wins; then a profile named by
+the exact-model rule, then one named by the architecture rule; then scoring among the device's
+profiles. A named profile is a preference, not an override: it must itself be usable, satisfy its
+version constraints and match its own `applies_to`, size band included, or resolution falls
+through to scoring. Name a profile in an architecture rule only when the family must differ from
+what scoring would choose. The decision is recorded as a `profile_selection` (basis
+`explicit`, `named_by_model_rule`, `named_by_architecture_rule`, `size_band` or `device_default`)
+whose one sentence the preparation plan shows as "Chosen because" and the manifest keeps in its
+notes.
+
 If two same-specificity rules conflict and priority does not resolve them, registry validation fails.
 
 `registry explain` must output:
@@ -286,6 +342,12 @@ A bundle is used only when all of the following hold, and they are checked again
 
 The bundle forms one layer after the built-in rules and before user overrides: it may replace a
 shipped rule by id, and a user override replaces either.
+
+`tools/registry_bundle.py build` sets `min_tool_version` from the newest `schema_version` in the
+bundle (schema 2 needs yonga 0.3.0), and refuses a lower `--min-tool-version`. An older yonga then
+refuses the bundle at `registry update` and keeps the one it has, instead of installing data it
+cannot parse. A schema-2 bundle therefore cuts older releases off from every remote update,
+including issue signatures; keep bundles at schema 1 until a band itself must change remotely.
 
 ## 13. Registry tests
 

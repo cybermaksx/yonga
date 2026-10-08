@@ -427,18 +427,18 @@ variants of the CPU profile were prepared and measured against FP16 in the same 
 | `cpu-int8-asym-ref` | 592 MiB | 0.0074 | 95.42 % | +0.33 % |
 
 Keeping 20 % of the layers at INT8 cuts the divergence by 31 % for 10.5 % more disk; 40 % buys a
-further 17 % for twice that. The ratio-0.8 profile now ships as `cpu-int4-asym-g128-r08`, opt-in
-through `--profile`. It is not made the default for small models, because one measured model is
-not evidence about all of them, and the registry has no size condition to express the rule with.
+further 17 % for twice that. The ratio-0.8 profile shipped as `cpu-int4-asym-g128-r08`, opt-in
+through `--profile`, because one measured model was not evidence about all of them and the
+registry had no size condition to express the rule with. Section 10 measured eleven more models,
+and the profile is now the CPU default below 5B parameters.
 
-Reproduce:
+Reproduce the ratio-1.0 and ratio-0.8 rows (the artifacts are prepared on the way; the group-size-64
+and ratio-0.6 rows used profiles that do not ship):
 
 ```bash
-yonga prepare HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive --device gpu --profile cpu-int8-asym-ref --yes
-yonga eval 197ef1cdb734bd80 --reference 3904983a446e705e --device cpu
-yonga eval 289ede59ae155cd8 --reference 3904983a446e705e --device cpu
+python tools/measure_profiles.py --out build/qwen3-0.6b.json --model Qwen/Qwen3-0.6B \
+  --reference cpu-fp16-ref
 ```
-
 
 ## 9. GGUF imports against the original weights
 
@@ -470,3 +470,123 @@ Two findings, and one thing not found:
   section 8.5: at this size, what stays at 8 bits matters more than the 4-bit format.
 - **Not measured:** GGUF files of other architectures, and any GPU comparison of GGUF imports; the
   CPU was used so the arithmetic would not blur the comparison.
+
+## 10. Small-model defaults: twelve models, three devices
+
+Section 8.5 found that keeping a fifth of the layers at INT8 helps `Qwen/Qwen3-0.6B` a lot, and left
+the profile opt-in because one model is not a rule. This section is the evidence the rule now rests
+on. It also measured the NPU's two INT4 formats against each other, which nobody had.
+
+### 10.1 Method
+
+`tools/measure_profiles.py` prepared, for each model, the INT8 reference (`cpu-int8-asym-ref`) and
+four INT4 artifacts, each on the device its profile names, so the NPU artifacts were also compiled
+and probed on the NPU. Every INT4 artifact was then compared with the reference by `yonga eval` on
+the CPU at f32 over `yonga-eval-v1`. INT8 stands in for the original weights: it is 0.006-0.007
+nats from FP16 (sections 8.1 and 9). Lunar Lake reference host, OpenVINO 2026.4, optimum-intel
+2.2.0, NNCF 3.4.0, October 2026. The parameter count is the Hugging Face Hub's, the number size
+bands are written in.
+
+```bash
+python tools/measure_profiles.py --out build/campaign.json \
+  --candidate cpu-int4-asym-g128 --candidate cpu-int4-asym-g128-r08 \
+  --candidate npu-int4-sym-cw --candidate npu-int4-sym-g128 \
+  --model LiquidAI/LFM2-350M --model Qwen/Qwen3-0.6B ...   # one --model per row below
+```
+
+### 10.2 INT4 ratio 1.0 against ratio 0.8
+
+Mean KL / top-1 agreement / perplexity change against INT8, and artifact size.
+
+| Model | Hub count | Ratio 1.0 | Ratio 0.8 | KL | Size |
+|---|---|---|---|---|---|
+| `LiquidAI/LFM2-350M` | 0.35B | 0.241 / 73.0 % / +16.7 % / 216 MiB | 0.178 / 76.6 % / +12.7 % / 242 MiB | -26 % | +12.3 % |
+| `Qwen/Qwen2.5-0.5B-Instruct` | 0.49B | 0.296 / 70.6 % / +29.3 % / 328 MiB | 0.196 / 76.2 % / +19.1 % / 362 MiB | -34 % | +10.3 % |
+| `Qwen/Qwen3-0.6B` | 0.75B | 0.355 / 70.1 % / +32.4 % / 389 MiB | 0.245 / 74.6 % / +21.6 % / 430 MiB | -31 % | +10.6 % |
+| `unsloth/gemma-3-1b-it` | 1.00B | 0.471 / 75.1 % / +32.5 % / 691 MiB | 0.361 / 78.2 % / +25.8 % / 755 MiB | -23 % | +9.3 % |
+| `unsloth/Llama-3.2-1B-Instruct` | 1.24B | 0.247 / 76.3 % / +29.4 % / 761 MiB | 0.196 / 78.8 % / +23.2 % / 853 MiB | -21 % | +12.1 % |
+| `allenai/OLMo-2-0425-1B-Instruct` | 1.48B | 0.162 / 78.2 % / +10.6 % / 938 MiB | 0.118 / 82.9 % / +6.9 % / 1039 MiB | -27 % | +10.7 % |
+| `Qwen/Qwen3-1.7B` | 2.03B | 0.344 / 77.6 % / +23.7 % / 1017 MiB | 0.199 / 82.2 % / +8.5 % / 1148 MiB | -42 % | +12.9 % |
+| `ibm-granite/granite-3.3-2b-instruct` | 2.53B | 0.184 / 80.3 % / +6.4 % / 1311 MiB | 0.128 / 83.8 % / +5.8 % / 1542 MiB | -31 % | +17.6 % |
+| `unsloth/gemma-2-2b-it` | 2.61B | 0.080 / 87.3 % / +5.6 % / 1623 MiB | 0.053 / 89.2 % / +4.7 % / 1811 MiB | -34 % | +11.5 % |
+| `HuggingFaceTB/SmolLM3-3B` | 3.08B | 0.252 / 80.4 % / +9.5 % / 1674 MiB | 0.212 / 83.2 % / +11.1 % / 1936 MiB | -16 % | +15.7 % |
+| `Qwen/Qwen3-4B` | 4.02B | 0.243 / 81.2 % / +18.5 % / 2194 MiB | 0.177 / 84.5 % / +7.5 % / 2535 MiB | -27 % | +15.5 % |
+| `Qwen/Qwen3-8B` | 8.19B | 0.136 / 85.1 % / +7.2 % / 4652 MiB | 0.096 / 87.1 % / +6.8 % / 5297 MiB | -29 % | +13.9 % |
+
+Ratio 0.8 is closer to the reference on every model, by 16-42 % in KL and 2-6 points of top-1
+agreement, for 9-18 % more disk. Perplexity improves on eleven of the twelve; on SmolLM3-3B it gets
+slightly worse while KL and top-1 both improve, so the two measures disagree there. What changes
+with size is not the relative gain but how much there is to gain: below 5B the perplexity increase
+of ratio 1.0 is often 20-33 % and ratio 0.8 removes a fifth to two thirds of it (a fifth on
+gemma-3-1b and Llama-3.2-1B) (Qwen3-1.7B +23.7 %
+to +8.5 %, Qwen3-4B +18.5 % to +7.5 %); at 8B it is +7.2 % and ratio 0.8 makes it +6.8 %.
+
+On the GPU itself, `yonga eval --device gpu` gives the same ordering: Qwen3-1.7B +24.4 % against
++10.8 %, Qwen3-4B +27.1 % against +9.8 %.
+
+### 10.3 The NPU's two formats
+
+| Model | Hub count | `npu-int4-sym-cw` KL / perplexity | `npu-int4-sym-g128` KL / perplexity |
+|---|---|---|---|
+| `LiquidAI/LFM2-350M` | 0.35B | 0.482 / +38.7 % | 0.265 / +21.4 % |
+| `Qwen/Qwen2.5-0.5B-Instruct` | 0.49B | 0.749 / +107.1 % | 0.339 / +38.2 % |
+| `Qwen/Qwen3-0.6B` | 0.75B | 0.775 / +81.3 % | 0.385 / +33.0 % |
+| `unsloth/gemma-3-1b-it` | 1.00B | 1.037 / +55.6 % | 0.520 / +32.4 % |
+| `unsloth/Llama-3.2-1B-Instruct` | 1.24B | 0.697 / +98.2 % | 0.266 / +33.1 % |
+| `allenai/OLMo-2-0425-1B-Instruct` | 1.48B | 0.391 / +33.7 % | 0.175 / +10.5 % |
+| `Qwen/Qwen3-1.7B` | 2.03B | 0.835 / +108.1 % | 0.330 / +17.9 % |
+| `ibm-granite/granite-3.3-2b-instruct` | 2.53B | 1.152 / +151.1 % | 0.226 / +12.5 % |
+| `unsloth/gemma-2-2b-it` | 2.61B | 0.190 / +19.6 % | 0.087 / +6.8 % |
+| `HuggingFaceTB/SmolLM3-3B` | 3.08B | 0.464 / +24.9 % | 0.245 / +7.2 % |
+| `Qwen/Qwen3-4B` | 4.02B | 0.529 / +25.7 % | 0.264 / +12.7 % |
+| `Qwen/Qwen3-8B` | 8.19B | 0.444 / +42.7 % | 0.150 / +9.4 % |
+
+Channel-wise INT4 diverges from the reference roughly two to five times as much as group-wise, on every
+model and at every size. Before this change the NPU used channel-wise for every family except
+Qwen3, so a small model on the NPU was, for example, Qwen2.5-0.5B at +107 % perplexity where
++38 % was available. Every group-wise artifact also compiled and generated on the NPU.
+
+### 10.4 Speed
+
+`yonga bench --suite standard`, two measured runs after one warmup. Tokens per second and time to
+first token, averaged over the suite's three prompts. The ratio-1.0 and ratio-0.8 columns use the
+CPU-profile artifacts on both the GPU and the CPU, so the GPU columns run without the
+`ATTENTION_BACKEND=SDPA` property the GPU profiles set.
+
+| Qwen3 | GPU r1.0 | GPU r0.8 | CPU r1.0 | CPU r0.8 | NPU cw | NPU g128 |
+|---|---|---|---|---|---|---|
+| 0.6B | 152.5 (27 ms) | 125.5 (49 ms) | 85.6 (41 ms) | 82.6 (41 ms) | 77.4 (123 ms) | 66.9 (168 ms) |
+| 1.7B | 74.4 (47 ms) | 67.1 (56 ms) | 44.4 (101 ms) | 39.9 (109 ms) | 35.2 (319 ms) | 36.9 (431 ms) |
+| 4B | 34.7 (60 ms) | 30.4 (74 ms) | 19.2 (276 ms) | 17.0 (292 ms) | 24.6 (832 ms) | 16.5 (1651 ms) |
+| 8B | 16.6 (96 ms) | 13.0 (128 ms) | 10.0 (625 ms) | 9.7 (547 ms) | 13.9 (1785 ms) | 10.6 (2842 ms) |
+
+Ratio 0.8 costs 10-18 % of the GPU's tokens per second below 5B, 22 % at 8B, and up to 12 % of the
+CPU's. With the GPU profiles themselves (`gpu-int4-asym-g128` against `gpu-int4-asym-g128-r08`,
+SDPA on), alternated runs with cool-downs at 1.7B and 4B gave suite medians of 58-64 against 53-66
+tok/s and 28-32 against 28-29 tok/s: the difference was inside the host's run-to-run spread of
+about 20 %, which this laptop's thermal state (72-83 °C during the runs) makes wide. Read the speed
+cost as "up to about a fifth", not as a precise figure. Group-wise INT4
+on the NPU costs 14 % at 0.6B, nothing at 1.7B, and a third at 4B with twice the time to first
+token, which is the size where the NPU documentation starts recommending channel-wise.
+
+### 10.5 What the registry does with it
+
+Below 5B parameters each device now defaults to the more accurate profile: `cpu-int4-asym-g128-r08`,
+the new `gpu-int4-asym-g128-r08` and `npu-int4-sym-g128`. At 5B and above, and whenever the size is
+unknown, the defaults are unchanged (`cpu-int4-asym-g128`, `gpu-int4-asym-g128`,
+`npu-int4-sym-cw`). Between the 4B and 8B rows nothing was measured, and 5B follows the NPU
+documentation's "roughly 4-5B". The plan says why a profile was chosen ("Chosen because"), and
+`--profile` overrides it either way.
+
+Exceptions, all deliberate: the VLM families keep their CPU and GPU pins to ratio 1.0, and the
+generic rule (Mistral and other unrecognised members of common families) and Phi-3 keep the NPU on
+channel-wise INT4, because group-wise was never prepared and probed on the NPU for them.
+
+Two choices the numbers leave open, recorded here rather than hidden in the threshold:
+
+- **At 8B on the NPU, channel-wise is a third faster and far less accurate** (+42.7 % against
+  +9.4 % perplexity). The default follows the documentation and the speed;
+  `--profile npu-int4-sym-g128` is the quality choice, and it compiles and runs.
+- **The VLM families keep ratio 1.0.** No VLM was measured, and a VLM's Hub count includes its
+  vision tower, so a band in Hub-count units says less about its language model.
+
