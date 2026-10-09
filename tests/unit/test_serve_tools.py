@@ -24,7 +24,7 @@ from tests.unit.test_chat_service import SECRET, build_service, make_manifest, w
 from tests.unit.test_serve_api import StreamingRuntime, content_of, events, final_reason
 from yonga.adapters.runtime_genai import ChatHistory, GenerationResult, ToolCall
 from yonga.api.app import create_app
-from yonga.api.openai import ChatCompletionRequest, UnsupportedParameter
+from yonga.api.openai import MAX_ARGUMENT_DEPTH, ChatCompletionRequest, UnsupportedParameter
 from yonga.application.chat import ChatMessage
 from yonga.application.serve import (
     IMAGES_EARLIER_TURN,
@@ -114,7 +114,7 @@ def post(server: ModelServer, body: dict[str, object]) -> Any:
     return TestClient(create_app(server)).post("/v1/chat/completions", json=body)
 
 
-def tool_deltas(response_text: str) -> list[dict[str, object]]:
+def tool_deltas(response_text: str) -> list[dict[str, Any]]:
     return [
         call
         for event in events(response_text)
@@ -664,6 +664,30 @@ def test_history_arguments_nested_too_deeply_are_a_400(tmp_path: Path) -> None:
     assert runtime.histories == []
 
 
+@pytest.mark.parametrize(
+    ("arguments", "too_deep"),
+    [
+        ("[" * MAX_ARGUMENT_DEPTH + "]" * MAX_ARGUMENT_DEPTH, False),
+        ("[" * (MAX_ARGUMENT_DEPTH + 1) + "]" * (MAX_ARGUMENT_DEPTH + 1), True),
+        ('{"a": "' + "[" * 500 + '"}', False),
+        ('{"a": "\\"' + "[" * 500 + '"}', False),
+        ("{" * (MAX_ARGUMENT_DEPTH + 1), True),
+    ],
+)
+def test_the_depth_limit_counts_brackets_outside_strings_only(
+    tmp_path: Path, arguments: str, too_deep: bool
+) -> None:
+    """The guard does not lean on RecursionError, whose depth depends on the stack."""
+    server, _ = make_server(tmp_path, ["Hi."])
+    body = round_trip()
+    messages: list[dict[str, Any]] = body["messages"]  # type: ignore[assignment]
+    messages[1]["tool_calls"][0]["function"]["arguments"] = arguments
+
+    response = post(server, body)
+
+    assert (response.status_code == 400) is too_deep, response.text
+
+
 def test_history_arguments_that_are_not_json_reach_the_template_as_text(tmp_path: Path) -> None:
     server, runtime = make_server(tmp_path, ["It is sunny."])
     body = round_trip()
@@ -672,7 +696,8 @@ def test_history_arguments_that_are_not_json_reach_the_template_as_text(tmp_path
 
     assert post(server, body).status_code == 200
     (payload,) = runtime.payloads
-    (call,) = payload[1]["tool_calls"]  # type: ignore[misc]
+    calls: list[dict[str, Any]] = payload[1]["tool_calls"]  # type: ignore[assignment]
+    (call,) = calls
     assert call["function"]["arguments"] == "city=Ankara"
 
 

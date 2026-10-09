@@ -77,6 +77,12 @@ __all__ = [
 #: request over it is refused with ``400`` naming ``messages``.
 MAX_MESSAGES = 4096
 
+#: Deepest nesting of arrays and objects accepted in a history tool call's
+#: arguments. Checked by counting brackets before parsing: whether ``json.loads``
+#: raises ``RecursionError`` on deep input depends on the interpreter's stack,
+#: so it cannot be the guard.
+MAX_ARGUMENT_DEPTH = 64
+
 #: A function name as OpenAI accepts one.
 _FUNCTION_NAME = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
@@ -410,6 +416,10 @@ def _tool_calls(index: int, message: WireMessage) -> list[ToolCall]:
             raise InvalidParameter(
                 f"{param}.function.arguments", "Tool call arguments are JSON text."
             )
+        if _nested_deeper_than(arguments, MAX_ARGUMENT_DEPTH):
+            raise InvalidParameter(
+                f"{param}.function.arguments", "Tool call arguments are nested too deeply."
+            )
         try:
             json.loads(arguments)
         except RecursionError:
@@ -420,6 +430,33 @@ def _tool_calls(index: int, message: WireMessage) -> list[ToolCall]:
             pass  # not JSON: it reaches the chat template as text
         calls.append(ToolCall(id=item["id"], name=function["name"], arguments=arguments))
     return calls
+
+
+def _nested_deeper_than(text: str, limit: int) -> bool:
+    """Whether JSON ``text`` opens more than ``limit`` arrays or objects at once.
+
+    Brackets inside strings do not count. The text need not be valid JSON:
+    only its depth is measured, so this runs before anything parses it.
+    """
+    depth = 0
+    in_string = escaped = False
+    for character in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+        elif character == '"':
+            in_string = True
+        elif character in "[{":
+            depth += 1
+            if depth > limit:
+                return True
+        elif character in "]}":
+            depth -= 1
+    return False
 
 
 def _content(

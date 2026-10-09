@@ -1185,7 +1185,7 @@ def test_a_pipeline_without_finish_chat_still_renders(artifact, settings, genai)
     """A later GenAI may drop the deprecated call; then there is no chat to close."""
     runtime = make_runtime(artifact, settings)
     pipeline = genai.pipelines[0]
-    pipeline.finish_chat = None  # type: ignore[method-assign,assignment]
+    pipeline.finish_chat = None
 
     result = runtime.generate(tool_conversation(), GenerationSettings())
 
@@ -1215,7 +1215,7 @@ def test_a_failing_reset_after_a_rendered_turn_does_not_hide_the_answer(artifact
         if len(resets) == 2:
             raise RuntimeError("reset failed")
 
-    pipeline.finish_chat = finish_chat  # type: ignore[method-assign]
+    pipeline.finish_chat = finish_chat
 
     result = runtime.generate(tool_conversation(), GenerationSettings())
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import random
 from itertools import count
+from typing import Any
 
 import pytest
 
@@ -22,6 +23,7 @@ from yonga.application.tool_calls import (
     supported_format,
     tool_names,
 )
+from yonga.domain.compatibility import EvidenceLevel
 from yonga.registry.schema import KNOWN_TOOL_CALL_FORMATS, SourceKind, SourceRef, ToolCallingRule
 
 TESTED = [SourceRef(kind=SourceKind.TESTED, note="demo")]
@@ -29,11 +31,11 @@ TAGGED = ToolCallingRule(
     format="tagged_json",
     open="<tool_call>",
     close="</tool_call>",
-    evidence="tested",
+    evidence=EvidenceLevel.TESTED,
     sources=TESTED,
 )
 LISTED = ToolCallingRule(
-    format="json_list", open="<|tool_call|>", evidence="tested", sources=TESTED
+    format="json_list", open="<|tool_call|>", evidence=EvidenceLevel.TESTED, sources=TESTED
 )
 NAMES = frozenset({"get_weather", "get_time"})
 
@@ -64,7 +66,7 @@ def test_call_ids_are_fresh_and_openai_shaped() -> None:
 
 
 def test_tool_names_reads_the_offered_functions() -> None:
-    tools = [
+    tools: list[dict[str, Any]] = [
         {"type": "function", "function": {"name": "get_weather"}},
         {"type": "function", "function": {"name": "get_time", "parameters": {}}},
         {"type": "function"},
@@ -142,7 +144,7 @@ def test_field_names_and_markers_come_from_the_rule() -> None:
         close="[/CALL]",
         name_field="function",
         arguments_field="parameters",
-        evidence="tested",
+        evidence=EvidenceLevel.TESTED,
         sources=TESTED,
     )
     parsed = parse('[CALL]{"function": "get_time", "parameters": {"zone": "UTC"}}[/CALL]', rule)
