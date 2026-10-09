@@ -277,6 +277,14 @@ The fix is `YONGA_CACHE_DIR` (or `--cache-dir`) pointing at a disk-backed direct
 `disk.insufficient_space` instead, often through OpenVINO's misleading
 `basic_ios::clear: iostream error`, which is a full filesystem and not a serialisation bug.
 
+The OpenVINO compile cache shares that filesystem and is often what filled it: one entry per
+artifact, device and OpenVINO version, several GiB each for NPU and GPU blobs, kept until something
+removes them. `yonga cache list` shows what it holds and which entries are dead (`orphaned`: the
+artifact is gone; `stale-runtime`: built by another OpenVINO release, never reused). `yonga cache
+prune --dry-run` shows what a prune would free, `yonga cache prune` frees it, and `--older-than
+DAYS`, `--unattributed` or `--all` go further. `yonga doctor` flags the reclaimable part under
+Storage once it reaches 10 GiB, or 25 % of the free space.
+
 ### 5.4 NNCF refuses the profile's group size
 
 Symptom: `yonga prepare` exits 40 with nothing useful, and the job log ends with:

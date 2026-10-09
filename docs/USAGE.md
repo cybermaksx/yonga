@@ -214,7 +214,20 @@ yonga probe ARTIFACT --device gpu   # compile each submodel, report what worked
 yonga chat ARTIFACT --device gpu
 yonga bench ARTIFACT --device gpu --suite quick --runs 3 --warmups 1
 yonga remove ARTIFACT               # artifact + its compile cache, nothing else
+yonga cache list                    # compile cache entries: size, last use, owner, status
+yonga cache prune                   # remove orphaned and stale-runtime entries (asks first)
 ```
+
+The compile cache (`~/.cache/yonga/compile`) holds the blobs OpenVINO compiled for each artifact,
+device and runtime version, so a second load is fast. It is not cleaned up on its own: an artifact
+deleted by hand, one prepared in another `--data-dir`, or an OpenVINO upgrade all leave entries
+behind. `yonga cache list` shows each entry's status (`in-use`, `orphaned`, `stale-runtime`,
+`unattributed`) and `yonga cache prune` removes the orphaned and stale-runtime ones after showing
+what it will delete. `--dry-run` only shows; `--older-than 30` also drops entries unused for 30
+days, `--unattributed` also drops entries no artifact can be traced to (typically ones made by
+yonga 0.3.0 and earlier, which wrote no ownership record), and `--all` empties the cache. Nothing outside the compile cache is touched,
+and a pruned entry only costs a recompile on the next load. `yonga doctor` warns when the
+reclaimable part reaches 10 GiB, or 25 % of the free space on the cache filesystem.
 
 `chat` supports `/help /reset /clear /tokens N /temp X /top-p X /top-k N /reasoning on|off
 /stats on|off /model /exit`, renders Markdown, and shows a metrics footer:
@@ -551,7 +564,7 @@ Without it those tests skip with a message telling you to run exactly that.
 
 ```
 ~/.config/yonga/config.toml              settings, and registry-overrides/
-~/.cache/yonga/{tmp,compile,metadata}    managed temp, compile cache
+~/.cache/yonga/{tmp,compile,metadata}    managed temp, compile cache (yonga cache list)
 ~/.local/share/yonga/artifacts/          prepared artifacts, each with .yonga/manifest.json
 ~/.local/share/yonga/{logs,benchmarks,chat-history}
 ```

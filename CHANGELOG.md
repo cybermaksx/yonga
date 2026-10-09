@@ -73,6 +73,22 @@ manifest may change in any minor release.
   dies without a result is a failure classified by the registry from its stderr. Without either
   option nothing changes, and `prepare` still always waits. `python -m yonga.application.probe`
   takes both options too. `docs/CLI_SPEC.md` section 11.
+- **`yonga cache list` and `yonga cache prune`: the OpenVINO compile cache is no longer
+  write-only.** Every compile cache entry yonga uses now gets an ownership record,
+  `.yonga-entry.json` (artifact id and path, repository, profile, device, OpenVINO version, runtime
+  properties, created and last used); writing it never fails a load. `cache list` (or plain
+  `yonga cache`) shows each entry's size, last use, device, OpenVINO version, owner and status:
+  `in-use`, `orphaned` (the artifact is gone), `stale-runtime` (built by an OpenVINO release other
+  than the installed one, so never reused) or `unattributed`. Entries made before the records are
+  attributed by recomputing the keys of every artifact in the store and every artifact a saved
+  benchmark names. `cache prune` removes orphaned and stale-runtime entries; `--older-than DAYS`,
+  `--unattributed` and `--all` go further, `--dry-run` only shows the plan, and it asks first
+  unless `--yes`. It deletes only key-named, real directories directly under the compile cache
+  root, never follows a symbolic link, and reports the bytes freed. `--json` on both.
+  `docs/CLI_SPEC.md` section 12b.
+- **`doctor` reports the compile cache** under Storage: entries, size and the reclaimable part,
+  a warning naming `yonga cache prune` from 10 GiB reclaimable or 25 % of the free space on the
+  cache filesystem (never below 1 GiB), and the numbers under `compile_cache` in `--json`.
 
 ### Changed
 
@@ -132,6 +148,15 @@ manifest may change in any minor release.
 
 ### Fixed
 
+- **The generation smoke test compiled into the default cache directory.** `prepare` and `probe`
+  built the smoke-test pipeline with default settings, so `--cache-dir` and the configuration
+  file's `cache_dir` and `compile_cache_enabled` were ignored for it, and `probe --timeout`'s child
+  process did the same. Both now use the invocation's settings; the child receives them as
+  `--cache-dir` and `--no-compile-cache`.
+- **`yonga remove` finds compile cache entries built by any OpenVINO release** through their
+  ownership records, and tries CPU, GPU and NPU keys whatever the manifest recorded; before, an
+  entry built after an OpenVINO upgrade, or on a device the artifact was never probed on, was left
+  behind.
 - **`prepare` works again for Qwen3.5 below 5B parameters.** The 0.3.0 registry pinned Qwen3.5 to
   ratio-1.0 INT4 on the CPU and GPU, and that fails NNCF's group-size check on Qwen3.5 0.8B, 2B
   and 4B (`export.quantization.group_size_mismatch`: the one-channel weight of the rotary-embedding

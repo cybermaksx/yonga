@@ -17,9 +17,10 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
@@ -30,6 +31,8 @@ import pytest
 from typer.testing import CliRunner, Result
 
 from tests.support import RefusingRunner, SmokeChildRunner, plain_text
+from tests.unit.test_artifact_store import make_manifest, publish
+from tests.unit.test_compile_cache import INSTALLED, OLDER, legacy_entry, recorded_entry
 from tests.unit.test_prepare_planning import (
     GGUF_REPO,
     SAFETENSORS_REPO,
@@ -352,6 +355,10 @@ class FakeWiring(Wiring):
         """Return the fake runtime factory."""
         return self._fake_factory
 
+    def openvino_version(self) -> str | None:
+        """Report a fixed installed runtime, so no test imports OpenVINO for it."""
+        return INSTALLED
+
     def artifact_store(self) -> ArtifactStore:
         """Return the real store, unless a test injected a broken one."""
         if self._fake_store is not None:
@@ -557,6 +564,7 @@ def test_help_lists_every_documented_command(runner: CliRunner) -> None:
         "serve",
         "publish",
         "eval",
+        "cache",
     ):
         assert command in result.stdout
 
@@ -1256,6 +1264,194 @@ def test_bench_rejects_an_unknown_suite(runner: CliRunner, home: Path, tmp_path:
     result = invoke(runner, home, ["bench", str(artifact), "--suite", "enormous"])
     assert result.exit_code == int(ExitCode.REGISTRY)
     assert "quick, standard, long" in result.stderr
+
+
+# ======================================================================
+# cache
+# ======================================================================
+def records(value: object) -> list[dict[str, Any]]:
+    """Narrow a JSON array of objects for indexing."""
+    assert isinstance(value, list)
+    assert all(isinstance(item, dict) for item in value)
+    return value
+
+
+def cli_settings(home: Path) -> Settings:
+    """The settings ``invoke`` gives every command, for building fixtures beside it."""
+    return Settings.model_validate(
+        {"config_dir": home / "config", "cache_dir": home / "cache", "data_dir": home / "data"}
+    )
+
+
+def populated_cache(home: Path, tmp_path: Path) -> dict[str, Path]:
+    """One compile cache entry per status, under the CLI's own directories."""
+    settings = cli_settings(home)
+    store = ArtifactStore(settings.paths, settings)
+    kept = publish(store, tmp_path, manifest=make_manifest(artifact_id="aaaaaaaaaaaaaaaa"))
+    gone = publish(
+        store,
+        tmp_path,
+        manifest=make_manifest(artifact_id="bbbbbbbbbbbbbbbb", profile="cpu-int4-asym-g128"),
+        name="staging-gone",
+    )
+    entries = {
+        "in-use": recorded_entry(settings, kept, size=1000),
+        "stale-runtime": recorded_entry(settings, kept, device="NPU", version=OLDER, size=3000),
+        "orphaned": recorded_entry(settings, gone, device="CPU", size=5000),
+        "unattributed": legacy_entry(settings, "0123456789abcdef", size=7000),
+    }
+    shutil.rmtree(gone)
+    return entries
+
+
+def test_cache_list_json_is_one_document_even_when_empty(runner: CliRunner, home: Path) -> None:
+    result = invoke(runner, home, ["cache", "list", "--json"])
+
+    payload = one_document(result)
+    assert result.exit_code == int(ExitCode.SUCCESS)
+    assert payload["ok"] is True
+    assert payload["count"] == 0
+    assert payload["total_bytes"] == 0
+    assert payload["compile_cache_dir"] == str(home / "cache" / "compile")
+
+
+def test_cache_list_shows_every_status_and_the_prune_hint(
+    runner: CliRunner, home: Path, tmp_path: Path
+) -> None:
+    entries = populated_cache(home, tmp_path)
+
+    result = invoke(runner, home, ["cache", "list"])
+
+    assert result.exit_code == int(ExitCode.SUCCESS)
+    output = plain_text(result.stdout)
+    for status, path in entries.items():
+        assert path.name in output
+        assert status in output
+    assert "bbbbbbbbbbbbbbbb" in output, "the owner of an orphan is still named"
+    assert "4 entries" in output
+    assert "yonga cache prune" in output
+    assert "--unattributed" in output
+
+
+def test_plain_cache_is_cache_list(runner: CliRunner, home: Path, tmp_path: Path) -> None:
+    entries = populated_cache(home, tmp_path)
+
+    listed = one_document(invoke(runner, home, ["cache", "list", "--json"]))
+    alias = one_document(invoke(runner, home, ["cache", "--json"]))
+
+    assert alias == listed
+    statuses = {entry["key"]: entry["status"] for entry in records(listed["entries"])}
+    assert statuses == {path.name: status for status, path in entries.items()}
+    assert listed["by_status"] == {
+        "in-use": 1,
+        "orphaned": 1,
+        "stale-runtime": 1,
+        "unattributed": 1,
+    }
+    assert listed["installed_openvino"] == INSTALLED
+
+
+def test_cache_prune_asks_first_and_declining_removes_nothing(
+    runner: CliRunner, home: Path, tmp_path: Path
+) -> None:
+    entries = populated_cache(home, tmp_path)
+
+    declined = invoke(runner, home, ["cache", "prune"])
+
+    assert declined.exit_code == int(ExitCode.CANCELLED)
+    assert all(path.is_dir() for path in entries.values())
+
+
+def test_cache_prune_dry_run_shows_the_plan_and_deletes_nothing(
+    runner: CliRunner, home: Path, tmp_path: Path
+) -> None:
+    entries = populated_cache(home, tmp_path)
+
+    result = invoke(runner, home, ["cache", "prune", "--dry-run", "--json"])
+
+    payload = one_document(result)
+    assert result.exit_code == int(ExitCode.SUCCESS)
+    assert payload["dry_run"] is True
+    planned = {entry["key"]: entry["selected_because"] for entry in records(payload["planned"])}
+    assert planned == {
+        entries["orphaned"].name: "orphaned",
+        entries["stale-runtime"].name: "stale-runtime",
+    }
+    assert payload["removed"] == []
+    assert payload["freed_bytes"] == 0
+    assert all(path.is_dir() for path in entries.values())
+
+
+def test_cache_prune_yes_removes_orphaned_and_stale_entries_only(
+    runner: CliRunner, home: Path, tmp_path: Path
+) -> None:
+    entries = populated_cache(home, tmp_path)
+
+    result = invoke(runner, home, ["cache", "prune", "--yes", "--json"])
+
+    payload = one_document(result)
+    assert result.exit_code == int(ExitCode.SUCCESS)
+    removed = payload["removed"]
+    assert isinstance(removed, list)
+    assert sorted(removed) == sorted([entries["orphaned"].name, entries["stale-runtime"].name])
+    assert payload["freed_bytes"] == payload["planned_bytes"]
+    freed = payload["freed_bytes"]
+    assert isinstance(freed, int) and freed >= 8000
+    assert payload["kept"] == 2
+    assert not entries["orphaned"].exists() and not entries["stale-runtime"].exists()
+    assert entries["in-use"].is_dir() and entries["unattributed"].is_dir()
+
+
+def test_cache_prune_all_and_unattributed_go_further(
+    runner: CliRunner, home: Path, tmp_path: Path
+) -> None:
+    entries = populated_cache(home, tmp_path)
+    keep = home / "cache" / "compile" / "not-an-entry"
+    keep.mkdir()
+
+    unattributed = invoke(runner, home, ["cache", "prune", "--unattributed", "--yes"])
+    assert unattributed.exit_code == int(ExitCode.SUCCESS)
+    assert not entries["unattributed"].exists()
+    assert entries["in-use"].is_dir()
+    assert "freed" in unattributed.stdout
+
+    everything = invoke(runner, home, ["cache", "prune", "--all", "--yes"])
+    assert everything.exit_code == int(ExitCode.SUCCESS)
+    assert not entries["in-use"].exists()
+    assert keep.is_dir(), "only key-named entries are ever removed"
+
+    nothing = invoke(runner, home, ["cache", "prune", "--yes"])
+    assert nothing.exit_code == int(ExitCode.SUCCESS)
+    assert "Nothing to prune" in nothing.stdout
+
+
+def test_cache_prune_rejects_a_negative_age(runner: CliRunner, home: Path) -> None:
+    result = invoke(runner, home, ["cache", "prune", "--older-than", "-3", "--json"])
+
+    assert result.exit_code == int(ExitCode.REGISTRY)
+    document = json.loads(result.stdout)
+    assert document["diagnostic"]["code"] == "cache.prune.older_than_invalid"
+
+
+def test_doctor_warns_about_a_large_reclaimable_compile_cache(
+    runner: CliRunner, home: Path, tmp_path: Path
+) -> None:
+    """A sparse 12 GiB blob of a removed artifact is over the 10 GiB threshold."""
+    entries = populated_cache(home, tmp_path)
+    with (entries["orphaned"] / "huge.blob").open("wb") as blob:
+        blob.truncate(12 * GIB)
+
+    result = invoke(runner, home, ["doctor", "--json"])
+
+    payload = one_document(result)
+    assert result.exit_code == int(ExitCode.WARNINGS)
+    summary = payload["compile_cache"]
+    assert isinstance(summary, dict)
+    assert summary["reclaimable_bytes"] >= 12 * GIB
+    storage = next(item for item in records(payload["sections"]) if item["id"] == "storage")
+    check = next(item for item in storage["checks"] if item["id"] == "storage.compile_cache")
+    assert check["status"] == "warning"
+    assert any("yonga cache prune" in line for line in check["remediation"])
 
 
 # ======================================================================

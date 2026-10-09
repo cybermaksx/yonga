@@ -23,9 +23,12 @@ Two deliberate policies govern the error handling here:
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 import time
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from contextlib import suppress
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -38,6 +41,11 @@ from yonga.domain.artifacts import (
     SubmodelRole,
     manifest_path,
     role_for_filename,
+)
+from yonga.domain.compile_cache import (
+    COMPILE_CACHE_ENTRY_FILENAME,
+    COMPILE_CACHE_ENTRY_SCHEMA,
+    CompileCacheRecord,
 )
 from yonga.domain.diagnostics import Diagnostic, FailureCategory, diagnostic
 from yonga.domain.hardware import OpenVINODevice, device_kind, normalise_device
@@ -54,6 +62,7 @@ __all__ = [
     "UNKNOWN",
     "OpenVINOProbe",
     "artifact_fingerprint",
+    "candidate_compile_cache_keys",
     "compile_cache_dir",
     "compile_cache_key",
     "compiler_in_plugin",
@@ -63,6 +72,8 @@ __all__ = [
     "openvino_missing_diagnostic",
     "openvino_runtime_version",
     "openvino_tokenizers_version",
+    "read_compile_cache_record",
+    "record_compile_cache_use",
 ]
 
 #: Placeholder recorded for any device property that could not be read.
@@ -288,23 +299,61 @@ def compile_cache_key(
     one. ``CACHE_DIR`` is excluded from the property set because the directory is
     derived from this key.
     """
-    scrubbed = {
-        str(name): _property_text(value)
-        for name, value in (properties or {}).items()
-        if str(name).upper() not in _CACHE_KEY_EXCLUDED_PROPERTIES
-    }
     payload = json.dumps(
         {
             "artifact": artifact_hash,
             "device": normalise_device(device),
             "openvino": (openvino_version or UNKNOWN).strip() or UNKNOWN,
-            "properties": scrubbed,
+            "properties": _key_properties(properties),
         },
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,
     )
     return short_hash(payload, 16)
+
+
+def _key_properties(properties: Mapping[str, object] | None) -> dict[str, str]:
+    """The properties that feed a compile cache key: stringified, ``CACHE_DIR`` dropped."""
+    return {
+        str(name): _property_text(value)
+        for name, value in (properties or {}).items()
+        if str(name).upper() not in _CACHE_KEY_EXCLUDED_PROPERTIES
+    }
+
+
+def candidate_compile_cache_keys(
+    artifact_hash: str,
+    *,
+    devices: Iterable[str],
+    versions: Iterable[str | None],
+    property_sets: Iterable[Mapping[str, str]],
+) -> dict[str, tuple[str, str | None, dict[str, str]]]:
+    """Every key one artifact could have produced, mapped to ``(device, version, properties)``.
+
+    The key cannot be inverted, so finding an artifact's cache entries means
+    recomputing every key it could plausibly have used. Devices are normalised
+    first, so ``GPU.0`` and ``gpu`` cost one digest, and duplicate property sets
+    are folded. The first combination that yields a key wins.
+    """
+    device_names = sorted({normalise_device(name) for name in devices if name.strip()})
+    version_list = list(dict.fromkeys(versions))
+    unique_sets: dict[str, dict[str, str]] = {}
+    for properties in property_sets:
+        scrubbed = _key_properties(properties)
+        unique_sets.setdefault(json.dumps(scrubbed, sort_keys=True), scrubbed)
+    found: dict[str, tuple[str, str | None, dict[str, str]]] = {}
+    for device in device_names:
+        for version in version_list:
+            for scrubbed in unique_sets.values():
+                key = compile_cache_key(
+                    artifact_hash=artifact_hash,
+                    device=device,
+                    openvino_version=version,
+                    properties=scrubbed,
+                )
+                found.setdefault(key, (device, version, scrubbed))
+    return found
 
 
 def compile_cache_dir(paths: Paths, key: str) -> Path:
@@ -318,6 +367,108 @@ def compile_cache_dir(paths: Paths, key: str) -> Path:
     with suppress(OSError):
         directory.mkdir(parents=True, exist_ok=True)
     return directory
+
+
+def read_compile_cache_record(directory: Path) -> CompileCacheRecord | None:
+    """Return the ownership record of one compile cache entry, or ``None``.
+
+    A missing, unreadable or malformed record, and one whose ``key`` is not the
+    directory's own name (a record copied from elsewhere), are all ``None``: the
+    entry is then treated as one yonga never recorded. The record is never read
+    through a symbolic link.
+    """
+    target = directory / COMPILE_CACHE_ENTRY_FILENAME
+    try:
+        if target.is_symlink() or not target.is_file():
+            return None
+        record = CompileCacheRecord.model_validate_json(target.read_bytes())
+    except (OSError, ValueError):
+        return None
+    if record.key != directory.name:
+        return None
+    return record
+
+
+def record_compile_cache_use(
+    directory: Path,
+    *,
+    artifact_dir: Path,
+    artifact_hash: str,
+    device: str,
+    openvino_version: str | None,
+    properties: Mapping[str, object] | None = None,
+    now: datetime | None = None,
+) -> None:
+    """Create or refresh the ownership record inside one compile cache entry.
+
+    Called each time yonga hands ``directory`` to OpenVINO as ``CACHE_DIR``. The
+    record says which artifact the blobs belong to, which device and OpenVINO
+    release built them, and when they were last used, so ``yonga cache prune``
+    can tell a live entry from a dead one without inverting the key. The first
+    ``created_at`` is kept across refreshes.
+
+    The write is atomic (a temporary file renamed over the record) and every
+    failure is swallowed: a read-only cache, a full disk or a racing writer must
+    never stop a model from loading, exactly as :func:`compile_cache_dir`
+    degrades to "no caching". That is why every ``Exception`` is caught here and
+    not only ``OSError``: bookkeeping must not be able to fail a compile.
+    """
+    with suppress(Exception):
+        if directory.is_symlink() or not directory.is_dir():
+            return
+        moment = now if now is not None else datetime.now(tz=UTC)
+        previous = read_compile_cache_record(directory)
+        scrubbed = _key_properties(properties)
+        summary = _manifest_summary(artifact_dir)
+        artifact_id = summary.get("artifact_id")
+        record = CompileCacheRecord(
+            schema_version=COMPILE_CACHE_ENTRY_SCHEMA,
+            key=directory.name,
+            fingerprint=artifact_hash,
+            artifact_id=artifact_id if artifact_id == artifact_hash else None,
+            artifact_path=str(Path(artifact_dir).absolute()),
+            repo_id=summary.get("repo_id"),
+            profile=summary.get("profile"),
+            device=normalise_device(device),
+            openvino_version=openvino_version,
+            properties=scrubbed,
+            properties_fingerprint=short_hash(json.dumps(scrubbed, sort_keys=True), 16),
+            created_at=previous.created_at if previous is not None else moment,
+            last_used_at=moment,
+        )
+        handle, temporary = tempfile.mkstemp(
+            dir=directory, prefix=f"{COMPILE_CACHE_ENTRY_FILENAME}.", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(handle, "w", encoding="utf-8") as stream:
+                stream.write(record.model_dump_json(indent=2) + "\n")
+            Path(temporary).replace(directory / COMPILE_CACHE_ENTRY_FILENAME)
+        except BaseException:
+            with suppress(OSError):
+                Path(temporary).unlink()
+            raise
+
+
+def _manifest_summary(artifact_dir: Path) -> dict[str, str]:
+    """Read the artifact id, repository and profile from a manifest, cheaply.
+
+    Empty when there is no readable manifest. Only these three strings are taken.
+    """
+    found: dict[str, str] = {}
+    with suppress(OSError, ValueError, TypeError):
+        document = json.loads(manifest_path(artifact_dir).read_text(encoding="utf-8"))
+        if not isinstance(document, dict):
+            return found
+        artifact_id = document.get("artifact_id")
+        if isinstance(artifact_id, str) and artifact_id.strip():
+            found["artifact_id"] = artifact_id.strip()
+        source = document.get("resolved_source")
+        if isinstance(source, dict) and isinstance(source.get("repo_id"), str):
+            found["repo_id"] = source["repo_id"]
+        export = document.get("export")
+        if isinstance(export, dict) and isinstance(export.get("profile"), str):
+            found["profile"] = export["profile"]
+    return found
 
 
 def artifact_fingerprint(artifact_dir: Path) -> str:

@@ -73,9 +73,17 @@ Storage
   cache filesystem       796 GiB free
   system /tmp            16 GiB tmpfs
   managed temp           ✓ disk-backed
+  compile cache          42 entries, 61.0 GiB, 12.0 GiB reclaimable
 ```
 
 Warnings must have remediation text.
+
+The `compile cache` line reports the size of the OpenVINO compile cache and how much of it is
+reclaimable: orphaned plus stale-runtime entries, as `yonga cache list` classifies them (section
+12b). It is a warning, with `yonga cache prune` as the remediation, when the reclaimable bytes are
+at least 10 GiB, or at least 25 % of the free space on the cache filesystem, but never below 1 GiB.
+The `--json` document carries the same numbers under `compile_cache` (`entries`, `total_bytes`,
+`reclaimable_bytes`, `warn_threshold_bytes`, `installed_openvino`).
 
 Exit codes:
 
@@ -236,7 +244,7 @@ directories.
 yonga remove ARTIFACT [--yes] [--json]
 ```
 
-Only removes tool-owned prepared artifact and compile cache references. It must not delete Hugging Face global cache unless a future explicit cache command is used.
+Only removes tool-owned prepared artifact and compile cache references. It must not delete Hugging Face global cache unless a future explicit cache command is used. The compile cache entries it removes are the ones whose ownership record names the artifact, plus the ones whose key the artifact's manifest reproduces (section 12b); `yonga cache prune` handles everything else in the compile cache.
 
 Interactive confirmation unless `--yes`.
 
@@ -399,6 +407,63 @@ yonga env remove KEY [--yes]
 Lists and removes the managed export environments `prepare` builds when an architecture's exporter
 requirements cannot be met by the installed packages. They live under the cache directory, are used
 only by the export subprocess, and never modify the environment yonga runs in.
+
+## 12b. `cache`
+
+```bash
+yonga cache [--json]                  # the same as 'cache list'
+yonga cache list [--json]
+yonga cache prune [--older-than DAYS] [--unattributed] [--all] [--dry-run] [--yes] [--json]
+```
+
+Shows and prunes the OpenVINO compile cache, `<cache-dir>/compile/<key>/`. Every pipeline yonga
+builds compiles into one entry, keyed by a digest of (artifact identity, device, OpenVINO version,
+runtime properties). The managed temp directory, export environments (section 12a) and the Hugging
+Face cache are out of scope.
+
+Whenever yonga hands an entry to OpenVINO it writes `.yonga-entry.json` into it: schema version,
+key, artifact id and path, repository and profile, device, OpenVINO version, runtime properties
+and their fingerprint, and when the entry was created and last used. OpenVINO only opens the blob
+files it names itself, so the record never interferes; a record that cannot be written is skipped
+and never fails a load.
+
+`list` prints, per entry: key, size, last use (the record's, or the newest file time), device,
+OpenVINO version, owner (artifact id; `*` when the artifact exists outside this artifact store)
+and status, then the total size and count. Statuses:
+
+| Status | Meaning |
+|---|---|
+| `in-use` | The owning artifact exists and the installed OpenVINO would reuse the blobs. |
+| `orphaned` | The owning artifact is gone from the store and from its recorded path. |
+| `stale-runtime` | Built by an OpenVINO version other than the installed one (compared on the full version string the runtime reports); it can never be reused. Not assigned when the installed version cannot be read. |
+| `unattributed` | No ownership record, and no known artifact produces the key. |
+
+An entry without a record (one made before records existed) is attributed by recomputing the
+keys every artifact in the store, and every artifact a saved benchmark names, could have produced:
+devices CPU, GPU and NPU plus those the manifest probed or recommends; OpenVINO versions from the
+installed runtime, manifests, benchmarks and other records; no properties, the manifest's
+recommended runtime properties, a recorded smoke test's properties and a benchmark's. `yonga
+remove` uses the records and the same derivation to find an artifact's entries.
+
+`prune` removes orphaned and stale-runtime entries. `--older-than DAYS` also removes any entry not
+used for that many days, `--unattributed` also removes unattributed entries, and `--all` empties the
+compile cache. It prints the plan (entries, why each was chosen, total size) and asks for
+confirmation unless `--yes`; `--dry-run` prints the plan and deletes nothing. Only direct children
+of the compile cache root whose names are 16 lowercase hexadecimal characters, and that are real
+directories rather than symbolic links, are ever deleted; the check is repeated immediately before
+each deletion, and anything else under the root is listed (with `--verbose`) and left alone. The
+result reports the bytes actually freed. An entry removed while a running `chat` or `serve` uses
+it costs that model a recompile on its next load, nothing more.
+
+`--json` documents: `list` carries `compile_cache_dir`, `artifacts_dir`, `installed_openvino`,
+`count`, `total_bytes`, `reclaimable_bytes`, `by_status`, `bytes_by_status`, `entries` and
+`ignored`. `prune` carries `criteria`, `dry_run`, `planned` (each entry with `selected_because`:
+`orphaned`, `stale-runtime`, `unattributed`, `older-than` or `all`), `planned_bytes`, `removed`,
+`failed`, `freed_bytes` and `kept`.
+
+Exit codes: 0 on success, including nothing to prune and a dry run; 2 when some entries could not
+be removed (`failed` lists them); 60 when the confirmation is declined, or when it cannot be asked
+(a non-interactive session or `--json` without `--yes`); 70 for an invalid `--older-than`.
 
 ## 13. `logs`
 

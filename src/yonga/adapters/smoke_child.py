@@ -51,6 +51,7 @@ from yonga.util.redaction import environment_secrets, redact_text
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from yonga.adapters import CommandRunner
     from yonga.application.jobs import JobContext
+    from yonga.config.settings import Settings
 
 __all__ = [
     "SMOKE_CHILD_MODULE",
@@ -117,10 +118,22 @@ class ChildProcessSmokeTester:
     Implements :class:`yonga.application.probe.IsolatedSmokeTester`.
     """
 
-    def __init__(self, runner: CommandRunner, *, python: str | None = None) -> None:
-        """Run children with ``python`` (default: the interpreter yonga runs in)."""
+    def __init__(
+        self,
+        runner: CommandRunner,
+        *,
+        python: str | None = None,
+        settings: Settings | None = None,
+    ) -> None:
+        """Run children with ``python`` (default: the interpreter yonga runs in).
+
+        ``settings`` carries the parent's cache directory and compile-cache
+        switch to the child, which would otherwise build its pipeline against
+        the default cache directory whatever ``--cache-dir`` said.
+        """
         self._runner = runner
         self._python = python or sys.executable
+        self._settings = settings
 
     def argv(
         self,
@@ -150,6 +163,10 @@ class ChildProcessSmokeTester:
         ]
         for key, value in properties.items():
             command += ["--property", f"{key}={value}"]
+        if self._settings is not None:
+            command += ["--cache-dir", str(self._settings.paths.cache_dir)]
+            if not self._settings.compile_cache_enabled:
+                command.append("--no-compile-cache")
         return command
 
     def smoke_test(
@@ -259,6 +276,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     from yonga.application.prepare import SmokeTester
     from yonga.application.probe import guard_smoke_test
     from yonga.application.wiring import GenAISmokeTester
+    from yonga.config.settings import Settings
 
     parser = argparse.ArgumentParser(
         prog=f"python -m {SMOKE_CHILD_MODULE}",
@@ -281,7 +299,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         metavar="KEY=VALUE",
         help="a GenAI pipeline property (repeatable)",
     )
+    parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        default=None,
+        help="the parent's cache directory, where the compile cache lives",
+    )
+    parser.add_argument(
+        "--no-compile-cache",
+        action="store_true",
+        help="build the pipeline without the managed compile cache",
+    )
     args = parser.parse_args(None if argv is None else list(argv))
+    settings: Settings | None = None
+    if args.cache_dir is not None or args.no_compile_cache:
+        overrides: dict[str, object] = {"compile_cache_enabled": not args.no_compile_cache}
+        if args.cache_dir is not None:
+            overrides["cache_dir"] = args.cache_dir
+        settings = Settings.model_validate(overrides)
     properties: dict[str, str] = {}
     for item in args.property:
         key, separator, value = str(item).partition("=")
@@ -289,7 +324,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             parser.error(f"--property expects KEY=VALUE, got {item!r}")
         properties[key] = value
 
-    tester: SmokeTester = GenAISmokeTester()
+    tester: SmokeTester = GenAISmokeTester(settings)
     with _stdout_to_stderr():
         result = guard_smoke_test(
             args.device,

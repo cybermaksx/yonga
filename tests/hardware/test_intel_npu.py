@@ -40,13 +40,14 @@ def _probe_service(tmp_path: Path) -> ProbeService:
     from yonga.application.wiring import GenAISmokeTester
     from yonga.registry import RegistryResolver, load_builtin_registry
 
+    settings = isolated_settings(tmp_path)
     return ProbeService(
         OpenVINOProbe(),
         RegistryResolver(load_builtin_registry()),
         None,
-        isolated_settings(tmp_path),
-        smoke_tester=GenAISmokeTester(),
-        isolated_smoke_tester=ChildProcessSmokeTester(smoke_child_runner()),
+        settings,
+        smoke_tester=GenAISmokeTester(settings),
+        isolated_smoke_tester=ChildProcessSmokeTester(smoke_child_runner(), settings=settings),
     )
 
 

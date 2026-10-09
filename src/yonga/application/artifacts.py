@@ -270,6 +270,14 @@ class ArtifactStore:
 
     # --- reading ------------------------------------------------------------
 
+    def artifact_directories(self) -> list[Path]:
+        """Every published artifact directory holding a manifest file, staging excluded.
+
+        The manifest may still be unreadable; :meth:`manifest_for` says. Nothing is
+        measured or hashed, so this is cheap enough to call on every command.
+        """
+        return list(self._artifact_dirs())
+
     def manifest_for(self, artifact_dir: Path) -> ArtifactManifest | None:
         """Read and validate the manifest of ``artifact_dir``, or ``None``.
 
@@ -855,10 +863,15 @@ class ArtifactStore:
     def _compile_cache_dirs(self, manifest: ArtifactManifest | None) -> list[Path]:
         """Return the existing compile-cache directories keyed to this artifact.
 
-        The cache key is a digest of (artifact identity, device, OpenVINO version,
-        runtime properties), so it cannot be inverted. Instead every key this
-        artifact could plausibly have produced is recomputed from its own manifest
-        and the resulting directories are kept when they exist.
+        Two sources are combined. The ownership record yonga writes into every
+        entry it uses names the artifact directly, which is the only way to find
+        an entry built by an OpenVINO release the manifest never mentions. Entries
+        made before those records existed are found the old way: the cache key is
+        a digest of (artifact identity, device, OpenVINO version, runtime
+        properties), so it cannot be inverted, and every key this artifact could
+        plausibly have produced is recomputed from its own manifest and kept when
+        the directory exists (:func:`yonga.application.compile_cache.manifest_key_inputs`
+        decides which devices, versions and properties are tried).
 
         The identity half of the key is the manifest's ``artifact_id`` and nothing
         else. Digesting the directory's *contents* instead would make two
@@ -868,40 +881,39 @@ class ArtifactStore:
         resolved revision and profile, which is exactly what a compiled blob is
         valid for. The OpenVINO version stays in the key because blobs are not
         portable across runtime releases (``docs/ARCHITECTURE.md`` section 7).
-        The key helper is imported lazily from the OpenVINO probe adapter: it is a
-        pure function with no OpenVINO import of its own, and deriving the key
-        twice in two places would be a guaranteed source of drift.
+        The helpers are imported lazily: the key derivation lives in the OpenVINO
+        probe adapter (a pure function with no OpenVINO import of its own), and
+        deriving the key twice in two places would be a guaranteed source of drift.
         """
         if manifest is None:
             return []
-        from yonga.adapters.openvino_probe import compile_cache_key
-
-        fingerprint = manifest.artifact_id
-        runtime = manifest.recommended_runtime
-        devices = set(manifest.device_probes)
-        if runtime is not None:
-            devices.add(runtime.device)
-        versions: set[str | None] = {None, installed_version(_OPENVINO_DISTRIBUTION)}
-        if manifest.validation is not None:
-            versions.add(manifest.validation.openvino_version)
-        property_sets: list[Mapping[str, str]] = [{}]
-        if runtime is not None and runtime.properties:
-            property_sets.append(dict(runtime.properties))
+        from yonga.adapters.openvino_probe import (
+            candidate_compile_cache_keys,
+            read_compile_cache_record,
+        )
+        from yonga.application.compile_cache import cache_entry_dirs, manifest_key_inputs
 
         cache_root = self._paths.compile_cache_dir
         found: list[Path] = []
-        for device in sorted(devices):
-            for version in versions:
-                for properties in property_sets:
-                    key = compile_cache_key(
-                        artifact_hash=fingerprint,
-                        device=device,
-                        openvino_version=version,
-                        properties=properties,
-                    )
-                    candidate = cache_root / key
-                    if candidate.is_dir() and candidate not in found:
-                        found.append(candidate)
+        entries = cache_entry_dirs(cache_root)
+        for entry in entries:
+            record = read_compile_cache_record(entry)
+            if record is not None and record.fingerprint == manifest.artifact_id:
+                found.append(entry)
+        devices, versions, property_sets = manifest_key_inputs(
+            manifest, extra_versions=(installed_version(_OPENVINO_DISTRIBUTION),)
+        )
+        keys = candidate_compile_cache_keys(
+            manifest.artifact_id,
+            devices=devices,
+            versions=versions,
+            property_sets=property_sets,
+        )
+        names = {entry.name: entry for entry in entries}
+        for key in keys:
+            candidate = names.get(key)
+            if candidate is not None and candidate not in found:
+                found.append(candidate)
         return found
 
     @staticmethod

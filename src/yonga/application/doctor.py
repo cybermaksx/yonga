@@ -41,6 +41,7 @@ from yonga.adapters.openvino_probe import (
 )
 from yonga.application.progress import ProgressEvent, ProgressKind, ProgressSink, null_sink
 from yonga.config.settings import Settings
+from yonga.domain.compile_cache import CompileCacheInventory
 from yonga.domain.diagnostics import (
     ExitCode,
     HealthCheck,
@@ -67,6 +68,9 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 __all__ = [
     "ABI_PACKAGES",
     "AUTH_SOURCE_KEY",
+    "COMPILE_CACHE_WARN_BYTES",
+    "COMPILE_CACHE_WARN_FLOOR_BYTES",
+    "COMPILE_CACHE_WARN_FREE_FRACTION",
     "MANAGED_TEMP_NOTE",
     "OPENVINO_INSTALL_HINT",
     "REPORTED_PACKAGES",
@@ -118,6 +122,18 @@ NEVER_INSTALLS_NOTE: str = (
 #: Below this much free space a filesystem is called out as an error, not a warning.
 CRITICAL_FREE_BYTES: int = 2 * _GIB
 
+#: Reclaimable compile cache (orphaned plus stale-runtime entries) at or above
+#: this many bytes is a warning, whatever the free space.
+COMPILE_CACHE_WARN_BYTES: int = 10 * _GIB
+
+#: Reclaimable compile cache at or above this share of the free space on the
+#: cache filesystem is a warning too: 3 GiB matters when 8 GiB are free.
+COMPILE_CACHE_WARN_FREE_FRACTION: float = 0.25
+
+#: ... but never below this many bytes, so a nearly full disk does not turn a
+#: few megabytes of dead blobs into a warning.
+COMPILE_CACHE_WARN_FLOOR_BYTES: int = 1 * _GIB
+
 #: Hosts with less RAM than this cannot hold a mid-sized model plus its export.
 LOW_MEMORY_BYTES: int = 8 * _GIB
 
@@ -163,6 +179,8 @@ class DoctorReport(BaseModel):
     runtime_usable: bool = False
     full: bool = False
     notes: list[str] = Field(default_factory=list)
+    compile_cache: dict[str, object] | None = None
+    """Size and reclaimable bytes of the compile cache, when it could be measured."""
 
     @property
     def checks(self) -> list[HealthCheck]:
@@ -239,11 +257,13 @@ class DoctorService:
         *,
         progress: ProgressSink | None = None,
         export_environments: Callable[[], Sequence[ExportEnvironment]] | None = None,
+        compile_cache: Callable[[], CompileCacheInventory] | None = None,
     ) -> None:
         """Store the injected adapters. Nothing is probed until :meth:`run`.
 
         ``export_environments`` lists the managed export environments, so the
-        report can say how much disk they hold.
+        report can say how much disk they hold. ``compile_cache`` measures the
+        OpenVINO compile cache, so it can say how much of it is reclaimable.
         """
         self._hardware = hardware_probe
         self._runtime = runtime_probe
@@ -252,11 +272,14 @@ class DoctorService:
         self._settings = settings if settings is not None else Settings()
         self._progress: ProgressSink = progress if progress is not None else null_sink()
         self._export_environments = export_environments
+        self._compile_cache = compile_cache
+        self._compile_cache_summary: dict[str, object] | None = None
 
     # --- entry point ---------------------------------------------------
 
     def run(self, *, full: bool = False) -> DoctorReport:
         """Collect every health section and return the report. Never raises."""
+        self._compile_cache_summary = None
         notes: list[str] = []
         inventory = self._inventory(full=full, notes=notes)
         auth = self._auth_info(inventory, notes)
@@ -286,6 +309,7 @@ class DoctorService:
             runtime_usable=runtime_usable,
             full=full,
             notes=notes,
+            compile_cache=self._compile_cache_summary,
         )
 
     # --- adapter calls -------------------------------------------------
@@ -573,6 +597,11 @@ class DoctorService:
         environments = self._environment_check(paths.envs_dir)
         if environments is not None:
             checks.append(environments)
+        compile_cache = self._compile_cache_check(
+            _filesystem_for(inventory, paths.compile_cache_dir) or inventory.managed_temp
+        )
+        if compile_cache is not None:
+            checks.append(compile_cache)
         if full:
             checks.extend(_extra_filesystem_checks(inventory, paths.artifacts_dir, paths.tmp_dir))
         return HealthSection(id="storage", title="Storage", checks=_finalise(checks))
@@ -596,6 +625,70 @@ class DoctorService:
             status=Severity.OK,
             value=value,
             detail=f"{root} — isolated environments exports run in; `yonga env list`",
+        )
+
+    def _compile_cache_check(self, filesystem: FilesystemInfo | None) -> HealthCheck | None:
+        """The compile cache's size, and a warning when much of it is dead weight.
+
+        Reclaimable means orphaned (the artifact is gone) or stale-runtime (built
+        by another OpenVINO release, so never reused). It is a warning at
+        :data:`COMPILE_CACHE_WARN_BYTES` or more, or at
+        :data:`COMPILE_CACHE_WARN_FREE_FRACTION` of the free space on the cache
+        filesystem, never below :data:`COMPILE_CACHE_WARN_FLOOR_BYTES`.
+        """
+        if self._compile_cache is None:
+            return None
+        try:
+            cache = self._compile_cache()
+        except Exception:
+            # Reporting disk use must never make doctor fail.
+            return None
+        free = None
+        if filesystem is not None:
+            free = filesystem.available_bytes or filesystem.free_bytes
+        total = cache.total_bytes
+        reclaimable = cache.reclaimable_bytes
+        threshold = COMPILE_CACHE_WARN_BYTES
+        if free is not None:
+            threshold = min(
+                threshold,
+                max(COMPILE_CACHE_WARN_FLOOR_BYTES, int(free * COMPILE_CACHE_WARN_FREE_FRACTION)),
+            )
+        self._compile_cache_summary = {
+            "path": str(cache.root),
+            "entries": len(cache.entries),
+            "total_bytes": total,
+            "reclaimable_bytes": reclaimable,
+            "warn_threshold_bytes": threshold,
+            "installed_openvino": cache.installed_openvino,
+        }
+        if not cache.entries:
+            value = "empty"
+        else:
+            value = f"{len(cache.entries)} entries, {format_bytes(total)}"
+            if reclaimable:
+                value += f", {format_bytes(reclaimable)} reclaimable"
+        detail = f"{cache.root} — compiled blobs; `yonga cache list`"
+        if reclaimable and reclaimable >= threshold:
+            return HealthCheck(
+                id="storage.compile_cache",
+                label="compile cache",
+                status=Severity.WARNING,
+                value=value,
+                detail=detail,
+                remediation=[
+                    f"{format_bytes(reclaimable)} of the compile cache belongs to removed "
+                    "artifacts or to another OpenVINO release and will never be reused.",
+                    "Reclaim it with: yonga cache prune",
+                    "Preview what would go first with: yonga cache prune --dry-run",
+                ],
+            )
+        return HealthCheck(
+            id="storage.compile_cache",
+            label="compile cache",
+            status=Severity.OK,
+            value=value,
+            detail=detail,
         )
 
     # --- hugging face -----------------------------------------------------

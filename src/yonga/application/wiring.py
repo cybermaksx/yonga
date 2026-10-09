@@ -42,6 +42,7 @@ from yonga.application.benchmark import BenchmarkService
 from yonga.application.benchmark import RuntimeFactory as BenchmarkRuntimeFactory
 from yonga.application.chat import ChatService
 from yonga.application.chat import RuntimeFactory as ChatRuntimeFactory
+from yonga.application.compile_cache import CompileCacheService
 from yonga.application.doctor import DoctorService
 from yonga.application.inspect_model import InspectService
 from yonga.application.prepare import PrepareService, SmokeTester
@@ -178,7 +179,15 @@ class GenAISmokeTester:
     where building a real pipeline is allowed, and the CLI injects it. Without it
     no text is ever generated from a freshly converted artifact and the smoke test
     is recorded as skipped.
+
+    ``settings`` decides where the pipeline's compile cache goes. Without them
+    the runtime falls back to ``Settings()``, which ignores ``--cache-dir`` and
+    the configuration file, so the wiring always passes its own.
     """
+
+    def __init__(self, settings: Settings | None = None) -> None:
+        """Bind the settings the pipeline is built with."""
+        self._settings = settings
 
     def smoke_test(
         self,
@@ -205,6 +214,7 @@ class GenAISmokeTester:
             device=device,
             pipeline=pipeline,
             properties=dict(properties),
+            settings=self._settings,
         )
         try:
             result = runtime.generate(history, config)
@@ -390,6 +400,18 @@ class Wiring:
             settings=self._settings,
         )
 
+    def openvino_version(self) -> str | None:
+        """Return the installed OpenVINO runtime's full version, or ``None``.
+
+        The same string the runtime folds into every compile cache key, so an
+        entry built by any other release can be recognised as unusable.
+        Importing OpenVINO happens here, on first call, and only for commands
+        that need the answer.
+        """
+        from yonga.adapters.openvino_probe import openvino_runtime_version
+
+        return openvino_runtime_version()
+
     def runtime_probe(self) -> RuntimeProbePort:
         """Return the OpenVINO runtime probe.
 
@@ -426,7 +448,7 @@ class Wiring:
 
     def smoke_tester(self) -> SmokeTester | None:
         """Return the generation smoke test injected into ``prepare``."""
-        return GenAISmokeTester()
+        return GenAISmokeTester(self._settings)
 
     def isolated_smoke_tester(self) -> IsolatedSmokeTester:
         """Return the smoke test ``probe --timeout`` runs in a child process it can stop.
@@ -439,7 +461,7 @@ class Wiring:
         """
         from yonga.adapters.smoke_child import ChildProcessSmokeTester
 
-        return ChildProcessSmokeTester(self.smoke_child_runner())
+        return ChildProcessSmokeTester(self.smoke_child_runner(), settings=self._settings)
 
     def smoke_child_runner(self) -> CommandRunner:
         """Return the supervised runner :meth:`isolated_smoke_tester` starts its child with."""
@@ -525,6 +547,15 @@ class Wiring:
             self._settings,
             progress=progress,
             export_environments=self.export_environments().environments,
+            compile_cache=self.compile_cache_service().inventory,
+        )
+
+    def compile_cache_service(self) -> CompileCacheService:
+        """Build the ``yonga cache`` service over the managed compile cache."""
+        return CompileCacheService(
+            self.paths,
+            self.artifact_store(),
+            runtime_version=self.openvino_version,
         )
 
     def inspect_service(self, *, progress: ProgressSink | None = None) -> InspectService:

@@ -1248,8 +1248,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         resolver,
         LocalArtifactStore(settings.paths),
         settings,
-        smoke_tester=GenAISmokeTester(),
-        isolated_smoke_tester=ChildProcessSmokeTester(smoke_child_runner()),
+        smoke_tester=GenAISmokeTester(settings),
+        isolated_smoke_tester=ChildProcessSmokeTester(smoke_child_runner(), settings=settings),
     )
     outcome = service.probe_detailed(
         args.artifact,

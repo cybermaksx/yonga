@@ -68,6 +68,7 @@ from yonga.adapters.openvino_probe import (
     compile_cache_dir,
     compile_cache_key,
     openvino_runtime_version,
+    record_compile_cache_use,
 )
 from yonga.config.settings import Settings
 from yonga.domain.benchmarks import GenerationSettings
@@ -1062,18 +1063,34 @@ class GenAIChatRuntime:
 
         The cache directory is keyed with the OpenVINO version so a runtime
         upgrade can never be handed blobs built by the previous release
-        (ARCHITECTURE section 7). An explicit ``CACHE_DIR`` from the caller wins.
+        (ARCHITECTURE section 7). An explicit ``CACHE_DIR`` from the caller wins,
+        and is not yonga's to record.
+
+        The managed directory gets an ownership record (artifact, device, runtime
+        version, last use) so ``yonga cache prune`` can later tell whether its
+        blobs still serve anything. Writing it never fails the load.
         """
         resolved = {str(name): str(value) for name, value in (properties or {}).items()}
         if not self._settings.compile_cache_enabled or _CACHE_DIR_PROPERTY in resolved:
             return resolved
+        fingerprint = artifact_fingerprint(self._artifact_dir)
+        version = openvino_runtime_version()
         key = compile_cache_key(
-            artifact_hash=artifact_fingerprint(self._artifact_dir),
+            artifact_hash=fingerprint,
             device=self._device,
-            openvino_version=openvino_runtime_version(),
+            openvino_version=version,
             properties=resolved,
         )
-        resolved[_CACHE_DIR_PROPERTY] = str(compile_cache_dir(self._settings.paths, key))
+        directory = compile_cache_dir(self._settings.paths, key)
+        record_compile_cache_use(
+            directory,
+            artifact_dir=self._artifact_dir,
+            artifact_hash=fingerprint,
+            device=self._device,
+            openvino_version=version,
+            properties=resolved,
+        )
+        resolved[_CACHE_DIR_PROPERTY] = str(directory)
         return resolved
 
     def _open_pipeline(self) -> Any:

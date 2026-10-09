@@ -248,11 +248,26 @@ as a reference against FP16 on Qwen3-0.6B.
 - **Granite is slow on the NPU.** `ibm-granite/granite-3.3-2b-instruct` generates about 4.5 tokens
   per second on the NPU in both INT4 formats, where other models of its size reach 25-40
   (`PROFILE_COMPARISON.md` section 10.4). It runs to completion; the cause was not isolated.
-- **The OpenVINO compile cache is never pruned.** Compiled blobs live under the cache directory
-  (`~/.cache/yonga/compile` by default), and only `yonga remove` deletes any, those keyed to the
-  one artifact it removes. Entries for artifacts deleted outside yonga, for artifacts in other data
-  directories and for older OpenVINO versions accumulate: the reference host had 276 GB in 203
-  entries. There is no `prune` command yet.
+- **`prepare`'s smoke-test compile is never reused.** The generation smoke test builds the pipeline
+  on the staging directory before the manifest is written, so its compile cache key uses the
+  file-listing fingerprint of that directory, a key the published artifact never produces. Every
+  `prepare` therefore leaves one compile cache entry nothing will load again. Since the ownership
+  records below, such an entry is `orphaned` once the job's staging directory is gone and
+  `yonga cache prune` removes it; the compile time and the disk until then are still spent.
+
+**Resolved: the OpenVINO compile cache was never pruned.** Compiled blobs live under the cache
+directory (`~/.cache/yonga/compile` by default), and only `yonga remove` deleted any, those keyed to
+the one artifact it removed. Entries for artifacts deleted outside yonga, for artifacts in other
+data directories and for older OpenVINO versions accumulated: the reference host had 276 GB in 203
+entries. yonga now writes an ownership record (`.yonga-entry.json`: artifact, device, OpenVINO
+version, last use) into every entry it uses; `yonga cache list` classifies each entry as `in-use`,
+`orphaned`, `stale-runtime` or `unattributed`; `yonga cache prune` removes the orphaned and
+stale-runtime ones (and, when asked, entries unused for N days, unattributed ones, or everything);
+and `yonga doctor` warns when the reclaimable part reaches 10 GiB or 25 % of the free space.
+Entries made before the records can only be attributed by recomputing the keys of artifacts yonga
+still knows about. On the reference host on 2026-10-09 that attributed 60 of 181 entries (239 GiB in
+total) to artifacts in the store; the other 121, 163 GiB, matched no known artifact and stay until
+`yonga cache prune --unattributed` or `--older-than DAYS` removes them.
 
 The previous defect, the default INT4 profiles on small models, is resolved: below 5B parameters
 every device now defaults to the more accurate profile, from a registry size condition and

@@ -17,6 +17,9 @@ import pytest
 
 from yonga.application.doctor import (
     AUTH_SOURCE_KEY,
+    COMPILE_CACHE_WARN_BYTES,
+    COMPILE_CACHE_WARN_FLOOR_BYTES,
+    COMPILE_CACHE_WARN_FREE_FRACTION,
     MANAGED_TEMP_NOTE,
     DoctorReport,
     DoctorService,
@@ -24,6 +27,7 @@ from yonga.application.doctor import (
 )
 from yonga.config.settings import Settings
 from yonga.domain.artifacts import IRDescription, ProbeResult, assert_no_secrets
+from yonga.domain.compile_cache import CacheEntryStatus, CompileCacheEntry, CompileCacheInventory
 from yonga.domain.diagnostics import ExitCode, HealthCheck, Severity
 from yonga.domain.hardware import (
     DeviceKind,
@@ -926,3 +930,119 @@ def test_exit_codes_follow_the_cli_spec(usable, status, expected):
     report = DoctorReport(runtime_usable=usable, status=status)
 
     assert report.exit_code() is expected
+
+
+# --- compile cache ---------------------------------------------------------------------
+
+
+def cache_inventory(settings: Settings, **sizes: int) -> CompileCacheInventory:
+    """A compile cache holding one entry per status keyword, with the given sizes."""
+    statuses = {
+        "in_use": CacheEntryStatus.IN_USE,
+        "orphaned": CacheEntryStatus.ORPHANED,
+        "stale": CacheEntryStatus.STALE_RUNTIME,
+        "unattributed": CacheEntryStatus.UNATTRIBUTED,
+    }
+    root = settings.paths.compile_cache_dir
+    entries = [
+        CompileCacheEntry(
+            key=f"{index:016x}", path=root / f"{index:016x}", size_bytes=size, status=statuses[name]
+        )
+        for index, (name, size) in enumerate(sizes.items())
+    ]
+    return CompileCacheInventory(
+        root=root,
+        store_root=settings.paths.artifacts_dir,
+        installed_openvino="2026.4.0",
+        entries=entries,
+    )
+
+
+def doctor_with_cache(
+    settings: Settings, cache: object, *, inventory: HardwareInventory | None = None
+) -> DoctorService:
+    """A healthy host's doctor whose compile cache reads ``cache`` (or raises it)."""
+
+    def read() -> CompileCacheInventory:
+        if isinstance(cache, BaseException):
+            raise cache
+        assert isinstance(cache, CompileCacheInventory)
+        return cache
+
+    return DoctorService(
+        FakeHardwareProbe(inventory or healthy_inventory(settings)),
+        FakeRuntimeProbe(("CPU", "GPU", "NPU")),
+        FakeHubClient(None),
+        None,
+        settings,
+        compile_cache=read,
+    )
+
+
+def test_much_reclaimable_compile_cache_warns_with_the_prune_command(tmp_path):
+    settings = make_settings(tmp_path)
+    cache = cache_inventory(settings, in_use=40 * GIB, orphaned=8 * GIB, stale=4 * GIB)
+
+    report = doctor_with_cache(settings, cache).run()
+
+    check = require(report, "storage.compile_cache")
+    assert check.status is Severity.WARNING
+    assert check.value == "3 entries, 52.0 GiB, 12.0 GiB reclaimable"
+    assert any("yonga cache prune" in line for line in check.remediation)
+    assert report.compile_cache is not None
+    assert report.compile_cache["reclaimable_bytes"] == 12 * GIB
+    assert report.compile_cache["warn_threshold_bytes"] == COMPILE_CACHE_WARN_BYTES
+    assert report.to_json()["compile_cache"] == report.compile_cache
+
+
+def test_a_little_reclaimable_cache_on_a_roomy_disk_is_fine(tmp_path):
+    settings = make_settings(tmp_path)
+    cache = cache_inventory(settings, in_use=40 * GIB, orphaned=2 * GIB, unattributed=30 * GIB)
+
+    check = require(doctor_with_cache(settings, cache).run(), "storage.compile_cache")
+
+    assert check.status is Severity.OK
+    assert "2.0 GiB reclaimable" in (check.value or "")
+
+
+def test_reclaimable_cache_is_a_warning_when_it_is_a_quarter_of_the_free_space(tmp_path):
+    settings = make_settings(tmp_path)
+    tight = FilesystemInfo(
+        path=Path("/"),
+        mount_point=Path("/"),
+        fstype="ext4",
+        total_bytes=500 * GIB,
+        free_bytes=6 * GIB,
+        available_bytes=6 * GIB,
+    )
+    inventory = healthy_inventory(settings, filesystems=[tight], managed_temp=tight)
+    small = cache_inventory(settings, orphaned=2 * GIB)
+    tiny = cache_inventory(settings, orphaned=GIB // 2)
+
+    warned = doctor_with_cache(settings, small, inventory=inventory).run()
+    floor = doctor_with_cache(settings, tiny, inventory=inventory).run()
+
+    assert COMPILE_CACHE_WARN_FREE_FRACTION * 6 * GIB < 2 * GIB < COMPILE_CACHE_WARN_BYTES
+    assert require(warned, "storage.compile_cache").status is Severity.WARNING
+    # Half a GiB is more than a quarter of nothing much, but under the floor.
+    assert GIB // 2 < COMPILE_CACHE_WARN_FLOOR_BYTES
+    assert require(floor, "storage.compile_cache").status is Severity.OK
+
+
+def test_an_empty_compile_cache_is_reported_as_such(tmp_path):
+    settings = make_settings(tmp_path)
+
+    report = doctor_with_cache(settings, cache_inventory(settings)).run()
+
+    check = require(report, "storage.compile_cache")
+    assert check.status is Severity.OK
+    assert check.value == "empty"
+
+
+def test_a_compile_cache_that_cannot_be_measured_never_fails_doctor(tmp_path):
+    settings = make_settings(tmp_path)
+
+    report = doctor_with_cache(settings, OSError("unreadable")).run()
+
+    assert report.check("storage.compile_cache") is None
+    assert report.compile_cache is None

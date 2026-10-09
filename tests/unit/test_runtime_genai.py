@@ -603,6 +603,65 @@ def test_an_explicit_cache_dir_wins(artifact, settings, genai):
     runtime.close()
 
 
+def test_the_compile_cache_entry_records_its_owner(artifact, settings, genai, monkeypatch):
+    """Every managed entry says which artifact, device and runtime built it."""
+    from yonga.adapters.openvino_probe import artifact_fingerprint, read_compile_cache_record
+    from yonga.domain.compile_cache import COMPILE_CACHE_ENTRY_FILENAME
+
+    runtime = make_runtime(
+        artifact, settings, device="GPU.0", properties={"ATTENTION_BACKEND": "SDPA"}
+    )
+    directory = Path(runtime.properties["CACHE_DIR"])
+    runtime.close()
+
+    record = read_compile_cache_record(directory)
+    assert record is not None
+    assert record.key == directory.name
+    assert record.fingerprint == artifact_fingerprint(artifact)
+    assert record.artifact_id is None, "a directory without a manifest has no artifact id"
+    assert record.artifact_path == str(artifact)
+    assert record.device == "GPU"
+    assert record.openvino_version == "2026.4.0"
+    assert record.properties == {"ATTENTION_BACKEND": "SDPA"}
+    assert record.last_used_at == record.created_at
+    # The record is the only file yonga adds, and it cannot pass for a blob.
+    assert [path.name for path in directory.iterdir()] == [COMPILE_CACHE_ENTRY_FILENAME]
+
+    reopened = make_runtime(
+        artifact, settings, device="GPU", properties={"ATTENTION_BACKEND": "SDPA"}
+    )
+    assert reopened.properties["CACHE_DIR"] == str(directory)
+    reopened.close()
+    refreshed = read_compile_cache_record(directory)
+    assert refreshed is not None
+    assert refreshed.created_at == record.created_at
+    assert refreshed.last_used_at >= record.last_used_at
+
+
+def test_an_unwritable_compile_cache_never_breaks_a_load(artifact, settings, genai, monkeypatch):
+    """Bookkeeping that fails is skipped; the pipeline is still built."""
+
+    def explode(*args: object, **kwargs: object) -> object:
+        raise PermissionError("read-only cache")
+
+    monkeypatch.setattr("yonga.adapters.openvino_probe.tempfile.mkstemp", explode)
+    runtime = make_runtime(artifact, settings, device="CPU")
+    directory = Path(runtime.properties["CACHE_DIR"])
+    assert genai.pipelines, "the pipeline was built"
+    assert directory.is_dir()
+    assert not any(directory.iterdir())
+    runtime.close()
+
+
+def test_an_explicit_cache_dir_gets_no_ownership_record(artifact, settings, genai, tmp_path):
+    """A directory the caller chose is not yonga's to annotate."""
+    mine = tmp_path / "mine"
+    mine.mkdir()
+    runtime = make_runtime(artifact, settings, properties={"CACHE_DIR": str(mine)})
+    runtime.close()
+    assert not any(mine.iterdir())
+
+
 # --- LLM generation -------------------------------------------------------------------
 
 

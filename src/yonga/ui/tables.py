@@ -30,6 +30,7 @@ from yonga.domain.compatibility import (
     EvidenceLevel,
     ResolutionExplanation,
 )
+from yonga.domain.compile_cache import CacheEntryStatus, CompileCacheEntry
 from yonga.domain.diagnostics import HealthSection, Severity
 from yonga.domain.evaluation import EvaluationResult
 from yonga.domain.models import ModelMetadata
@@ -45,6 +46,7 @@ __all__ = [
     "SourceOption",
     "artifact_list",
     "benchmark_summary",
+    "compile_cache_entries",
     "doctor_report",
     "inspect_report",
     "preparation_plan",
@@ -748,6 +750,134 @@ def artifact_list(summaries: Sequence[ArtifactSummary]) -> RenderableType:
             "No prepared artifacts yet. Run 'yonga prepare MODEL' to make one.", style="dim"
         )
     return _ArtifactList(summaries)
+
+
+# ----------------------------------------------------------------------
+# compile cache
+# ----------------------------------------------------------------------
+#: Severity shown for each compile cache entry status.
+_CACHE_STATUS_SEVERITY: dict[CacheEntryStatus, Severity] = {
+    CacheEntryStatus.IN_USE: Severity.OK,
+    CacheEntryStatus.ORPHANED: Severity.WARNING,
+    CacheEntryStatus.STALE_RUNTIME: Severity.WARNING,
+    CacheEntryStatus.UNATTRIBUTED: Severity.UNKNOWN,
+}
+
+
+def _release(version: str | None) -> str | None:
+    """Shorten ``2026.4.0-22959-99c81491cc3-releases/2026/4`` to ``2026.4.0``."""
+    if version is None:
+        return None
+    return version.split("-", 1)[0].strip() or version
+
+
+def _cache_owner(entry: CompileCacheEntry) -> Text:
+    """The owning artifact; ``*`` marks one that lives outside the artifact store."""
+    label = entry.artifact_id or (entry.artifact_path.name if entry.artifact_path else None)
+    if label is None:
+        return Text(_DASH, style="dim")
+    owner = Text(label, style="" if entry.owner_exists else "dim")
+    if entry.owner_exists and not entry.owner_in_store:
+        owner.append("*", style="cyan")
+    return owner
+
+
+#: Optional ``yonga cache`` columns, in the order they are given up when the
+#: terminal is too narrow. Key, size, owner and status always stay.
+_CACHE_DROP_ORDER: tuple[str, ...] = ("Model", "Last used", "OpenVINO", "Dev")
+
+
+class _CacheTable:
+    """The compile cache entries, laid out for the terminal they are printed on.
+
+    Like ``yonga list``, whole columns are dropped, in a fixed order, until the
+    rest fit at their natural width, so a key or a status is never cut short.
+    """
+
+    def __init__(
+        self, entries: Sequence[CompileCacheEntry], reasons: dict[str, str] | None
+    ) -> None:
+        """Build every cell once; the layout is chosen at render time."""
+        self._why = reasons is not None and any(
+            reasons.get(entry.key) != entry.status.value for entry in entries
+        )
+        self._rows: list[dict[str, Text]] = []
+        for entry in entries:
+            severity = _CACHE_STATUS_SEVERITY[entry.status]
+            row = {
+                "Key": Text(entry.key),
+                "Size": Text(human_bytes(entry.size_bytes)),
+                "Last used": Text(_timestamp(entry.last_used_at, minutes=False)),
+                "Dev": _text(entry.device),
+                "OpenVINO": _text(_release(entry.openvino_version)),
+                "Owner": _cache_owner(entry),
+                "Status": _status_text(severity, entry.status.value),
+                "Model": _text(entry.repo_id),
+            }
+            if self._why and reasons is not None:
+                row["Why"] = _text(reasons.get(entry.key))
+            self._rows.append(row)
+
+    def _table(self, dropped: frozenset[str]) -> Table:
+        headers = ["Key", "Size", "Last used", "Dev", "OpenVINO", "Owner", "Status"]
+        if self._why:
+            headers.append("Why")
+        headers.append("Model")
+        table = Table(
+            box=SIMPLE, show_edge=False, pad_edge=False, header_style="bold", padding=(0, 1, 0, 0)
+        )
+        shown = [header for header in headers if header not in dropped]
+        for header in shown:
+            table.add_column(
+                header,
+                no_wrap=True,
+                overflow="ellipsis",
+                justify="right" if header == "Size" else "left",
+                max_width=_LIST_MODEL_MAX_WIDTH if header == "Model" else None,
+            )
+        for row in self._rows:
+            table.add_row(*(row[header] for header in shown))
+        return table
+
+    def table_for(self, console: Console, options: ConsoleOptions) -> Table:
+        """Return the widest layout whose natural width fits ``options``."""
+        wide = options.update_width(_LIST_MEASURE_WIDTH)
+        dropped: set[str] = set()
+        candidate = self._table(frozenset())
+        for header in _CACHE_DROP_ORDER:
+            if Measurement.get(console, wide, candidate).maximum <= options.max_width:
+                return candidate
+            dropped.add(header)
+            candidate = self._table(frozenset(dropped))
+        return candidate
+
+    def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
+        """Render the chosen layout."""
+        yield self.table_for(console, options)
+
+    def __rich_measure__(self, console: Console, options: ConsoleOptions) -> Measurement:
+        """Measure the layout that would be chosen for ``options``."""
+        return Measurement.get(console, options, self.table_for(console, options))
+
+
+def compile_cache_entries(
+    entries: Sequence[CompileCacheEntry],
+    *,
+    reasons: dict[str, str] | None = None,
+) -> RenderableType:
+    """Render the entries of ``yonga cache list`` or a ``cache prune`` plan.
+
+    ``reasons`` adds a column saying why each entry was selected for pruning,
+    when that is not simply its status. An owner marked ``*`` exists, but
+    outside this artifact store (another ``--data-dir``, or a running
+    ``prepare``'s staging directory).
+    """
+    if not entries:
+        return Text("The compile cache is empty.", style="dim")
+    table = _CacheTable(entries, reasons)
+    if not any(entry.owner_exists and not entry.owner_in_store for entry in entries):
+        return table
+    return Group(table, Text("* the artifact exists, outside this artifact store", style="dim"))
 
 
 # ----------------------------------------------------------------------

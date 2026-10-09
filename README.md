@@ -67,7 +67,7 @@ on Python 3.14, and Python 3.11-3.13 are not affected. GGUF import is verified s
 
 ## What works today
 
-Fifteen commands; `registry` has six subcommands and `env` two:
+Sixteen commands; `registry` has six subcommands, `env` and `cache` two each:
 
 | Command | What it does |
 |---|---|
@@ -84,6 +84,7 @@ Fifteen commands; `registry` has six subcommands and `env` two:
 | `yonga publish ARTIFACT --repo NS/NAME` | Uploads an artifact to the Hugging Face Hub in one commit, with a model card generated from its manifest: lineage, quantization, every repair, per-device probe evidence, file digests. Checks both source licenses first; private by default; `--dry-run` writes the card locally. |
 | `yonga serve ARTIFACT` | An OpenAI-compatible HTTP API (`/v1/models`, `/v1/chat/completions` with SSE streaming, `/health`) over the same session `chat` uses, bound to `127.0.0.1` by default. |
 | `yonga env list` / `env remove KEY` | The isolated environments `prepare` builds when a model's exporter needs package versions other than the installed ones, and the disk they use. |
+| `yonga cache list` / `cache prune` | The OpenVINO compile cache: each entry's size, last use, owning artifact and whether it is still used, orphaned, or built by another OpenVINO release; `prune` removes the dead ones (`--older-than DAYS`, `--unattributed`, `--all`, `--dry-run`). |
 | `yonga logs [JOB_ID]` | Lists job logs, prints one as a table, or `--raw` for the JSON Lines file. |
 | `yonga registry validate` | Loads every registry layer and checks it is internally consistent. |
 | `yonga registry explain MODEL` | Shows which rules matched, which lost, and why. |

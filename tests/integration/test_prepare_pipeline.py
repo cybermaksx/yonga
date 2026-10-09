@@ -408,8 +408,12 @@ class GenAISmokeTester:
 
     This is the shape the CLI is expected to inject: the application layer keeps
     the port, and the concrete pipeline is built here, at the edge, where
-    ``openvino_genai`` may legitimately be imported.
+    ``openvino_genai`` may legitimately be imported. ``settings`` keeps the
+    pipeline's compile cache inside the test's own directories.
     """
+
+    def __init__(self, settings: Settings) -> None:
+        self._settings = settings
 
     def smoke_test(
         self,
@@ -433,6 +437,7 @@ class GenAISmokeTester:
             device=device,
             pipeline=pipeline,
             properties=dict(properties),
+            settings=self._settings,
         )
         try:
             result = runtime.generate(history, config)
@@ -513,7 +518,7 @@ def test_real_openvino_artifact_is_repaired_probed_and_published(
         registry_resolver=builtin_resolver(),
         artifact_store=ArtifactStore(settings.paths, settings),
         settings=settings,
-        smoke_tester=GenAISmokeTester(),
+        smoke_tester=GenAISmokeTester(settings),
     )
 
     plan = service.plan(repo_id, device="cpu")

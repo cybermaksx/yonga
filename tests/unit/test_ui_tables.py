@@ -31,6 +31,7 @@ from yonga.domain.compatibility import (
     ResolutionExplanation,
     RuleCandidate,
 )
+from yonga.domain.compile_cache import CacheEntryStatus, CompileCacheEntry
 from yonga.domain.diagnostics import (
     FailureCategory,
     HealthCheck,
@@ -63,6 +64,7 @@ from yonga.ui.tables import (
     SourceOption,
     artifact_list,
     benchmark_summary,
+    compile_cache_entries,
     doctor_report,
     inspect_report,
     preparation_plan,
@@ -843,3 +845,69 @@ def test_registry_explanation_handles_empty_resolutions(explanation):
     )
     text = render(registry_explanation(empty), width=140)
     assert "no candidate rules" in text
+
+
+# ----------------------------------------------------------------------
+# compile cache
+# ----------------------------------------------------------------------
+def cache_entries() -> list[CompileCacheEntry]:
+    """One entry per kind of owner, the way ``yonga cache list`` sees them."""
+    root = Path("/home/user/.cache/yonga/compile")
+    used = datetime(2026, 10, 8, 15, 29, tzinfo=UTC)
+    return [
+        CompileCacheEntry(
+            key="67aa6f019e912a22",
+            path=root / "67aa6f019e912a22",
+            size_bytes=7823 * 2**20,
+            last_used_at=used,
+            device="NPU",
+            openvino_version="2026.4.0-22959-99c81491cc3-releases/2026/4",
+            artifact_id="201e471c1669050f",
+            repo_id="nDimensional/Qwen3.5-9B-Uncensored-Safetensors",
+            owner_in_store=True,
+            owner_exists=True,
+            status=CacheEntryStatus.IN_USE,
+        ),
+        CompileCacheEntry(
+            key="b3da3fcc7841fcac",
+            path=root / "b3da3fcc7841fcac",
+            size_bytes=5 * 2**30,
+            last_used_at=used,
+            device="GPU",
+            openvino_version="2026.3.0",
+            artifact_id="bbbbbbbbbbbbbbbb",
+            status=CacheEntryStatus.STALE_RUNTIME,
+            owner_exists=True,
+            owner_in_store=False,
+        ),
+        CompileCacheEntry(
+            key="0123456789abcdef",
+            path=root / "0123456789abcdef",
+            size_bytes=2048,
+            last_used_at=used,
+        ),
+    ]
+
+
+def test_compile_cache_entries_never_cut_a_key_or_a_status_short() -> None:
+    entries = cache_entries()
+    for width in (80, 120):
+        text = render(compile_cache_entries(entries), width=width)
+        for entry in entries:
+            assert entry.key in text
+            assert entry.status.value in text
+        assert "* the artifact exists, outside this artifact store" in text
+    wide = render(compile_cache_entries(entries), width=160)
+    assert "2026.4.0 " in wide
+    assert "22959" not in wide, "the release is shown, not the build string"
+    assert "nDimensional/Qwen3.5" in wide
+
+
+def test_a_prune_plan_says_why_only_when_it_is_not_the_status() -> None:
+    entries = cache_entries()[1:]
+    same = {entry.key: entry.status.value for entry in entries}
+    aged = {**same, entries[1].key: "older-than"}
+
+    assert "Why" not in render(compile_cache_entries(entries, reasons=same), width=160)
+    assert "older-than" in render(compile_cache_entries(entries, reasons=aged), width=160)
+    assert "empty" in render(compile_cache_entries([]))

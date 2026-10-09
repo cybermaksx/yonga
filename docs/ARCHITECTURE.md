@@ -286,6 +286,11 @@ artifact hash + device + runtime version + relevant compile properties
 
 Never reuse cache blindly across incompatible OpenVINO versions.
 
+The key is a one-way digest, so every entry also carries a tool-owned ownership record,
+`.yonga-entry.json` (artifact, device, OpenVINO version, properties, last use), written whenever the
+runtime hands the directory to OpenVINO. `yonga cache list` and `yonga cache prune` read it to tell
+live entries from orphaned and stale-runtime ones (`CLI_SPEC.md` section 12b).
+
 ## 8. Optimum export adapter
 
 Initial implementation wraps CLI execution. Example logical request:

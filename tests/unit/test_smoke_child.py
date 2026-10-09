@@ -87,6 +87,41 @@ def test_the_child_is_an_argv_list_with_the_cwd_kept_off_sys_path(tmp_path: Path
     assert timeout == 42
 
 
+def test_the_child_builds_its_pipeline_in_the_parents_cache_directory(tmp_path: Path) -> None:
+    """``--cache-dir`` is forwarded; without it the child's compile cache went elsewhere."""
+    settings = Settings.model_validate(
+        {"cache_dir": tmp_path / "cache", "compile_cache_enabled": False}
+    )
+    runner = SmokeChildRunner(stdout=[ok_line()])
+    run(ChildProcessSmokeTester(runner, settings=settings), tmp_path)
+
+    (command, _), *_ = runner.calls
+    assert command[command.index("--cache-dir") + 1] == str(tmp_path / "cache")
+    assert "--no-compile-cache" in command
+
+
+def test_the_child_applies_the_forwarded_cache_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[Settings | None] = []
+
+    class RecordingTester:
+        def __init__(self, settings: Settings | None = None) -> None:
+            seen.append(settings)
+
+        def smoke_test(self, artifact_dir: Path, **kwargs: object) -> ProbeResult:
+            return ProbeResult(device="CPU", status=ProbeStatus.OK)
+
+    monkeypatch.setattr("yonga.application.wiring.GenAISmokeTester", RecordingTester)
+    code = main([str(tmp_path), "--device", "CPU", "--cache-dir", str(tmp_path / "elsewhere")])
+
+    assert code == 0
+    (settings,) = seen
+    assert settings is not None
+    assert settings.paths.compile_cache_dir == tmp_path / "elsewhere" / "compile"
+    assert settings.compile_cache_enabled is True
+
+
 def test_the_childs_verdict_is_returned(tmp_path: Path) -> None:
     result = run(ChildProcessSmokeTester(SmokeChildRunner(stdout=[ok_line()])), tmp_path)
 
@@ -251,6 +286,9 @@ def test_the_child_prints_one_json_result(
     calls: list[dict[str, object]] = []
 
     class RecordingTester:
+        def __init__(self, settings: Settings | None = None) -> None:
+            self.settings = settings
+
         def smoke_test(self, artifact_dir: Path, **kwargs: object) -> ProbeResult:
             calls.append({"artifact": artifact_dir, **kwargs})
             return ProbeResult(device="NPU", status=ProbeStatus.OK, message="generated 3 token(s)")
@@ -290,6 +328,9 @@ def test_the_child_reports_a_typed_failure_as_json(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     class FailingTester:
+        def __init__(self, settings: Settings | None = None) -> None:
+            self.settings = settings
+
         def smoke_test(self, artifact_dir: Path, **kwargs: object) -> ProbeResult:
             raise CompileError(
                 diagnostic(
@@ -324,10 +365,21 @@ def test_a_real_child_process_returns_a_verdict(tmp_path: Path) -> None:
     The artifact does not exist, so the pipeline cannot be built whether or not
     OpenVINO is installed -- what matters is that the verdict came back as JSON
     from the child rather than as a crash without one.
+
+    The child is handed a private cache directory: without one it would
+    compile into the developer's own ``~/.cache/yonga``.
     """
-    tester = ChildProcessSmokeTester(smoke_child_runner())
+    settings = Settings.model_validate(
+        {
+            "config_dir": tmp_path / "config",
+            "cache_dir": tmp_path / "cache",
+            "data_dir": tmp_path / "data",
+        }
+    )
+    tester = ChildProcessSmokeTester(smoke_child_runner(), settings=settings)
 
     result = run(tester, tmp_path / "missing", timeout=120)
 
     assert result.status is ProbeStatus.FAILED
     assert "without a result" not in (result.message or "")
+    assert any((tmp_path / "cache" / "compile").iterdir()), "the child used the given cache"

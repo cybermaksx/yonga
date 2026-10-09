@@ -60,6 +60,7 @@ from yonga.domain.compatibility import (
     EvidenceLevel,
     strongest_evidence,
 )
+from yonga.domain.compile_cache import CacheEntryStatus, CompileCachePruneReport
 from yonga.domain.diagnostics import (
     CancelledError,
     ConfigurationError,
@@ -459,6 +460,13 @@ env_app = typer.Typer(
     add_completion=False,
 )
 app.add_typer(env_app, name="env")
+cache_app = typer.Typer(
+    name="cache",
+    help="Show and prune the OpenVINO compile cache.",
+    invoke_without_command=True,
+    add_completion=False,
+)
+app.add_typer(cache_app, name="cache")
 
 
 def _version_callback(value: bool) -> None:
@@ -1769,6 +1777,198 @@ def _env_remove(state: CliState, key: str, *, yes: bool) -> ExitCode:
         return ExitCode.SUCCESS
     state.console.print(f"Removed {removed.path} ({human_bytes(removed.size_bytes)} freed).")
     return ExitCode.SUCCESS
+
+
+# ======================================================================
+# cache
+# ======================================================================
+@cache_app.callback()
+def cache_main(
+    ctx: typer.Context,
+    json_output: bool = typer.Option(False, "--json", help="Emit the entries as JSON."),
+) -> None:
+    """Show and prune the OpenVINO compile cache. Alone, the same as 'cache list'."""
+    if ctx.invoked_subcommand is not None:
+        if json_output:
+            cli_state(ctx, json_output=True)
+        return
+    state = cli_state(ctx, json_output=json_output)
+    _dispatch(state, lambda: _cache_list(state))
+
+
+@cache_app.command("list")
+def cache_list(
+    ctx: typer.Context,
+    json_output: bool = typer.Option(False, "--json", help="Emit the entries as JSON."),
+) -> None:
+    """List compile cache entries: size, last use, owner, and whether they are still used."""
+    state = cli_state(ctx, json_output=json_output)
+    _dispatch(state, lambda: _cache_list(state))
+
+
+def _cache_list(state: CliState) -> ExitCode:
+    """Render the compile cache inventory (``docs/CLI_SPEC.md`` section 12b)."""
+    inventory = state.graph.compile_cache_service().inventory()
+    if state.json_mode:
+        state.emit(inventory.to_json())
+        return ExitCode.SUCCESS
+    console = state.console
+    console.print(f"Compile cache  {inventory.root}")
+    if not inventory.entries:
+        console.print("The compile cache is empty.", style="dim")
+        return ExitCode.SUCCESS
+    console.print(tables.compile_cache_entries(inventory.entries))
+    counts = inventory.counts()
+    breakdown = ", ".join(f"{count} {status}" for status, count in counts.items() if count)
+    console.print(
+        f"{len(inventory.entries)} entries, {human_bytes(inventory.total_bytes)} in total "
+        f"({breakdown})."
+    )
+    _cache_runtime_note(state, inventory.installed_openvino)
+    if inventory.reclaimable_bytes:
+        console.print(
+            f"{human_bytes(inventory.reclaimable_bytes)} is orphaned or built by another "
+            "OpenVINO release: yonga cache prune"
+        )
+    if counts[CacheEntryStatus.UNATTRIBUTED.value]:
+        console.print(
+            "Unattributed entries carry no ownership record and match no known artifact; "
+            "'yonga cache prune --unattributed' removes them too.",
+            style="dim",
+        )
+    for name in inventory.ignored:
+        console.detail(f"Not a cache entry, left alone: {inventory.root / name}")
+    return ExitCode.SUCCESS
+
+
+def _cache_runtime_note(state: CliState, installed: str | None) -> None:
+    """Say so when no entry can be called stale because OpenVINO is unreadable."""
+    if installed is None:
+        state.console.print_error(
+            "The installed OpenVINO version could not be read, so no entry is marked "
+            "stale-runtime.",
+            style="dim",
+        )
+
+
+@cache_app.command("prune")
+def cache_prune(
+    ctx: typer.Context,
+    older_than: float | None = typer.Option(
+        None,
+        "--older-than",
+        metavar="DAYS",
+        help="Also remove any entry not used for this many days.",
+    ),
+    unattributed: bool = typer.Option(
+        False,
+        "--unattributed",
+        help="Also remove entries that cannot be traced to any artifact.",
+    ),
+    everything: bool = typer.Option(False, "--all", help="Empty the whole compile cache."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show what would go; delete nothing."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Do not ask for confirmation."),
+    json_output: bool = typer.Option(False, "--json", help="Emit the outcome as JSON."),
+) -> None:
+    """Remove orphaned and stale-runtime compile cache entries (and more, when asked)."""
+    state = cli_state(ctx, json_output=json_output)
+    _dispatch(
+        state,
+        lambda: _cache_prune(
+            state,
+            older_than=older_than,
+            unattributed=unattributed,
+            everything=everything,
+            dry_run=dry_run,
+            yes=yes,
+        ),
+    )
+
+
+def _cache_prune(
+    state: CliState,
+    *,
+    older_than: float | None,
+    unattributed: bool,
+    everything: bool,
+    dry_run: bool,
+    yes: bool,
+) -> ExitCode:
+    """Plan, show, confirm, then delete compile cache entries and report the bytes freed."""
+    service = state.graph.compile_cache_service()
+    inventory = service.inventory()
+    plan = service.plan_prune(
+        inventory,
+        older_than_days=older_than,
+        unattributed=unattributed,
+        everything=everything,
+    )
+    console = state.console
+
+    def document(report: CompileCachePruneReport) -> dict[str, object]:
+        return {
+            "compile_cache_dir": str(plan.root),
+            "installed_openvino": plan.installed_openvino,
+            "criteria": plan.criteria(),
+            "dry_run": report.dry_run,
+            "planned": [
+                {**entry.model_dump(mode="json"), "selected_because": plan.reasons[entry.key]}
+                for entry in plan.entries
+            ],
+            "planned_bytes": report.planned_bytes,
+            "removed": list(report.removed),
+            "failed": [failure.model_dump(mode="json") for failure in report.failed],
+            "freed_bytes": report.freed_bytes,
+            "kept": len(inventory.entries) - len(plan.entries),
+        }
+
+    if not plan.entries:
+        if state.json_mode:
+            state.emit(document(CompileCachePruneReport(dry_run=dry_run)))
+            return ExitCode.SUCCESS
+        if inventory.entries:
+            console.print(
+                f"Nothing to prune: {len(inventory.entries)} entries "
+                f"({human_bytes(inventory.total_bytes)}) are all kept under these options."
+            )
+        else:
+            console.print("Nothing to prune: the compile cache is empty.")
+        _cache_runtime_note(state, plan.installed_openvino)
+        return ExitCode.SUCCESS
+
+    console.print(tables.compile_cache_entries(plan.entries, reasons=plan.reasons))
+    kept = len(inventory.entries) - len(plan.entries)
+    console.print(
+        f"Prune {len(plan.entries)} of {len(inventory.entries)} entries, "
+        f"{human_bytes(plan.total_bytes)}; {kept} kept. Only {plan.root} is touched."
+    )
+    _cache_runtime_note(state, plan.installed_openvino)
+    if dry_run:
+        state.emit(document(service.prune(plan, dry_run=True)))
+        console.print("Dry run: nothing was removed.", style="dim")
+        return ExitCode.SUCCESS
+
+    if not console.confirm("Remove these compile cache entries?", default=False, assume_yes=yes):
+        raise CancelledError(
+            diagnostic(
+                "cache.prune.declined",
+                FailureCategory.USER_CANCELLED,
+                "Nothing was pruned",
+                f"The compile cache under {plan.root} was left as it was.",
+                remediation=["Re-run with --yes to prune without a prompt."],
+            )
+        )
+
+    report = service.prune(plan)
+    if state.json_mode:
+        state.emit(document(report), ok=not report.failed)
+    else:
+        console.print(
+            f"Removed {len(report.removed)} entries, {human_bytes(report.freed_bytes)} freed."
+        )
+        for failure in report.failed:
+            console.print_error(f"Could not remove {failure.path}: {failure.error}")
+    return ExitCode.WARNINGS if report.failed else ExitCode.SUCCESS
 
 
 @registry_app.command("validate")
