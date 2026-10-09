@@ -213,7 +213,8 @@ infrastructure, not code.
   the reference host with one small model each, prepared and generating on GPU and NPU and
   benchmarked on the CPU: qwen3, qwen2, llama, gemma3-text, gemma2, olmo2, granite, smollm3, lfm2
   and qwen2.5-vl (whose NPU compile is refused). Beside them the registry has rules for qwen3.5,
-  phi3 and a generic text-generation fallback. Measuring the ten found four defects, all fixed:
+  phi3 (CPU and NPU claims from a patched export, below) and a generic text-generation fallback.
+  Measuring the ten found four defects, all fixed:
   - models were exported stateless when no rule named a task (OLMo-2: "beam_idx was not found");
   - optimum-intel's own per-architecture Transformers ranges were ignored until the export failed
     (Gemma, LFM2, Qwen2.5-VL); they are now read and satisfied by a managed environment;
@@ -223,8 +224,13 @@ infrastructure, not code.
   phi3 and mistral cannot be exported on Python 3.14: optimum 2.3.0, the release optimum-intel
   2.2.0 requires, binds `NormalizedConfig.with_args` through a `functools.partial`, which Python
   3.14 turned into a method descriptor (`export.optimum.normalized_config`). optimum fixed it in
-  pull request 2496, which no release carries yet; Python 3.11-3.13 are not affected. mistral
-  remains covered only by the generic rule.
+  pull request 2496, which no release carries yet; Python 3.11-3.13 are not affected. Both were
+  measured on 2026-10-09 all the same, exported from a scratch environment holding optimum 2.3.0
+  plus that one-line fix (which changes descriptor binding, not the exported graph):
+  `microsoft/Phi-4-mini-instruct` and `h2oai/h2o-danube2-1.8b-chat` compiled and generated on the
+  NPU in both INT4 formats and were evaluated on the CPU (`PROFILE_COMPARISON.md` section 10.3).
+  A user still needs Python 3.11-3.13, or an optimum release carrying pull request 2496, to export
+  them. mistral remains covered only by the generic rule.
 - **A GUI or web frontend. [L]** Application services already emit structured `ProgressEvent`s and
   never import Rich, so a second frontend does not require touching the core.
 
@@ -242,12 +248,18 @@ as a reference against FP16 on Qwen3-0.6B.
 - **Granite is slow on the NPU.** `ibm-granite/granite-3.3-2b-instruct` generates about 4.5 tokens
   per second on the NPU in both INT4 formats, where other models of its size reach 25-40
   (`PROFILE_COMPARISON.md` section 10.4). It runs to completion; the cause was not isolated.
+- **The OpenVINO compile cache is never pruned.** Compiled blobs live under the cache directory
+  (`~/.cache/yonga/compile` by default), and only `yonga remove` deletes any, those keyed to the
+  one artifact it removes. Entries for artifacts deleted outside yonga, for artifacts in other data
+  directories and for older OpenVINO versions accumulate: the reference host had 276 GB in 203
+  entries. There is no `prune` command yet.
 
 The previous defect, the default INT4 profiles on small models, is resolved: below 5B parameters
 every device now defaults to the more accurate profile, from a registry size condition and
-measurements on twelve models (`PROFILE_COMPARISON.md` section 10). What it leaves open is listed
-there: no VLM was measured, so the VLM families keep ratio 1.0, and nothing was measured
-between 4B and 8B.
+measurements on twelve models (`PROFILE_COMPARISON.md` section 10). The VLM families were measured
+since (Qwen2.5-VL-3B, Qwen3.5 0.8B-4B, section 10.6) and follow the same bands; their 0.3.0 pin to
+ratio 1.0 made the default `prepare` fail for every Qwen3.5 below 5B. What is still not measured:
+image-conditioned quality (the VLM figures are text only), and any model between 4.66B and 8B.
 
 ---
 

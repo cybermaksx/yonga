@@ -51,18 +51,11 @@ def test_the_builtin_registry_validates_clean() -> None:
 
 
 #: Every (architecture rule, device) -> profile pin the built-in data makes. A
-#: pin overrides the size bands, so each one is a deliberate decision: the VLM
-#: families keep ratio 1.0 (the bands were measured on text models, and a VLM's
-#: Hub count includes its vision tower), and families never tried with the
-#: group-wise NPU profile keep channel-wise.
-EXPECTED_PINS: dict[tuple[str, str], str] = {
-    ("arch-qwen3_5", "CPU"): "cpu-int4-asym-g128",
-    ("arch-qwen3_5", "GPU"): "gpu-int4-asym-g128",
-    ("arch-qwen2_5_vl", "CPU"): "cpu-int4-asym-g128",
-    ("arch-qwen2_5_vl", "GPU"): "gpu-int4-asym-g128",
-    ("arch-generic-text-generation", "NPU"): "npu-int4-sym-cw",
-    ("arch-phi3", "NPU"): "npu-int4-sym-cw",
-}
+#: pin overrides the size bands, so adding one must be a deliberate, measured
+#: decision. None is left: the VLM families, phi3 and the generic rule were
+#: measured on 2026-10-09 and follow the bands like every other family
+#: (``docs/PROFILE_COMPARISON.md`` sections 10.3 and 10.6).
+EXPECTED_PINS: dict[tuple[str, str], str] = {}
 
 
 def test_the_profile_pins_are_exactly_the_deliberate_ones() -> None:
@@ -195,10 +188,66 @@ def test_every_measured_family_gets_the_small_model_profiles(
     assert chosen(resolver, meta, "npu") == "npu-int4-sym-g128"
 
 
-def test_a_small_vlm_keeps_ratio_one(resolver: RegistryResolver) -> None:
-    meta = text_model("qwen2_5_vl", "Qwen2_5_VLForConditionalGeneration", 3_754_622_976)
-    assert chosen(resolver, meta, "cpu") == "cpu-int4-asym-g128"
-    assert chosen(resolver, meta, "gpu") == "gpu-int4-asym-g128"
+@pytest.mark.parametrize(
+    ("model_type", "architecture", "count", "cpu", "gpu"),
+    [
+        pytest.param(
+            "qwen2_5_vl",
+            "Qwen2_5_VLForConditionalGeneration",
+            3_754_622_976,
+            "cpu-int4-asym-g128-r08",
+            "gpu-int4-asym-g128-r08",
+            id="qwen2.5-vl-3b",
+        ),
+        pytest.param(
+            "qwen2_5_vl",
+            "Qwen2_5_VLForConditionalGeneration",
+            8_292_166_656,
+            "cpu-int4-asym-g128",
+            "gpu-int4-asym-g128",
+            id="qwen2.5-vl-7b",
+        ),
+        pytest.param(
+            "qwen3_5",
+            "Qwen3_5ForConditionalGeneration",
+            873_438_784,
+            "cpu-int4-asym-g128-r08",
+            "gpu-int4-asym-g128-r08",
+            id="qwen3.5-0.8b",
+        ),
+        pytest.param(
+            "qwen3_5",
+            "Qwen3_5ForConditionalGeneration",
+            2_274_069_824,
+            "cpu-int4-asym-g128-r08",
+            "gpu-int4-asym-g128-r08",
+            id="qwen3.5-2b",
+        ),
+        pytest.param(
+            "qwen3_5",
+            "Qwen3_5ForConditionalGeneration",
+            9_653_104_368,
+            "cpu-int4-asym-g128",
+            "gpu-int4-asym-g128",
+            id="qwen3.5-9b",
+        ),
+    ],
+)
+def test_a_vlm_follows_the_size_bands(
+    resolver: RegistryResolver,
+    model_type: str,
+    architecture: str,
+    count: int,
+    cpu: str,
+    gpu: str,
+) -> None:
+    """Below 5B ratio 1.0 cannot even prepare Qwen3.5 (NNCF's group-size check fails)."""
+    meta = text_model(model_type, architecture, count)
+    arch_rule, _ = resolver.resolve_architecture(meta)
+    assert arch_rule is not None
+    assert arch_rule.id == f"arch-{model_type}"
+    assert chosen(resolver, meta, "cpu") == cpu
+    assert chosen(resolver, meta, "gpu") == gpu
 
 
 @pytest.mark.parametrize(
@@ -230,10 +279,28 @@ def test_an_unusable_size_gets_the_device_defaults(
     assert chosen(resolver, meta, "npu") == "npu-int4-sym-cw"
 
 
-def test_an_unknown_small_family_on_the_npu_stays_channel_wise(
-    resolver: RegistryResolver,
+@pytest.mark.parametrize(
+    ("count", "npu"),
+    [
+        pytest.param(1_831_201_280, "npu-int4-sym-g128", id="danube2-1.8b"),
+        pytest.param(7_248_023_552, "npu-int4-sym-cw", id="mistral-7b"),
+    ],
+)
+def test_mistral_on_the_npu_follows_the_size_bands(
+    resolver: RegistryResolver, count: int, npu: str
 ) -> None:
-    """mistral reaches only the generic rule, which was never tried with group-wise INT4."""
-    meta = text_model("mistral", "MistralForCausalLM", 1_000_000_000)
-    assert chosen(resolver, meta, "npu") == "npu-int4-sym-cw"
+    """mistral reaches only the generic rule, which no longer pins the NPU."""
+    meta = text_model("mistral", "MistralForCausalLM", count)
+    arch_rule, _ = resolver.resolve_architecture(meta)
+    assert arch_rule is not None
+    assert arch_rule.id == "arch-generic-text-generation"
+    assert chosen(resolver, meta, "npu") == npu
+
+
+def test_a_small_phi3_gets_group_wise_int4_on_the_npu(resolver: RegistryResolver) -> None:
+    meta = text_model("phi3", "Phi3ForCausalLM", 3_836_021_760)
+    arch_rule, _ = resolver.resolve_architecture(meta)
+    assert arch_rule is not None
+    assert arch_rule.id == "arch-phi3"
+    assert chosen(resolver, meta, "npu") == "npu-int4-sym-g128"
     assert chosen(resolver, meta, "cpu") == "cpu-int4-asym-g128-r08"

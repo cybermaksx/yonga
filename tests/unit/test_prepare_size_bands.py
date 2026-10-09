@@ -3,10 +3,10 @@
 Every test here adds its own band, so the threshold under test does not move
 with the built-in data: ``cpu-int4-asym-g128-small``, a CPU profile for models
 below 2B parameters that outranks both the CPU default and the built-in
-``cpu-int4-asym-g128-r08``. The Qwen3.5 fixture's architecture rule names
-``cpu-int4-asym-g128`` for CPU (VLM families keep ratio 1.0), and a named
-profile is preferred before any scoring happens, so :func:`banded_resolver`
-drops that CPU entry; otherwise the band could never decide anything.
+``cpu-int4-asym-g128-r08``. A profile an architecture rule names is preferred
+before any scoring happens, so :func:`banded_resolver` drops every rule's CPU
+entry: the built-in Qwen3.5 rule of the fixture names none today, and a pin
+added to the built-in data later must not stop the band from deciding.
 """
 
 from __future__ import annotations

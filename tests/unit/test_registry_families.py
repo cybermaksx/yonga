@@ -84,9 +84,17 @@ def test_an_unmeasured_family_still_falls_back_honestly() -> None:
     assert rule.devices["GPU"].evidence is EvidenceLevel.INFERRED
 
 
-def test_phi3_claims_no_device_until_an_exporter_converts_it() -> None:
+def test_phi3_claims_only_the_devices_its_patched_export_ran_on() -> None:
+    """Phi-4-mini ran on the CPU and NPU, exported with optimum's unreleased fix (PR 2496).
+
+    The GPU was never tried, and the Python 3.14 export limitation stays recorded.
+    """
     rule, _ = RESOLVER.resolve_architecture(meta("phi3", "Phi3ForCausalLM"))
 
     assert rule is not None and rule.id == "arch-phi3"
-    assert all(rule.devices[d].status is DeviceStatus.UNKNOWN for d in ALL_TESTED)
-    assert rule.known_limitations
+    for device in ("CPU", "NPU"):
+        assert rule.devices[device].status is DeviceStatus.SUPPORTED
+        assert rule.devices[device].evidence is EvidenceLevel.TESTED
+    assert rule.devices["GPU"].status is DeviceStatus.UNKNOWN
+    assert any("2496" in note for note in rule.devices["NPU"].notes)
+    assert any("Python 3.14" in item for item in rule.known_limitations)

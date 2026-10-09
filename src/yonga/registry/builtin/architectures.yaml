@@ -47,17 +47,24 @@ architectures:
             The NPU plugin compiles the graph and then rejects it. The driver and
             the compiler are healthy; the graph is what is unsupported.
     recommended_device: gpu
-    # Pinned to ratio 1.0: the size-banded small-model profiles were measured
-    # on text models only, and a VLM's Hub count includes its vision tower.
-    profiles:
-      gpu: gpu-int4-asym-g128
-      cpu: cpu-int4-asym-g128
+    # No profile pin: the size bands decide, as for the text families. Below 5B
+    # ratio 1.0 does not even prepare (known_limitations), and ratio 0.8 does.
+    # The Hub count includes the vision tower, which can only move a model
+    # toward the 5B-and-above profiles. docs/PROFILE_COMPARISON.md section 10.6.
     chat_profile: chat-qwen3_5
     known_limitations:
       - >-
         Export needs Transformers 5.2; newer Transformers releases change the
         modelling code this architecture was exported with.
       - NPU is not a target for this architecture on OpenVINO 2026.x.
+      - >-
+        Ratio-1.0 group-wise INT4 (cpu-int4-asym-g128, gpu-int4-asym-g128) fails
+        on Qwen3.5 0.8B, 2B and 4B with export.quantization.group_size_mismatch:
+        NNCF cannot split the one-channel weight of
+        `__module.rotary_emb/aten::matmul/MatMul` into groups of 128. Ratio 0.8,
+        the default below 5B, prepares all three, because NNCF's mixed-precision
+        step kept that weight in its INT8 backup precision; that was observed
+        with NNCF 3.4.0, not guaranteed. The 9B prepares at ratio 1.0.
     sources:
       - kind: official_docs
         url: https://github.com/openvinotoolkit/openvino.genai/blob/master/site/docs/supported-models/index.mdx
@@ -85,6 +92,18 @@ architectures:
           architecture looks supported. Config loading is therefore not evidence
           that the export will work, and this requirement must not be relaxed on
           the strength of it.
+      - kind: tested
+        note: >-
+          Qwen/Qwen3.5-0.8B, -2B and -4B (Hub 0.87B, 2.27B, 4.66B, vision tower
+          included) on the Lunar Lake reference host, 2026-10-09, OpenVINO 2026.4,
+          optimum-intel 2.2.0, NNCF 3.4.0. cpu-int4-asym-g128 failed on all three
+          (and gpu-int4-asym-g128 on the 0.8B, the one tried) with NNCF's
+          InvalidGroupSizeError on `__module.rotary_emb/aten::matmul/MatMul`
+          (channel size 1). cpu-int4-asym-g128-r08 and gpu-int4-asym-g128-r08
+          prepared all three; against cpu-int8-asym-ref, text only, on the CPU
+          the r08 artifacts measured KL 0.152 / 0.098 / 0.064 and perplexity
+          +19.9 / +12.2 / +8.0 %. nDimensional/Qwen3.5-9B-Uncensored-Safetensors
+          (Hub 9.65B) still prepared with cpu-int4-asym-g128 the same day.
 
   - id: arch-generic-text-generation
     schema_version: 1
@@ -129,9 +148,13 @@ architectures:
           - >-
             NPU support depends on the exact graph. Probe the compiled artifact
             before claiming support.
+          - >-
+            One mistral model, h2oai/h2o-danube2-1.8b-chat, compiled and generated
+            on the NPU in both INT4 formats (2026-10-09). Nothing else this rule
+            catches was tried on the NPU.
     recommended_device: gpu
-    profiles:
-      npu: npu-int4-sym-cw
+    # No NPU pin: below 5B the NPU gets npu-int4-sym-g128 as every measured
+    # family does. Measured through this rule for one mistral model only.
     chat_profile: chat-default
     known_limitations:
       - >-
@@ -146,6 +169,20 @@ architectures:
         note: >-
           Family-level fallback so unknown members of well-known decoder-only
           families still get a usable CPU/GPU plan.
+      - kind: tested
+        note: >-
+          h2oai/h2o-danube2-1.8b-chat (MistralForCausalLM, Hub 1.83B) on the Lunar
+          Lake reference host, 2026-10-09, OpenVINO 2026.4, optimum-intel 2.2.0,
+          NNCF 3.4.0, evaluated on the CPU against cpu-int8-asym-ref. On the NPU,
+          npu-int4-sym-g128 against npu-int4-sym-cw: KL 0.208 against 0.367,
+          perplexity +15.5 % against +30.0 %, 41.8 against 56.4 tok/s (time to
+          first token 397 against 313 ms). On the CPU, ratio 0.8 against 1.0: KL
+          0.166 against 0.192. Exported on Python 3.14 in a scratch environment
+          with optimum 2.3.0 plus the one-line fix of optimum pull request 2496
+          (a staticmethod around the functools.partial in
+          NormalizedConfig.with_args), which released optimum lacks; the fix
+          changes descriptor binding only, not the exported graph. This is the
+          only model measured through this rule.
 
   - id: arch-qwen3
     schema_version: 1
@@ -523,11 +560,9 @@ architectures:
         notes:
           - 'The NPU compiler refuses the graph: npu.compiler.pass_failed.'
     recommended_device: gpu
-    # Pinned to ratio 1.0: the size-banded small-model profiles were measured
-    # on text models only, and a VLM's Hub count includes its vision tower.
-    profiles:
-      gpu: gpu-int4-asym-g128
-      cpu: cpu-int4-asym-g128
+    # No profile pin: the size bands decide, as for the text families
+    # (docs/PROFILE_COMPARISON.md section 10.6). The Hub count includes the
+    # vision tower, which can only move a model toward the 5B-and-above profiles.
     sources:
       - kind: tested
         note: >-
@@ -535,6 +570,16 @@ architectures:
           optimum-intel 2.2.0: prepared, probed and generating on CPU, GPU, NPU; the NPU
           refused it. optimum-intel declares transformers <=5.0 for qwen2_5_vl; verified
           exporting in a managed environment.
+      - kind: tested
+        note: >-
+          Qwen/Qwen2.5-VL-3B-Instruct (Hub 3.75B, 0.67B of it the vision tower),
+          2026-10-09, same host and stack with NNCF 3.4.0, text only, against
+          cpu-int8-asym-ref. On the CPU, ratio 0.8 against 1.0: KL 0.102 against
+          0.304, top-1 84.4 % against 76.4 %, perplexity +7.9 % against +35.2 %,
+          2896 against 2633 MiB. Evaluated on the GPU: gpu-int4-asym-g128-r08 KL
+          0.142, perplexity +12.7 %, against 0.234 and +23.8 % for
+          gpu-int4-asym-g128; 42.5 against 48.4 tok/s on the GPU (about 12 %
+          slower, time to first token 74-75 ms for both).
 
   - id: arch-phi3
     schema_version: 1
@@ -556,17 +601,28 @@ architectures:
       native_implementation: true
     devices:
       cpu:
-        status: unknown
-        evidence: unknown
+        status: supported
+        evidence: tested
+        notes:
+          - >-
+            Phi-4-mini prepared and evaluated on the CPU (2026-10-09), exported
+            with the patched optimum described under the NPU entry.
       gpu:
         status: unknown
         evidence: unknown
       npu:
-        status: unknown
-        evidence: unknown
+        status: supported
+        evidence: tested
+        notes:
+          - >-
+            Phi-4-mini compiled and generated on the NPU with npu-int4-sym-cw and
+            npu-int4-sym-g128 (2026-10-09). It was exported on Python 3.14 with
+            optimum 2.3.0 plus the one-line fix of optimum pull request 2496, which
+            changes descriptor binding only, not the exported graph; released
+            optimum cannot export phi3 on Python 3.14 (known_limitations).
     recommended_device: gpu
-    profiles:
-      npu: npu-int4-sym-cw
+    # No NPU pin: below 5B the NPU gets npu-int4-sym-g128 as every measured
+    # family does (docs/PROFILE_COMPARISON.md section 10.3).
     known_limitations:
       - >-
         On Python 3.14, optimum 2.3.0 (the release optimum-intel 2.2.0
@@ -582,3 +638,16 @@ architectures:
           microsoft/Phi-4-mini-instruct on the Lunar Lake reference host: remote
           code correctly not required; the optimum-intel 2.2.0 export then failed
           with the NormalizedConfig 'allow_new' TypeError.
+      - kind: tested
+        note: >-
+          microsoft/Phi-4-mini-instruct (Hub 3.84B) on the Lunar Lake reference
+          host, 2026-10-09, OpenVINO 2026.4, optimum-intel 2.2.0, NNCF 3.4.0,
+          evaluated on the CPU against cpu-int8-asym-ref. On the NPU,
+          npu-int4-sym-g128 against npu-int4-sym-cw: KL 0.240 against 0.427,
+          perplexity +20.3 % against +44.9 %, 21.9 against 25.1 tok/s (time to
+          first token 866 against 715 ms). On the CPU, ratio 0.8 against 1.0: KL
+          0.212 against 0.231. Exported on Python 3.14 in a scratch environment
+          with optimum 2.3.0 plus the one-line fix of optimum pull request 2496
+          (a staticmethod around the functools.partial in
+          NormalizedConfig.with_args), which released optimum lacks; the fix
+          changes descriptor binding only, not the exported graph.

@@ -56,11 +56,13 @@ on the NPU, and benchmarked on the CPU. The registry's device claims for these f
 | lfm2 | `LiquidAI/LFM2-350M` | ✓ 21.8 tok/s | ✓ | ✓ |
 | qwen2.5-vl | `Qwen/Qwen2.5-VL-3B-Instruct` | ✓ 6.2 tok/s | ✓ | ✗ compiler refuses the graph |
 | qwen3.5 | the reference 9B VLM | ✓ | ✓ | ✗ compiler refuses the graph |
-| phi3 | `microsoft/Phi-4-mini-instruct` | — | — | — the optimum-intel 2.2.0 export fails |
+| phi3 | `microsoft/Phi-4-mini-instruct` | ✓ prepared and evaluated | — not tried | ✓ 21.9 tok/s (group-wise) |
 
 CPU figures are single-run INT4 throughput on the short prompt. Gemma, LFM2 and Qwen2.5-VL need an
 older Transformers than the one installed; `prepare` read that range from optimum-intel and
-exported them in managed environments. GGUF import is verified separately (see
+exported them in managed environments. phi3 was exported on Python 3.14 with optimum 2.3.0 plus
+the unreleased fix of optimum pull request 2496: released optimum cannot build its export config
+on Python 3.14, and Python 3.11-3.13 are not affected. GGUF import is verified separately (see
 [`docs/PROFILE_COMPARISON.md`](https://github.com/ooguz/yonga/blob/main/docs/PROFILE_COMPARISON.md#9-gguf-imports-against-the-original-weights) section 9).
 
 ## What works today
@@ -186,9 +188,10 @@ Saved: ~/.local/share/yonga/benchmarks/20261008T174148Z-cpu-quick-54fb2207.json
 
 Below 5B parameters each device's default profile keeps a fifth of the layers at INT8 (on the NPU,
 group-wise INT4), because measured over twelve models that loses far less quality for 9-18 % more
-disk; larger models, models whose size is unknown and the VLM families keep plain INT4, and the
-NPU keeps channel-wise INT4 for the families never tried with group-wise. `--profile` overrides
-either way, and [`docs/PROFILE_COMPARISON.md`](https://github.com/ooguz/yonga/blob/main/docs/PROFILE_COMPARISON.md#10-small-model-defaults-twelve-models-three-devices)
+disk. Phi-4-mini, a mistral model and Qwen2.5-VL-3B confirmed it since, and on Qwen3.5 below 5B
+plain INT4 does not even prepare. Larger models and models whose size is unknown keep plain INT4
+(channel-wise on the NPU), and no family is exempt from the bands. `--profile` overrides either
+way, and [`docs/PROFILE_COMPARISON.md`](https://github.com/ooguz/yonga/blob/main/docs/PROFILE_COMPARISON.md#10-small-model-defaults-twelve-models-three-devices)
 section 10 has the numbers.
 
 Those numbers are one real run of one small model on this host's CPU. They are an illustration of the output, not a performance claim.

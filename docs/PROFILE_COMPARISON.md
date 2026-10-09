@@ -475,7 +475,9 @@ Two findings, and one thing not found:
 
 Section 8.5 found that keeping a fifth of the layers at INT8 helps `Qwen/Qwen3-0.6B` a lot, and left
 the profile opt-in because one model is not a rule. This section is the evidence the rule now rests
-on. It also measured the NPU's two INT4 formats against each other, which nobody had.
+on. It also measured the NPU's two INT4 formats against each other, which nobody had. The twelve
+models are the core; Phi-4-mini, h2o-danube2-1.8b and the VLMs of section 10.6 were measured later
+the same way, to retire the family exceptions 0.3.0 shipped with (section 10.5).
 
 ### 10.1 Method
 
@@ -524,6 +526,12 @@ to +8.5 %, Qwen3-4B +18.5 % to +7.5 %); at 8B it is +7.2 % and ratio 0.8 makes i
 On the GPU itself, `yonga eval --device gpu` gives the same ordering: Qwen3-1.7B +24.4 % against
 +10.8 %, Qwen3-4B +27.1 % against +9.8 %.
 
+Two more families, measured on 2026-10-09 the same way (exported as section 10.3 describes), agree
+with a smaller gain: `microsoft/Phi-4-mini-instruct` (phi3, 3.84B) 0.231 / 80.8 % / +19.4 % /
+2211 MiB against 0.212 / 81.9 % / +17.7 % / 2526 MiB (KL -8 %), and `h2oai/h2o-danube2-1.8b-chat`
+(mistral, 1.83B) 0.192 / 80.9 % / +13.3 % / 991 MiB against 0.166 / 82.7 % / +11.0 % / 1147 MiB
+(KL -14 %). The VLMs are in section 10.6.
+
 ### 10.3 The NPU's two formats
 
 | Model | Hub count | `npu-int4-sym-cw` KL / perplexity | `npu-int4-sym-g128` KL / perplexity |
@@ -534,10 +542,12 @@ On the GPU itself, `yonga eval --device gpu` gives the same ordering: Qwen3-1.7B
 | `unsloth/gemma-3-1b-it` | 1.00B | 1.037 / +55.6 % | 0.520 / +32.4 % |
 | `unsloth/Llama-3.2-1B-Instruct` | 1.24B | 0.697 / +98.2 % | 0.266 / +33.1 % |
 | `allenai/OLMo-2-0425-1B-Instruct` | 1.48B | 0.391 / +33.7 % | 0.175 / +10.5 % |
+| `h2oai/h2o-danube2-1.8b-chat` | 1.83B | 0.367 / +30.0 % | 0.208 / +15.5 % |
 | `Qwen/Qwen3-1.7B` | 2.03B | 0.835 / +108.1 % | 0.330 / +17.9 % |
 | `ibm-granite/granite-3.3-2b-instruct` | 2.53B | 1.152 / +151.1 % | 0.226 / +12.5 % |
 | `unsloth/gemma-2-2b-it` | 2.61B | 0.190 / +19.6 % | 0.087 / +6.8 % |
 | `HuggingFaceTB/SmolLM3-3B` | 3.08B | 0.464 / +24.9 % | 0.245 / +7.2 % |
+| `microsoft/Phi-4-mini-instruct` | 3.84B | 0.427 / +44.9 % | 0.240 / +20.3 % |
 | `Qwen/Qwen3-4B` | 4.02B | 0.529 / +25.7 % | 0.264 / +12.7 % |
 | `Qwen/Qwen3-8B` | 8.19B | 0.444 / +42.7 % | 0.150 / +9.4 % |
 
@@ -545,6 +555,16 @@ Channel-wise INT4 diverges from the reference roughly two to five times as much 
 model and at every size. Before this change the NPU used channel-wise for every family except
 Qwen3, so a small model on the NPU was, for example, Qwen2.5-0.5B at +107 % perplexity where
 +38 % was available. Every group-wise artifact also compiled and generated on the NPU.
+
+The `h2o-danube2-1.8b-chat` (mistral) and `Phi-4-mini-instruct` (phi3) rows were added on
+2026-10-09, with the same stack and method, and both formats compiled and generated on the NPU for
+both. Group-wise lowers their divergence by about 44 %, a smaller factor than for most of the
+twelve. One caveat applies to these two rows and to every other figure for them in this section:
+released optimum cannot build their export configs on Python 3.14
+(`export.optimum.normalized_config`), so they were exported on Python 3.14 from a scratch
+environment holding optimum 2.3.0 plus the one-line fix of optimum pull request 2496 (a
+`staticmethod` around the `functools.partial` in `NormalizedConfig.with_args`). The fix changes
+how a descriptor binds, not the exported graph.
 
 ### 10.4 Speed
 
@@ -579,9 +599,11 @@ two measured runs); tokens per second with time to first token:
 | `unsloth/gemma-3-1b-it` | 48.3 (270 ms) | 41.3 (314 ms) | -14 % |
 | `unsloth/Llama-3.2-1B-Instruct` | 71.2 (188 ms) | 57.8 (301 ms) | -19 % |
 | `allenai/OLMo-2-0425-1B-Instruct` | 44.5 (268 ms) | 40.3 (469 ms) | -9 % |
+| `h2oai/h2o-danube2-1.8b-chat` | 56.4 (313 ms) | 41.8 (397 ms) | -26 % |
 | `ibm-granite/granite-3.3-2b-instruct` | 4.6 (660 ms) | 4.4 (950 ms) | -4 % |
 | `unsloth/gemma-2-2b-it` | 36.1 (362 ms) | 26.6 (541 ms) | -26 % |
 | `HuggingFaceTB/SmolLM3-3B` | 33.8 (549 ms) | 23.8 (842 ms) | -30 % |
+| `microsoft/Phi-4-mini-instruct` | 25.1 (715 ms) | 21.9 (866 ms) | -13 % |
 
 So group-wise costs these families a tenth to a third of the NPU's tokens per second, more than it
 cost Qwen3 at the same sizes, and up to about one and a half times the time to first token. The
@@ -590,26 +612,81 @@ default keeps it: the divergence it removes (section 10.3) is two to five times 
 session on an idle NPU; the first, which may have shared the NPU with a test run, measured
 22.8, 48.1 and 24.2 tok/s with group-wise, so read the costs as approximate. Granite is slow on the
 NPU in both formats, about 4.5 tok/s where models of its size reach 25-40; the cause was not
-isolated.
+isolated. The danube2 and Phi-4-mini rows come from the patched export of section 10.3 and fall in
+the same range, -26 % and -13 %.
 
 ### 10.5 What the registry does with it
 
-Below 5B parameters each device now defaults to the more accurate profile: `cpu-int4-asym-g128-r08`,
-the new `gpu-int4-asym-g128-r08` and `npu-int4-sym-g128`. At 5B and above, and whenever the size is
-unknown, the defaults are unchanged (`cpu-int4-asym-g128`, `gpu-int4-asym-g128`,
-`npu-int4-sym-cw`). Between the 4B and 8B rows nothing was measured, and 5B follows the NPU
-documentation's "roughly 4-5B". The plan says why a profile was chosen ("Chosen because"), and
-`--profile` overrides it either way.
+Below 5B parameters each device defaults to the more accurate profile: `cpu-int4-asym-g128-r08`,
+`gpu-int4-asym-g128-r08` and `npu-int4-sym-g128`. At 5B and above, and whenever the size is
+unknown, the defaults are `cpu-int4-asym-g128`, `gpu-int4-asym-g128` and `npu-int4-sym-cw`. Between
+the 4B and 8B rows nothing was measured, and 5B follows the NPU documentation's "roughly 4-5B". The
+plan says why a profile was chosen ("Chosen because"), and `--profile` overrides it either way.
 
-Exceptions, all deliberate: the VLM families keep their CPU and GPU pins to ratio 1.0, and the
-generic rule (Mistral and other unrecognised members of common families) and Phi-3 keep the NPU on
-channel-wise INT4, because group-wise was never prepared and probed on the NPU for them.
+There are no family exceptions any more. Version 0.3.0 pinned the VLM families (Qwen3.5,
+Qwen2.5-VL) to ratio 1.0 on the CPU and GPU, and phi3 and the generic rule (mistral and
+unrecognised members of common families) to channel-wise INT4 on the NPU, because none of them had
+been measured. They were measured on 2026-10-09 (sections 10.3, 10.4 and 10.6) and the pins are
+gone, so the bands decide for them as for every other family. For Qwen3.5 the pin was a defect,
+not a cautious choice: ratio 1.0 cannot quantize Qwen3.5 0.8B-4B at all, so the default `prepare`
+failed for every Qwen3.5 below 5B. The generic rule was measured with one mistral model only; the
+bands apply to everything else it catches without a measurement of its own.
 
-Two choices the numbers leave open, recorded here rather than hidden in the threshold:
+One choice the numbers leave open, recorded here rather than hidden in the threshold:
 
 - **At 8B on the NPU, channel-wise is a third faster and far less accurate** (+42.7 % against
   +9.4 % perplexity). The default follows the documentation and the speed;
   `--profile npu-int4-sym-g128` is the quality choice, and it compiles and runs.
-- **The VLM families keep ratio 1.0.** No VLM was measured, and a VLM's Hub count includes its
-  vision tower, so a band in Hub-count units says less about its language model.
 
+### 10.6 VLMs
+
+Measured on 2026-10-09 with the method of section 10.1: `cpu-int8-asym-ref` as the reference and
+`yonga eval` over `yonga-eval-v1`, which is text only. The ratio changes only the language model:
+the vision tower and the text embeddings are INT8 in every profile (for Qwen2.5-VL-3B their files
+are byte-identical across the ratio-1.0, ratio-0.8 and INT8 artifacts), so a text-only divergence
+isolates what the ratio changes. What this does not measure is image-conditioned quality: no answer
+about an image was scored.
+
+`Qwen/Qwen2.5-VL-3B-Instruct` (Hub 3.75B, of which the vision tower is 0.67B). The GPU rows are the
+GPU profiles' artifacts evaluated on the GPU against the same INT8 reference, so compare them with
+each other rather than with the CPU rows. Mean KL / top-1 agreement / perplexity change against
+INT8, and artifact size:
+
+| Profile | Evaluated on | KL | Top-1 | Perplexity | Size |
+|---|---|---|---|---|---|
+| `cpu-int4-asym-g128` | CPU | 0.304 | 76.4 % | +35.2 % | 2633 MiB |
+| `cpu-int4-asym-g128-r08` | CPU | 0.102 | 84.4 % | +7.9 % | 2896 MiB |
+| `gpu-int4-asym-g128` | GPU | 0.234 | 77.8 % | +23.8 % | 2633 MiB |
+| `gpu-int4-asym-g128-r08` | GPU | 0.142 | 83.8 % | +12.7 % | 2896 MiB |
+
+Ratio 0.8 lowers the divergence by 66 % on the CPU, more than on any text model of section 10.2,
+and by 39 % on the GPU, for 10 % more disk. On the GPU (`yonga bench --suite standard`, one warmup,
+two measured runs, the two profiles alternated twice) it costs about 12 % of the tokens per second:
+48.5 and 48.3 tok/s for ratio 1.0, 42.5 and 42.5 for ratio 0.8, with 74-75 ms to the first token
+for both.
+
+`Qwen/Qwen3.5-0.8B`, `-2B` and `-4B`: ratio 1.0 does not prepare. `cpu-int4-asym-g128` fails on
+all three, and `gpu-int4-asym-g128` on the 0.8B (the one tried), with
+`export.quantization.group_size_mismatch`: NNCF's `InvalidGroupSizeError` for
+`__module.rotary_emb/aten::matmul/MatMul`, whose weight has one channel and cannot be split into
+groups of 128. Ratio 0.8 prepares all three on the CPU and on the GPU, because NNCF's
+mixed-precision step kept that weight in its INT8 backup precision; that was observed with NNCF
+3.4.0, not guaranteed by it. The ratio-0.8 artifacts against INT8, on the CPU:
+
+| Model | Hub count | Ratio 1.0 | Ratio 0.8 KL / top-1 / perplexity / size |
+|---|---|---|---|
+| `Qwen/Qwen3.5-0.8B` | 0.87B | fails to prepare | 0.152 / 79.7 % / +19.9 % / 927 MiB |
+| `Qwen/Qwen3.5-2B` | 2.27B | fails to prepare | 0.098 / 84.2 % / +12.2 % / 2179 MiB |
+| `Qwen/Qwen3.5-4B` | 4.66B | fails to prepare | 0.064 / 86.5 % / +8.0 % / 3753 MiB |
+
+The 0.3.0 registry pinned Qwen3.5 to ratio 1.0 on both devices, so the default `prepare` failed
+for every Qwen3.5 below 5B. Above the band, a Qwen3.5-9B derivative
+(`nDimensional/Qwen3.5-9B-Uncensored-Safetensors`, Hub 9.65B) was re-checked the same day and
+still prepares with `cpu-int4-asym-g128` at ratio 1.0. Nothing was tried between 4.66B and 9.65B.
+
+A VLM's Hub count includes its vision tower, 5-19 % of the count for these models, so the band is
+applied to a number larger than the language model it quantizes. That errs in the safe direction:
+a VLM can only cross 5B earlier and get the default that larger models get, never a small-model
+profile its language model is too large for. For Qwen3.5 that default is ratio 1.0, which failed
+below 5B; a model whose language model sits just under 5B while its Hub count is above would meet
+it, and no such size was measured.

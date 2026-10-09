@@ -105,8 +105,41 @@ manifest may change in any minor release.
   GenAI reads these universal tags anywhere as "image N goes here", so typed text could claim an
   image that was not attached and fail generation. A model's own vision tokens typed as text are
   not removed; which they are is per-family knowledge the registry does not hold yet.
+- **The VLM families follow the size bands.** Qwen2.5-VL and Qwen3.5 no longer pin the CPU and GPU
+  to ratio 1.0, so below 5B they get `cpu-int4-asym-g128-r08` and `gpu-int4-asym-g128-r08`, and
+  from 5B the ratio-1.0 profiles, like every text family. Measured on 2026-10-09, text only,
+  against INT8: on `Qwen/Qwen2.5-VL-3B-Instruct` ratio 0.8 lowers the divergence by 66 % on the CPU
+  (perplexity +35.2 % to +7.9 %, 2633 to 2896 MiB) and by 39 % evaluated on the GPU (+23.8 % to
+  +12.7 %), for about 12 % of the GPU's tokens per second (48.4 to 42.5). Image-conditioned quality
+  was not measured. A VLM's Hub count includes its vision tower, so it reaches 5B early, never
+  late. `docs/PROFILE_COMPARISON.md` section 10.6.
+- **phi3 and the generic rule get group-wise INT4 on the NPU below 5B.** `arch-phi3` and
+  `arch-generic-text-generation` (mistral and unrecognised members of common families) no longer
+  pin `npu-int4-sym-cw`, so below 5B the NPU gets `npu-int4-sym-g128` as every other family does;
+  from 5B, and for an unknown size, it stays channel-wise. Against INT8, group-wise lowers the
+  divergence by about 44 % on `microsoft/Phi-4-mini-instruct` (KL 0.427 to 0.240, perplexity
+  +44.9 % to +20.3 %) and on `h2oai/h2o-danube2-1.8b-chat` (0.367 to 0.208, +30.0 % to +15.5 %),
+  for 13 % and 26 % of the NPU's tokens per second (25.1 to 21.9 and 56.4 to 41.8 tok/s, with
+  a fifth to a quarter more time to the first token); `--profile npu-int4-sym-cw` is the fast
+  choice. The generic rule was measured with that one mistral model only. phi3 now claims CPU
+  and NPU support as tested; the GPU was not tried. Both models were exported on Python 3.14 with
+  optimum 2.3.0 plus the unreleased one-line fix of optimum pull request 2496, which changes
+  descriptor binding only, not the exported graph; released optimum still cannot export them on
+  Python 3.14 (Python 3.11-3.13 can). `docs/PROFILE_COMPARISON.md` sections 10.3 and 10.4.
+- **Upgrading.** As in 0.3.0, a changed default is a new artifact, never a replacement: preparing
+  one of these models again exports it under the new profile id next to the existing artifact,
+  and the plan says so beforehand with the `--profile` that would reuse the old one.
 
 ### Fixed
+
+- **`prepare` works again for Qwen3.5 below 5B parameters.** The 0.3.0 registry pinned Qwen3.5 to
+  ratio-1.0 INT4 on the CPU and GPU, and that fails NNCF's group-size check on Qwen3.5 0.8B, 2B
+  and 4B (`export.quantization.group_size_mismatch`: the one-channel weight of the rotary-embedding
+  MatMul cannot be split into groups of 128), so the default `prepare` failed for every Qwen3.5
+  below 5B. They now get the ratio-0.8 profiles, which prepare all three (NNCF keeps that weight at
+  INT8; observed with NNCF 3.4.0, not guaranteed), with perplexity +19.9 %, +12.2 % and +8.0 %
+  against INT8. Qwen3.5-9B still prepares at ratio 1.0. The limitation is recorded in
+  `arch-qwen3_5`.
 
 - **`serve` answers the request that hands a tool's result back** on an LLM artifact that runs
   OpenVINO GenAI's stateful pipeline (`ATTENTION_BACKEND=SDPA` on the GPU, and every NPU LLM).
