@@ -352,6 +352,19 @@ def test_repetition_penalty_applies_without_sampling(genai):
     assert not hasattr(config, "temperature")
 
 
+def test_registry_stop_strings_are_applied_natively_and_left_out_of_the_answer(genai):
+    config = build_generation_config(GenerationSettings(stop_strings=["<|end|>", "", "<|end|>"]))
+    assert config.stop_strings == {"<|end|>"}
+    assert config.include_stop_str_in_output is False
+    assert config.validated == 1
+
+
+def test_no_stop_strings_leave_the_genai_defaults_untouched(genai):
+    config = build_generation_config(GenerationSettings())
+    assert not hasattr(config, "stop_strings")
+    assert not hasattr(config, "include_stop_str_in_output")
+
+
 def test_max_new_tokens_never_drops_below_one(genai):
     assert build_generation_config(GenerationSettings(max_new_tokens=0)).max_new_tokens == 1
 

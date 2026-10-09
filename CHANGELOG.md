@@ -11,6 +11,13 @@ manifest may change in any minor release.
 
 ### Added
 
+- **`serve` honours OpenAI `stop`.** A string or up to 4 non-empty strings of at most 256
+  characters; anything else is a 400 `invalid_request` naming `stop`. yonga matches them on the
+  visible answer after the reasoning sanitiser, never inside a hidden reasoning block, across chunk
+  boundaries, and ends the answer before the earliest match with `finish_reason` `stop`. A stream
+  holds back only the tail that could still become a match. A request with stop sequences is
+  streamed internally even when the client did not ask for a stream, so generation ends at the
+  match. `docs/CLI_SPEC.md` section 14.
 - **`yonga probe --quick` and `--timeout SECONDS`.** Settling a deferred NPU compile means building
   the GenAI pipeline, which for a 9B model ran past 15 minutes. `--quick` never builds it;
   `--timeout` builds it in a child process (`python -P -m yonga.adapters.smoke_child`) and stops it
@@ -21,6 +28,15 @@ manifest may change in any minor release.
   dies without a result is a failure classified by the registry from its stderr. Without either
   option nothing changes, and `prepare` still always waits. `python -m yonga.application.probe`
   takes both options too. `docs/CLI_SPEC.md` section 11.
+
+### Changed
+
+- **The registry chat profile's `stop_strings` is applied.** The field was parsed and never used; it
+  now reaches OpenVINO GenAI's `GenerationConfig.stop_strings` as model-level end markers, left out
+  of the answer. Empty and duplicate entries are dropped when a rule loads. A benchmark's settings
+  fingerprint includes stop strings only when there are some, so every recorded fingerprint still
+  matches. No built-in rule declares any, so nothing shipped behaves differently.
+  `docs/REGISTRY_SPEC.md` section 8b.
 
 ### Fixed
 

@@ -12,7 +12,8 @@ rather than risk leaking a hidden block. The one thing it cannot deduce is that
 the *prompt* opened a block, leaving a reply that contains no wrapper at all;
 that state arrives as ``starts_in_reasoning``, established by
 :func:`yonga.adapters.runtime_genai.resolve_starts_in_reasoning` from the
-artifact's own chat template.
+artifact's own chat template. A client's stop sequences are matched after it,
+on the visible text only, by :class:`StopMatcher`.
 
 *The session.* :class:`ChatSession` owns one conversation: the pipeline is built
 once by the injected ``runtime_factory`` and reused for every turn, generation
@@ -76,6 +77,7 @@ from yonga.util.redaction import redact_text
 __all__ = [
     "DEFAULT_REASONING_WRAPPERS",
     "MAX_OUTPUT_TOKENS",
+    "STOP_SEQUENCE_REASON",
     "TEMPERATURE_RANGE",
     "TOP_K_MAX",
     "TOP_P_RANGE",
@@ -100,11 +102,13 @@ __all__ = [
     "Role",
     "RuntimeFactory",
     "SanitizedAnswer",
+    "StopMatcher",
     "StreamingSanitizer",
     "TextSink",
     "chat_history_filename",
     "sanitize_answer",
     "sanitize_reasoning",
+    "truncate_at_stop",
 ]
 
 #: Largest value ``/tokens`` accepts. Mirrors ``yonga.ui.chat_tui.MAX_OUTPUT_TOKENS``;
@@ -544,6 +548,89 @@ class StreamingSanitizer:
         return delta
 
 
+#: ``GenerationResult.stop_reason`` of an answer a client's stop sequence ended.
+STOP_SEQUENCE_REASON = "stop_sequence"
+
+
+def _earliest_stop(text: str, stops: Sequence[str]) -> int | None:
+    """Index of the earliest occurrence of any of ``stops`` in ``text``, if one occurs."""
+    found = [index for index in (text.find(stop) for stop in stops if stop) if index >= 0]
+    return min(found) if found else None
+
+
+def truncate_at_stop(text: str, stops: Sequence[str]) -> tuple[str, bool]:
+    """Cut ``text`` before the earliest stop sequence; return it and whether one matched.
+
+    ``text`` is the sanitised visible answer. The cut also drops the whitespace
+    in front of the match, exactly as :class:`StopMatcher` releases it, so a
+    streamed and an unstreamed answer to the same request read the same.
+    """
+    index = _earliest_stop(text, stops)
+    if index is None:
+        return text, False
+    return text[:index].rstrip(), True
+
+
+class StopMatcher:
+    """Find a client's stop sequences in a visible answer that arrives in pieces.
+
+    It sits *after* :class:`StreamingSanitizer`, so it only ever sees text that
+    will be shown: a stop sequence inside a hidden reasoning block cannot end
+    the answer, which a native GenAI stop string would. Each piece is appended
+    to a small held tail and released except for:
+
+    * the longest suffix that is still the start of some stop sequence, which
+      the next piece may complete -- that is what finds a match split across
+      chunk boundaries;
+    * the whitespace in front of that suffix, because a match drops it
+      (:func:`truncate_at_stop`) and released text cannot be taken back.
+
+    On a match the text before it is released, :attr:`hit` turns true, and every
+    later piece is swallowed. The concatenated output equals
+    ``truncate_at_stop(answer, stops)[0]`` for the concatenated input.
+    """
+
+    def __init__(self, stops: Sequence[str]) -> None:
+        """Match ``stops``; empty strings are ignored."""
+        self._stops = [stop for stop in stops if stop]
+        self._held = ""
+        self._hit = False
+
+    @property
+    def hit(self) -> bool:
+        """True once a stop sequence matched."""
+        return self._hit
+
+    def feed(self, piece: str) -> str:
+        """Take one piece of visible text; return what may be released now."""
+        if self._hit:
+            return ""
+        text = self._held + piece
+        index = _earliest_stop(text, self._stops)
+        if index is not None:
+            self._hit = True
+            self._held = ""
+            return text[:index].rstrip()
+        cut = len(text) - self._partial_suffix(text)
+        cut = len(text[:cut].rstrip())
+        self._held = text[cut:]
+        return text[:cut]
+
+    def finish(self) -> str:
+        """Return whatever is still held once the answer has ended without a match."""
+        held, self._held = ("" if self._hit else self._held), ""
+        return held
+
+    def _partial_suffix(self, text: str) -> int:
+        """Length of the longest suffix of ``text`` that starts some stop sequence."""
+        longest = max((len(stop) for stop in self._stops), default=1) - 1
+        for size in range(min(longest, len(text)), 0, -1):
+            tail = text[-size:]
+            if any(stop.startswith(tail) for stop in self._stops):
+                return size
+        return 0
+
+
 #: Receives each piece of a streamed answer; returning ``True`` asks to stop.
 TextSink = Callable[[str], bool | None]
 
@@ -724,6 +811,10 @@ class ChatProfileView(BaseModel):
         ``do_sample`` is inferred when the profile does not state it: a family
         that documents a temperature, a nucleus or a top-k expects sampling, and
         without the flag OpenVINO GenAI would silently decode greedily.
+
+        The profile's ``stop_strings`` travel with the settings as model-level
+        end markers, which the runtime applies natively (see
+        :func:`~yonga.adapters.runtime_genai.build_generation_config`).
         """
         values = self.defaults_for(thinking=thinking)
         maximum = values.max_new_tokens or fallback_max_new_tokens
@@ -734,6 +825,7 @@ class ChatProfileView(BaseModel):
             top_k=values.top_k,
             do_sample=_infer_do_sample(values),
             repetition_penalty=values.repetition_penalty,
+            stop_strings=[text for text in self.stop_strings if text],
         )
 
 
@@ -1282,6 +1374,7 @@ class ChatSession:
         generation: GenerationSettings,
         *,
         on_text: TextSink | None = None,
+        stop: Sequence[str] = (),
     ) -> ChatTurn:
         """Answer one complete conversation without touching this session's own.
 
@@ -1295,6 +1388,14 @@ class ChatSession:
         runtime that cannot stream answers in one piece through the same sink.
         Failures come back as a :class:`ChatTurn` carrying a diagnostic, and an
         exception raised by ``on_text`` itself propagates to the caller.
+
+        ``stop`` holds a client's stop sequences. A :class:`StopMatcher` after
+        the sanitiser looks for them in the visible answer only, and the first
+        match ends the answer before it: the runtime is asked to stop, the
+        result's ``display_text`` is cut there (see :func:`truncate_at_stop`)
+        and its ``stop_reason`` is :data:`STOP_SEQUENCE_REASON`. A runtime that
+        can stream is streamed even without ``on_text`` then, so generation
+        ends at the match instead of running on to its token limit.
         """
         if not any(m.role == "user" and m.content.strip() for m in history.messages):
             return ChatTurn(diagnostic=_empty_prompt_diagnostic())
@@ -1303,18 +1404,26 @@ class ChatSession:
             show=self._show_reasoning,
             starts_in_reasoning=self._starts_in_reasoning,
         )
+        stops = [text for text in stop if text]
+        matcher = StopMatcher(stops)
+
+        def visible(chunk: str) -> str:
+            released = streaming.feed(chunk)
+            return matcher.feed(released) if stops and released else released
+
         try:
             runtime = self.load()
-            if on_text is not None and isinstance(runtime, StreamingChatRuntime):
+            if (on_text is not None or stops) and isinstance(runtime, StreamingChatRuntime):
 
                 def forward(chunk: str) -> bool | None:
-                    released = streaming.feed(chunk)
-                    return on_text(released) if released else None
+                    released = visible(chunk)
+                    wants_stop = on_text(released) if on_text is not None and released else None
+                    return True if matcher.hit else wants_stop
 
                 raw = runtime.generate_stream(history, generation, forward)
             else:
                 raw = runtime.generate(history, generation)
-                released = streaming.feed(raw.text)
+                released = visible(raw.text)
                 if on_text is not None and released:
                     on_text(released)
             answer = sanitize_answer(
@@ -1327,18 +1436,22 @@ class ChatSession:
             return ChatTurn(diagnostic=error.diagnostic)
         if on_text is not None:
             rest = streaming.finish()
+            if stops:
+                rest = (matcher.feed(rest) if rest else "") + matcher.finish()
             if rest:
                 on_text(rest)
-        return ChatTurn(
-            result=raw.model_copy(
-                update={
-                    "display_text": answer.display_text,
-                    "reasoning_text": answer.reasoning_text,
-                    "reasoning_hidden": answer.reasoning_hidden,
-                    "reasoning_unterminated": answer.reasoning_unterminated,
-                }
-            )
-        )
+        update: dict[str, object] = {
+            "display_text": answer.display_text,
+            "reasoning_text": answer.reasoning_text,
+            "reasoning_hidden": answer.reasoning_hidden,
+            "reasoning_unterminated": answer.reasoning_unterminated,
+        }
+        if stops:
+            text, matched = truncate_at_stop(answer.display_text.strip(), stops)
+            if matched:
+                update["display_text"] = text
+                update["stop_reason"] = STOP_SEQUENCE_REASON
+        return ChatTurn(result=raw.model_copy(update=update))
 
     def _rollback_user_turn(self) -> None:
         """Drop the user message that produced no answer, keeping the history consistent."""

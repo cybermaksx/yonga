@@ -52,6 +52,7 @@ from yonga.domain.diagnostics import FailureCategory as Category
 from yonga.domain.models import PipelineKind
 from yonga.registry.loader import load_builtin_registry
 from yonga.registry.resolver import RegistryResolver
+from yonga.registry.schema import ChatProfileRule
 from yonga.ui.chat_tui import ChatSessionInfo, ChatView, parse_command
 from yonga.ui.console import YongaConsole
 
@@ -252,6 +253,19 @@ def test_defaults_come_from_the_registry_chat_profile(session_parts):
     assert settings.top_k == 20
     assert settings.max_new_tokens == 4096
     assert settings.do_sample is True
+
+
+def test_registry_stop_strings_travel_with_the_generation_settings():
+    view = ChatProfileView.from_rule(ChatProfileRule(id="chat-x", stop_strings=["<|end|>"]))
+    settings = view.generation_settings(thinking=False, fallback_max_new_tokens=64)
+    assert settings.stop_strings == ["<|end|>"]
+
+
+def test_no_built_in_chat_profile_declares_stop_strings_yet(session_parts):
+    """Wiring the field changed nothing shipped: every fingerprint stays put."""
+    service, _factory, _runtime, artifact = session_parts
+    assert service.open_artifact(artifact).generation_settings.stop_strings == []
+    assert all(not rule.stop_strings for rule in load_builtin_registry().chat)
 
 
 def test_thinking_defaults_differ_from_non_thinking_defaults(session_parts):

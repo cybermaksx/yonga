@@ -1392,6 +1392,28 @@ class ChatProfileRule(BaseRule):
     defaults: GenerationDefaults = Field(default_factory=GenerationDefaults)
     thinking_defaults: GenerationDefaults = Field(default_factory=GenerationDefaults)
     stop_strings: list[str] = Field(default_factory=list)
+    """Raw-text end markers for the family, applied natively by OpenVINO GenAI.
+
+    Model-level data, such as an end-of-turn marker a template writes as text
+    rather than as a special token. GenAI stops at the first one and leaves it
+    out of the answer. It matches the raw output, inside a reasoning block too,
+    which is why a client's ``stop`` sequences are matched separately, on the
+    visible answer.
+    """
+
+    @field_validator("stop_strings", mode="after")
+    @classmethod
+    def _clean_stop_strings(cls, value: list[str]) -> list[str]:
+        """Drop empty and duplicate stop strings, preserving the declared order.
+
+        Whitespace is kept: ``"\\n\\n"`` is a meaningful marker. An empty string
+        would match everywhere, and GenAI's own validation does not refuse it.
+        """
+        cleaned: list[str] = []
+        for text in value:
+            if text and text not in cleaned:
+                cleaned.append(text)
+        return cleaned
 
     @field_validator("thinking_variable_candidates", mode="after")
     @classmethod

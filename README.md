@@ -12,7 +12,7 @@ The tool is **NPU-first, not NPU-only**. If a model cannot compile on the NPU, `
 
 `yonga` prepares, validates, runs and benchmarks OpenVINO artifacts on one machine, and it is honest about the parts that do not exist yet:
 
-- **`serve` is deliberately small.** It serves one artifact, text only, one request at a time, and refuses what it cannot honour (`n` > 1, stop sequences, tools, JSON response formats, images) with a 400 rather than ignoring it.
+- **`serve` is deliberately small.** It serves one artifact, text only, one request at a time, and refuses what it cannot honour (`n` > 1, tools, JSON response formats, images) with a 400 rather than ignoring it. Stop sequences are honoured, matched on the visible answer so a hidden reasoning block cannot trigger one.
 - **Windows is not supported yet.** The architecture keeps the door open, but every device, driver and path probe is written and tested against Linux only.
 - The registry ships knowledge for a small number of architectures. Everything else resolves through generic rules, which is why `inspect` says `inferred` rather than `official` for most models.
 

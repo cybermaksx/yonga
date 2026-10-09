@@ -42,7 +42,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from yonga import __version__
-from yonga.api.openai import ChatCompletionRequest, UnsupportedParameter
+from yonga.api.openai import ChatCompletionRequest, ParameterError
 from yonga.application.chat import ChatTurn
 from yonga.application.serve import (
     CompletionRequest,
@@ -136,8 +136,8 @@ def create_app(
         try:
             completion = body.to_completion()
             limit = server.generation_for(completion).max_new_tokens
-        except UnsupportedParameter as error:
-            return _error(400, str(error), "unsupported_parameter", param=error.param)
+        except ParameterError as error:
+            return _error(400, str(error), error.code, param=error.param)
         except YongaError as error:
             return _diagnostic_error(error.diagnostic)
         if body.stream:

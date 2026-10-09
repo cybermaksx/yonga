@@ -32,7 +32,7 @@ in the repository is a complete example document for the Qwen3.5 reference case.
 normalizes every document into typed records.
 
 The examples in sections 3 to 7 (except 5.1) and 9 show single rules; in a document each sits as a
-list item under its section, as the examples in sections 5.1, 8 and 8a do.
+list item under its section, as the examples in sections 5.1, 8, 8a and 8b do.
 
 ## 3. Common fields
 
@@ -275,6 +275,37 @@ also holds `Q5_0`, which the reader cannot convert. List only what has been veri
 and running a file on real hardware. A rule whose constraint cannot be checked (GenAI not
 installed) does not count, because unknown is not support. The highest-priority usable rule wins;
 a remote bundle or a user override can extend support without a code change.
+
+## 8b. Chat profile rule
+
+How a model family expects a conversation to be driven: its thinking variable, reasoning wrappers,
+generation defaults and end markers. `chat` and `serve` use the matching rule; without one, the
+copy `prepare` recorded in the artifact's manifest (which includes `stop_strings`), and otherwise a
+conservative built-in default.
+
+```yaml
+chat:
+  - id: chat-qwen3_5
+    match:
+      model_types: [qwen3_5]
+    supports_thinking_flag: true          # true | false (veto) | unset (detect from template)
+    thinking_template_variable: enable_thinking
+    default_thinking: false
+    reasoning_wrappers:
+      - ["<think>", "</think>"]
+    defaults: {temperature: 0.7, top_p: 0.8, top_k: 20, max_new_tokens: 4096}
+    thinking_defaults: {temperature: 0.6, top_p: 0.95}
+    stop_strings: []                      # model-level end markers, applied natively
+```
+
+`stop_strings` lists raw-text end markers, such as an end-of-turn marker a template writes as text
+rather than as a special token. They are passed to OpenVINO GenAI's `GenerationConfig.stop_strings`,
+which stops at the first one and leaves it out of the answer. Empty and duplicate entries are
+dropped when the rule loads. GenAI matches them in the raw output, inside a reasoning block too, so
+list only markers that end the model's turn wherever they appear. A client's `stop` sequences are a
+different thing, matched by yonga on the visible answer (`docs/CLI_SPEC.md` section 14). An empty
+list leaves generation and a benchmark's settings fingerprint exactly as they were; no built-in rule
+declares any yet.
 
 ## 9. Exact model rules
 

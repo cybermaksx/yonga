@@ -3,10 +3,15 @@
 Unknown fields are ignored, the way OpenAI-compatible servers generally treat
 them, so a client that sends ``user`` or ``stream_options`` works unchanged.
 What is *not* ignored is a field whose value would change the answer in a way
-yonga cannot honour -- ``n`` above 1, ``stop`` sequences, tools, a JSON
-response format, image content, penalties. Those are refused with a 400 that
-names the parameter, because silently answering a different question than the
-client asked is worse than saying no.
+yonga cannot honour -- ``n`` above 1, tools, a JSON response format, image
+content, penalties. Those are refused with a 400 that names the parameter,
+because silently answering a different question than the client asked is worse
+than saying no.
+
+``stop`` is honoured: a string or a list of at most
+:data:`~yonga.application.serve.MAX_STOP_SEQUENCES` non-empty strings of at most
+:data:`~yonga.application.serve.MAX_STOP_LENGTH` characters each. Anything else
+is a 400 naming ``stop``.
 """
 
 from __future__ import annotations
@@ -16,11 +21,13 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from yonga.application.chat import ChatMessage
-from yonga.application.serve import CompletionRequest
+from yonga.application.serve import MAX_STOP_LENGTH, MAX_STOP_SEQUENCES, CompletionRequest
 
 __all__ = [
     "MAX_MESSAGES",
     "ChatCompletionRequest",
+    "InvalidParameter",
+    "ParameterError",
     "UnsupportedParameter",
 ]
 
@@ -30,12 +37,24 @@ __all__ = [
 MAX_MESSAGES = 4096
 
 
-class UnsupportedParameter(ValueError):
-    """A request parameter yonga cannot honour; ``param`` names it."""
+class ParameterError(ValueError):
+    """A request parameter refused with a 400; ``param`` names it, ``code`` says why."""
+
+    code = "invalid_request"
 
     def __init__(self, param: str, message: str) -> None:
         super().__init__(message)
         self.param = param
+
+
+class UnsupportedParameter(ParameterError):
+    """A request parameter yonga cannot honour."""
+
+    code = "unsupported_parameter"
+
+
+class InvalidParameter(ParameterError):
+    """A parameter yonga honours, given a value it does not accept."""
 
 
 class WireMessage(BaseModel):
@@ -98,13 +117,12 @@ class ChatCompletionRequest(BaseModel):
             top_k=self.top_k,
             seed=self.seed,
             repetition_penalty=self.repetition_penalty,
+            stop=self._stop_sequences(),
         )
 
     def _refuse_unsupported(self) -> None:
         if self.n is not None and self.n != 1:
             raise UnsupportedParameter("n", "Only n=1 is supported: one pipeline, one answer.")
-        if self.stop:
-            raise UnsupportedParameter("stop", "Stop sequences are not supported yet.")
         for name in ("presence_penalty", "frequency_penalty"):
             if getattr(self, name):
                 raise UnsupportedParameter(name, f"{name} is not supported; repetition_penalty is.")
@@ -121,6 +139,23 @@ class ChatCompletionRequest(BaseModel):
             raise UnsupportedParameter(
                 "messages", "The last message must come from the user; there is nothing to answer."
             )
+
+    def _stop_sequences(self) -> list[str]:
+        """``stop`` as a list without duplicates; refused when it breaks the limits."""
+        if self.stop is None:
+            return []
+        stops = [self.stop] if isinstance(self.stop, str) else list(self.stop)
+        if len(stops) > MAX_STOP_SEQUENCES:
+            raise InvalidParameter(
+                "stop", f"At most {MAX_STOP_SEQUENCES} stop sequences are accepted."
+            )
+        if any(not text for text in stops):
+            raise InvalidParameter("stop", "A stop sequence cannot be empty.")
+        if any(len(text) > MAX_STOP_LENGTH for text in stops):
+            raise InvalidParameter(
+                "stop", f"A stop sequence can be at most {MAX_STOP_LENGTH} characters long."
+            )
+        return list(dict.fromkeys(stops))
 
 
 _ROLES: dict[str, Literal["system", "user", "assistant"]] = {

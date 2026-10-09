@@ -272,6 +272,12 @@ opens: same chat profile, generation defaults and hidden reasoning, including wh
 client owns the conversation and sends all of it each time; nothing is kept between requests.
 Requests are answered one at a time, and a streaming client that disconnects stops its generation.
 
+`stop` works as in OpenAI's API: up to 4 sequences, each at most 256 characters. yonga matches them
+on the visible answer, so a stop such as `"\n\n"` cannot fire inside a hidden reasoning block and
+leave an empty answer. The answer ends before the first match with `finish_reason` `stop`, streamed
+or not, and generation stops there. `n` above 1, tools, images, penalties and JSON response formats
+are still refused with a 400.
+
 Binding anything but loopback (`--host 0.0.0.0`) prints a warning, and a stronger one when no key
 is set. Set `YONGA_API_KEY` in the environment whenever you bind beyond loopback: every endpoint
 except `/health` then requires `Authorization: Bearer <key>`. The key is read from the environment

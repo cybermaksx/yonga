@@ -440,12 +440,28 @@ serialised; a streaming client that disconnects stops its generation.
 `model` must be the name given to `serve`, the artifact id, or the source repository (404
 `model_not_found` otherwise). Accepted parameters: `max_tokens` / `max_completion_tokens`,
 `temperature` (0 is greedy), `top_p`, `top_k`, `seed`, `repetition_penalty`, validated with the same
-ranges as `chat`'s slash commands. Unknown fields are ignored. Parameters that would change the
-answer in a way yonga cannot honour are refused with 400 and `param` set: `n` other than 1,
-non-empty `stop`, non-zero `presence_penalty` / `frequency_penalty`, `tools` / `functions`, a
+ranges as `chat`'s slash commands, and `stop` (below). Unknown fields are ignored. Parameters that
+would change the answer in a way yonga cannot honour are refused with 400 and `param` set: `n`
+other than 1, non-zero `presence_penalty` / `frequency_penalty`, `tools` / `functions`, a
 `response_format` other than text, `logprobs`, non-text content parts, and a conversation whose
 last message is not from the user. A runtime failure is a 500 whose `error.code` is the diagnostic
 code.
+
+`stop` is a string or a list of at most 4 strings (`MAX_STOP_SEQUENCES` in
+`src/yonga/application/serve.py`), each non-empty and at most 256 characters (`MAX_STOP_LENGTH`).
+Anything else is a 400 `invalid_request` with `param` `stop`; an empty list means no stop. yonga
+matches the sequences itself, on the visible answer after the reasoning sanitiser, never inside a
+hidden reasoning block: a common stop such as `"\n\n"` would otherwise end a reasoning model's
+answer before it began. The answer ends before the earliest match, without the match and without
+the whitespace in front of it, and `finish_reason` is `stop`, also when generation had reached its
+token limit. Matches across chunk boundaries are found: a stream holds back only the tail that
+could still become a match, so no part of a stop sequence is ever sent. With a stop sequence the
+model is streamed internally even for a non-streaming request, so generation ends at the match
+instead of at the token limit. A streamed and an unstreamed answer to the same request end at the
+same place.
+
+The registry chat profile's `stop_strings` (`docs/REGISTRY_SPEC.md` section 8b) are separate:
+model-level end markers OpenVINO GenAI applies natively and leaves out of the answer.
 
 Request limits (`DEFAULT_MAX_BODY_BYTES` in `src/yonga/api/app.py`, `MAX_MESSAGES` in
 `src/yonga/api/openai.py`):
@@ -459,7 +475,7 @@ Every error response uses OpenAI's shape, `{"error": {"message", "type", "param"
 
 | Status | `code` | When |
 |---|---|---|
-| 400 | `invalid_request` | The body does not validate (missing or mistyped fields, too many messages); `param` names the field. |
+| 400 | `invalid_request` | The body does not validate (missing or mistyped fields, too many messages, `stop` outside its limits); `param` names the field. |
 | 400 | `unsupported_parameter` | A parameter yonga cannot honour (above); `param` names it. |
 | 400 | the diagnostic code (`serve.request.*`) | A generation setting outside the ranges `chat` accepts. |
 | 401 | `invalid_api_key` | A key is configured and the request does not carry it. |

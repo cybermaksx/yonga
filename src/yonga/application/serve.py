@@ -29,6 +29,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from yonga.application.chat import (
     MAX_OUTPUT_TOKENS,
+    STOP_SEQUENCE_REASON,
     TEMPERATURE_RANGE,
     TOP_K_MAX,
     TOP_P_RANGE,
@@ -42,10 +43,18 @@ from yonga.domain.benchmarks import GenerationSettings
 from yonga.domain.diagnostics import ConfigurationError, FailureCategory, diagnostic
 
 __all__ = [
+    "MAX_STOP_LENGTH",
+    "MAX_STOP_SEQUENCES",
     "CompletionRequest",
     "ModelServer",
     "ServedModel",
 ]
+
+#: Most stop sequences one request may carry, as OpenAI allows.
+MAX_STOP_SEQUENCES = 4
+#: Longest stop sequence accepted, in characters. Every piece of a streamed
+#: answer is held back by up to this much while a match may still complete.
+MAX_STOP_LENGTH = 256
 
 
 class ServedModel(BaseModel):
@@ -80,6 +89,8 @@ class CompletionRequest(BaseModel):
     top_k: int | None = None
     seed: int | None = None
     repetition_penalty: float | None = None
+    stop: list[str] = Field(default_factory=list)
+    """The client's stop sequences, matched on the visible answer (see ``ChatSession.respond``)."""
 
 
 def _invalid(code: str, detail: str) -> ConfigurationError:
@@ -203,7 +214,7 @@ class ModelServer:
         settings = self.generation_for(request)
         history = ChatHistory(messages=list(request.messages))
         with self._lock:
-            return self._session.respond(history, settings, on_text=on_text)
+            return self._session.respond(history, settings, on_text=on_text, stop=request.stop)
 
 
 def completion_id() -> str:
@@ -212,11 +223,17 @@ def completion_id() -> str:
 
 
 def finish_reason(turn: ChatTurn, settings_limit: int) -> str:
-    """OpenAI's ``finish_reason`` for a finished turn: ``length`` or ``stop``."""
+    """OpenAI's ``finish_reason`` for a finished turn: ``length`` or ``stop``.
+
+    A turn a stop sequence ended is ``stop`` even when the runtime went on to
+    its token limit, as one that cannot stream early does.
+    """
     result = turn.result
     if result is None:
         return "stop"
     reason = (result.stop_reason or "").lower()
+    if reason == STOP_SEQUENCE_REASON:
+        return "stop"
     if reason == "length":
         return "length"
     if result.output_tokens is not None and result.output_tokens >= settings_limit:

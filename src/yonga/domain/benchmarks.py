@@ -74,10 +74,20 @@ class GenerationSettings(BaseModel):
     do_sample: bool = False
     repetition_penalty: float | None = None
     seed: int | None = None
+    stop_strings: list[str] = Field(default_factory=list)
+    """Model-level end markers the runtime stops at natively, never shown.
+
+    They come from the registry chat profile, not from a client: a client's
+    stop sequences are matched on the visible answer by the chat service.
+    """
 
     def canonical_payload(self) -> dict[str, object]:
-        """Return the sampling-relevant fields in a canonical, hashable form."""
-        return {
+        """Return the sampling-relevant fields in a canonical, hashable form.
+
+        ``stop_strings`` joins the payload only when there are some, so every
+        fingerprint recorded before the field existed still matches.
+        """
+        payload: dict[str, object] = {
             "max_new_tokens": self.max_new_tokens,
             "temperature": self.temperature,
             "top_p": self.top_p,
@@ -86,6 +96,9 @@ class GenerationSettings(BaseModel):
             "repetition_penalty": self.repetition_penalty,
             "seed": self.seed,
         }
+        if self.stop_strings:
+            payload["stop_strings"] = sorted(set(self.stop_strings))
+        return payload
 
     def fingerprint(self) -> str:
         """Stable SHA-256 fingerprint of the sampling-relevant settings."""

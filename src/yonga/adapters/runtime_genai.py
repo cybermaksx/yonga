@@ -621,8 +621,13 @@ def build_generation_config(settings: GenerationSettings) -> Any:
     ``temperature``, ``top_p``, ``top_k`` and the RNG seed only take effect when
     ``do_sample`` is true, so they are applied only in that case — setting them
     for greedy decoding would silently suggest a sampling behaviour the runtime
-    will not perform. ``repetition_penalty`` applies to both modes. The config is
-    validated before it is returned.
+    will not perform. ``repetition_penalty`` applies to both modes.
+
+    ``stop_strings`` are the registry chat profile's model-level end markers.
+    GenAI matches them natively, across chunk boundaries and without releasing
+    a partial match to the streamer, and they are excluded from the output. They
+    are set only when there are some, so a profile without any leaves GenAI's
+    defaults untouched. The config is validated before it is returned.
     """
     genai = _require_genai()
     config = genai.GenerationConfig()
@@ -630,6 +635,10 @@ def build_generation_config(settings: GenerationSettings) -> Any:
     config.do_sample = bool(settings.do_sample)
     if settings.repetition_penalty is not None:
         config.repetition_penalty = float(settings.repetition_penalty)
+    stop_strings = {text for text in settings.stop_strings if text}
+    if stop_strings:
+        config.stop_strings = stop_strings
+        config.include_stop_str_in_output = False
     if settings.do_sample:
         if settings.temperature is not None:
             config.temperature = float(settings.temperature)

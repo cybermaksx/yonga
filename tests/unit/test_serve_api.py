@@ -187,7 +187,6 @@ def test_request_parameters_override_the_profile_defaults(tmp_path: Path) -> Non
     ("extra", "param"),
     [
         ({"n": 2}, "n"),
-        ({"stop": ["\n"]}, "stop"),
         ({"tools": [{"type": "function"}]}, "tools"),
         ({"presence_penalty": 0.5}, "presence_penalty"),
         ({"response_format": {"type": "json_object"}}, "response_format"),
@@ -209,6 +208,109 @@ def test_harmless_unknown_fields_are_ignored(tmp_path: Path) -> None:
     response = client_for(server).post(
         "/v1/chat/completions", json=ask(user="someone", stop=None, n=1, presence_penalty=0)
     )
+
+    assert response.status_code == 200
+
+
+# --- stop sequences -------------------------------------------------------------------
+
+
+def content_of(response_text: str) -> str:
+    return "".join(
+        event["choices"][0]["delta"].get("content", "")
+        for event in events(response_text)
+        if isinstance(event, dict) and event.get("choices")
+    )
+
+
+def final_reason(response_text: str) -> str | None:
+    reasons = [
+        event["choices"][0]["finish_reason"]
+        for event in events(response_text)
+        if isinstance(event, dict) and event.get("choices")
+    ]
+    return reasons[-1]
+
+
+@pytest.mark.parametrize("stop", ["Two", ["Four", "Two"]])
+def test_a_stop_sequence_ends_the_answer_before_it(tmp_path: Path, stop: object) -> None:
+    server, runtime = make_server(tmp_path, ["One. Two. Three."])
+    body = client_for(server).post("/v1/chat/completions", json=ask(stop=stop)).json()
+
+    (choice,) = body["choices"]
+    assert choice["message"]["content"] == "One."
+    assert choice["finish_reason"] == "stop"
+    assert isinstance(runtime, StreamingRuntime)
+    assert runtime.stopped_early, "streamed internally so generation ends at the match"
+    assert runtime.configs[0].stop_strings == [], "client stops are not native stop strings"
+
+
+def test_a_streamed_answer_stops_at_the_same_place(tmp_path: Path) -> None:
+    server, runtime = make_server(tmp_path, ["One. Two. Three."])
+    response = client_for(server).post("/v1/chat/completions", json=ask(stream=True, stop=["Two"]))
+
+    assert content_of(response.text) == "One."
+    assert "Two" not in response.text
+    assert final_reason(response.text) == "stop"
+    assert isinstance(runtime, StreamingRuntime) and runtime.stopped_early
+
+
+def test_a_stop_sequence_inside_hidden_reasoning_is_ignored(tmp_path: Path) -> None:
+    server, _ = make_server(tmp_path, [THOUGHT + "The answer is 42."] * 2)
+    client = client_for(server)
+
+    plain = client.post("/v1/chat/completions", json=ask(stop="never")).json()
+    streamed = client.post("/v1/chat/completions", json=ask(stream=True, stop="never"))
+
+    assert plain["choices"][0]["message"]["content"] == "The answer is 42."
+    assert content_of(streamed.text) == "The answer is 42."
+    assert SECRET not in json.dumps(plain) + streamed.text
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_a_runtime_that_cannot_stream_is_cut_at_the_stop_too(tmp_path: Path, stream: bool) -> None:
+    """It runs to its limit, but the answer still ends at the match, as ``stop``."""
+    server, _ = make_server(tmp_path, ["One. Two. Three."], streaming=False)
+    response = client_for(server).post(
+        "/v1/chat/completions", json=ask(stop="Two", stream=stream, max_tokens=34)
+    )
+
+    if stream:
+        assert content_of(response.text) == "One."
+        assert final_reason(response.text) == "stop"
+    else:
+        (choice,) = response.json()["choices"]
+        assert choice["message"]["content"] == "One."
+        assert choice["finish_reason"] == "stop", "34 tokens hit the limit, but the stop came first"
+
+
+def test_an_unmatched_stop_sequence_changes_nothing(tmp_path: Path) -> None:
+    server, runtime = make_server(tmp_path, ["One. Two. Three."])
+    body = client_for(server).post("/v1/chat/completions", json=ask(stop=["Four"])).json()
+
+    assert body["choices"][0]["message"]["content"] == "One. Two. Three."
+    assert isinstance(runtime, StreamingRuntime) and not runtime.stopped_early
+
+
+@pytest.mark.parametrize(
+    "stop",
+    [["a", "b", "c", "d", "e"], "", ["ok", ""], "x" * 257, [7]],
+)
+def test_stop_sequences_outside_the_limits_are_refused(tmp_path: Path, stop: object) -> None:
+    server, runtime = make_server(tmp_path, ["Hi."])
+    response = client_for(server).post("/v1/chat/completions", json=ask(stop=stop))
+
+    assert response.status_code == 400
+    error = response.json()["error"]
+    assert error["param"].startswith("stop")
+    assert error["code"] == "invalid_request"
+    assert runtime.histories == []
+
+
+def test_four_stop_sequences_of_the_longest_length_are_accepted(tmp_path: Path) -> None:
+    server, _ = make_server(tmp_path, ["Hi."])
+    stops = [letter * 256 for letter in "abcd"]
+    response = client_for(server).post("/v1/chat/completions", json=ask(stop=stops))
 
     assert response.status_code == 200
 

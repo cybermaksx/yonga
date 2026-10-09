@@ -141,7 +141,10 @@ the VLM path is now stateless where the build allows it and falls back to the hi
 `start_chat()` session otherwise. Verified on the reference host with the Qwen3.5-9B GPU artifact
 and the official `openai` Python client: plain, streamed and multi-turn completions, 404/400
 mapping, and a disconnected 1500-token stream releasing the GPU (the next request answered in
-0.43 s). Not done: images, tool calls, stop sequences, concurrent generation.
+0.43 s). Stop sequences followed after 0.3.0: matched by yonga on the visible answer, outside
+hidden reasoning, across chunk boundaries; the registry chat profile's `stop_strings` became live as
+native GenAI end markers. Covered by unit tests with fake runtimes; the check on a GPU artifact
+through serve is still to be run. Not done: images, tool calls, concurrent generation.
 
 **2.2 — `yonga publish`. [done]**
 One-commit upload of the manifest's files, the source's license files, a generated model card and

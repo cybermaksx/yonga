@@ -278,6 +278,11 @@ def test_chat_profile_without_thinking_returns_no_template_context():
     assert rule.reasoning_wrappers == [("<think>", "</think>")]
 
 
+def test_chat_profile_stop_strings_drop_empty_and_duplicate_entries():
+    rule = ChatProfileRule(id="chat-stops", stop_strings=["<|end|>", "", "\n\n", "<|end|>"])
+    assert rule.stop_strings == ["<|end|>", "\n\n"], "whitespace is a real marker; kept"
+
+
 def test_registry_indexes_every_rule_kind():
     registry = Registry(
         architectures=[ArchitectureRule(id="a")],

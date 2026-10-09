@@ -70,6 +70,33 @@ def test_fingerprint_is_stable_and_sampling_sensitive() -> None:
         assert changed.fingerprint() != base.fingerprint()
 
 
+def test_no_stop_strings_keep_every_recorded_fingerprint() -> None:
+    """The field arrived after fingerprints were recorded; an empty list must not move them."""
+    settings = GenerationSettings(max_new_tokens=256, temperature=0.7, do_sample=True)
+    before_the_field = {
+        "max_new_tokens": 256,
+        "temperature": 0.7,
+        "top_p": None,
+        "top_k": None,
+        "do_sample": True,
+        "repetition_penalty": None,
+        "seed": None,
+    }
+    canonical = json.dumps(before_the_field, sort_keys=True, separators=(",", ":"))
+
+    assert settings.canonical_payload() == before_the_field
+    assert settings.fingerprint() == hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def test_stop_strings_change_the_fingerprint_but_not_their_order() -> None:
+    base = GenerationSettings()
+    one = GenerationSettings(stop_strings=["<|end|>", "\n\nUser:"])
+    other = GenerationSettings(stop_strings=["\n\nUser:", "<|end|>"])
+
+    assert one.fingerprint() != base.fingerprint()
+    assert one.fingerprint() == other.fingerprint()
+
+
 def test_fingerprint_canonical_payload_is_json_serialisable() -> None:
     settings = GenerationSettings()
     assert json.dumps(settings.canonical_payload())
