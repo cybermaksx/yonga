@@ -19,16 +19,21 @@ is a 400 naming ``stop``.
 at most :data:`~yonga.application.serve.MAX_IMAGES` per request, and only in the
 last message unless the server carries earlier images forward. Every refusal
 names the content part. ``image_url.detail`` is a resolution hint and is
-ignored: the image is used as sent.
+ignored: the image is used as sent. Only an image's header is read here; its
+pixels are decoded once the request holds the pipeline (see
+:class:`~yonga.application.serve.PendingImage`).
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from functools import partial
 from typing import Any, Literal, NamedTuple
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from yonga.api.images import ImageRefused, decode_data_url
+from yonga.api.images import ImageRefused, check_data_url, decode_data_url
 from yonga.application.chat import ChatImage, ChatMessage
 from yonga.application.serve import (
     EARLIER_TURN_REASON,
@@ -39,6 +44,7 @@ from yonga.application.serve import (
     TOO_MANY_IMAGES,
     CompletionRequest,
     ImagePolicy,
+    PendingImage,
 )
 
 __all__ = [
@@ -126,25 +132,35 @@ class ChatCompletionRequest(BaseModel):
 
     @property
     def has_images(self) -> bool:
-        """Whether any message carries an image part, so translating it decodes images."""
+        """Whether any message carries an image part, so translating it reads image headers."""
         return any(
             isinstance(message.content, list)
             and any(part.get("type") == "image_url" for part in message.content)
             for message in self.messages
         )
 
-    def to_completion(self, images: ImagePolicy | None = None) -> CompletionRequest:
+    def to_completion(
+        self,
+        images: ImagePolicy | None = None,
+        *,
+        check: Callable[[CompletionRequest], object] | None = None,
+    ) -> CompletionRequest:
         """Translate into yonga's request, refusing what cannot be honoured.
 
         ``images`` is what the server accepts; without one, any image is
-        refused. Accepted images are decoded here, which takes CPU time, so a
-        caller on an event loop runs this on a worker thread when
-        :attr:`has_images` says so.
+        refused. ``check`` sees the request before any image is read, so a
+        request it refuses (by raising) costs no image work at all. Then each
+        accepted image's header is read, which takes some CPU time, so a caller
+        on an event loop runs this on a worker thread when :attr:`has_images`
+        says so. The pixels are decoded later (see
+        :class:`~yonga.application.serve.PendingImage`).
         """
         self._refuse_unsupported()
         parsed = [_parse(index, message) for index, message in enumerate(self.messages)]
-        return CompletionRequest(
-            messages=_with_images(parsed, images),
+        located = [(index, part) for index, message in enumerate(parsed) for part in message.images]
+        policy = _check_images(located, len(parsed) - 1, images) if located else None
+        completion = CompletionRequest(
+            messages=[ChatMessage(role=message.role, content=message.text) for message in parsed],
             max_tokens=self.max_completion_tokens
             if self.max_completion_tokens is not None
             else self.max_tokens,
@@ -155,6 +171,12 @@ class ChatCompletionRequest(BaseModel):
             repetition_penalty=self.repetition_penalty,
             stop=self._stop_sequences(),
         )
+        if check is not None:
+            check(completion)
+        if policy is None:
+            return completion
+        pending = [_pending(index, part, policy) for index, part in located]
+        return completion.model_copy(update={"images": pending})
 
     def _refuse_unsupported(self) -> None:
         if self.n is not None and self.n != 1:
@@ -253,26 +275,6 @@ def _parse(index: int, message: WireMessage) -> _Parsed:
     return _Parsed(role, "".join(texts), images)
 
 
-def _with_images(parsed: list[_Parsed], policy: ImagePolicy | None) -> list[ChatMessage]:
-    """The messages, with their images checked against ``policy`` and then decoded.
-
-    Everything that can be refused without decoding is refused first, so a
-    request that cannot be served costs no decoding at all.
-    """
-    located = [(index, part) for index, message in enumerate(parsed) for part in message.images]
-    if not located:
-        return [ChatMessage(role=message.role, content=message.text) for message in parsed]
-    accepted = _check_images(located, len(parsed) - 1, policy)
-    return [
-        ChatMessage(
-            role=message.role,
-            content=message.text,
-            images=[_decode(part, accepted) for part in message.images],
-        )
-        for message in parsed
-    ]
-
-
 def _check_images(
     located: list[tuple[int, _ImagePart]], last: int, policy: ImagePolicy | None
 ) -> ImagePolicy:
@@ -297,10 +299,24 @@ def _check_images(
     return policy
 
 
+def _pending(message: int, part: _ImagePart, policy: ImagePolicy) -> PendingImage:
+    """``part`` with its header checked, to be decoded once the request holds the pipeline."""
+    with _refused_as(part):
+        check_data_url(part.url, max_pixels=policy.max_pixels)
+    return PendingImage(message=message, decode=partial(_decode, part, policy))
+
+
 def _decode(part: _ImagePart, policy: ImagePolicy) -> ChatImage:
+    with _refused_as(part):
+        return decode_data_url(part.url, max_pixels=policy.max_pixels)
+
+
+@contextmanager
+def _refused_as(part: _ImagePart) -> Iterator[None]:
+    """Turn an :class:`ImageRefused` into the 400 naming ``part``'s URL."""
     param = f"{part.param}.image_url.url"
     try:
-        return decode_data_url(part.url, max_pixels=policy.max_pixels)
+        yield
     except ImageRefused as refusal:
         if refusal.unsupported:
             raise UnsupportedParameter(param, str(refusal)) from None

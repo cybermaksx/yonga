@@ -10,6 +10,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+import struct
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -21,7 +24,7 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 from tests.unit.test_chat_service import build_service, make_manifest, write_artifact
-from tests.unit.test_serve_api import StreamingRuntime, content_of
+from tests.unit.test_serve_api import StreamingRuntime, content_of, events
 from yonga.adapters.runtime_genai import ChatHistory, ChatImage, ChatMessage, GenerationResult
 from yonga.api.app import create_app
 from yonga.api.images import decode_data_url
@@ -29,6 +32,7 @@ from yonga.application.serve import (
     MAX_IMAGES,
     CompletionRequest,
     ModelServer,
+    PendingImage,
     carry_images_forward,
 )
 from yonga.domain.artifacts import RecommendedRuntime
@@ -37,7 +41,9 @@ from yonga.domain.diagnostics import ConfigurationError, FailureCategory, diagno
 from yonga.domain.models import PipelineKind
 
 RED, BLUE = (255, 0, 0), (0, 0, 255)
-#: Where the wire layer looks the decoder up, for tests that watch or forbid it.
+#: Where the wire layer looks up the header check and the decoder, for tests
+#: that watch or forbid them.
+CHECK = "yonga.api.openai.check_data_url"
 DECODE = "yonga.api.openai.decode_data_url"
 
 Seen = list[tuple[str, str, list[tuple[int, int, bytes]]]]
@@ -194,9 +200,34 @@ def test_images_are_decoded_off_the_event_loop(
 @pytest.fixture
 def no_decoding(monkeypatch: pytest.MonkeyPatch) -> None:
     def refuse(url: str, *, max_pixels: int) -> ChatImage:
-        raise AssertionError("a request that is refused anyway must not decode images")
+        raise AssertionError("a request that is refused anyway must not read images")
 
+    monkeypatch.setattr(CHECK, refuse)
     monkeypatch.setattr(DECODE, refuse)
+
+
+@pytest.mark.usefixtures("no_decoding")
+@pytest.mark.parametrize(
+    ("extra", "code", "param"),
+    [
+        ({"stop": [""]}, "invalid_request", "stop"),
+        ({"stop": ["a", "b", "c", "d", "e"]}, "invalid_request", "stop"),
+        ({"temperature": 9.0}, "serve.request.temperature", None),
+        ({"top_p": 0.0}, "serve.request.top_p", None),
+        ({"max_tokens": 0}, "serve.request.max_tokens", None),
+    ],
+)
+def test_a_request_refused_for_its_settings_reads_no_image(
+    tmp_path: Path, extra: dict[str, object], code: str, param: str | None
+) -> None:
+    server, runtime = make_server(tmp_path, ["Hi."])
+    parts = [image_part(png()) for _ in range(MAX_IMAGES)]
+    body = post(client_for(server), ask(user(*parts), **extra))
+
+    assert body["status"] == 400
+    assert error_of(body)["code"] == code
+    assert error_of(body)["param"] == param
+    assert runtime.seen == []
 
 
 @pytest.mark.usefixtures("no_decoding")
@@ -332,7 +363,7 @@ def test_an_image_larger_than_the_body_limit_is_a_413(tmp_path: Path) -> None:
 def test_without_pillow_an_image_request_names_the_extra(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    def missing(url: str, *, max_pixels: int) -> ChatImage:
+    def missing(url: str, *, max_pixels: int) -> None:
         raise ConfigurationError(
             diagnostic(
                 "serve.images.dependency_missing",
@@ -343,12 +374,137 @@ def test_without_pillow_an_image_request_names_the_extra(
             )
         )
 
-    monkeypatch.setattr(DECODE, missing)
+    monkeypatch.setattr(CHECK, missing)
     server, _ = make_server(tmp_path, ["Hi."])
     body = post(client_for(server), ask(user(image_part(png()))))
 
     assert body["status"] == 500
     assert error_of(body)["code"] == "serve.images.dependency_missing"
+
+
+# --- images whose pixels only fail once decoded ---------------------------------------
+
+
+def truncated_png() -> str:
+    """A PNG whose header is fine and whose pixel data stops halfway."""
+    buffer = io.BytesIO()
+    Image.effect_noise((32, 32), 50).convert("RGB").save(buffer, format="PNG")
+    data = buffer.getvalue()[: len(buffer.getvalue()) // 2]
+    return "data:image/png;base64," + base64.b64encode(data).decode("ascii")
+
+
+def test_pixels_that_fail_to_decode_are_a_400_naming_the_image(tmp_path: Path) -> None:
+    server, runtime = make_server(tmp_path, ["Hi."])
+    body = post(client_for(server), ask(user(text_part("?"), image_part(truncated_png()))))
+
+    assert body["status"] == 400
+    error = error_of(body)
+    assert error["code"] == "invalid_request"
+    assert error["param"] == "messages[0].content[1].image_url.url"
+    assert runtime.seen == []
+
+
+def test_pixels_that_fail_to_decode_end_a_stream_with_an_error(tmp_path: Path) -> None:
+    server, runtime = make_server(tmp_path, ["Hi."])
+    response = client_for(server).post(
+        "/v1/chat/completions", json=ask(user(image_part(truncated_png())), stream=True)
+    )
+
+    errors = [
+        event for event in events(response.text) if isinstance(event, dict) and "error" in event
+    ]
+    assert errors == [
+        {
+            "error": {
+                "message": "The image could not be decoded as PNG, JPEG, WebP or GIF.",
+                "code": "invalid_request",
+                "param": "messages[0].content[0].image_url.url",
+            }
+        }
+    ]
+    assert runtime.seen == []
+
+
+def test_an_unexpected_decoder_failure_is_a_400_not_a_500(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A corrupt EXIF block once escaped Pillow as ``struct.error``."""
+
+    def failing(self: object, *args: object) -> object:
+        raise struct.error("required argument is not an integer")
+
+    monkeypatch.setattr(Image.Image, "transpose", failing)
+    exif = Image.Exif()
+    exif[0x0112] = 6
+    buffer = io.BytesIO()
+    Image.new("RGB", (4, 2), RED).save(buffer, format="JPEG", exif=exif)
+    url = "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+    server, runtime = make_server(tmp_path, ["Hi."])
+    body = post(client_for(server), ask(user(image_part(url))))
+
+    assert body["status"] == 400
+    assert error_of(body)["code"] == "invalid_request"
+    assert error_of(body)["param"] == "messages[0].content[0].image_url.url"
+    assert runtime.seen == []
+
+
+# --- decoded pixels are held by one request at a time ---------------------------------
+
+
+class WatchedLock:
+    """The server's lock, counting who waits for it."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._changed = threading.Condition()
+        self.waiting = 0
+
+    def locked(self) -> bool:
+        return self._lock.locked()
+
+    def __enter__(self) -> None:
+        with self._changed:
+            self.waiting += 1
+            self._changed.notify_all()
+        self._lock.acquire()
+        with self._changed:
+            self.waiting -= 1
+
+    def __exit__(self, *_: object) -> None:
+        self._lock.release()
+
+    def wait_for(self, waiting: int) -> None:
+        with self._changed:
+            assert self._changed.wait_for(lambda: self.waiting >= waiting, timeout=10)
+
+
+def test_images_are_decoded_only_while_their_request_holds_the_pipeline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, runtime = make_server(tmp_path, ["Red.", "Blue."])
+    lock = WatchedLock()
+    server._lock = lock  # type: ignore[assignment]
+    decoded: list[bool] = []
+    real = decode_data_url
+
+    def watching(url: str, *, max_pixels: int) -> ChatImage:
+        decoded.append(lock.locked())
+        return real(url, max_pixels=max_pixels)
+
+    monkeypatch.setattr(DECODE, watching)
+    client = client_for(server)
+    with ThreadPoolExecutor(2) as pool, lock:
+        sent = [
+            pool.submit(post, client, ask(user(image_part(png(color)), text_part("?"))))
+            for color in (RED, BLUE)
+        ]
+        lock.wait_for(2)
+        assert decoded == [], "requests waiting for the pipeline hold no decoded image"
+    bodies = [future.result() for future in sent]
+
+    assert [body["status"] for body in bodies] == [200, 200]
+    assert decoded == [True, True]
+    assert len(runtime.seen) == 2
 
 
 # --- carrying earlier images forward --------------------------------------------------
@@ -448,3 +604,31 @@ def test_the_service_refuses_an_earlier_image_unless_carrying_forward(tmp_path: 
     assert refused.value.diagnostic.code == "serve.request.images_earlier_turn"
     assert turn.diagnostic is None
     assert runtime.seen[0][-1][2] == [(1, 1, bytes(RED))]
+
+
+def test_the_service_decodes_pending_images_onto_their_messages(tmp_path: Path) -> None:
+    server, runtime = make_server(tmp_path, ["Yes."], carry_images_forward=True)
+    blue = ChatImage(width=1, height=1, pixels=bytes(BLUE))
+    request = image_request(
+        ChatMessage(role="user", content="?"),
+        ChatMessage(role="assistant", content="Hm."),
+        ChatMessage(role="user", content="This?", images=[red()]),
+    ).model_copy(update={"images": [PendingImage(message=0, decode=lambda: blue)]})
+
+    turn = server.complete(request)
+
+    assert turn.diagnostic is None
+    assert runtime.seen[0][-1][2] == [(1, 1, bytes(BLUE)), (1, 1, bytes(RED))]
+
+
+def test_the_service_refuses_a_pending_image_of_no_message(tmp_path: Path) -> None:
+    server, runtime = make_server(tmp_path, ["Hi."])
+    request = image_request(ChatMessage(role="user", content="?")).model_copy(
+        update={"images": [PendingImage(message=1, decode=red)]}
+    )
+
+    with pytest.raises(ConfigurationError) as refused:
+        server.complete(request)
+
+    assert refused.value.diagnostic.code == "serve.request.image_message"
+    assert runtime.seen == []

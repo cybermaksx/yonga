@@ -486,6 +486,7 @@ this order, each refusal naming the content part in `param`:
   with index 0", and list content in an earlier turn is rejected outright. So an image in any
   earlier message is a 400 `serve.request.images_earlier_turn` that says so, unless the server
   runs with `--carry-images-forward` (below).
+- Then `stop` and the generation settings are checked, before any image is read.
 - `image_url.url` must be a `data:image/(png|jpeg|webp|gif);base64,` URL. `http`, `https`, `file`
   and every other scheme are refused with 400 `unsupported_parameter`, `param`
   `messages[i].content[j].image_url.url`: permanently, with no option to allow them. yonga never
@@ -498,14 +499,23 @@ this order, each refusal naming the content part in `param`:
   the image header and checked before any pixel is decoded, which also stops decompression bombs;
   a larger image is refused, never scaled down. The encoded size is bounded by the body limit.
 
-Everything that can be refused without decoding is refused first. Decoding runs on a worker
-thread, not on the event loop. An accepted image is used as sent: the first frame of an animation,
-an EXIF rotation applied as a browser shows it, transparency on white; `image_url.detail` is
-ignored. The images go to the pipeline with the last user message, in order, ahead of its text
-(GenAI places untagged images there); a message holding only images is a question too. GenAI reads
-`<ov_genai_image_N>` and `<ov_genai_video_N>` anywhere in a VLM prompt as "image N goes here", so
-those tags are removed from the text of every message sent to a VLM artifact: words a client typed
-can never claim or move an image.
+Only the image headers are read before a request waits for the pipeline, on a worker thread, not
+on the event loop. The pixels are decoded once the request holds the pipeline, so however many
+requests are queued, at most one holds decoded images; a waiting request costs its body and no
+more. An image whose header is fine but whose pixel data is broken (a truncated file, say) is
+therefore found only then: a 400 `invalid_request` with the same `param` without `stream`, and
+with `stream: true` an error event (below) that also carries `param`. Any failure inside Pillow
+counts as a broken image, never as a server error. An accepted image is used as sent: the first
+frame of an animation, an EXIF rotation applied as a browser shows it (an EXIF block that cannot
+be read leaves the image as stored), transparency on white, 16-bit greyscale scaled to 8 bits;
+`image_url.detail` is ignored. The images go to the pipeline with the last user message, in order,
+ahead of its text (GenAI places untagged images there); a message holding only images is a
+question too. GenAI reads its universal tags `<ov_genai_image_N>` and `<ov_genai_video_N>`
+anywhere in a VLM prompt as "image N goes here", so those tags are removed from the text of every
+message sent to a VLM artifact, repeatedly until none is left, and typing one cannot claim or move
+an image. A model's own vision tokens typed as text (such as Qwen2-VL's
+`<|vision_start|><|image_pad|><|vision_end|>`) are not removed: GenAI may read them as image
+placeholders too, and which they are is per-family knowledge the registry does not hold yet.
 
 `--carry-images-forward` trades accuracy for compatibility. Clients such as Open WebUI resend every
 image of the conversation with each follow-up question, which the default refuses. With the flag,
@@ -544,7 +554,8 @@ Other HTTP errors raised by routing carry `invalid_request`.
 With `stream: true`, a request refused before generation starts gets the same status and body as
 above. A generation failure after the stream has begun cannot change the status, which is already
 200: it arrives as one event, `data: {"error": {"message", "code"}}`, where `code` is the
-diagnostic code or `internal_error`, followed by `data: [DONE]`.
+diagnostic code or `internal_error`, followed by `data: [DONE]`. An image whose pixels fail to
+decode is reported the same way, with `code` `invalid_request` and the image's `param`.
 
 When `YONGA_API_KEY` is set in the environment, every endpoint except `/health` requires
 `Authorization: Bearer <key>` (401 otherwise). Authentication runs before the size limit, so a

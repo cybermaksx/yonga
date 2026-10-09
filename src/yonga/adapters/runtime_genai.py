@@ -803,15 +803,26 @@ def _has_user_input(messages: Sequence[ChatMessage]) -> bool:
     )
 
 
-#: The tags OpenVINO GenAI reads, anywhere in a VLM prompt, as "image N" or
-#: "video N goes here". They are removed from the conversation's text, so words
-#: a client typed can never claim an image that was not attached (GenAI then
-#: fails with "Missing image/video with index N") or move one that was.
+#: GenAI's universal media tags, which it reads anywhere in a VLM prompt as
+#: "image N" or "video N goes here". They are removed from the conversation's
+#: text, so typing one cannot claim an image that was not attached (GenAI then
+#: fails with "Missing image/video with index N") or move one that was. A
+#: model's own vision tokens typed as text (such as Qwen2-VL's
+#: ``<|vision_start|><|image_pad|><|vision_end|>``) are not removed: which
+#: those are is per-family knowledge yonga does not carry.
 _MEDIA_TAG = re.compile(r"<ov_genai_(?:image|video)_\d+>")
 
 
 def _without_media_tags(text: str) -> str:
-    return _MEDIA_TAG.sub("", text)
+    """``text`` without universal media tags, removed until none is left.
+
+    One pass is not enough: removing the inner tag of
+    ``<ov_genai_<ov_genai_image_0>image_0>`` would join the rest into a new one.
+    """
+    while True:
+        text, removed = _MEDIA_TAG.subn("", text)
+        if not removed:
+            return text
 
 
 def _image_tensor(image: ChatImage) -> Any:

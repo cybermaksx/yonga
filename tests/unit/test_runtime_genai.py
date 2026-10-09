@@ -1049,6 +1049,29 @@ def test_genai_media_tags_typed_by_a_client_are_removed(artifact, settings, gena
     assert args[0].messages[0]["content"] == "Look  and here"
 
 
+@pytest.mark.parametrize(
+    "typed",
+    [
+        "<ov_genai_<ov_genai_image_0>image_0>",
+        "<ov_genai_<ov_genai_video_1>video_2>",
+        "<ov_<ov_genai_<ov_genai_image_0>image_1>genai_image_2>",
+    ],
+)
+def test_a_media_tag_hidden_inside_another_is_removed_too(
+    artifact, settings, genai, tensors, typed
+):
+    """Removing the inner tag must not leave a new one behind."""
+    genai.vlm_accepts_history = True
+    runtime = make_runtime(artifact, settings, pipeline=PipelineKind.VLM)
+    history = ChatHistory()
+    history.add_user(f"Look {typed}here")
+
+    runtime.generate(history, GenerationSettings())
+
+    ((args, _),) = genai.pipelines[0].generate_calls
+    assert args[0].messages[0]["content"] == "Look here"
+
+
 def test_the_legacy_vlm_prompt_loses_media_tags_too(artifact, settings, genai):
     runtime = make_runtime(artifact, settings, pipeline=PipelineKind.VLM)
     history = ChatHistory()

@@ -13,7 +13,12 @@ its header and anything over
 :data:`~yonga.application.serve.MAX_IMAGE_PIXELS` is refused before its pixels
 are decoded; a larger one is not scaled down, so the model never sees something
 other than what was sent. The encoded size is already bounded by the request
-body limit. Decoding takes CPU time, so callers run it off the event loop.
+body limit. :func:`check_data_url` reads only that header, so the wire layer can
+refuse a request before it waits for the pipeline; :func:`decode_data_url`
+decodes the pixels, which the server does only once the request holds the
+pipeline, so at most one request at a time holds decoded images. Both take CPU
+time, so callers run them off the event loop. Any failure inside Pillow is a
+refusal, never an error escaping to the server.
 
 Pillow is part of the ``serve`` extra but imported only here, when an image is
 actually decoded: without it, text requests are served as before and an image
@@ -26,6 +31,8 @@ import base64
 import binascii
 import io
 import re
+from collections.abc import Iterator
+from contextlib import contextmanager
 from importlib.util import find_spec
 from typing import Any
 
@@ -34,6 +41,8 @@ from yonga.domain.diagnostics import ConfigurationError, FailureCategory, diagno
 
 __all__ = [
     "ImageRefused",
+    "check_data_url",
+    "check_image",
     "decode_data_url",
     "decode_image",
     "image_bytes",
@@ -48,6 +57,23 @@ _FORMATS = ("PNG", "JPEG", "WEBP", "GIF")
 
 #: Image modes that carry transparency, flattened onto white rather than black.
 _ALPHA_MODES = frozenset({"RGBA", "RGBa", "LA", "La", "PA"})
+
+#: Greyscale modes wider than 8 bits (a 16-bit PNG opens as ``I;16``). Converting
+#: one straight to RGB clips every value over 255 to white, so it is scaled first.
+_WIDE_GREY_MODES = frozenset({"I", "I;16", "I;16L", "I;16B", "I;16N"})
+
+#: The EXIF orientation tag, and the transposition each of its values asks for so
+#: that the image is shown upright, as a browser shows it.
+_ORIENTATION_TAG = 0x0112
+_UPRIGHT = {
+    2: "FLIP_LEFT_RIGHT",
+    3: "ROTATE_180",
+    4: "FLIP_TOP_BOTTOM",
+    5: "TRANSPOSE",
+    6: "ROTATE_270",
+    7: "TRANSVERSE",
+    8: "ROTATE_90",
+}
 
 
 class ImageRefused(ValueError):
@@ -96,33 +122,80 @@ def image_bytes(url: str) -> bytes:
     return data
 
 
+def check_image(data: bytes, *, max_pixels: int) -> None:
+    """Refuse ``data`` unless its header shows a PNG, JPEG, WebP or GIF within ``max_pixels``.
+
+    Only the header is read; no pixel is decoded. A broken image can still pass
+    and be refused by :func:`decode_image` later.
+    """
+    with _opened(_pillow(), data, max_pixels=max_pixels):
+        pass
+
+
 def decode_image(data: bytes, *, max_pixels: int) -> ChatImage:
     """Decode ``data`` (PNG, JPEG, WebP or GIF) into RGB pixels.
 
     The first frame of an animation is used, an EXIF rotation is applied the
-    way a browser shows the image, and transparency is flattened onto white.
+    way a browser shows the image, transparency is flattened onto white and a
+    16-bit greyscale image is scaled down to 8 bits.
     """
-    image_module, image_ops = _pillow()
-    try:
-        with image_module.open(io.BytesIO(data), formats=_FORMATS) as image:
-            width, height = image.size
-            if width * height > max_pixels:
-                raise _too_large(width, height, max_pixels)
-            upright = image_ops.exif_transpose(image)
-            rgb = _flatten(image_module, upright)
-            return ChatImage(width=rgb.width, height=rgb.height, pixels=rgb.tobytes())
-    except ImageRefused:
-        raise
-    except image_module.DecompressionBombError:
-        raise ImageRefused(f"The image is larger than {_limit(max_pixels)}.") from None
-    except (OSError, SyntaxError, ValueError, EOFError):
-        # Pillow's message may quote the bytes it choked on; it is not repeated.
-        raise ImageRefused("The image could not be decoded as PNG, JPEG, WebP or GIF.") from None
+    image_module = _pillow()
+    with _opened(image_module, data, max_pixels=max_pixels) as image:
+        rgb = _flatten(image_module, _upright(image_module, image))
+        return ChatImage(width=rgb.width, height=rgb.height, pixels=rgb.tobytes())
+
+
+def check_data_url(url: str, *, max_pixels: int) -> None:
+    """:func:`image_bytes` then :func:`check_image`."""
+    check_image(image_bytes(url), max_pixels=max_pixels)
 
 
 def decode_data_url(url: str, *, max_pixels: int) -> ChatImage:
     """:func:`image_bytes` then :func:`decode_image`."""
     return decode_image(image_bytes(url), max_pixels=max_pixels)
+
+
+@contextmanager
+def _opened(image_module: Any, data: bytes, *, max_pixels: int) -> Iterator[Any]:
+    """``data`` opened by Pillow, its size checked; any failure inside is a refusal.
+
+    Pillow's decoders raise more than ``OSError`` and ``ValueError`` on hostile
+    input (a corrupt EXIF block has given ``struct.error``), so every exception
+    but running out of memory becomes an :class:`ImageRefused`. Pillow's message
+    may quote the bytes it choked on; it is not repeated.
+    """
+    try:
+        with image_module.open(io.BytesIO(data), formats=_FORMATS) as image:
+            width, height = image.size
+            if width * height > max_pixels:
+                raise _too_large(width, height, max_pixels)
+            yield image
+    except ImageRefused:
+        raise
+    except image_module.DecompressionBombError:
+        raise ImageRefused(f"The image is larger than {_limit(max_pixels)}.") from None
+    except MemoryError:
+        raise
+    except Exception:
+        raise ImageRefused("The image could not be decoded as PNG, JPEG, WebP or GIF.") from None
+
+
+def _upright(image_module: Any, image: Any) -> Any:
+    """``image`` turned the way its EXIF orientation says.
+
+    The tag is read directly rather than through ``ImageOps.exif_transpose``,
+    which writes the whole EXIF block back out and fails on a corrupt one. An
+    EXIF block that cannot be read leaves the image as stored, which is what a
+    browser shows too.
+    """
+    try:
+        orientation = image.getexif().get(_ORIENTATION_TAG)
+    except Exception:
+        return image
+    method = _UPRIGHT.get(orientation) if isinstance(orientation, int) else None
+    if method is None:
+        return image
+    return image.transpose(getattr(image_module.Transpose, method))
 
 
 def _flatten(image_module: Any, image: Any) -> Any:
@@ -131,6 +204,8 @@ def _flatten(image_module: Any, image: Any) -> Any:
         rgba = image.convert("RGBA")
         background = image_module.new("RGBA", rgba.size, (255, 255, 255, 255))
         return image_module.alpha_composite(background, rgba).convert("RGB")
+    if image.mode in _WIDE_GREY_MODES:
+        image = image.convert("I").point(lambda value: value * (1 / 257)).convert("L")
     return image.convert("RGB")
 
 
@@ -147,10 +222,10 @@ def _limit(max_pixels: int) -> str:
     return f"{side}x{side} pixels" if side * side == max_pixels else f"{max_pixels} pixels"
 
 
-def _pillow() -> tuple[Any, Any]:
-    """Pillow's ``Image`` and ``ImageOps``, or a diagnostic naming the extra."""
+def _pillow() -> Any:
+    """Pillow's ``Image`` module, or a diagnostic naming the extra."""
     try:
-        from PIL import Image, ImageOps
+        from PIL import Image
     except ImportError as error:
         raise ConfigurationError(
             diagnostic(
@@ -161,4 +236,4 @@ def _pillow() -> tuple[Any, Any]:
                 remediation=["pip install 'yonga[serve]'"],
             )
         ) from error
-    return Image, ImageOps
+    return Image

@@ -146,11 +146,12 @@ hidden reasoning, across chunk boundaries; the registry chat profile's `stop_str
 native GenAI end markers. Images followed too, for VLM artifacts only: inline
 `data:image/(png|jpeg|webp|gif);base64,` URLs, never a fetch of any other URL, at most 4 per
 request and 4096 x 4096 pixels each, decoded with Pillow (now in the `serve` extra) off the event
-loop, and only with the last user message, because GenAI 2026.4 binds images to the newest turn of
-a stateless history; `--carry-images-forward` moves earlier ones there with a note, and
-`--max-body-mb` raises the 8 MiB body limit. Covered by unit tests with fake runtimes; the checks
-through serve on a GPU artifact, for stop sequences and for images (Qwen2.5-VL-3B and Qwen3.5-9B),
-are still to be run. Not done: tool calls, concurrent generation, `detail`-driven image resizing.
+loop and only while the request holds the pipeline, and only with the last user message, because
+GenAI 2026.4 binds images to the newest turn of a stateless history; `--carry-images-forward`
+moves earlier ones there with a note, and `--max-body-mb` raises the 8 MiB body limit. Covered by
+unit tests with fake runtimes; the checks through serve on a GPU artifact, for stop sequences and
+for images (Qwen2.5-VL-3B and Qwen3.5-9B), are still to be run. Not done: tool calls, concurrent
+generation, `detail`-driven image resizing.
 
 **2.2 — `yonga publish`. [done]**
 One-commit upload of the manifest's files, the source's license files, a generated model card and

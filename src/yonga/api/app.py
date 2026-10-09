@@ -17,8 +17,10 @@ validated. A body larger than ``max_body_bytes`` (by default
 :data:`DEFAULT_MAX_BODY_BYTES`, far more than any model's context holds as
 text, and what ``serve --max-body-mb`` sets) is refused with ``413`` and the
 error code ``request_too_large``. That limit is also what bounds the encoded
-size of the images a request embeds. The
-limit is enforced on the bytes actually received, not only on the declared
+size of the images a request embeds; their decoded pixels are held only by the
+request that holds the pipeline (see :class:`~yonga.application.serve.PendingImage`),
+so requests waiting for it cost their bodies and no more. The limit is
+enforced on the bytes actually received, not only on the declared
 ``Content-Length``, so a chunked upload is held to it too. The number of
 messages in one request is bounded separately (see
 :data:`yonga.api.openai.MAX_MESSAGES`) and refused with ``400``. With an API
@@ -137,12 +139,13 @@ def create_app(
     async def chat_completions(body: ChatCompletionRequest) -> JSONResponse | StreamingResponse:
         if not server.model.answers_to(body.model):
             return _model_not_found(body.model)
+        policy, check = server.image_policy, server.generation_for
         try:
             if body.has_images:
-                # Decoding images takes CPU time; it must not hold up the event loop.
-                completion = await asyncio.to_thread(body.to_completion, server.image_policy)
+                # Reading image headers takes CPU time; it must not hold up the event loop.
+                completion = await asyncio.to_thread(body.to_completion, policy, check=check)
             else:
-                completion = body.to_completion(server.image_policy)
+                completion = body.to_completion(policy, check=check)
             limit = server.generation_for(completion).max_new_tokens
         except ParameterError as error:
             return _error(400, str(error), error.code, param=error.param)
@@ -154,7 +157,14 @@ def create_app(
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
-        turn = await asyncio.to_thread(server.complete, completion)
+        try:
+            turn = await asyncio.to_thread(server.complete, completion)
+        except ParameterError as error:
+            # An image whose header was fine but whose pixels are not, found
+            # only when it is decoded for the pipeline.
+            return _error(400, str(error), error.code, param=error.param)
+        except YongaError as error:
+            return _diagnostic_error(error.diagnostic)
         if turn.diagnostic is not None:
             return _diagnostic_error(turn.diagnostic)
         return JSONResponse(_completion(server, turn, limit=limit))
@@ -289,9 +299,19 @@ async def _stream(
                     if isinstance(value, YongaError)
                     else None
                 )
-                message = report.message if report is not None else "Generation failed."
-                code = report.code if report is not None else "internal_error"
-                yield f"data: {json.dumps({'error': {'message': message, 'code': code}})}\n\n"
+                if isinstance(value, ParameterError):
+                    # An image that only failed once decoded; the stream had already begun.
+                    error: dict[str, object] = {
+                        "message": str(value),
+                        "code": value.code,
+                        "param": value.param,
+                    }
+                else:
+                    error = {
+                        "message": report.message if report is not None else "Generation failed.",
+                        "code": report.code if report is not None else "internal_error",
+                    }
+                yield f"data: {json.dumps({'error': error})}\n\n"
             yield "data: [DONE]\n\n"
             return
     finally:

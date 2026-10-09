@@ -26,8 +26,13 @@ manifest may change in any minor release.
   decoding and refused rather than scaled down. Images go with the last user message only, because
   OpenVINO GenAI 2026.4 binds images to the newest turn of a stateless conversation; an image in an
   earlier message is a 400 `serve.request.images_earlier_turn` saying so. An LLM artifact refuses
-  images with `serve.request.images_unsupported`. Decoding runs off the event loop.
-  `docs/CLI_SPEC.md` section 14.
+  images with `serve.request.images_unsupported`. Every other check, `stop` and the generation
+  settings included, comes before any image is read. Only the headers are read, off the event
+  loop, before a request waits for the pipeline; the pixels are decoded once it holds the
+  pipeline, so at most one request holds decoded images however many are queued. Any failure
+  inside Pillow is a refusal naming the image, never a server error. EXIF rotation is applied as a browser
+  shows it (an unreadable EXIF block leaves the image as stored), and 16-bit greyscale is scaled to
+  8 bits rather than clipped. `docs/CLI_SPEC.md` section 14.
 - **`serve --carry-images-forward`** moves images of earlier messages onto the last user message,
   with a line telling the model they came earlier, for clients that resend every image of a
   conversation. The model then no longer knows which words each image went with.
@@ -57,8 +62,10 @@ manifest may change in any minor release.
   image request is a 500 `serve.images.dependency_missing` naming `pip install 'yonga[serve]'`.
   The AppImage, which bundles the extra, grows by Pillow's size.
 - **`<ov_genai_image_N>` and `<ov_genai_video_N>` are removed from text sent to a VLM artifact**,
-  in `chat` as in `serve`. GenAI reads them anywhere as "image N goes here", so typed text could
-  claim an image that was not attached and fail generation.
+  in `chat` as in `serve`, repeatedly until none is left (removing one must not join a new one).
+  GenAI reads these universal tags anywhere as "image N goes here", so typed text could claim an
+  image that was not attached and fail generation. A model's own vision tokens typed as text are
+  not removed; which they are is per-family knowledge the registry does not hold yet.
 
 ### Fixed
 

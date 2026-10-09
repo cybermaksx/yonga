@@ -16,7 +16,13 @@ import zlib
 import pytest
 
 from yonga.adapters.runtime_genai import ChatImage, ChatMessage
-from yonga.api.images import ImageRefused, decode_data_url, image_bytes, pillow_available
+from yonga.api.images import (
+    ImageRefused,
+    check_data_url,
+    decode_data_url,
+    image_bytes,
+    pillow_available,
+)
 from yonga.domain.diagnostics import ConfigurationError, FailureCategory
 
 Image = pytest.importorskip("PIL.Image")
@@ -105,6 +111,73 @@ def test_an_exif_rotation_is_applied_as_a_browser_shows_it() -> None:
     image = decode_data_url(data_url(photo, "jpeg"), max_pixels=LIMIT)
 
     assert (image.width, image.height) == (2, 4)
+
+
+@pytest.mark.parametrize("orientation", range(1, 9))
+def test_every_exif_orientation_is_turned_as_pillow_turns_it(orientation: int) -> None:
+    """yonga reads the tag itself; the result must match ``ImageOps.exif_transpose``."""
+    from PIL import ImageOps
+
+    exif = Image.Exif()
+    exif[0x0112] = orientation
+    original = Image.new("RGB", (3, 2))
+    original.putpixel((0, 0), RED)  # one marked corner shows every flip and turn
+    buffer = io.BytesIO()
+    original.save(buffer, format="PNG", exif=exif)
+
+    image = decode_data_url(data_url(buffer.getvalue()), max_pixels=LIMIT)
+
+    expected = ImageOps.exif_transpose(Image.open(io.BytesIO(buffer.getvalue())))
+    assert (image.width, image.height) == expected.size
+    assert image.pixels == expected.convert("RGB").tobytes()
+
+
+def test_a_corrupt_exif_block_still_gives_the_rotated_image() -> None:
+    """Pillow's ``exif_transpose`` fails on this one with ``struct.error``; yonga does not."""
+    from PIL import ImageOps
+
+    exif = Image.Exif()
+    exif[0x0112] = 6
+    exif[0x0110] = "Model"
+    photo = encoded("JPEG", size=(4, 2), exif=exif)
+    # Retag the camera model, an ASCII string, as the image width, which must be a number.
+    broken = photo.replace(b"\x01\x10\x00\x02", b"\x01\x00\x00\x02", 1)
+    assert broken != photo
+    with pytest.raises(struct.error):
+        ImageOps.exif_transpose(Image.open(io.BytesIO(broken)))
+
+    image = decode_data_url(data_url(broken, "jpeg"), max_pixels=LIMIT)
+
+    assert (image.width, image.height) == (2, 4)
+
+
+def test_an_unreadable_exif_block_leaves_the_image_as_stored(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unreadable(self: object) -> object:
+        raise struct.error("required argument is not an integer")
+
+    exif = Image.Exif()
+    exif[0x0112] = 6
+    photo = encoded("JPEG", size=(4, 2), exif=exif)
+    monkeypatch.setattr(Image.Image, "getexif", unreadable)
+
+    image = decode_data_url(data_url(photo, "jpeg"), max_pixels=LIMIT)
+
+    assert (image.width, image.height) == (4, 2)
+
+
+def test_16_bit_greyscale_is_scaled_to_8_bits_not_clipped() -> None:
+    grey = Image.new("I;16", (4, 1))
+    for x, value in enumerate((0, 16384, 32768, 65535)):
+        grey.putpixel((x, 0), value)
+    buffer = io.BytesIO()
+    grey.save(buffer, format="PNG")
+    assert Image.open(io.BytesIO(buffer.getvalue())).mode == "I;16"
+
+    image = decode_data_url(data_url(buffer.getvalue()), max_pixels=LIMIT)
+
+    assert image.pixels == bytes(level for level in (0, 63, 127, 255) for _ in range(3))
 
 
 def test_a_declared_type_that_does_not_match_the_bytes_still_decodes() -> None:
@@ -200,6 +273,40 @@ def test_an_image_at_the_limit_is_accepted() -> None:
 def test_bytes_that_are_not_an_accepted_image_are_refused(data: bytes) -> None:
     with pytest.raises(ImageRefused, match="could not be decoded"):
         decode_data_url(data_url(data), max_pixels=LIMIT)
+
+
+@pytest.mark.parametrize("error", [struct.error("bad"), KeyError(7), TypeError("bad")])
+def test_any_failure_inside_pillow_is_a_refusal(
+    monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> None:
+    """Pillow raises more than OSError on hostile bytes; none of it may escape as a 500."""
+
+    def failing(self: object, *args: object) -> object:
+        raise error
+
+    monkeypatch.setattr(Image.Image, "convert", failing)
+
+    with pytest.raises(ImageRefused, match="could not be decoded"):
+        decode_data_url(data_url(encoded("PNG")), max_pixels=LIMIT)
+
+
+def test_a_header_check_reads_no_pixels() -> None:
+    """Truncated pixel data passes the header check and is refused once decoded."""
+    noise = Image.effect_noise((32, 32), 50).convert("RGB")
+    buffer = io.BytesIO()
+    noise.save(buffer, format="PNG")
+    truncated = buffer.getvalue()[: len(buffer.getvalue()) // 2]
+
+    check_data_url(data_url(truncated), max_pixels=LIMIT)
+    with pytest.raises(ImageRefused, match="could not be decoded"):
+        decode_data_url(data_url(truncated), max_pixels=LIMIT)
+
+
+def test_a_header_check_refuses_what_the_header_shows() -> None:
+    with pytest.raises(ImageRefused, match="more than 4096x4096 pixels"):
+        check_data_url(data_url(png_header(5000, 5000)), max_pixels=LIMIT)
+    with pytest.raises(ImageRefused, match="could not be decoded"):
+        check_data_url(data_url(encoded("BMP")), max_pixels=LIMIT)
 
 
 def test_without_pillow_an_image_names_the_extra(monkeypatch: pytest.MonkeyPatch) -> None:

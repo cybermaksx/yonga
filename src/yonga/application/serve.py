@@ -25,6 +25,12 @@ earlier images forward, which moves them onto the newest user message with a
 short note saying so (see :func:`carry_images_forward`). That trades accuracy
 about *when* an image was shown for compatibility with clients that resend
 every image of the conversation on each follow-up.
+
+An image waits for the pipeline undecoded. The wire layer checks what an
+image's header says and hands over a :class:`PendingImage`; its pixels are
+decoded only once the request holds the pipeline, so however many requests are
+queued, at most one holds decoded images, and a waiting request costs no more
+memory than its body.
 """
 
 from __future__ import annotations
@@ -32,7 +38,7 @@ from __future__ import annotations
 import threading
 import time
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -44,6 +50,7 @@ from yonga.application.chat import (
     TOP_K_MAX,
     TOP_P_RANGE,
     ChatHistory,
+    ChatImage,
     ChatMessage,
     ChatSession,
     ChatTurn,
@@ -65,6 +72,7 @@ __all__ = [
     "CompletionRequest",
     "ImagePolicy",
     "ModelServer",
+    "PendingImage",
     "ServedModel",
     "carry_images_forward",
 ]
@@ -130,6 +138,21 @@ class ImagePolicy(BaseModel):
     max_pixels: int = MAX_IMAGE_PIXELS
 
 
+class PendingImage(BaseModel):
+    """An accepted image whose pixels are not decoded yet.
+
+    ``decode`` is called once the request holds the pipeline (see the module
+    docstring); it raises the caller's own refusal when the pixels turn out to
+    be broken although the header was fine.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    message: int = Field(ge=0)
+    """Index of the message in :attr:`CompletionRequest.messages` the image came with."""
+    decode: Callable[[], ChatImage] = Field(repr=False)
+
+
 class CompletionRequest(BaseModel):
     """One chat completion, already translated out of the wire format."""
 
@@ -144,6 +167,8 @@ class CompletionRequest(BaseModel):
     repetition_penalty: float | None = None
     stop: list[str] = Field(default_factory=list)
     """The client's stop sequences, matched on the visible answer (see ``ChatSession.respond``)."""
+    images: list[PendingImage] = Field(default_factory=list)
+    """Images to decode onto their messages, after any those already carry."""
 
 
 def _invalid(code: str, detail: str) -> ConfigurationError:
@@ -277,35 +302,55 @@ class ModelServer:
     def complete(self, request: CompletionRequest, *, on_text: TextSink | None = None) -> ChatTurn:
         """Answer ``request``, streaming through ``on_text`` when one is given.
 
-        Waits for any generation already running. Invalid parameters raise; a
-        runtime failure comes back as a turn carrying its diagnostic.
+        Waits for any generation already running. Invalid parameters raise; so
+        does what a pending image's ``decode`` raises. A runtime failure comes
+        back as a turn carrying its diagnostic.
         """
         settings = self.generation_for(request)
-        history = ChatHistory(messages=self._conversation(request))
+        self._check_images(request)
         with self._lock:
+            # Decoded only now, so that requests waiting for the pipeline hold
+            # their encoded images and nothing more.
+            history = ChatHistory(messages=self._conversation(request))
             return self._session.respond(history, settings, on_text=on_text, stop=request.stop)
 
-    def _conversation(self, request: CompletionRequest) -> list[ChatMessage]:
-        """The request's messages, its images checked against the policy.
+    def _check_images(self, request: CompletionRequest) -> None:
+        """Refuse the request's images unless the policy allows them.
 
         The wire layer has already refused what is checked here, naming the
         parameter; this holds the same line for any other caller.
         """
-        messages = list(request.messages)
-        count = sum(len(message.images) for message in messages)
-        if not count:
-            return messages
+        messages = request.messages
+        if any(pending.message >= len(messages) for pending in request.images):
+            raise _invalid("serve.request.image_message", "An image belongs to no message.")
+        counts = [len(message.images) for message in messages]
+        for pending in request.images:
+            counts[pending.message] += 1
+        if not sum(counts):
+            return
         policy = self._image_policy
         if not policy.accepted:
             raise _invalid(IMAGES_UNSUPPORTED, "This model takes text only; it is not a VLM.")
-        if count > policy.max_images:
+        if sum(counts) > policy.max_images:
             raise _invalid(TOO_MANY_IMAGES, f"At most {policy.max_images} images are accepted.")
-        earlier = any(message.images for message in messages[:-1])
-        if earlier and not policy.carry_forward:
+        if any(counts[:-1]) and not policy.carry_forward:
             raise _invalid(IMAGES_EARLIER_TURN, EARLIER_TURN_REASON)
         if messages[-1].role != "user":
             raise _invalid(IMAGES_EARLIER_TURN, EARLIER_TURN_REASON)
-        return carry_images_forward(messages) if earlier else messages
+
+    def _conversation(self, request: CompletionRequest) -> list[ChatMessage]:
+        """The request's messages with its pending images decoded onto them.
+
+        Images of earlier messages move onto the newest one, which
+        :meth:`_check_images` allowed only when the policy carries them forward.
+        """
+        messages = list(request.messages)
+        for pending in request.images:
+            message = messages[pending.message]
+            messages[pending.message] = message.model_copy(
+                update={"images": [*message.images, pending.decode()]}
+            )
+        return carry_images_forward(messages)
 
 
 def carry_images_forward(messages: Sequence[ChatMessage]) -> list[ChatMessage]:
