@@ -59,6 +59,7 @@ from yonga.adapters import (
 )
 from yonga.adapters.filesystem import system_temp_dir
 from yonga.adapters.runtime_genai import ChatHistory, ChatProfileLike, ChatRuntime, GenerationResult
+from yonga.adapters.smoke_child import verdict_line
 from yonga.application.artifacts import ArtifactStore
 from yonga.application.benchmark import RuntimeFactory as BenchmarkRuntimeFactory
 from yonga.application.chat import RuntimeFactory as ChatRuntimeFactory
@@ -313,6 +314,10 @@ class FakeWiring(Wiring):
 
     def command_runner(self) -> CommandRunner:
         """Refuse every process: an unfaked adapter must not reach the network."""
+        return RefusingRunner()
+
+    def smoke_child_runner(self) -> CommandRunner:
+        """Refuse the probe's smoke-test child too, unless a test scripts it."""
         return RefusingRunner()
 
     def hardware_probe(self) -> HardwareProbe:
@@ -1022,14 +1027,14 @@ def test_probe_quick_explains_how_to_settle_the_device(
 
 
 class ChildProcessWiring(FakeWiring):
-    """A :class:`FakeWiring` whose process runner plays the smoke-test child."""
+    """A :class:`FakeWiring` whose smoke-test runner plays the child process."""
 
     def __init__(self, settings: Settings, *, child: CommandRunner, **kwargs: object) -> None:
         super().__init__(settings, **kwargs)  # type: ignore[arg-type]
         self._child = child
 
-    def command_runner(self) -> CommandRunner:
-        """Return the scripted child instead of refusing every process."""
+    def smoke_child_runner(self) -> CommandRunner:
+        """Return the scripted child instead of refusing it."""
         return self._child
 
 
@@ -1071,7 +1076,7 @@ def test_probe_timeout_passes_a_device_whose_child_generated(
     artifact = _staged_artifact(tmp_path)
     runtime = FakeRuntimeProbe(compile_failures={"NPU": NPU_DYNAMIC_SHAPE_ERROR})
     verdict = ProbeResult(device="NPU", status=ProbeStatus.OK, message="generated 24 token(s)")
-    child = SmokeChildRunner(stdout=[verdict.model_dump_json()])
+    child = SmokeChildRunner(stdout=[verdict_line(verdict)])
 
     def wiring_for(settings: Settings) -> Wiring:
         return ChildProcessWiring(settings, child=child, runtime=runtime)

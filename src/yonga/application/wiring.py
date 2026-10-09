@@ -431,12 +431,21 @@ class Wiring:
     def isolated_smoke_tester(self) -> IsolatedSmokeTester:
         """Return the smoke test ``probe --timeout`` runs in a child process it can stop.
 
-        It shares the supervised :meth:`command_runner`, so the child's output is
-        redacted into the job log like any other process yonga starts.
+        Its runner (:meth:`smoke_child_runner`) is supervised and redacts the
+        child's output into the job log like any other process yonga starts, but
+        it is not the exporter's :meth:`command_runner`: it never reports a
+        compiler line as a conversion milestone, and it keeps the child's JSON
+        verdict off the console.
         """
         from yonga.adapters.smoke_child import ChildProcessSmokeTester
 
-        return ChildProcessSmokeTester(self.command_runner())
+        return ChildProcessSmokeTester(self.smoke_child_runner())
+
+    def smoke_child_runner(self) -> CommandRunner:
+        """Return the supervised runner :meth:`isolated_smoke_tester` starts its child with."""
+        from yonga.adapters.smoke_child import smoke_child_runner
+
+        return smoke_child_runner()
 
     # ------------------------------------------------------------------
     # registry and artifacts

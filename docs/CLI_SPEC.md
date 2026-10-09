@@ -336,18 +336,20 @@ minutes; the probe says so before it starts.
   `inconclusive` (`probe.inconclusive.timeout`): never `ok`, and never a compiler verdict. A child
   that dies without printing its JSON result is `failed`, classified through the registry from its
   stderr like an in-process failure.
-- The two cannot be combined (`probe.options.conflict`, exit 70); a timeout of zero or less is
-  `probe.timeout.invalid`, exit 70. Without either option the pipeline is built in-process, with no
-  time limit.
+- The two cannot be combined (`probe.options.conflict`, exit 70); a timeout that is not a finite
+  number above zero is `probe.timeout.invalid`, exit 70. Without either option the pipeline is
+  built in-process, with no time limit.
 
 `inconclusive` never counts as working — not in the exit code, the role matrix, the manifest or a
 model card — and never as a failure of the device or the model. Exit codes: 0 when any device
 passed; otherwise the code of the first definite failure; otherwise, when every remaining device
-is inconclusive, 2. `--json` carries `"inconclusive": true` in that case, and the `quick` and
-`timeout_seconds` the probe ran with.
+is inconclusive, 2. `--json` has `"ok": false` and `"inconclusive": true` in that case, and the
+`quick` and `timeout_seconds` the probe ran with; tell it from a failure by the exit code or
+`inconclusive`.
 
 `python -m yonga.application.probe ARTIFACT` accepts the same `--quick` and `--timeout`, prints the
-JSON report, and exits 0, 2 or 1.
+JSON report, and exits 0, 2 (inconclusive) or 1; an invalid `--quick`/`--timeout` combination exits
+70, and argparse usage errors exit 2 as usual.
 
 ## 12. `registry`
 
@@ -555,11 +557,12 @@ directory, login name and hostname anonymised and secrets redacted. The artifact
 directory (repair backups, validation records) is never uploaded.
 
 The model card states that the artifact is a quantized conversion and not a fine-tune. It lists
-lineage with revisions and licenses, every export setting and package version, and every repair
-with its before and after digests. Devices appear with probe evidence: `works` only for a passing
-probe, `failed` with the diagnostic code, `inconclusive` for a probe that stopped before the GenAI
-pipeline settled it, `not tested` for a device never probed. It also says so when the profile's
-target device is not among the verified ones, and lists every file with its SHA-256.
+lineage with revisions and licenses, every export setting and package version, and every repair with
+its before and after digests. Devices appear with probe evidence: `works` only for a passing probe,
+`failed` with the diagnostic code, `inconclusive` if a recorded probe is (`yonga probe` does not
+write the manifest; `prepare` always settles its probes), `not tested` for a device never probed. It
+also says so when the profile's target device is not among the verified ones, and lists every file
+with its SHA-256.
 
 `--dry-run` runs every check (credential problems become warnings) and writes `README.md`,
 `yonga-manifest.json` and `upload.txt` (digest, size and path of every file) to `--output`, by

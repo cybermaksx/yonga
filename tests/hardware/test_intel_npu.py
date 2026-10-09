@@ -35,8 +35,7 @@ def _npu() -> None:
 
 def _probe_service(tmp_path: Path) -> ProbeService:
     from yonga.adapters.openvino_probe import OpenVINOProbe
-    from yonga.adapters.smoke_child import ChildProcessSmokeTester
-    from yonga.adapters.subprocess import SubprocessRunner
+    from yonga.adapters.smoke_child import ChildProcessSmokeTester, smoke_child_runner
     from yonga.application.probe import ProbeService
     from yonga.application.wiring import GenAISmokeTester
     from yonga.registry import RegistryResolver, load_builtin_registry
@@ -47,7 +46,7 @@ def _probe_service(tmp_path: Path) -> ProbeService:
         None,
         isolated_settings(tmp_path),
         smoke_tester=GenAISmokeTester(),
-        isolated_smoke_tester=ChildProcessSmokeTester(SubprocessRunner()),
+        isolated_smoke_tester=ChildProcessSmokeTester(smoke_child_runner()),
     )
 
 
@@ -226,8 +225,13 @@ def test_an_npu_pipeline_build_past_its_timeout_is_stopped_and_inconclusive(
     assert report.diagnostic is not None
     assert report.diagnostic.code == "probe.inconclusive.timeout"
     assert _probe_exit(outcome) is ExitCode.WARNINGS
-    # The stop escalates SIGINT -> SIGTERM -> SIGKILL; the child dies on the first.
-    assert elapsed < 60, f"stopping the child took {elapsed:.0f} s"
+    # The stop escalates SIGINT -> SIGTERM -> SIGKILL, five seconds apart; the
+    # child must die on the first. Its measured run includes the stop, so one
+    # that survived SIGINT would take over 1 + 5 s.
+    child_seconds = report.smoke_test.duration_seconds
+    assert child_seconds is not None
+    assert child_seconds < 1 + 4, f"the child took {child_seconds:.1f} s to stop"
+    assert elapsed < 60, f"the whole probe took {elapsed:.0f} s"
 
 
 def test_a_bounded_npu_probe_passes_an_llm_through_the_child_process(tmp_path: Path) -> None:

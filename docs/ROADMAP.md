@@ -7,9 +7,8 @@ a session, **M** a few days, **L** a substantial piece of work.
 ## Where things stand
 
 Phases 0, 1 and 2 are done, within the limits each item records (2.1, for example, lists what
-`serve` does not do yet), except the open half of 0.5: a `--quick` NPU probe and a bounded timeout
-for pipeline builds. What remains is in Phase 3: Windows support, a GUI or web frontend,
-and more architectures in the registry. Each item keeps the note written when it closed, with what
+`serve` does not do yet). What remains is in Phase 3: Windows support, a GUI or web frontend, and
+more architectures in the registry. Each item keeps the note written when it closed, with what
 was measured and what building it found; the numbers in those notes are as of that date. For the
 current command set run `yonga --help`, and for the current test count `pytest --collect-only -q`.
 
@@ -75,10 +74,10 @@ and names the two ways out. `--quick` stops at the raw compile and reports a def
 the new status `inconclusive`. `--timeout SECONDS` builds the pipeline in a child process
 (`python -P -m yonga.adapters.smoke_child`, through the supervised subprocess runner) and stops it
 at the limit, which is `inconclusive` too — a native compile cannot be interrupted in-process. An
-inconclusive device never counts as working or as failed: exit 2 when nothing else decided, and
-the model card says `inconclusive`. `prepare` still waits for its pipeline build. On the reference
-host a quick NPU probe of the 0.6B test artifact answers in about a second, and `--timeout 1` stops
-its pipeline build and reports inconclusive; both are hardware tests.
+inconclusive device never counts as working or as failed: exit 2 when nothing else decided, and a
+model card would never list it as working. `prepare` still waits for its pipeline build. On the
+reference host a quick NPU probe of the 0.6B test artifact answers in about a second, and
+`--timeout 1` stops its pipeline build and reports inconclusive; both are hardware tests.
 
 ---
 

@@ -396,9 +396,9 @@ yonga prepare tiiuae/falcon-rw-1b --device cpu --yes     # exit 22, tells you to
 yonga probe ARTIFACT --device npu
 ```
 
-On the NPU a probe builds the real GenAI pipeline whenever the raw compile is inconclusive, which is
-every LLM. For a small model that takes seconds; for a 9B model it is a full NPU compilation and can
-take well over ten minutes and several GiB of RAM. Two options shorten that:
+On the NPU a probe builds the real GenAI pipeline whenever the raw compile is deferred to the
+pipeline, which is every LLM. For a small model that takes seconds; for a 9B model it is a full NPU
+compilation and can take well over ten minutes and several GiB of RAM. Two options shorten that:
 
 ```bash
 yonga probe ARTIFACT --device npu --quick         # raw compile only; a deferred device is inconclusive

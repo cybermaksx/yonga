@@ -192,11 +192,13 @@ yonga probe ARTIFACT --device npu --quick         # no pipeline build: NPU is in
 yonga probe ARTIFACT --device npu --timeout 600   # pipeline built in a child, stopped after 600 s
 ```
 
-Both report the NPU as `inconclusive` rather than guessing (`probe.inconclusive.quick`,
-`probe.inconclusive.timeout`, exit 2). That is not a compiler verdict, and it does not mean the
-NPU is broken: the pipeline that decides was never finished. A native compile cannot be
-interrupted inside a running process, which is why `--timeout` builds it in a child it can stop.
-To settle it, run the probe again without `--quick`, or with a longer `--timeout`.
+`--quick` always reports the NPU as `inconclusive` (`probe.inconclusive.quick`, exit 2).
+`--timeout` does too, but only when the build is stopped at the limit
+(`probe.inconclusive.timeout`); a build that finishes in time gives the normal ok or failed
+verdict. `inconclusive` is not a compiler verdict, and it does not mean the NPU is broken: the
+pipeline that decides was never finished. A native compile cannot be interrupted inside a running
+process, which is why `--timeout` builds it in a child it can stop. To settle it, run the probe
+again without `--quick`, or with a longer `--timeout`.
 
 The dynamic-shape message is one form of this. Another, seen on this host by loading a Qwen3-0.6B
 artifact with `yonga chat ARTIFACT --device npu`, names the compiler pass instead:

@@ -1020,7 +1020,10 @@ def probe(
         None,
         "--timeout",
         metavar="SECONDS",
-        help="Build the pipeline in a child process and give up after SECONDS (inconclusive).",
+        help=(
+            "Bound the GenAI pipeline build that settles a deferred compile: run it in a child "
+            "process and stop it after SECONDS (the device is then inconclusive)."
+        ),
     ),
     json_output: bool = typer.Option(False, "--json", help="Emit the report as JSON."),
 ) -> None:

@@ -12,11 +12,13 @@ any moment, so the bounded build happens in one.
 output line redacted into the job log -- and turns what comes back into a
 :class:`~yonga.domain.artifacts.ProbeResult`:
 
-* the child's own verdict, printed as one JSON line on stdout, when there is
-  one: ``ok``, or ``failed`` with the raw runtime text for the registry;
+* the child's own verdict, printed as one JSON line on stdout under the
+  :data:`VERDICT_KEY` sentinel, when there is one: ``ok``, or ``failed`` with
+  the raw runtime text for the registry. It stands even when the time limit
+  ran out afterwards, while the child was still tearing down;
 * :attr:`~yonga.domain.artifacts.ProbeStatus.INCONCLUSIVE` when the time limit
-  stopped the build. A stopped build says nothing about the graph, so it is
-  never reported as a compiler failure;
+  stopped the build before a verdict. A stopped build says nothing about the
+  graph, so it is never reported as a compiler failure;
 * ``failed`` with the stderr tail when the child died without a verdict (a
   native crash, an import error), which the caller classifies.
 
@@ -38,23 +40,75 @@ from typing import TYPE_CHECKING
 
 from pydantic import ValidationError
 
+from yonga.adapters.subprocess import SubprocessRunner, default_line_selector
+from yonga.application.progress import ProgressKind
 from yonga.domain.artifacts import ProbeResult, ProbeStatus
 from yonga.domain.diagnostics import CancelledError, FailureCategory, diagnostic
+from yonga.domain.hardware import normalise_device
 from yonga.domain.models import PipelineKind
-from yonga.util.redaction import redact_text
+from yonga.util.redaction import environment_secrets, redact_text
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from yonga.adapters import CommandRunner
     from yonga.application.jobs import JobContext
 
-__all__ = ["SMOKE_CHILD_MODULE", "ChildProcessSmokeTester", "main", "result_from_stdout"]
+__all__ = [
+    "SMOKE_CHILD_MODULE",
+    "VERDICT_KEY",
+    "ChildProcessSmokeTester",
+    "main",
+    "result_from_stdout",
+    "smoke_child_runner",
+    "smoke_line_selector",
+    "verdict_line",
+]
 
 #: The module the child process runs; ``python -P -m`` keeps the working
 #: directory off ``sys.path``, so a stray file there cannot shadow yonga.
 SMOKE_CHILD_MODULE = "yonga.adapters.smoke_child"
 
+#: The one key of the object the child prints its verdict in. Native libraries
+#: write to stdout too, and a JSON object of theirs must never pass for a result.
+VERDICT_KEY = "yonga_smoke_result"
+
 #: How many trailing stderr lines a failure without a verdict keeps.
 _STDERR_TAIL = 40
+
+#: The statuses a child's verdict can carry; anything else is not a verdict.
+_VERDICT_STATUSES = frozenset({ProbeStatus.OK.value, ProbeStatus.FAILED.value})
+
+
+def verdict_line(result: ProbeResult) -> str:
+    """Return the line the child prints its result as.
+
+    Pure ASCII (``ensure_ascii``), so it survives a child whose locale is not
+    UTF-8: the parent always decodes the pipe as UTF-8, and a message quoting a
+    path or a prompt must not fail to encode after the smoke test ran.
+    """
+    return json.dumps({VERDICT_KEY: result.model_dump(mode="json")}, ensure_ascii=True)
+
+
+def smoke_line_selector(line: str) -> ProgressKind | None:
+    """Classify one line of the child's output for the probe's progress display.
+
+    A warning or error is shown as a log line, as for any child process. The
+    verdict line never is -- the probe reports the result itself -- and nothing
+    is ever an ``EXPORT`` milestone: a compiler's "loading weights" is not a
+    conversion step, and a probe has no export task to advance.
+    """
+    text = line.strip()
+    if not text or text.startswith("{") or VERDICT_KEY in text:
+        return None
+    return ProgressKind.LOG if default_line_selector(text) is ProgressKind.LOG else None
+
+
+def smoke_child_runner() -> SubprocessRunner:
+    """Return a runner for the child: supervised, redacting, with its own line selector.
+
+    The exporter's runner reports conversion milestones; this one must not, and
+    it keeps the verdict line off the console (:func:`smoke_line_selector`).
+    """
+    return SubprocessRunner(line_selector=smoke_line_selector, extra_secrets=environment_secrets())
 
 
 class ChildProcessSmokeTester:
@@ -136,6 +190,12 @@ class ChildProcessSmokeTester:
                     context={"device": device},
                 )
             )
+        verdict = result_from_stdout(result.stdout_lines, device=device)
+        if verdict is not None:
+            # The verdict is trusted over the exit code, and over the time limit:
+            # OpenVINO can crash, or take its time releasing the device, while the
+            # interpreter tears down after the pipeline already generated.
+            return verdict
         if result.timed_out:
             return ProbeResult(
                 device=device,
@@ -145,11 +205,6 @@ class ChildProcessSmokeTester:
                     f"the GenAI pipeline build did not finish within {timeout:g} s and was stopped"
                 ),
             )
-        verdict = result_from_stdout(result.stdout_lines)
-        if verdict is not None:
-            # The verdict is trusted over the exit code: OpenVINO can crash while
-            # the interpreter tears down, after the pipeline already generated.
-            return verdict
         tail = [line for line in result.stderr_lines if line.strip()][-_STDERR_TAIL:]
         message = f"the smoke-test process exited with {result.returncode} without a result"
         if tail:
@@ -162,25 +217,33 @@ class ChildProcessSmokeTester:
         )
 
 
-def result_from_stdout(lines: Sequence[str]) -> ProbeResult | None:
-    """Return the last JSON :class:`ProbeResult` in a child's stdout, if any.
+def result_from_stdout(lines: Sequence[str], *, device: str) -> ProbeResult | None:
+    """Return the child's verdict for ``device`` from its stdout, if it printed one.
 
     Searched from the end, line by line, because native libraries may print to
     stdout too -- even after the verdict, when their buffers are flushed at
-    exit. A line that is not a JSON object or not a valid result is skipped.
+    exit. Only an object under :data:`VERDICT_KEY` counts, and only one that
+    states ``ok`` or ``failed`` for the device that was asked for; any other
+    line, JSON or not, is skipped.
     """
+    wanted = normalise_device(device)
     for line in reversed(lines):
         text = line.strip()
-        if not text.startswith("{"):
+        if not text.startswith("{") or VERDICT_KEY not in text:
             continue
         try:
             payload = json.loads(text)
         except ValueError:
             continue
-        if not isinstance(payload, dict):
+        if not isinstance(payload, dict) or set(payload) != {VERDICT_KEY}:
+            continue
+        body = payload[VERDICT_KEY]
+        if not isinstance(body, dict) or body.get("status") not in _VERDICT_STATUSES:
             continue
         with suppress(ValidationError):
-            return ProbeResult.model_validate(payload)
+            verdict = ProbeResult.model_validate(body)
+            if verdict.device == wanted:
+                return verdict
     return None
 
 
@@ -239,7 +302,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 max_new_tokens=args.max_new_tokens,
             ),
         )
-    sys.stdout.write(json.dumps(result.model_dump(mode="json"), ensure_ascii=False) + "\n")
+    sys.stdout.write(verdict_line(result) + "\n")
     sys.stdout.flush()
     return 0 if result.ok else 1
 

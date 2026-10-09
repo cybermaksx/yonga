@@ -1099,8 +1099,15 @@ def publication_plan(plan: PublishPlan) -> RenderableType:
             ),
         )
     for evidence in plan.devices:
-        style = {"ok": "green", "failed": "red"}.get(evidence.status, "dim")
-        word = {"ok": "works", "failed": "failed", "not_tested": "not tested"}[evidence.status]
+        style = {"ok": "green", "failed": "red", "inconclusive": "yellow"}.get(
+            evidence.status, "dim"
+        )
+        word = {
+            "ok": "works",
+            "failed": "failed",
+            "inconclusive": "inconclusive",
+            "not_tested": "not tested",
+        }.get(evidence.status, evidence.status)
         body.add_row(
             Text(f"Device {evidence.device}"),
             Text.assemble(

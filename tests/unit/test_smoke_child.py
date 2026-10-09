@@ -3,14 +3,17 @@
 A native NPU compile cannot be interrupted in-process, so a bounded pipeline
 build runs in ``python -P -m yonga.adapters.smoke_child``. These tests pin the
 contract between the two sides: the command is an argv list, the child's
-verdict is one JSON line found even among native noise, a build stopped at the
-time limit is inconclusive rather than a failure, and a child that dies without
-a verdict is a failure carrying its redacted stderr for the registry.
+verdict is one sentinel-wrapped JSON line found even among native noise (and
+no other JSON line passes for it), a build stopped at the time limit before a
+verdict is inconclusive rather than a failure, a child that dies without a
+verdict is a failure carrying its redacted stderr for the registry, and the
+verdict never reaches the console as a progress line.
 """
 
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -18,23 +21,35 @@ import pytest
 from tests.support import SmokeChildRunner
 from yonga.adapters.smoke_child import (
     SMOKE_CHILD_MODULE,
+    VERDICT_KEY,
     ChildProcessSmokeTester,
     main,
     result_from_stdout,
+    smoke_child_runner,
+    smoke_line_selector,
+    verdict_line,
 )
-from yonga.adapters.subprocess import SubprocessRunner
+from yonga.application.jobs import JobContext
 from yonga.application.probe import IsolatedSmokeTester
+from yonga.application.progress import CollectingSink, ProgressKind
+from yonga.config.settings import Settings
 from yonga.domain.artifacts import ProbeResult, ProbeStatus
 from yonga.domain.diagnostics import CancelledError, CompileError, FailureCategory, diagnostic
 from yonga.domain.models import PipelineKind
+from yonga.util.jsonlog import null_logger
 
 FAKE_TOKEN = "hf_smokechildsecretvalue0000000000000"
 
 
-def ok_line(device: str = "NPU") -> str:
+def ok_line(device: str = "NPU", message: str = "generated 24 token(s)") -> str:
     """The line a child prints after the pipeline generated."""
-    result = ProbeResult(device=device, status=ProbeStatus.OK, message="generated 24 token(s)")
-    return json.dumps(result.model_dump(mode="json"))
+    return verdict_line(ProbeResult(device=device, status=ProbeStatus.OK, message=message))
+
+
+def failed_line(device: str = "NPU") -> str:
+    """The line a child prints after the pipeline could not be built."""
+    result = ProbeResult(device=device, status=ProbeStatus.FAILED, message="Compilation failed")
+    return verdict_line(result)
 
 
 def run(tester: ChildProcessSmokeTester, artifact: Path, *, timeout: float = 30.0) -> ProbeResult:
@@ -90,6 +105,24 @@ def test_the_verdict_is_found_among_native_output_before_and_after_it(tmp_path: 
     assert result.status is ProbeStatus.OK
 
 
+def test_a_verdict_printed_before_the_time_limit_stands(tmp_path: Path) -> None:
+    """The child generated, then ran out of time releasing the device: still ok."""
+    runner = SmokeChildRunner(timed_out=True, stdout=[ok_line()])
+
+    result = run(ChildProcessSmokeTester(runner), tmp_path, timeout=5)
+
+    assert result.status is ProbeStatus.OK
+
+
+def test_a_failed_verdict_printed_before_the_time_limit_stands(tmp_path: Path) -> None:
+    runner = SmokeChildRunner(timed_out=True, stdout=[failed_line()])
+
+    result = run(ChildProcessSmokeTester(runner), tmp_path, timeout=5)
+
+    assert result.status is ProbeStatus.FAILED
+    assert result.message == "Compilation failed"
+
+
 def test_a_stop_at_the_time_limit_is_inconclusive_never_a_failure(tmp_path: Path) -> None:
     runner = SmokeChildRunner(timed_out=True, stderr=["[ERROR] [vpux-compiler] half way"])
 
@@ -132,10 +165,83 @@ def test_a_child_that_dies_without_a_verdict_fails_with_its_redacted_stderr(
         ["plain text"],
         ["[1, 2, 3]"],
         ['{"device": "NPU", "status": "no-such-status"}'],
+        # A bare result, not under the sentinel: a native library's JSON, for all we know.
+        [ProbeResult(device="NPU", status=ProbeStatus.OK).model_dump_json()],
+        [json.dumps({VERDICT_KEY: {"device": "NPU"}})],
+        [json.dumps({VERDICT_KEY: {"device": "NPU", "status": "not_attempted"}})],
+        [json.dumps({VERDICT_KEY: {"device": "NPU", "status": "inconclusive"}})],
+        [json.dumps({VERDICT_KEY: {"device": "NPU", "status": "ok"}, "extra": 1})],
+        [json.dumps({VERDICT_KEY: "ok"})],
+        [ok_line(device="GPU")],
     ],
 )
-def test_anything_but_a_result_object_is_no_verdict(lines: list[str]) -> None:
-    assert result_from_stdout(lines) is None
+def test_anything_but_a_verdict_for_the_device_is_no_verdict(lines: list[str]) -> None:
+    assert result_from_stdout(lines, device="NPU") is None
+
+
+def test_the_last_verdict_wins_and_foreign_json_after_it_is_ignored() -> None:
+    lines = [
+        failed_line(),
+        ok_line(message="the second verdict"),
+        '{"device": "NPU"}',
+        '{"device": "NPU", "status": "failed"}',
+        "bye",
+    ]
+
+    verdict = result_from_stdout(lines, device="npu")
+
+    assert verdict is not None
+    assert verdict.status is ProbeStatus.OK
+    assert verdict.message == "the second verdict"
+
+
+def test_the_verdict_line_is_ascii_whatever_the_message_holds() -> None:
+    """A child whose locale is not UTF-8 must still be able to print it."""
+    message = "görüntü /home/şule/modeller 模型"
+    line = ok_line(message=message)
+
+    assert line.isascii()
+    verdict = result_from_stdout([line], device="NPU")
+    assert verdict is not None and verdict.message == message
+
+
+def test_the_verdict_and_compiler_chatter_never_reach_the_console() -> None:
+    assert smoke_line_selector(failed_line()) is None
+    assert smoke_line_selector("Converting the model") is None
+    assert smoke_line_selector("loading weights") is None
+    assert smoke_line_selector("[ERROR] Compilation failed") is ProgressKind.LOG
+
+
+def test_the_child_runner_shows_errors_but_no_verdict_and_no_export_step(
+    tmp_path: Path,
+) -> None:
+    """Through the real runner: a failed verdict, a milestone-looking line, an error."""
+    settings = Settings(
+        config_dir=tmp_path / "config", cache_dir=tmp_path / "cache", data_dir=tmp_path / "data"
+    )
+    sink = CollectingSink()
+    logger = null_logger("job-smoke")
+    ctx = JobContext(
+        job_id="job-smoke", logger=logger, paths=settings.paths, settings=settings, progress=sink
+    )
+    script = "\n".join(
+        [
+            "import sys",
+            "print('Converting weights for the NPU')",
+            "print('[ERROR] vpux-compiler: Compilation failed', file=sys.stderr)",
+            f"print({failed_line()!r})",
+        ]
+    )
+    try:
+        result = smoke_child_runner().run([sys.executable, "-P", "-c", script], ctx=ctx)
+    finally:
+        logger.close()
+
+    assert result.returncode == 0
+    assert sink.of_kind(ProgressKind.EXPORT) == []
+    shown = [event.message for event in sink.of_kind(ProgressKind.LOG)]
+    assert shown == ["[ERROR] vpux-compiler: Compilation failed"]
+    assert not any(VERDICT_KEY in message or "{" in message for message in shown)
 
 
 def test_the_child_prints_one_json_result(
@@ -176,7 +282,7 @@ def test_the_child_prints_one_json_result(
             "max_new_tokens": 3,
         }
     ]
-    verdict = result_from_stdout(capsys.readouterr().out.splitlines())
+    verdict = result_from_stdout(capsys.readouterr().out.splitlines(), device="NPU")
     assert verdict is not None and verdict.status is ProbeStatus.OK
 
 
@@ -199,7 +305,7 @@ def test_the_child_reports_a_typed_failure_as_json(
     code = main([str(tmp_path), "--device", "NPU"])
 
     assert code == 1
-    verdict = result_from_stdout(capsys.readouterr().out.splitlines())
+    verdict = result_from_stdout(capsys.readouterr().out.splitlines(), device="NPU")
     assert verdict is not None and verdict.status is ProbeStatus.FAILED
     assert verdict.diagnostic is not None
     assert verdict.diagnostic.code == "runtime.genai.load_failed"
@@ -219,7 +325,7 @@ def test_a_real_child_process_returns_a_verdict(tmp_path: Path) -> None:
     OpenVINO is installed -- what matters is that the verdict came back as JSON
     from the child rather than as a crash without one.
     """
-    tester = ChildProcessSmokeTester(SubprocessRunner())
+    tester = ChildProcessSmokeTester(smoke_child_runner())
 
     result = run(tester, tmp_path / "missing", timeout=120)
 

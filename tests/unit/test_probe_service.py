@@ -8,6 +8,7 @@ therefore about real behaviour, not about a mock.
 
 from __future__ import annotations
 
+import shlex
 import textwrap
 from collections.abc import Iterator, Mapping, Sequence
 from datetime import UTC, datetime
@@ -16,7 +17,7 @@ from pathlib import Path
 import pytest
 
 from tests.support import SmokeChildRunner
-from yonga.adapters.smoke_child import ChildProcessSmokeTester
+from yonga.adapters.smoke_child import ChildProcessSmokeTester, verdict_line
 from yonga.application.jobs import JobContext
 from yonga.application.probe import (
     DEFAULT_DEVICE_ORDER,
@@ -44,7 +45,12 @@ from yonga.domain.artifacts import (
     manifest_path,
     role_for_filename,
 )
-from yonga.domain.diagnostics import ConfigurationError, FailureCategory, Severity
+from yonga.domain.diagnostics import (
+    ConfigurationError,
+    ExitCode,
+    FailureCategory,
+    Severity,
+)
 from yonga.domain.models import PipelineKind
 from yonga.registry.loader import load_builtin_registry
 from yonga.registry.resolver import RegistryResolver
@@ -819,7 +825,7 @@ def test_a_small_pipeline_build_is_not_announced_as_slow(
 def ok_child_line(device: str = "NPU") -> str:
     """What ``python -m yonga.adapters.smoke_child`` prints after generating."""
     result = ProbeResult(device=device, status=ProbeStatus.OK, message="generated 24 token(s)")
-    return result.model_dump_json()
+    return verdict_line(result)
 
 
 def test_quick_never_builds_a_pipeline_and_reports_inconclusive(
@@ -852,6 +858,26 @@ def test_quick_never_builds_a_pipeline_and_reports_inconclusive(
     assert "deferred" in report.diagnostic.title
     assert any("--timeout" in step for step in report.diagnostic.remediation)
     assert not any("Building the GenAI pipeline" in event.message for event in sink.events)
+
+
+def test_quick_remediation_repeats_the_probe_as_a_command_that_can_be_pasted(
+    tmp_path: Path,
+) -> None:
+    """The reference is shell-quoted, and ``--all-submodels`` is kept."""
+    artifact = make_artifact(tmp_path / "my models")
+    write_manifest(artifact, repo_id="acme/model")
+    runtime = FakeRuntimeProbe(compile_errors={"NPU": NPU_DYNAMIC_SHAPE_ERROR})
+
+    outcome = service(runtime, tmp_path).probe_detailed(
+        str(artifact), device="npu", all_submodels=True, quick=True
+    )
+
+    found = outcome.reports[0].diagnostic
+    assert found is not None and found.code == "probe.inconclusive.quick"
+    settle, bounded = (step.split(": ", 1)[1] for step in found.remediation)
+    probe = ["yonga", "probe", str(artifact), "--device", "npu", "--all-submodels"]
+    assert shlex.split(settle) == probe
+    assert shlex.split(bounded) == [*probe, "--timeout", "SECONDS"]
 
 
 def test_quick_does_not_change_a_device_that_needs_no_pipeline(tmp_path: Path) -> None:
@@ -1022,6 +1048,27 @@ def test_quick_and_a_timeout_cannot_be_combined(tmp_path: Path) -> None:
         )
 
     assert raised.value.diagnostic.code == "probe.options.conflict"
+
+
+@pytest.mark.parametrize(
+    ("args", "code"),
+    [
+        (["--timeout", "0"], "probe.timeout.invalid"),
+        (["--timeout", "-1"], "probe.timeout.invalid"),
+        (["--timeout", "nan"], "probe.timeout.invalid"),
+        (["--quick", "--timeout", "5"], "probe.options.conflict"),
+    ],
+)
+def test_the_manual_entry_point_refuses_bad_options_with_70_not_2(
+    args: list[str], code: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """2 means inconclusive there, so an option error must not exit with it."""
+    from yonga.application.probe import main
+
+    assert main(["some-artifact", *args]) == int(ExitCode.REGISTRY)
+    captured = capsys.readouterr()
+    assert code in captured.err
+    assert captured.out == ""
 
 
 def test_a_timeout_without_a_child_process_tester_is_refused(tmp_path: Path) -> None:

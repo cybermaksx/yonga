@@ -58,6 +58,7 @@ from yonga.domain.plans import (
     QuantizationSettings,
     TempPlan,
 )
+from yonga.domain.publication import DeviceEvidence, LicenseAssessment, LicenseClass, PublishPlan
 from yonga.ui.tables import (
     SourceOption,
     artifact_list,
@@ -66,6 +67,7 @@ from yonga.ui.tables import (
     inspect_report,
     preparation_plan,
     probe_report,
+    publication_plan,
     registry_explanation,
 )
 
@@ -688,6 +690,40 @@ def test_every_probe_status_has_a_table_severity():
             submodels=[ProbeResult(device="CPU", role=SubmodelRole.LANGUAGE, status=status)],
         )
         assert status.value in render(probe_report([report]))
+
+
+def test_publication_plan_shows_an_inconclusive_device_as_neither_works_nor_failed():
+    plan = PublishPlan(
+        artifact_id="acme-model-npu-int4",
+        artifact_dir=Path("/artifacts/acme-model-npu-int4"),
+        repo_id="me/acme-model-npu-int4",
+        private=True,
+        repo_exists=False,
+        licenses=[
+            LicenseAssessment(
+                repo_id="acme/model",
+                role="source",
+                license="apache-2.0",
+                classification=LicenseClass.PERMISSIVE,
+            )
+        ],
+        devices=[
+            DeviceEvidence(device="CPU", status="ok"),
+            DeviceEvidence(
+                device="NPU", status="inconclusive", detail="probe.inconclusive.timeout"
+            ),
+            DeviceEvidence(device="GPU", status="not_tested"),
+        ],
+        files=[],
+    )
+
+    lines = render(publication_plan(plan)).splitlines()
+
+    npu = next(line for line in lines if "Device NPU" in line)
+    assert "inconclusive" in npu
+    assert "works" not in npu and "failed" not in npu
+    assert "works" in next(line for line in lines if "Device CPU" in line)
+    assert "not tested" in next(line for line in lines if "Device GPU" in line)
 
 
 def test_probe_report_handles_empty_inputs():

@@ -28,6 +28,8 @@ from __future__ import annotations
 
 import json
 import math
+import shlex
+import sys
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import suppress
 from datetime import UTC, datetime
@@ -657,6 +659,7 @@ class ProbeService:
                     tokenizer=tokenizer,
                     manifest=manifest,
                     reference=str(artifact_or_model),
+                    all_submodels=all_submodels,
                     quick=quick,
                     timeout=timeout,
                     ctx=ctx,
@@ -736,6 +739,7 @@ class ProbeService:
         tokenizer: ProbeResult | None,
         manifest: ArtifactManifest | None,
         reference: str,
+        all_submodels: bool,
         quick: bool,
         timeout: float | None,
         ctx: JobContext | None,
@@ -795,6 +799,7 @@ class ProbeService:
                     device,
                     deferred[0],
                     reference=reference,
+                    all_submodels=all_submodels,
                     timeout=None if smoke is None else timeout,
                 )
         elif smoke.status is ProbeStatus.OK:
@@ -1101,6 +1106,7 @@ def _inconclusive(
     deferred: ProbeResult,
     *,
     reference: str,
+    all_submodels: bool,
     timeout: float | None,
 ) -> Diagnostic:
     """Explain an unsettled deferred compile, and how to settle it.
@@ -1109,9 +1115,12 @@ def _inconclusive(
     ``timeout`` is the limit that stopped the pipeline build, or ``None`` when
     ``--quick`` never started one. The registry's diagnostic for the raw compile
     is deliberately not reused -- its fallback advice would read as a verdict
-    the probe does not have.
+    the probe does not have. The commands it suggests repeat the probe as it was
+    asked for, quoted so they can be pasted into a shell.
     """
-    command = f"yonga probe {reference} --device {device.lower()}"
+    command = f"yonga probe {shlex.quote(reference)} --device {shlex.quote(device.lower())}"
+    if all_submodels:
+        command += " --all-submodels"
     context = {"device": device}
     if deferred.diagnostic is not None:
         context["deferred_code"] = deferred.diagnostic.code
@@ -1185,18 +1194,18 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     ``--quick`` and ``--timeout`` behave as they do for ``yonga probe``. Exit 0
     when a device passed, 2 when nothing failed but something is inconclusive,
-    1 otherwise.
+    1 otherwise. An invalid ``--quick``/``--timeout`` combination is reported on
+    stderr and exits 70, as ``yonga probe`` does, so it is never mistaken for an
+    inconclusive probe; other argparse usage errors exit 2, as argparse's do.
     """
     import argparse
 
     from yonga.adapters.openvino_probe import OpenVINOProbe
-    from yonga.adapters.smoke_child import ChildProcessSmokeTester
-    from yonga.adapters.subprocess import SubprocessRunner
+    from yonga.adapters.smoke_child import ChildProcessSmokeTester, smoke_child_runner
     from yonga.application.wiring import GenAISmokeTester
     from yonga.config.settings import load_settings
     from yonga.registry.loader import load_builtin_registry
     from yonga.registry.resolver import RegistryResolver, installed_registry_versions
-    from yonga.util.redaction import environment_secrets
 
     parser = argparse.ArgumentParser(
         prog="python -m yonga.application.probe",
@@ -1219,13 +1228,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         type=float,
         default=None,
         metavar="SECONDS",
-        help="build the pipeline in a child process and stop it after SECONDS",
+        help=(
+            "bound the GenAI pipeline build that settles a deferred compile: run it in a "
+            "child process and stop it after SECONDS (the device is then inconclusive)"
+        ),
     )
     args = parser.parse_args(None if argv is None else list(argv))
     try:
         check_probe_options(quick=args.quick, timeout=args.timeout)
     except ConfigurationError as error:
-        parser.error(error.diagnostic.title)
+        found = error.diagnostic
+        print(f"{parser.prog}: {found.code}: {found.title}. {found.message}", file=sys.stderr)
+        return int(error.exit_code())
 
     settings = load_settings()
     resolver = RegistryResolver(load_builtin_registry(), versions=installed_registry_versions())
@@ -1235,9 +1249,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         LocalArtifactStore(settings.paths),
         settings,
         smoke_tester=GenAISmokeTester(),
-        isolated_smoke_tester=ChildProcessSmokeTester(
-            SubprocessRunner(extra_secrets=environment_secrets())
-        ),
+        isolated_smoke_tester=ChildProcessSmokeTester(smoke_child_runner()),
     )
     outcome = service.probe_detailed(
         args.artifact,
