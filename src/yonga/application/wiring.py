@@ -45,7 +45,7 @@ from yonga.application.chat import RuntimeFactory as ChatRuntimeFactory
 from yonga.application.doctor import DoctorService
 from yonga.application.inspect_model import InspectService
 from yonga.application.prepare import PrepareService, SmokeTester
-from yonga.application.probe import LocalArtifactStore, ProbeService
+from yonga.application.probe import IsolatedSmokeTester, LocalArtifactStore, ProbeService
 from yonga.application.progress import ProgressSink
 from yonga.application.publish import PublishService
 from yonga.application.search import SearchService
@@ -428,6 +428,16 @@ class Wiring:
         """Return the generation smoke test injected into ``prepare``."""
         return GenAISmokeTester()
 
+    def isolated_smoke_tester(self) -> IsolatedSmokeTester:
+        """Return the smoke test ``probe --timeout`` runs in a child process it can stop.
+
+        It shares the supervised :meth:`command_runner`, so the child's output is
+        redacted into the job log like any other process yonga starts.
+        """
+        from yonga.adapters.smoke_child import ChildProcessSmokeTester
+
+        return ChildProcessSmokeTester(self.command_runner())
+
     # ------------------------------------------------------------------
     # registry and artifacts
     # ------------------------------------------------------------------
@@ -556,6 +566,7 @@ class Wiring:
             self.readable_artifacts(),
             self._settings,
             smoke_tester=self.smoke_tester(),
+            isolated_smoke_tester=self.isolated_smoke_tester(),
         )
 
     def chat_service(self, *, progress: ProgressSink | None = None) -> ChatService:

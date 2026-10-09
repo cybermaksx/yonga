@@ -15,12 +15,15 @@ from pathlib import Path
 
 import pytest
 
+from tests.support import SmokeChildRunner
+from yonga.adapters.smoke_child import ChildProcessSmokeTester
 from yonga.application.jobs import JobContext
 from yonga.application.probe import (
     DEFAULT_DEVICE_ORDER,
     TOKENIZER_DEVICE,
     ArtifactStoreLike,
     LocalArtifactStore,
+    ProbeOutcome,
     ProbeService,
     resolve_artifact,
     role_device_matrix,
@@ -41,7 +44,7 @@ from yonga.domain.artifacts import (
     manifest_path,
     role_for_filename,
 )
-from yonga.domain.diagnostics import ConfigurationError, FailureCategory
+from yonga.domain.diagnostics import ConfigurationError, FailureCategory, Severity
 from yonga.domain.models import PipelineKind
 from yonga.registry.loader import load_builtin_registry
 from yonga.registry.resolver import RegistryResolver
@@ -286,9 +289,17 @@ def service(
     *,
     store: ArtifactStoreLike | None = None,
     smoke: FakeSmokeTester | None = None,
+    child: SmokeChildRunner | None = None,
 ) -> ProbeService:
-    """Build the service under test."""
-    return ProbeService(runtime, resolver(), store, make_settings(tmp_path), smoke_tester=smoke)
+    """Build the service under test; ``child`` scripts the ``--timeout`` child process."""
+    return ProbeService(
+        runtime,
+        resolver(),
+        store,
+        make_settings(tmp_path),
+        smoke_tester=smoke,
+        isolated_smoke_tester=None if child is None else ChildProcessSmokeTester(child),
+    )
 
 
 # --- role assignment ------------------------------------------------------------------
@@ -800,3 +811,301 @@ def test_a_small_pipeline_build_is_not_announced_as_slow(
     service(runtime, tmp_path, smoke=FakeSmokeTester()).probe(artifact, device="npu", ctx=ctx)
 
     assert not any("can take many minutes" in event.message for event in sink.events)
+
+
+# --- --quick and --timeout: a deferred device the probe chose not to settle ------------
+
+
+def ok_child_line(device: str = "NPU") -> str:
+    """What ``python -m yonga.adapters.smoke_child`` prints after generating."""
+    result = ProbeResult(device=device, status=ProbeStatus.OK, message="generated 24 token(s)")
+    return result.model_dump_json()
+
+
+def test_quick_never_builds_a_pipeline_and_reports_inconclusive(
+    tmp_path: Path, job_ctx: tuple[JobContext, CollectingSink]
+) -> None:
+    """``--quick`` stops at the raw compile: a deferred device is neither ok nor failed."""
+    artifact = make_artifact(tmp_path)
+    write_manifest(artifact, repo_id="acme/model")
+    runtime = FakeRuntimeProbe(compile_errors={"NPU": NPU_DYNAMIC_SHAPE_ERROR})
+    smoke = FakeSmokeTester()
+    ctx, sink = job_ctx
+
+    outcome = service(runtime, tmp_path, smoke=smoke).probe_detailed(
+        artifact, device="npu", quick=True, ctx=ctx
+    )
+
+    report = outcome.reports[0]
+    assert smoke.calls == []
+    assert report.status is ProbeStatus.INCONCLUSIVE
+    assert report.smoke_test is None
+    assert outcome.ok is False
+    assert outcome.inconclusive is True
+    assert outcome.quick is True
+    # The raw attempt stays on record, still marked deferred.
+    assert any(result.status is ProbeStatus.DEFERRED for result in report.submodels)
+    assert report.diagnostic is not None
+    assert report.diagnostic.code == "probe.inconclusive.quick"
+    assert report.diagnostic.severity is Severity.WARNING
+    assert report.diagnostic.context["deferred_code"] == "npu.compiler.dynamic_shape"
+    assert "deferred" in report.diagnostic.title
+    assert any("--timeout" in step for step in report.diagnostic.remediation)
+    assert not any("Building the GenAI pipeline" in event.message for event in sink.events)
+
+
+def test_quick_does_not_change_a_device_that_needs_no_pipeline(tmp_path: Path) -> None:
+    artifact = make_artifact(tmp_path)
+    smoke = FakeSmokeTester()
+
+    outcome = service(FakeRuntimeProbe(), tmp_path, smoke=smoke).probe_detailed(
+        artifact, device="gpu", quick=True
+    )
+
+    assert outcome.reports[0].status is ProbeStatus.OK
+    assert outcome.inconclusive is False
+    assert smoke.calls == []
+
+
+def test_quick_keeps_a_definite_failure_on_another_submodel(tmp_path: Path) -> None:
+    """An unsettled deferral never hides a submodel that failed outright."""
+    artifact = make_artifact(
+        tmp_path, ["openvino_language_model.xml", "openvino_vision_embeddings_model.xml"]
+    )
+    write_manifest(artifact, repo_id="acme/model", model_type="qwen3_5")
+    runtime = FakeRuntimeProbe(
+        compile_errors={
+            "NPU:openvino_language_model.xml": NPU_DYNAMIC_SHAPE_ERROR,
+            "NPU:openvino_vision_embeddings_model.xml": (
+                "OneShotBufferizeVPU2VPUIP failed : Only supports FP16."
+            ),
+        }
+    )
+
+    outcome = service(runtime, tmp_path).probe_detailed(
+        artifact, device="npu", all_submodels=True, quick=True
+    )
+
+    report = outcome.reports[0]
+    assert report.status is ProbeStatus.FAILED
+    assert outcome.inconclusive is False
+    assert report.diagnostic is not None
+    assert report.diagnostic.code == "npu.compiler.unsupported_graph.qwen35"
+    # The language model itself was never settled; only the vision encoder failed.
+    assert outcome.role_matrix() == {
+        "language": {"NPU": "inconclusive"},
+        "vision_embeddings": {"NPU": "failed"},
+    }
+
+
+def test_a_pipeline_build_stopped_at_the_timeout_is_inconclusive(
+    tmp_path: Path, job_ctx: tuple[JobContext, CollectingSink]
+) -> None:
+    """``--timeout`` runs the build in a child; stopping it is not a compiler verdict."""
+    artifact = make_artifact(tmp_path)
+    write_manifest(artifact, repo_id="acme/model")
+    runtime = FakeRuntimeProbe(compile_errors={"NPU": NPU_DYNAMIC_SHAPE_ERROR})
+    smoke = FakeSmokeTester()
+    child = SmokeChildRunner(timed_out=True, stderr=["[ERROR] [vpux-compiler] still compiling"])
+    ctx, sink = job_ctx
+
+    outcome = service(runtime, tmp_path, smoke=smoke, child=child).probe_detailed(
+        artifact, device="npu", timeout=30, ctx=ctx
+    )
+
+    report = outcome.reports[0]
+    assert smoke.calls == [], "a bounded build never runs in-process"
+    assert [timeout for _, timeout in child.calls] == [30]
+    assert report.status is ProbeStatus.INCONCLUSIVE
+    assert report.smoke_test is not None
+    assert report.smoke_test.status is ProbeStatus.INCONCLUSIVE
+    assert report.diagnostic is not None
+    assert report.diagnostic.code == "probe.inconclusive.timeout"
+    assert report.diagnostic.category is not FailureCategory.COMPILER_UNSUPPORTED_GRAPH
+    assert "30 s" in report.diagnostic.message
+    assert outcome.inconclusive is True
+    assert outcome.timeout_seconds == 30
+    assert outcome.role_matrix()["language"] == {"NPU": "inconclusive"}
+    assert any("child process stopped after 30 s" in event.message for event in sink.events)
+
+
+def test_a_child_that_generates_passes_the_device(tmp_path: Path) -> None:
+    artifact = make_artifact(tmp_path)
+    write_manifest(artifact, repo_id="acme/model")
+    runtime = FakeRuntimeProbe(compile_errors={"NPU": NPU_DYNAMIC_SHAPE_ERROR})
+    child = SmokeChildRunner(stdout=["[ INFO ] noise", ok_child_line()])
+
+    outcome = service(runtime, tmp_path, child=child).probe_detailed(
+        artifact, device="npu", timeout=600
+    )
+
+    report = outcome.reports[0]
+    assert report.status is ProbeStatus.OK
+    assert report.smoke_test is not None and report.smoke_test.ok
+    assert outcome.ok is True
+    assert outcome.role_matrix()["language"] == {"NPU": "ok"}
+
+
+def test_a_child_crash_is_a_failure_classified_by_the_registry(tmp_path: Path) -> None:
+    """No verdict from the child: its stderr is the raw text the registry reads."""
+    artifact = make_artifact(tmp_path)
+    write_manifest(artifact, repo_id="acme/model", model_type="qwen3_5")
+    runtime = FakeRuntimeProbe(compile_errors={"NPU": NPU_DYNAMIC_SHAPE_ERROR})
+    child = SmokeChildRunner(
+        stderr=["OneShotBufferizeVPU2VPUIP failed : Only supports FP16.", "Aborted"],
+        returncode=-6,
+    )
+
+    outcome = service(runtime, tmp_path, child=child).probe_detailed(
+        artifact, device="npu", timeout=600
+    )
+
+    report = outcome.reports[0]
+    assert report.status is ProbeStatus.FAILED
+    assert outcome.inconclusive is False
+    assert report.smoke_test is not None
+    assert report.smoke_test.status is ProbeStatus.FAILED
+    assert report.diagnostic is not None
+    assert report.diagnostic.code == "npu.compiler.unsupported_graph.qwen35"
+
+
+def test_without_a_timeout_the_pipeline_is_still_built_in_process(tmp_path: Path) -> None:
+    artifact = make_artifact(tmp_path)
+    write_manifest(artifact, repo_id="acme/model")
+    runtime = FakeRuntimeProbe(compile_errors={"NPU": NPU_DYNAMIC_SHAPE_ERROR})
+    smoke = FakeSmokeTester()
+    child = SmokeChildRunner(stdout=[ok_child_line()])
+
+    report = service(runtime, tmp_path, smoke=smoke, child=child).probe(artifact, device="npu")[0]
+
+    assert report.status is ProbeStatus.OK
+    assert len(smoke.calls) == 1
+    assert child.calls == []
+
+
+def test_the_slow_build_notice_names_the_options_that_bound_it(
+    tmp_path: Path, job_ctx: tuple[JobContext, CollectingSink]
+) -> None:
+    artifact = make_artifact(tmp_path)
+    write_manifest(artifact, repo_id="acme/model")
+    with (artifact / "openvino_model.bin").open("wb") as weights:
+        weights.truncate(3 * 2**30)  # sparse: no disk is actually used
+    runtime = FakeRuntimeProbe(compile_errors={"NPU": NPU_DYNAMIC_SHAPE_ERROR})
+    ctx, sink = job_ctx
+
+    service(runtime, tmp_path, smoke=FakeSmokeTester()).probe(artifact, device="npu", ctx=ctx)
+
+    notice = next(event.message for event in sink.events if "many minutes" in event.message)
+    assert "--timeout" in notice and "--quick" in notice
+
+
+@pytest.mark.parametrize("timeout", [0, -5, float("nan"), float("inf")])
+def test_a_timeout_must_be_a_positive_number_of_seconds(tmp_path: Path, timeout: float) -> None:
+    artifact = make_artifact(tmp_path)
+    child = SmokeChildRunner()
+
+    with pytest.raises(ConfigurationError) as raised:
+        service(FakeRuntimeProbe(), tmp_path, child=child).probe(
+            artifact, device="npu", timeout=timeout
+        )
+
+    assert raised.value.diagnostic.code == "probe.timeout.invalid"
+    assert child.calls == []
+
+
+def test_quick_and_a_timeout_cannot_be_combined(tmp_path: Path) -> None:
+    artifact = make_artifact(tmp_path)
+
+    with pytest.raises(ConfigurationError) as raised:
+        service(FakeRuntimeProbe(), tmp_path, child=SmokeChildRunner()).probe(
+            artifact, device="npu", quick=True, timeout=10
+        )
+
+    assert raised.value.diagnostic.code == "probe.options.conflict"
+
+
+def test_a_timeout_without_a_child_process_tester_is_refused(tmp_path: Path) -> None:
+    """Never a silent fall back to an unbounded in-process build."""
+    artifact = make_artifact(tmp_path)
+
+    with pytest.raises(ConfigurationError) as raised:
+        service(FakeRuntimeProbe(), tmp_path, smoke=FakeSmokeTester()).probe(
+            artifact, device="npu", timeout=10
+        )
+
+    assert raised.value.diagnostic.code == "probe.timeout.unavailable"
+
+
+def test_the_role_matrix_reads_an_inconclusive_device_as_inconclusive() -> None:
+    deferred = ProbeResult(device="NPU", role=SubmodelRole.LANGUAGE, status=ProbeStatus.DEFERRED)
+    reports = [
+        DeviceProbeReport(device="NPU", status=ProbeStatus.INCONCLUSIVE, submodels=[deferred]),
+        DeviceProbeReport(
+            device="GPU",
+            status=ProbeStatus.OK,
+            submodels=[
+                ProbeResult(device="GPU", role=SubmodelRole.LANGUAGE, status=ProbeStatus.OK)
+            ],
+        ),
+    ]
+
+    assert role_device_matrix(reports) == {"language": {"NPU": "inconclusive", "GPU": "ok"}}
+
+
+def test_inconclusive_ranks_between_ok_and_failed_in_the_role_matrix() -> None:
+    def result(role: SubmodelRole, status: ProbeStatus) -> ProbeResult:
+        return ProbeResult(device="NPU", role=role, status=status)
+
+    reports = [
+        DeviceProbeReport(
+            device="NPU",
+            status=ProbeStatus.FAILED,
+            submodels=[
+                result(SubmodelRole.LANGUAGE, ProbeStatus.OK),
+                result(SubmodelRole.LANGUAGE, ProbeStatus.INCONCLUSIVE),
+                result(SubmodelRole.VISION_EMBEDDINGS, ProbeStatus.FAILED),
+                result(SubmodelRole.VISION_EMBEDDINGS, ProbeStatus.INCONCLUSIVE),
+            ],
+        )
+    ]
+
+    assert role_device_matrix(reports) == {
+        "language": {"NPU": "inconclusive"},
+        "vision_embeddings": {"NPU": "failed"},
+    }
+
+
+def test_an_inconclusive_outcome_is_one_where_nothing_was_decided(tmp_path: Path) -> None:
+    def outcome(*statuses: ProbeStatus) -> ProbeOutcome:
+        names = ("NPU", "GPU", "CPU")
+        return ProbeOutcome(
+            artifact_dir=tmp_path,
+            reports=[
+                DeviceProbeReport(device=name, status=status)
+                for name, status in zip(names, statuses, strict=False)
+            ],
+        )
+
+    assert outcome(ProbeStatus.INCONCLUSIVE).inconclusive is True
+    assert outcome(ProbeStatus.INCONCLUSIVE, ProbeStatus.SKIPPED).inconclusive is True
+    assert outcome(ProbeStatus.INCONCLUSIVE, ProbeStatus.OK).inconclusive is False
+    assert outcome(ProbeStatus.INCONCLUSIVE, ProbeStatus.FAILED).inconclusive is False
+    assert outcome(ProbeStatus.FAILED).inconclusive is False
+
+
+def test_a_deferred_raw_compile_is_reported_as_deferred_not_as_an_error(
+    tmp_path: Path, job_ctx: tuple[JobContext, CollectingSink]
+) -> None:
+    """The progress line must not shout "failed" about a compile the pipeline decides."""
+    artifact = make_artifact(tmp_path)
+    write_manifest(artifact, repo_id="acme/model")
+    runtime = FakeRuntimeProbe(compile_errors={"NPU": NPU_DYNAMIC_SHAPE_ERROR})
+    ctx, sink = job_ctx
+
+    service(runtime, tmp_path).probe(artifact, device="npu", quick=True, ctx=ctx)
+
+    language = [event for event in sink.events if event.message == "language on NPU: deferred"]
+    assert len(language) == 1
+    assert language[0].status == "deferred"
+    assert language[0].severity is Severity.INFO
+    assert not any(event.message == "language on NPU: failed" for event in sink.events)

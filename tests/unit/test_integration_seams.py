@@ -89,6 +89,7 @@ LAZY_MODULES = (
     "yonga.adapters.hf",
     "yonga.adapters.openvino_probe",
     "yonga.adapters.runtime_genai",
+    "yonga.adapters.smoke_child",
     "yonga.adapters.subprocess",
     "yonga.adapters.system_linux",
 )

@@ -78,6 +78,8 @@ _PROBE_STATUS_SEVERITY: dict[ProbeStatus, Severity] = {
     ProbeStatus.NOT_ATTEMPTED: Severity.UNKNOWN,
     # Not an error on its own: the pipeline smoke test carries the verdict.
     ProbeStatus.DEFERRED: Severity.INFO,
+    # Neither a pass nor a failure: the probe stopped before it had evidence.
+    ProbeStatus.INCONCLUSIVE: Severity.WARNING,
 }
 
 

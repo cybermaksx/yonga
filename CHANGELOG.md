@@ -9,6 +9,26 @@ manifest may change in any minor release.
 
 ## [Unreleased]
 
+### Added
+
+- **`yonga probe --quick` and `--timeout SECONDS`.** Settling a deferred NPU compile means building
+  the GenAI pipeline, which for a 9B model ran past 15 minutes. `--quick` never builds it;
+  `--timeout` builds it in a child process (`python -P -m yonga.adapters.smoke_child`) and stops it
+  at the limit, since a native compile cannot be interrupted in-process. Either way an unsettled
+  device gets the new probe status `inconclusive`: never counted as working, never as a failure,
+  and shown as such in the tables, the role matrix, `--json` (`"inconclusive": true`) and a
+  published model card. A probe where nothing passed or failed outright exits 2. A child that dies
+  without a result is a failure classified by the registry from its stderr. Without either option
+  nothing changes, and `prepare` still always waits. `python -m yonga.application.probe` takes both
+  options too. `docs/CLI_SPEC.md` section 11.
+
+### Fixed
+
+- `yonga probe` no longer prints a deferred raw NPU compile as an error with its diagnostic while
+  it runs; the line now reads `deferred`, and the pipeline's result is the verdict.
+- `python -m yonga.application.probe` settles a deferred device by building the GenAI pipeline, as
+  `yonga probe` does. It had no smoke tester, so it reported every NPU LLM as failed.
+
 ## [0.3.0] - 2026-10-09
 
 ### Added

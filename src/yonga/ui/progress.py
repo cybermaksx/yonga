@@ -76,6 +76,8 @@ _STATUS_SEVERITY: dict[str, Severity] = {
     "skipped": Severity.INFO,
     "not_attempted": Severity.UNKNOWN,
     "unknown": Severity.UNKNOWN,
+    "deferred": Severity.INFO,
+    "inconclusive": Severity.WARNING,
     "warning": Severity.WARNING,
     "failed": Severity.ERROR,
     "error": Severity.ERROR,

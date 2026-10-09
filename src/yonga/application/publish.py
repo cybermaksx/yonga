@@ -423,6 +423,13 @@ def _evidence(device: str, report: DeviceProbeReport | None) -> DeviceEvidence:
         if smoke is not None and smoke.ok:
             detail += f"; generation smoke test passed ({smoke.message or 'ok'})"
         return DeviceEvidence(device=device, status="ok", detail=detail, attempted_at=when)
+    if report.status is ProbeStatus.INCONCLUSIVE:
+        # Not a pass and not a failure: the pipeline build that decides was
+        # skipped or stopped, so nothing is claimed in either direction.
+        detail = "the probe stopped before the GenAI pipeline settled it"
+        return DeviceEvidence(
+            device=device, status="inconclusive", detail=detail, attempted_at=when
+        )
     reason = report.diagnostic
     detail = f"`{reason.code}`: {reason.title}" if reason is not None else "the probe failed"
     return DeviceEvidence(device=device, status="failed", detail=detail, attempted_at=when)

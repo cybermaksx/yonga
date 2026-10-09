@@ -398,7 +398,18 @@ yonga probe ARTIFACT --device npu
 
 On the NPU a probe builds the real GenAI pipeline whenever the raw compile is inconclusive, which is
 every LLM. For a small model that takes seconds; for a 9B model it is a full NPU compilation and can
-take well over ten minutes and several GiB of RAM.
+take well over ten minutes and several GiB of RAM. Two options shorten that:
+
+```bash
+yonga probe ARTIFACT --device npu --quick         # raw compile only; a deferred device is inconclusive
+yonga probe ARTIFACT --device npu --timeout 600   # build in a child process, stop it after 600 s
+```
+
+`--quick` never builds the pipeline. `--timeout` builds it in a child process that can be stopped,
+because a native compile cannot be interrupted from inside yonga; a build stopped there is
+`inconclusive`, not a compiler verdict. An inconclusive device is neither working nor failed: when
+nothing passed and nothing failed outright, the probe exits 2, and `--json` says
+`"inconclusive": true`. Run it again without `--quick`, or with a longer `--timeout`, to settle it.
 
 In `--device auto` yonga *may* fall back — but only for a compatibility failure. A broken
 environment (permission denied, missing driver) stops instead of being hidden behind another device:
@@ -445,8 +456,9 @@ device or their input is missing; they never download anything. On the GPU they 
 with metrics, compile-cache reuse, the probe, streaming, `serve` (plain and SSE) and GPU logits
 against CPU. On the NPU they cover node access, a raw compile being deferred rather than taken as
 the verdict, a pipeline failure coming out typed instead of as exit 99, generation with
-string-valued properties, yonga's own probe passing an NPU LLM, and streaming with a second turn.
-`slow` selects `tests/hardware/test_gguf_import.py`, the real GGUF import from a cached GGUF file;
+string-valued properties, yonga's own probe passing an NPU LLM, streaming with a second turn, and
+`probe --quick` and `--timeout` coming back inconclusive rather than passed or failed. `slow`
+selects `tests/hardware/test_gguf_import.py`, the real GGUF import from a cached GGUF file;
 `large_model` selects `tests/hardware/test_vlm.py`, text chat through the VLM pipeline on the GPU.
 `docs/TESTING.md` section 6 lists each file and the input it needs.
 

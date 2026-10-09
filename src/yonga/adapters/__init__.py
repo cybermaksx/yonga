@@ -260,6 +260,7 @@ class CommandResult(Protocol):
     stdout_lines: Sequence[str]
     stderr_lines: Sequence[str]
     cancelled: bool
+    timed_out: bool
 
 
 @runtime_checkable

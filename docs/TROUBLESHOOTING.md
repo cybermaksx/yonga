@@ -38,7 +38,7 @@ From `docs/CLI_SPEC.md` section 15; the mapping from category to code lives in
 | Code | Meaning |
 |---|---|
 | 0 | success |
-| 2 | success with warnings (this is what `doctor` returns on a tmpfs `/tmp`) |
+| 2 | success with warnings (this is what `doctor` returns on a tmpfs `/tmp`); also `probe` when no device passed or failed and one is inconclusive (section 5.1) |
 | 10 | environment unusable (missing packages, driver, permission) |
 | 20 | model/source resolution failure |
 | 21 | authentication/gated access required |
@@ -185,7 +185,18 @@ failed pipeline means the graph is not NPU-compatible on this compiler, so run t
 
 Probing a large model on the NPU can take many minutes, because the pipeline build is a real NPU
 compilation of the whole model. An instant answer used to come from the raw compile, and it was
-wrong for every LLM.
+wrong for every LLM. When you cannot wait, choose what you give up:
+
+```bash
+yonga probe ARTIFACT --device npu --quick         # no pipeline build: NPU is inconclusive, exit 2
+yonga probe ARTIFACT --device npu --timeout 600   # pipeline built in a child, stopped after 600 s
+```
+
+Both report the NPU as `inconclusive` rather than guessing (`probe.inconclusive.quick`,
+`probe.inconclusive.timeout`, exit 2). That is not a compiler verdict, and it does not mean the
+NPU is broken: the pipeline that decides was never finished. A native compile cannot be
+interrupted inside a running process, which is why `--timeout` builds it in a child it can stop.
+To settle it, run the probe again without `--quick`, or with a longer `--timeout`.
 
 The dynamic-shape message is one form of this. Another, seen on this host by loading a Qwen3-0.6B
 artifact with `yonga chat ARTIFACT --device npu`, names the compiler pass instead:

@@ -645,6 +645,51 @@ def test_probe_report_shows_per_submodel_results():
     assert "NPU compile failed" in text
 
 
+def test_probe_report_shows_an_inconclusive_device_as_neither_ok_nor_failed():
+    reports = [
+        DeviceProbeReport(
+            device="NPU",
+            status=ProbeStatus.INCONCLUSIVE,
+            submodels=[
+                ProbeResult(
+                    device="NPU",
+                    role=SubmodelRole.LANGUAGE,
+                    status=ProbeStatus.DEFERRED,
+                    message="A raw compile on NPU is not conclusive for this graph",
+                )
+            ],
+            smoke_test=ProbeResult(
+                device="NPU",
+                status=ProbeStatus.INCONCLUSIVE,
+                duration_seconds=30.0,
+                message="the GenAI pipeline build did not finish within 30 s and was stopped",
+            ),
+            diagnostic=diagnostic(
+                "probe.inconclusive.timeout",
+                FailureCategory.UNKNOWN_RUNTIME_ERROR,
+                "NPU is inconclusive: the pipeline build hit --timeout",
+                "This is not a compiler verdict.",
+                severity=Severity.WARNING,
+            ),
+        )
+    ]
+    text = render(probe_report(reports))
+    assert "inconclusive" in text
+    assert "did not finish within 30 s" in text
+    assert "failed" not in text
+    assert " ok" not in text
+
+
+def test_every_probe_status_has_a_table_severity():
+    for status in ProbeStatus:
+        report = DeviceProbeReport(
+            device="CPU",
+            status=status,
+            submodels=[ProbeResult(device="CPU", role=SubmodelRole.LANGUAGE, status=status)],
+        )
+        assert status.value in render(probe_report([report]))
+
+
 def test_probe_report_handles_empty_inputs():
     assert "No device probes" in render(probe_report([]))
     assert "nothing probed" in render(probe_report([DeviceProbeReport(device="CPU")]))

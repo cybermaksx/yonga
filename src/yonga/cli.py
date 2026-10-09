@@ -49,11 +49,11 @@ from yonga.application.jobs import (
     open_job,
     sweep_managed_workspaces,
 )
-from yonga.application.probe import ProbeOutcome
+from yonga.application.probe import ProbeOutcome, check_probe_options
 from yonga.application.progress import ProgressSink, null_sink
 from yonga.application.wiring import Wiring, WiringFactory
 from yonga.config.settings import Settings, load_settings
-from yonga.domain.artifacts import ArtifactSummary
+from yonga.domain.artifacts import ArtifactSummary, DeviceProbeReport, ProbeStatus
 from yonga.domain.compatibility import (
     CompatibilityDecision,
     DeviceStatus,
@@ -1011,16 +1011,46 @@ def probe(
     all_submodels: bool = typer.Option(
         False, "--all-submodels", help="Compile every submodel, not only the language model."
     ),
+    quick: bool = typer.Option(
+        False,
+        "--quick",
+        help="Never build the GenAI pipeline; a deferred raw compile is reported inconclusive.",
+    ),
+    timeout: float | None = typer.Option(
+        None,
+        "--timeout",
+        metavar="SECONDS",
+        help="Build the pipeline in a child process and give up after SECONDS (inconclusive).",
+    ),
     json_output: bool = typer.Option(False, "--json", help="Emit the report as JSON."),
 ) -> None:
     """Compile a prepared artifact on a device and report what worked."""
     state = cli_state(ctx, json_output=json_output)
-    _dispatch(state, lambda: _probe(state, artifact, device=device, all_submodels=all_submodels))
+    _dispatch(
+        state,
+        lambda: _probe(
+            state,
+            artifact,
+            device=device,
+            all_submodels=all_submodels,
+            quick=quick,
+            timeout=timeout,
+        ),
+    )
 
 
-def _probe(state: CliState, artifact: str, *, device: str, all_submodels: bool) -> ExitCode:
+def _probe(
+    state: CliState,
+    artifact: str,
+    *,
+    device: str,
+    all_submodels: bool,
+    quick: bool = False,
+    timeout: float | None = None,
+) -> ExitCode:
     """Run the per-submodel probe (``docs/CLI_SPEC.md`` section 11)."""
     target = _device(device) or "auto"
+    check_probe_options(quick=quick, timeout=timeout)
     service = state.graph.probe_service()
     with open_job(
         settings=state.settings,
@@ -1032,29 +1062,51 @@ def _probe(state: CliState, artifact: str, *, device: str, all_submodels: bool) 
         state.job = job
         with _quiet_native_stdout(state.json_mode):
             outcome = service.probe_detailed(
-                artifact, device=target, all_submodels=all_submodels, ctx=job
+                artifact,
+                device=target,
+                all_submodels=all_submodels,
+                quick=quick,
+                timeout=timeout,
+                ctx=job,
             )
     if state.json_mode:
         payload = outcome.model_dump(mode="json")
         payload["role_matrix"] = outcome.role_matrix()
+        payload["inconclusive"] = outcome.inconclusive
         state.emit(payload, ok=outcome.ok)
         return _probe_exit(outcome)
     state.console.print(tables.probe_report(outcome.reports))
     for note in outcome.notes:
         state.console.print_error(note, style="dim")
     if not outcome.ok:
-        for report in outcome.reports:
+        # The explanation shown is the one the exit code comes from: a definite
+        # failure first, an inconclusive device only when nothing failed.
+        for report in _probe_verdict_order(outcome):
             if report.diagnostic is not None:
                 state.console.diagnostic(report.diagnostic)
                 break
     return _probe_exit(outcome)
 
 
+def _probe_verdict_order(outcome: ProbeOutcome) -> list[DeviceProbeReport]:
+    """The reports, inconclusive ones last: they are never the reason for a failure."""
+    return sorted(outcome.reports, key=lambda report: report.status is ProbeStatus.INCONCLUSIVE)
+
+
 def _probe_exit(outcome: ProbeOutcome) -> ExitCode:
-    """Exit 0 when a device worked, otherwise the first failure's own code."""
+    """Exit 0 when a device worked, otherwise the first failure's own code.
+
+    A device left inconclusive by ``--quick`` or ``--timeout`` is not a failure:
+    when nothing failed outright the probe exits 2, a warning, so a script can
+    tell "not settled" from both "works" and "does not work".
+    """
     if outcome.ok:
         return ExitCode.SUCCESS
-    for report in outcome.reports:
+    if outcome.inconclusive:
+        return ExitCode.WARNINGS
+    for report in _probe_verdict_order(outcome):
+        if report.status is ProbeStatus.INCONCLUSIVE:
+            continue
         if report.diagnostic is not None:
             # A probe that failed is a compilation failure by definition. An
             # unclassified diagnostic must not surface as exit 99 ("yonga hit a

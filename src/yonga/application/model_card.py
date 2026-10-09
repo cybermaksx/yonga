@@ -7,8 +7,9 @@ constrained by ``SPEC.md`` section 21:
 * a quantized conversion is described as one, and the card says in plain words
   that no weights were trained;
 * a device appears as supported only when its probe passed; a failed probe is
-  listed as failed with its diagnostic code, and a device never probed is
-  listed as not tested, never as unsupported and never as working;
+  listed as failed with its diagnostic code, an inconclusive probe is listed
+  as inconclusive, and a device never probed is listed as not tested -- none
+  of these as unsupported and none as working;
 * every repair is disclosed with the files it changed and their digests;
 * every file is listed with its SHA-256.
 
@@ -194,9 +195,12 @@ def render_model_card(
     lines += ["## Tested hardware and software", ""]
     lines += ["| Device | Result | Evidence | Date |", "|---|---|---|---|"]
     for evidence in devices:
-        result = {"ok": "works", "failed": "**failed**", "not_tested": "not tested"}.get(
-            evidence.status, evidence.status
-        )
+        result = {
+            "ok": "works",
+            "failed": "**failed**",
+            "inconclusive": "inconclusive",
+            "not_tested": "not tested",
+        }.get(evidence.status, evidence.status)
         lines.append(
             f"| {evidence.device} | {result} | {evidence.detail or '—'} "
             f"| {evidence.attempted_at or '—'} |"
@@ -217,10 +221,15 @@ def render_model_card(
         lines += [f"- {key}: {value}" for key, value in present]
         lines.append("")
     failed = [d for d in devices if d.status == "failed"]
+    unsettled = [d for d in devices if d.status == "inconclusive"]
     untested = [d for d in devices if d.status == "not_tested"]
-    if failed or untested:
+    if failed or unsettled or untested:
         lines += ["### Not supported or not tested", ""]
         lines += [f"- **{d.device}: failed.** {d.detail}" for d in failed]
+        lines += [
+            f"- **{d.device}: inconclusive.** The probe was not completed; nothing is claimed."
+            for d in unsettled
+        ]
         lines += [
             f"- **{d.device}: not tested.** No probe was run; nothing is claimed." for d in untested
         ]

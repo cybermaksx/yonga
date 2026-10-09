@@ -27,7 +27,8 @@ development (``docs/MODEL_PIPELINE.md`` section 10).
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable, Mapping, Sequence
+import math
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
@@ -51,6 +52,7 @@ from yonga.domain.artifacts import (
 )
 from yonga.domain.compatibility import DeviceStatus
 from yonga.domain.diagnostics import (
+    CancelledError,
     ConfigurationError,
     Diagnostic,
     FailureCategory,
@@ -71,9 +73,12 @@ __all__ = [
     "DEFAULT_DEVICE_ORDER",
     "TOKENIZER_DEVICE",
     "ArtifactStoreLike",
+    "IsolatedSmokeTester",
     "LocalArtifactStore",
     "ProbeOutcome",
     "ProbeService",
+    "check_probe_options",
+    "guard_smoke_test",
     "main",
     "resolve_artifact",
     "role_device_matrix",
@@ -99,6 +104,7 @@ _STATUS_SEVERITY: Mapping[ProbeStatus, int] = {
     ProbeStatus.DEFERRED: 1,
     ProbeStatus.SKIPPED: 1,
     ProbeStatus.NOT_ATTEMPTED: 2,
+    ProbeStatus.INCONCLUSIVE: 2,
     ProbeStatus.FAILED: 3,
 }
 
@@ -156,6 +162,101 @@ def resolve_artifact(store: ArtifactStoreLike, reference: str | Path) -> Path:
             context={"reference": str(reference)},
         )
     )
+
+
+@runtime_checkable
+class IsolatedSmokeTester(Protocol):
+    """Runs the generation smoke test in a child process it can stop.
+
+    ``yonga probe --timeout`` depends on this port: a native NPU compile cannot
+    be interrupted in-process, so a bounded pipeline build has to run where a
+    signal can end it. Implemented by
+    :class:`~yonga.adapters.smoke_child.ChildProcessSmokeTester`.
+    """
+
+    def smoke_test(
+        self,
+        artifact_dir: Path,
+        *,
+        device: str,
+        pipeline: PipelineKind,
+        properties: Mapping[str, str],
+        prompt: str,
+        max_new_tokens: int,
+        timeout: float,
+        ctx: JobContext | None = None,
+    ) -> ProbeResult:
+        """Build the pipeline and generate, giving up after ``timeout`` seconds.
+
+        Returns ``ok`` or ``failed`` as :class:`~yonga.application.prepare.SmokeTester`
+        does, with a failure's raw text left for the registry to classify, and
+        :attr:`~yonga.domain.artifacts.ProbeStatus.INCONCLUSIVE` when the time
+        limit stopped the build. Raises
+        :class:`~yonga.domain.diagnostics.CancelledError` when the job is
+        cancelled while the child runs.
+        """
+        ...
+
+
+def check_probe_options(*, quick: bool, timeout: float | None) -> None:
+    """Reject a ``--quick``/``--timeout`` combination that cannot mean anything.
+
+    ``timeout`` must be a finite number of seconds above zero, and it cannot be
+    combined with ``quick``: a quick probe never builds the pipeline the timeout
+    would bound.
+    """
+    if timeout is not None and not (math.isfinite(timeout) and timeout > 0):
+        raise ConfigurationError(
+            diagnostic(
+                "probe.timeout.invalid",
+                FailureCategory.CONFIGURATION_ERROR,
+                "The probe timeout must be a positive number of seconds",
+                f"--timeout {timeout:g} cannot bound a pipeline build.",
+                remediation=["Pass a number of seconds above zero, for example --timeout 600."],
+                context={"timeout": f"{timeout:g}"},
+            )
+        )
+    if quick and timeout is not None:
+        raise ConfigurationError(
+            diagnostic(
+                "probe.options.conflict",
+                FailureCategory.CONFIGURATION_ERROR,
+                "--quick and --timeout cannot be combined",
+                "A quick probe never builds the GenAI pipeline, so there is nothing for "
+                "--timeout to bound.",
+                remediation=[
+                    "Drop --timeout for the raw compile only.",
+                    "Drop --quick to settle a deferred device within the timeout.",
+                ],
+            )
+        )
+
+
+def guard_smoke_test(device: str, run: Callable[[], ProbeResult]) -> ProbeResult:
+    """Run one smoke test and turn whatever it raises into a failed result.
+
+    A typed failure keeps its diagnostic; anything else keeps its redacted
+    text for the registry. Cancellation is not a result and propagates. Shared
+    by the in-process probe and the child process, so both report a failure
+    the same way.
+    """
+    try:
+        return run()
+    except CancelledError:
+        raise
+    except YongaError as error:
+        return ProbeResult(
+            device=device,
+            status=ProbeStatus.FAILED,
+            diagnostic=error.diagnostic,
+            message=error.diagnostic.message,
+        )
+    except Exception as exc:
+        return ProbeResult(
+            device=device,
+            status=ProbeStatus.FAILED,
+            message=redact_text(f"{type(exc).__name__}: {exc}"),
+        )
 
 
 class LocalArtifactStore:
@@ -259,6 +360,10 @@ class ProbeOutcome(BaseModel):
 
     artifact_dir: Path
     requested_device: str = _AUTO
+    quick: bool = False
+    """``--quick``: no GenAI pipeline was built, so a deferred device is inconclusive."""
+    timeout_seconds: float | None = None
+    """``--timeout``: the bound on a pipeline build, which then ran in a child process."""
     candidates: list[str] = Field(default_factory=list)
     irs: list[IRDescription] = Field(default_factory=list)
     reports: list[DeviceProbeReport] = Field(default_factory=list)
@@ -269,6 +374,18 @@ class ProbeOutcome(BaseModel):
     def ok(self) -> bool:
         """True when at least one probed device compiled everything it was given."""
         return any(report.ok for report in self.reports)
+
+    @property
+    def inconclusive(self) -> bool:
+        """True when no device passed, none failed outright, and one is inconclusive.
+
+        That is a ``--quick`` or ``--timeout`` probe that settled nothing: a
+        warning, not a failure, and never a pass.
+        """
+        if self.ok:
+            return False
+        statuses = {report.status for report in self.reports}
+        return ProbeStatus.INCONCLUSIVE in statuses and ProbeStatus.FAILED not in statuses
 
     @property
     def working_devices(self) -> list[str]:
@@ -291,15 +408,17 @@ def role_device_matrix(reports: Iterable[DeviceProbeReport]) -> dict[str, dict[s
 
     A :attr:`ProbeStatus.DEFERRED` raw compile reads as the device's verdict:
     deferral means the pipeline decides, so a role the GenAI pipeline ran is
-    ``ok`` and one it could not run is ``failed``. The pipeline smoke test itself
-    covers the whole model rather than one role, so it has no row of its own.
+    ``ok``, one it could not run is ``failed``, and one whose pipeline was never
+    built or was stopped at ``--timeout`` is ``inconclusive``. The pipeline smoke
+    test itself covers the whole model rather than one role, so it has no row of
+    its own.
     """
     matrix: dict[str, dict[str, str]] = {}
     for report in reports:
         for result in report.submodels:
             status = result.status
             if status is ProbeStatus.DEFERRED:
-                status = ProbeStatus.OK if report.status is ProbeStatus.OK else ProbeStatus.FAILED
+                status = _deferred_verdict(report)
             role = (result.role or SubmodelRole.OTHER).value
             per_device = matrix.setdefault(role, {})
             previous = per_device.get(result.device)
@@ -310,6 +429,18 @@ def role_device_matrix(reports: Iterable[DeviceProbeReport]) -> dict[str, dict[s
             if _STATUS_SEVERITY[status] > previous_rank:
                 per_device[result.device] = status.value
     return matrix
+
+
+def _deferred_verdict(report: DeviceProbeReport) -> ProbeStatus:
+    """What a deferred raw compile amounts to, given its device's report."""
+    if report.status in (ProbeStatus.OK, ProbeStatus.INCONCLUSIVE):
+        return report.status
+    smoke = report.smoke_test
+    if smoke is None or smoke.status is ProbeStatus.INCONCLUSIVE:
+        # The device failed on another submodel, and this one was never settled:
+        # ``--quick`` built no pipeline, or ``--timeout`` stopped it.
+        return ProbeStatus.INCONCLUSIVE
+    return ProbeStatus.FAILED
 
 
 # --- the service ----------------------------------------------------------------------
@@ -325,6 +456,7 @@ class ProbeService:
         artifact_store: ArtifactStoreLike | None = None,
         settings: Settings | None = None,
         smoke_tester: SmokeTester | None = None,
+        isolated_smoke_tester: IsolatedSmokeTester | None = None,
     ) -> None:
         """Wire the service to its adapters.
 
@@ -336,11 +468,16 @@ class ProbeService:
         settle a raw compile the registry marks ``defer_to_pipeline`` -- a probe
         stays a cheap compile check otherwise. Without one, a deferred failure
         leaves the device unproven rather than passed.
+
+        ``isolated_smoke_tester`` builds the same pipeline in a child process,
+        and is used instead of ``smoke_tester`` only when a probe is given a
+        ``timeout``: that is the only way to stop a native compile part-way.
         """
         self._runtime = runtime_probe
         self._resolver = registry_resolver
         self._settings = settings
         self._smoke = smoke_tester
+        self._isolated = isolated_smoke_tester
         paths = None if settings is None else settings.paths
         self._store: ArtifactStoreLike = artifact_store or LocalArtifactStore(paths)
 
@@ -436,6 +573,8 @@ class ProbeService:
         *,
         device: str = _AUTO,
         all_submodels: bool = False,
+        quick: bool = False,
+        timeout: float | None = None,
         ctx: JobContext | None = None,
     ) -> list[DeviceProbeReport]:
         """Probe an artifact and return one report per device that was tried.
@@ -444,11 +583,20 @@ class ProbeService:
         numeric IR in the artifact is compiled; by default only the language
         model is, which is the cheap answer to "can this run here at all".
         Tokenizers are always probed, always on CPU.
+
+        A raw compile the registry defers to the GenAI pipeline is settled by
+        building that pipeline, which for a large model on the NPU takes many
+        minutes. ``quick`` never builds it and reports such a device
+        :attr:`~yonga.domain.artifacts.ProbeStatus.INCONCLUSIVE`; ``timeout``
+        builds it in a child process and stops it after that many seconds,
+        which is inconclusive too. The two cannot be combined.
         """
         return self.probe_detailed(
             artifact_or_model,
             device=device,
             all_submodels=all_submodels,
+            quick=quick,
+            timeout=timeout,
             ctx=ctx,
         ).reports
 
@@ -458,9 +606,26 @@ class ProbeService:
         *,
         device: str = _AUTO,
         all_submodels: bool = False,
+        quick: bool = False,
+        timeout: float | None = None,
         ctx: JobContext | None = None,
     ) -> ProbeOutcome:
-        """Probe an artifact and return the reports together with the IR inventory."""
+        """Probe an artifact and return the reports together with the IR inventory.
+
+        ``quick`` and ``timeout`` are described on :meth:`probe`.
+        """
+        check_probe_options(quick=quick, timeout=timeout)
+        if timeout is not None and self._isolated is None:
+            raise ConfigurationError(
+                diagnostic(
+                    "probe.timeout.unavailable",
+                    FailureCategory.CONFIGURATION_ERROR,
+                    "This probe cannot bound a pipeline build",
+                    "--timeout needs a smoke tester that runs in a child process, and none "
+                    "is configured here.",
+                    remediation=["Run the probe without --timeout, or with --quick."],
+                )
+            )
         artifact_dir = resolve_artifact(self._store, artifact_or_model)
         manifest = self._store.manifest_for(artifact_dir)
         notes: list[str] = []
@@ -491,6 +656,9 @@ class ProbeService:
                     targets=numeric,
                     tokenizer=tokenizer,
                     manifest=manifest,
+                    reference=str(artifact_or_model),
+                    quick=quick,
+                    timeout=timeout,
                     ctx=ctx,
                 )
             )
@@ -498,6 +666,8 @@ class ProbeService:
         return ProbeOutcome(
             artifact_dir=artifact_dir,
             requested_device=(device or _AUTO).strip() or _AUTO,
+            quick=quick,
+            timeout_seconds=timeout,
             candidates=candidates,
             irs=irs,
             reports=reports,
@@ -565,6 +735,9 @@ class ProbeService:
         targets: Sequence[IRDescription],
         tokenizer: ProbeResult | None,
         manifest: ArtifactManifest | None,
+        reference: str,
+        quick: bool,
+        timeout: float | None,
         ctx: JobContext | None,
     ) -> DeviceProbeReport:
         """Compile every numeric target on one device and build its report.
@@ -572,7 +745,10 @@ class ProbeService:
         A raw failure the registry marks ``defer_to_pipeline`` is recorded as
         :attr:`ProbeStatus.DEFERRED` and settled by building the GenAI pipeline:
         the device passes only if that pipeline generates. With no pipeline
-        evidence the device is reported failed, never passed by default.
+        evidence the device is reported failed, never passed by default -- except
+        when the probe itself chose not to wait for that evidence (``quick``, or a
+        build stopped at ``timeout``): then it is
+        :attr:`ProbeStatus.INCONCLUSIVE`, unless another submodel already failed.
         """
         results: list[ProbeResult] = []
         total = len(targets)
@@ -584,11 +760,7 @@ class ProbeService:
                 current=index,
                 total=total,
             )
-            results.append(
-                _defer_if_marked(
-                    self._probe_one(ir, device=device, manifest=manifest, ctx=ctx), device
-                )
-            )
+            results.append(self._probe_one(ir, device=device, manifest=manifest, ctx=ctx))
         if tokenizer is not None:
             # Carried into every device report on purpose: the tokenizer is part
             # of the pipeline on any device, and its own ``device`` field keeps
@@ -605,9 +777,27 @@ class ProbeService:
                 attempted_at=_now(),
             )
 
-        smoke = self._settle_on_pipeline(artifact_dir, device, manifest=manifest, ctx=ctx)
         others = [result for result in results if result.status is not ProbeStatus.DEFERRED]
-        if smoke.status is ProbeStatus.OK:
+        smoke = (
+            None
+            if quick
+            else self._settle_on_pipeline(
+                artifact_dir, device, manifest=manifest, timeout=timeout, ctx=ctx
+            )
+        )
+        if smoke is None or smoke.status is ProbeStatus.INCONCLUSIVE:
+            if _report_status(others) is ProbeStatus.FAILED:
+                status = ProbeStatus.FAILED
+                verdict = _first_diagnostic(others)
+            else:
+                status = ProbeStatus.INCONCLUSIVE
+                verdict = _inconclusive(
+                    device,
+                    deferred[0],
+                    reference=reference,
+                    timeout=None if smoke is None else timeout,
+                )
+        elif smoke.status is ProbeStatus.OK:
             status = _report_status([*others, smoke])
             verdict = _first_diagnostic(others)
         elif smoke.status is ProbeStatus.FAILED:
@@ -644,6 +834,7 @@ class ProbeService:
         device: str,
         *,
         manifest: ArtifactManifest | None,
+        timeout: float | None,
         ctx: JobContext | None,
     ) -> ProbeResult:
         """Build the GenAI pipeline on ``device`` and generate a few tokens.
@@ -652,51 +843,68 @@ class ProbeService:
         were recorded for this same device: a GPU artifact's
         ``ATTENTION_BACKEND=SDPA`` means nothing to the NPU, whose pipeline falls
         back to GenAI's own static-shape defaults.
+
+        With a ``timeout`` the build runs in a child process, and one stopped at
+        the limit comes back :attr:`ProbeStatus.INCONCLUSIVE`. Either way a
+        failure is classified by the registry from its raw text.
         """
         from yonga.application.prepare import SMOKE_MAX_NEW_TOKENS, SMOKE_PROMPT
 
-        if self._smoke is None:
-            return ProbeResult(
-                device=device,
-                status=ProbeStatus.SKIPPED,
-                message="no GenAI pipeline smoke tester is configured",
-            )
         pipeline = PipelineKind.UNKNOWN if manifest is None else manifest.pipeline
         runtime = None if manifest is None else manifest.recommended_runtime
         properties: dict[str, str] = {}
         if runtime is not None and normalise_device(runtime.device) == normalise_device(device):
             properties = dict(runtime.properties)
+
+        isolated, smoke = self._isolated, self._smoke
+        if timeout is not None and isolated is not None:
+            limit = timeout
+
+            def run() -> ProbeResult:
+                return isolated.smoke_test(
+                    artifact_dir,
+                    device=device,
+                    pipeline=pipeline,
+                    properties=properties,
+                    prompt=SMOKE_PROMPT,
+                    max_new_tokens=SMOKE_MAX_NEW_TOKENS,
+                    timeout=limit,
+                    ctx=ctx,
+                )
+
+        elif timeout is None and smoke is not None:
+
+            def run() -> ProbeResult:
+                return smoke.smoke_test(
+                    artifact_dir,
+                    device=device,
+                    pipeline=pipeline,
+                    properties=properties,
+                    prompt=SMOKE_PROMPT,
+                    max_new_tokens=SMOKE_MAX_NEW_TOKENS,
+                )
+
+        else:
+            return ProbeResult(
+                device=device,
+                status=ProbeStatus.SKIPPED,
+                message="no GenAI pipeline smoke tester is configured",
+            )
+
         weights = _weight_bytes(artifact_dir)
         notice = f"Building the GenAI pipeline on {device} to settle the probe"
+        if timeout is not None:
+            notice += f", in a child process stopped after {timeout:g} s"
         if weights >= _SLOW_PIPELINE_BUILD_BYTES:
             # Measured on the reference host: a 9B INT4 model's NPU build ran
             # past 15 minutes at ~9 GiB RSS. Say so before the wait, not after.
             notice += (
                 f" -- this compiles {weights / 2**30:.1f} GiB of weights and can take many minutes"
             )
+            if timeout is None:
+                notice += "; --timeout SECONDS bounds the wait and --quick skips the build"
         self._emit(ctx, notice, device=device)
-        try:
-            result = self._smoke.smoke_test(
-                artifact_dir,
-                device=device,
-                pipeline=pipeline,
-                properties=properties,
-                prompt=SMOKE_PROMPT,
-                max_new_tokens=SMOKE_MAX_NEW_TOKENS,
-            )
-        except YongaError as error:
-            result = ProbeResult(
-                device=device,
-                status=ProbeStatus.FAILED,
-                diagnostic=error.diagnostic,
-                message=error.diagnostic.message,
-            )
-        except Exception as exc:
-            result = ProbeResult(
-                device=device,
-                status=ProbeStatus.FAILED,
-                message=redact_text(f"{type(exc).__name__}: {exc}"),
-            )
+        result = guard_smoke_test(device, run)
         if result.status is ProbeStatus.FAILED:
             # Registry first, even over a diagnostic the adapter attached: a
             # pipeline load failure arrives generic, and only the registry
@@ -754,6 +962,9 @@ class ProbeService:
             )
         if result.role is None:
             result = result.model_copy(update={"role": ir.role})
+        # Re-labelled before it is reported, so a raw failure the pipeline is
+        # about to overrule -- or that --quick leaves open -- is not shown as an error.
+        result = _defer_if_marked(result, device)
         self._emit_result(result, ctx=ctx)
         return result
 
@@ -831,11 +1042,20 @@ class ProbeService:
         """Report one finished probe."""
         if ctx is None:
             return
-        severity = Severity.OK if result.ok else Severity.ERROR
+        if result.ok:
+            severity = Severity.OK
+        elif result.status is ProbeStatus.DEFERRED:
+            severity = Severity.INFO
+        elif result.status is ProbeStatus.INCONCLUSIVE:
+            severity = Severity.WARNING
+        else:
+            severity = Severity.ERROR
         role = (result.role or SubmodelRole.OTHER).value
+        # A result without a role is the pipeline smoke test, which covers the whole model.
+        label = role if result.role is not None else "pipeline smoke test"
         ctx.emit(
             ProgressKind.PROBE,
-            f"{role} on {result.device}: {result.status.value}",
+            f"{label} on {result.device}: {result.status.value}",
             device=result.device,
             status=result.status.value,
             severity=severity,
@@ -876,6 +1096,62 @@ def _defer_if_marked(result: ProbeResult, device: str) -> ProbeResult:
     )
 
 
+def _inconclusive(
+    device: str,
+    deferred: ProbeResult,
+    *,
+    reference: str,
+    timeout: float | None,
+) -> Diagnostic:
+    """Explain an unsettled deferred compile, and how to settle it.
+
+    A warning, not a failure: nothing was learned about the model on ``device``.
+    ``timeout`` is the limit that stopped the pipeline build, or ``None`` when
+    ``--quick`` never started one. The registry's diagnostic for the raw compile
+    is deliberately not reused -- its fallback advice would read as a verdict
+    the probe does not have.
+    """
+    command = f"yonga probe {reference} --device {device.lower()}"
+    context = {"device": device}
+    if deferred.diagnostic is not None:
+        context["deferred_code"] = deferred.diagnostic.code
+    if timeout is None:
+        return diagnostic(
+            "probe.inconclusive.quick",
+            FailureCategory.UNKNOWN_RUNTIME_ERROR,
+            f"{device} is inconclusive: the raw compile was deferred",
+            (
+                f"A raw compile on {device} is not conclusive for this graph, and the GenAI "
+                "pipeline that decides was not built because of --quick. Nothing is known yet "
+                f"about whether this model runs on {device}."
+            ),
+            severity=Severity.WARNING,
+            remediation=[
+                f"Settle it by building the pipeline: {command}",
+                f"Or bound the wait: {command} --timeout SECONDS",
+            ],
+            context=context,
+        )
+    context["timeout"] = f"{timeout:g}"
+    return diagnostic(
+        "probe.inconclusive.timeout",
+        FailureCategory.UNKNOWN_RUNTIME_ERROR,
+        f"{device} is inconclusive: the pipeline build hit --timeout",
+        (
+            f"A raw compile on {device} is not conclusive for this graph, and the GenAI "
+            f"pipeline that decides did not finish building within {timeout:g} s, so it was "
+            "stopped. This is not a compiler verdict: a large model can take many minutes "
+            f"to compile for {device}."
+        ),
+        severity=Severity.WARNING,
+        remediation=[
+            f"Allow it longer: {command} --timeout {max(timeout * 4, 600):g}",
+            f"Or wait for it without a limit: {command}",
+        ],
+        context=context,
+    )
+
+
 def _report_status(results: Sequence[ProbeResult]) -> ProbeStatus:
     """Collapse per-submodel statuses into a device verdict, worst-case first.
 
@@ -906,13 +1182,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     This is a command-line entry point, so — like the CLI — it is the one place in
     this module that constructs concrete adapters and writes to stdout. Nothing
     above this function imports or touches them.
+
+    ``--quick`` and ``--timeout`` behave as they do for ``yonga probe``. Exit 0
+    when a device passed, 2 when nothing failed but something is inconclusive,
+    1 otherwise.
     """
     import argparse
 
     from yonga.adapters.openvino_probe import OpenVINOProbe
+    from yonga.adapters.smoke_child import ChildProcessSmokeTester
+    from yonga.adapters.subprocess import SubprocessRunner
+    from yonga.application.wiring import GenAISmokeTester
     from yonga.config.settings import load_settings
     from yonga.registry.loader import load_builtin_registry
     from yonga.registry.resolver import RegistryResolver, installed_registry_versions
+    from yonga.util.redaction import environment_secrets
 
     parser = argparse.ArgumentParser(
         prog="python -m yonga.application.probe",
@@ -925,7 +1209,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="compile every numeric submodel, not just the language model",
     )
+    parser.add_argument(
+        "--quick",
+        action="store_true",
+        help="never build the GenAI pipeline; a deferred raw compile is inconclusive",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="build the pipeline in a child process and stop it after SECONDS",
+    )
     args = parser.parse_args(None if argv is None else list(argv))
+    try:
+        check_probe_options(quick=args.quick, timeout=args.timeout)
+    except ConfigurationError as error:
+        parser.error(error.diagnostic.title)
 
     settings = load_settings()
     resolver = RegistryResolver(load_builtin_registry(), versions=installed_registry_versions())
@@ -934,16 +1234,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         resolver,
         LocalArtifactStore(settings.paths),
         settings,
+        smoke_tester=GenAISmokeTester(),
+        isolated_smoke_tester=ChildProcessSmokeTester(
+            SubprocessRunner(extra_secrets=environment_secrets())
+        ),
     )
     outcome = service.probe_detailed(
         args.artifact,
         device=args.device,
         all_submodels=args.all_submodels,
+        quick=args.quick,
+        timeout=args.timeout,
     )
     document = outcome.model_dump(mode="json")
     document["role_matrix"] = outcome.role_matrix()
+    document["inconclusive"] = outcome.inconclusive
     print(json.dumps(document, indent=2, sort_keys=True, ensure_ascii=False))
-    return 0 if outcome.ok else 1
+    if outcome.ok:
+        return 0
+    return 2 if outcome.inconclusive else 1
 
 
 # OpenVINO may start a multiprocessing forkserver whose child re-imports the main

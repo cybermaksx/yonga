@@ -82,6 +82,7 @@ class FakeCommandResult:
     stdout_lines: Sequence[str] = field(default_factory=list)
     stderr_lines: Sequence[str] = field(default_factory=list)
     cancelled: bool = False
+    timed_out: bool = False
 
 
 @dataclass

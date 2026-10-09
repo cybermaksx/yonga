@@ -29,7 +29,7 @@ import pytest
 # annotation tracks whichever version is installed.
 from typer.testing import CliRunner, Result
 
-from tests.support import RefusingRunner, plain_text
+from tests.support import RefusingRunner, SmokeChildRunner, plain_text
 from tests.unit.test_prepare_planning import (
     GGUF_REPO,
     SAFETENSORS_REPO,
@@ -67,7 +67,7 @@ from yonga.application.progress import ProgressSink
 from yonga.application.wiring import Wiring
 from yonga.cli import app
 from yonga.config.settings import Settings
-from yonga.domain.artifacts import IRDescription, ProbeResult, assert_no_secrets
+from yonga.domain.artifacts import IRDescription, ProbeResult, ProbeStatus, assert_no_secrets
 from yonga.domain.benchmarks import GenerationSettings
 from yonga.domain.diagnostics import ConfigurationError, ExitCode, FailureCategory, diagnostic
 from yonga.domain.hardware import (
@@ -87,6 +87,13 @@ from yonga.registry.resolver import RegistryResolver
 GIB = 1024**3
 
 #: The real Qwen3.5 NPU compiler refusal recorded in ``HOST_FACTS.md``.
+#: The raw NPU compile failure the registry defers to the GenAI pipeline.
+NPU_DYNAMIC_SHAPE_ERROR = (
+    "[NPU_VCL] Compiler returned msg:\n"
+    "Exception from src/core/src/partial_shape.cpp:261:\n"
+    "to_shape was called on a dynamic shape."
+)
+
 NPU_UNSUPPORTED_GRAPH = (
     "Exception from src/plugins/intel_npu/src/plugin/src/plugin.cpp:552:\n"
     "OneShotBufferizeVPU2VPUIP failed : Only supports FP16."
@@ -960,6 +967,186 @@ def _staged_artifact(tmp_path: Path) -> Path:
     write_tokenizer_pair(directory, broken=False)
     (directory / "config.json").write_text('{"model_type": "qwen3_5"}\n', encoding="utf-8")
     return directory
+
+
+def test_probe_quick_never_builds_a_pipeline_and_exits_with_a_warning(
+    runner: CliRunner, home: Path, tmp_path: Path
+) -> None:
+    """``--quick``: a deferred NPU compile is inconclusive, JSON says so, exit 2."""
+    artifact = _staged_artifact(tmp_path)
+    runtime = FakeRuntimeProbe(compile_failures={"NPU": NPU_DYNAMIC_SHAPE_ERROR})
+    smoke = FakeSmokeTester()
+    wiring_for = lambda settings: FakeWiring(settings, runtime=runtime, smoke=smoke)  # noqa: E731
+
+    result = invoke(
+        runner,
+        home,
+        ["probe", str(artifact), "--device", "npu", "--quick", "--json"],
+        factory=wiring_for,
+    )
+
+    assert result.exit_code == int(ExitCode.WARNINGS)
+    payload = one_document(result)
+    assert payload["ok"] is False
+    assert payload["inconclusive"] is True
+    assert payload["quick"] is True
+    reports = payload["reports"]
+    assert isinstance(reports, list)
+    assert reports[0]["status"] == "inconclusive"
+    assert reports[0]["smoke_test"] is None
+    assert reports[0]["diagnostic"]["code"] == "probe.inconclusive.quick"
+    assert payload["role_matrix"] == {
+        "language": {"NPU": "inconclusive"},
+        "tokenizer": {"CPU": "ok"},
+    }
+    assert smoke.calls == []
+
+
+def test_probe_quick_explains_how_to_settle_the_device(
+    runner: CliRunner, home: Path, tmp_path: Path
+) -> None:
+    artifact = _staged_artifact(tmp_path)
+    runtime = FakeRuntimeProbe(compile_failures={"NPU": NPU_DYNAMIC_SHAPE_ERROR})
+    wiring_for = lambda settings: FakeWiring(settings, runtime=runtime)  # noqa: E731
+
+    result = invoke(
+        runner, home, ["probe", str(artifact), "--device", "npu", "--quick"], factory=wiring_for
+    )
+
+    assert result.exit_code == int(ExitCode.WARNINGS)
+    assert "inconclusive" in result.stdout
+    stderr = plain_text(result.stderr)
+    assert "the raw compile was deferred" in stderr
+    assert "--timeout SECONDS" in stderr
+    assert "Traceback" not in result.stderr
+
+
+class ChildProcessWiring(FakeWiring):
+    """A :class:`FakeWiring` whose process runner plays the smoke-test child."""
+
+    def __init__(self, settings: Settings, *, child: CommandRunner, **kwargs: object) -> None:
+        super().__init__(settings, **kwargs)  # type: ignore[arg-type]
+        self._child = child
+
+    def command_runner(self) -> CommandRunner:
+        """Return the scripted child instead of refusing every process."""
+        return self._child
+
+
+def test_probe_timeout_stops_the_build_and_reports_inconclusive(
+    runner: CliRunner, home: Path, tmp_path: Path
+) -> None:
+    artifact = _staged_artifact(tmp_path)
+    runtime = FakeRuntimeProbe(compile_failures={"NPU": NPU_DYNAMIC_SHAPE_ERROR})
+    smoke = FakeSmokeTester()
+    child = SmokeChildRunner(timed_out=True)
+
+    def wiring_for(settings: Settings) -> Wiring:
+        return ChildProcessWiring(settings, child=child, runtime=runtime, smoke=smoke)
+
+    result = invoke(
+        runner,
+        home,
+        ["probe", str(artifact), "--device", "npu", "--timeout", "1.5", "--json"],
+        factory=wiring_for,
+    )
+
+    assert result.exit_code == int(ExitCode.WARNINGS)
+    payload = one_document(result)
+    assert payload["inconclusive"] is True
+    assert payload["timeout_seconds"] == 1.5
+    reports = payload["reports"]
+    assert isinstance(reports, list)
+    assert reports[0]["status"] == "inconclusive"
+    assert reports[0]["diagnostic"]["code"] == "probe.inconclusive.timeout"
+    assert smoke.calls == []
+    (command, timeout), *_ = child.calls
+    assert command[1:4] == ["-P", "-m", "yonga.adapters.smoke_child"]
+    assert timeout == 1.5
+
+
+def test_probe_timeout_passes_a_device_whose_child_generated(
+    runner: CliRunner, home: Path, tmp_path: Path
+) -> None:
+    artifact = _staged_artifact(tmp_path)
+    runtime = FakeRuntimeProbe(compile_failures={"NPU": NPU_DYNAMIC_SHAPE_ERROR})
+    verdict = ProbeResult(device="NPU", status=ProbeStatus.OK, message="generated 24 token(s)")
+    child = SmokeChildRunner(stdout=[verdict.model_dump_json()])
+
+    def wiring_for(settings: Settings) -> Wiring:
+        return ChildProcessWiring(settings, child=child, runtime=runtime)
+
+    result = invoke(
+        runner,
+        home,
+        ["probe", str(artifact), "--device", "npu", "--timeout", "600", "--json"],
+        factory=wiring_for,
+    )
+
+    assert result.exit_code == int(ExitCode.SUCCESS)
+    payload = one_document(result)
+    assert payload["ok"] is True
+    assert payload["inconclusive"] is False
+
+
+@pytest.mark.parametrize(
+    ("args", "code"),
+    [
+        (["--timeout", "0"], "probe.timeout.invalid"),
+        (["--timeout", "-30"], "probe.timeout.invalid"),
+        (["--timeout", "nan"], "probe.timeout.invalid"),
+        (["--quick", "--timeout", "30"], "probe.options.conflict"),
+    ],
+)
+def test_probe_rejects_a_timeout_that_cannot_bound_anything(
+    runner: CliRunner, home: Path, tmp_path: Path, args: list[str], code: str
+) -> None:
+    artifact = _staged_artifact(tmp_path)
+    runtime = FakeRuntimeProbe(compile_failures={"NPU": NPU_DYNAMIC_SHAPE_ERROR})
+    wiring_for = lambda settings: FakeWiring(settings, runtime=runtime)  # noqa: E731
+
+    result = invoke(
+        runner,
+        home,
+        ["probe", str(artifact), "--device", "npu", *args, "--json"],
+        factory=wiring_for,
+    )
+
+    assert result.exit_code == int(ExitCode.REGISTRY)
+    assert runtime.compiled == [], "an invalid option is refused before anything compiles"
+    assert code in result.stderr + result.stdout
+
+
+def test_an_inconclusive_device_never_masks_a_failure_in_the_exit_code(tmp_path: Path) -> None:
+    from yonga.application.probe import ProbeOutcome
+    from yonga.cli import _probe_exit
+    from yonga.domain.artifacts import DeviceProbeReport
+
+    unsettled = diagnostic(
+        "probe.inconclusive.quick",
+        FailureCategory.UNKNOWN_RUNTIME_ERROR,
+        "NPU is inconclusive",
+        "Deferred.",
+        severity="warning",
+    )
+    denied = diagnostic(
+        "npu.permission_denied",
+        FailureCategory.PERMISSION_DENIED,
+        "NPU not accessible",
+        "Permission denied on /dev/accel/accel0",
+    )
+    inconclusive = DeviceProbeReport(
+        device="NPU", status=ProbeStatus.INCONCLUSIVE, diagnostic=unsettled
+    )
+    failed = DeviceProbeReport(device="GPU", status=ProbeStatus.FAILED, diagnostic=denied)
+    passed = DeviceProbeReport(device="CPU", status=ProbeStatus.OK)
+
+    def exit_for(*reports: DeviceProbeReport) -> ExitCode:
+        return _probe_exit(ProbeOutcome(artifact_dir=tmp_path, reports=list(reports)))
+
+    assert exit_for(inconclusive) is ExitCode.WARNINGS
+    assert exit_for(inconclusive, failed) is denied.exit_code()
+    assert exit_for(inconclusive, passed) is ExitCode.SUCCESS
 
 
 # ======================================================================

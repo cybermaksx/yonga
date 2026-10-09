@@ -115,7 +115,7 @@ class DeviceEvidence(BaseModel):
 
     device: str
     status: str
-    """``ok``, ``failed``, or ``not_tested``."""
+    """``ok``, ``failed``, ``inconclusive`` or ``not_tested``."""
     detail: str = ""
     attempted_at: str | None = None
 

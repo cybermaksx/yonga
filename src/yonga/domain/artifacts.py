@@ -272,6 +272,15 @@ class ProbeStatus(str, Enum):
     OpenVINO GenAI pipeline reshapes first. The raw attempt is kept on record
     under this status and the device verdict comes from the pipeline smoke test.
     """
+    INCONCLUSIVE = "inconclusive"
+    """The probe stopped before it had evidence either way.
+
+    A device verdict, never a compiler's: a deferred raw compile whose GenAI
+    pipeline was not built (``yonga probe --quick``), or whose build was stopped
+    at ``--timeout``. It never counts as working, and never as a failure of the
+    device or the model; only a probe that runs the pipeline to completion
+    settles it.
+    """
 
 
 class ProbeResult(BaseModel):

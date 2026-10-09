@@ -269,6 +269,33 @@ def test_a_failed_device_is_listed_as_failed_and_never_claimed(
     assert "Tested on: **GPU**" in card
 
 
+def test_an_inconclusive_device_is_neither_claimed_nor_called_failed(
+    settings: Settings, hub: FakeHub, artifact: ArtifactManifest, tmp_path: Path
+) -> None:
+    """A probe stopped by --quick or --timeout proves nothing in either direction."""
+    unsettled = DeviceProbeReport(
+        device="NPU",
+        status=ProbeStatus.INCONCLUSIVE,
+        diagnostic=diagnostic(
+            "probe.inconclusive.timeout",
+            FailureCategory.UNKNOWN_RUNTIME_ERROR,
+            "NPU is inconclusive: the pipeline build hit --timeout",
+            "stopped",
+            severity="warning",
+        ),
+    )
+    rewrite_manifest(settings, artifact, device_probes={**artifact.device_probes, "NPU": unsettled})
+    service = publisher_service(settings, hub, FakePublisher(someone()), tmp_path)
+    plan = service.plan(artifact.artifact_id, REPO)
+    card = plan.generated["README.md"]
+
+    assert plan.supported_devices == ["GPU"]
+    assert "| NPU | inconclusive |" in card
+    assert "**NPU: inconclusive.**" in card
+    assert "**NPU: failed.**" not in card
+    assert "| NPU | works |" not in card
+
+
 # --- refusals -------------------------------------------------------------------------
 
 

@@ -134,6 +134,53 @@ class SimulatedPipRunner:
         return CompletedCommand(argv=command, returncode=0, duration_seconds=0.0)
 
 
+class SmokeChildRunner:
+    """A CommandRunner standing in for ``python -P -m yonga.adapters.smoke_child``.
+
+    It replays one scripted outcome -- the child's stdout and stderr, its exit
+    code, or a stop at the time limit -- and records every call, so a test can
+    check both the argv the parent built and the timeout it passed.
+    """
+
+    def __init__(
+        self,
+        *,
+        stdout: Sequence[str] = (),
+        stderr: Sequence[str] = (),
+        returncode: int = 0,
+        timed_out: bool = False,
+        cancelled: bool = False,
+    ) -> None:
+        self.stdout = list(stdout)
+        self.stderr = list(stderr)
+        self.returncode = returncode
+        self.timed_out = timed_out
+        self.cancelled = cancelled
+        self.calls: list[tuple[list[str], float | None]] = []
+
+    def run(
+        self,
+        argv: Sequence[str],
+        *,
+        env: Mapping[str, str] | None = None,
+        cwd: Path | None = None,
+        timeout: float | None = None,
+        ctx: JobContext | None = None,
+    ) -> CompletedCommand:
+        command = [str(part) for part in argv]
+        self.calls.append((command, timeout))
+        stopped = self.timed_out or self.cancelled
+        return CompletedCommand(
+            argv=command,
+            returncode=-2 if stopped else self.returncode,
+            duration_seconds=timeout if self.timed_out and timeout is not None else 0.5,
+            stdout_lines=list(self.stdout),
+            stderr_lines=list(self.stderr),
+            timed_out=self.timed_out,
+            cancelled=self.cancelled,
+        )
+
+
 def _satisfying(specifier: str) -> str:
     """A version that meets ``==X.Y.*``, ``==X.Y.Z`` or an empty specifier."""
     if specifier.startswith("=="):

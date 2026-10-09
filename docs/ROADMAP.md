@@ -65,14 +65,20 @@ history. On 2026-09-24 the directory was filtered out of every commit: all thirt
 their messages are kept, the final tree is byte-identical, and `.git` went from 7.0 MB to 964 KB.
 Every commit from the one that added the fixture onward has a new SHA.
 
-**0.5 — NPU probes of large models are slow now, honestly. [partly done]**
+**0.5 — NPU probes of large models are slow now, honestly. [done]**
 Because deferral hands the verdict to a real pipeline build, `yonga probe` of a large model on the
 NPU no longer fails instantly on a raw compile — it performs the NPU compilation the answer actually
 depends on. Measured on the reference host: the GPU-quantized Qwen3.5-9B artifact was still
 compiling for the NPU after 15 minutes at ~9 GiB RSS. The instant answer was false, so this is the
-right trade. The probe now says before the wait when it is about to compile more than 2 GiB of
-weights. Still open: a `--quick` mode that stops at the raw compile and labels the result
-inconclusive, and a bounded timeout for pipeline builds.
+right trade. The probe says before the wait when it is about to compile more than 2 GiB of weights,
+and names the two ways out. `--quick` stops at the raw compile and reports a deferred device with
+the new status `inconclusive`. `--timeout SECONDS` builds the pipeline in a child process
+(`python -P -m yonga.adapters.smoke_child`, through the supervised subprocess runner) and stops it
+at the limit, which is `inconclusive` too — a native compile cannot be interrupted in-process. An
+inconclusive device never counts as working or as failed: exit 2 when nothing else decided, and
+the model card says `inconclusive`. `prepare` still waits for its pipeline build. On the reference
+host a quick NPU probe of the 0.6B test artifact answers in about a second, and `--timeout 1` stops
+its pipeline build and reports inconclusive; both are hardware tests.
 
 ---
 
