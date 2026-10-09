@@ -979,11 +979,28 @@ def doctor_with_cache(
     )
 
 
+def roomy_inventory(settings: Settings) -> HardwareInventory:
+    """A host whose cache filesystem has 500 GiB free, whatever the test machine has.
+
+    The warning threshold depends on free space, so a test that expects the
+    fixed 10 GiB threshold must not read the real disk under ``tmp_path``.
+    """
+    roomy = FilesystemInfo(
+        path=Path("/"),
+        mount_point=Path("/"),
+        fstype="ext4",
+        total_bytes=1000 * GIB,
+        free_bytes=500 * GIB,
+        available_bytes=500 * GIB,
+    )
+    return healthy_inventory(settings, filesystems=[roomy], managed_temp=roomy)
+
+
 def test_much_reclaimable_compile_cache_warns_with_the_prune_command(tmp_path):
     settings = make_settings(tmp_path)
     cache = cache_inventory(settings, in_use=40 * GIB, orphaned=8 * GIB, stale=4 * GIB)
 
-    report = doctor_with_cache(settings, cache).run()
+    report = doctor_with_cache(settings, cache, inventory=roomy_inventory(settings)).run()
 
     check = require(report, "storage.compile_cache")
     assert check.status is Severity.WARNING
@@ -999,7 +1016,10 @@ def test_a_little_reclaimable_cache_on_a_roomy_disk_is_fine(tmp_path):
     settings = make_settings(tmp_path)
     cache = cache_inventory(settings, in_use=40 * GIB, orphaned=2 * GIB, unattributed=30 * GIB)
 
-    check = require(doctor_with_cache(settings, cache).run(), "storage.compile_cache")
+    check = require(
+        doctor_with_cache(settings, cache, inventory=roomy_inventory(settings)).run(),
+        "storage.compile_cache",
+    )
 
     assert check.status is Severity.OK
     assert "2.0 GiB reclaimable" in (check.value or "")

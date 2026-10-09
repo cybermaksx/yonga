@@ -678,7 +678,8 @@ class DoctorService:
                 detail=detail,
                 remediation=[
                     f"{format_bytes(reclaimable)} of the compile cache belongs to removed "
-                    "artifacts or to another OpenVINO release and will never be reused.",
+                    "artifacts or to another OpenVINO release, which this installation "
+                    "cannot reuse (another installation sharing this cache still may).",
                     "Reclaim it with: yonga cache prune",
                     "Preview what would go first with: yonga cache prune --dry-run",
                 ],
