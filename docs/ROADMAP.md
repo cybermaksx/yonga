@@ -1,14 +1,24 @@
-# ROADMAP.md — what to do next
+# ROADMAP.md — status and what to do next
 
-Written at the end of the MVP build, 2026-09-23. Ordered by what would most change the tool's
-usefulness or trustworthiness, not by what is easiest. Sizes are rough: **S** a session, **M** a
-few days, **L** a substantial piece of work.
+Started at the end of the MVP build, 2026-09-23, and updated as items closed. Ordered by what would
+most change the tool's usefulness or trustworthiness, not by what is easiest. Sizes are rough: **S**
+a session, **M** a few days, **L** a substantial piece of work.
 
-The MVP works end to end on one machine: ten commands (`registry` carries three subcommands of its
-own — `validate`, `explain`, `paths`), the full Qwen3.5 reference case (GGUF-only source → declared derivative → 17.5 GiB download → INT4 conversion → seven VLM submodels
-validated → tokenizer repaired → GPU probed → artifact with a complete manifest), and — since
-2026-09-24 — NPU preparation, chat and benchmarking of a small LLM. 1824 default tests plus eight
-hardware tests, ruff and mypy clean. What follows is what it does *not* yet have.
+## Where things stand
+
+Phases 0, 1 and 2 are done, within the limits each item records (2.1, for example, lists what
+`serve` does not do yet), except the open half of 0.5: a `--quick` NPU probe and a bounded timeout
+for pipeline builds. What remains is in Phase 3: Windows support, a GUI or web frontend,
+and more architectures in the registry. Each item keeps the note written when it closed, with what
+was measured and what building it found; the numbers in those notes are as of that date. For the
+current command set run `yonga --help`, and for the current test count `pytest --collect-only -q`.
+
+At the end of the MVP build the tool worked end to end on one machine: the full Qwen3.5 reference
+case (GGUF-only source → declared derivative → 17.5 GiB download → INT4 conversion → seven VLM
+submodels validated → tokenizer repaired → GPU probed → artifact with a complete manifest) and, from
+2026-09-24, NPU preparation, chat and benchmarking of a small LLM. The items below were the plan
+from that point; each is marked **[done]**, **[partly done]** or **[ongoing]**, or left open with
+a size.
 
 ---
 
@@ -19,12 +29,14 @@ These were places where the project looked better covered than it was. Items 0.1
 0.3.
 
 **0.1 — Hardware test coverage actually exists. [done]**
-`intel_gpu` and `intel_npu` now select real tests in `tests/hardware/` — three on the GPU
-(generation with metrics, compile-cache reuse, the probe service with the tokenizer routed to CPU)
-and five on the NPU (node access, raw-compile deferral, a typed pipeline failure, generation with
-manifest-shaped properties, and the probe service passing an NPU LLM). All eight pass on the
-reference host. The NPU generation tests need `python tools/make_test_artifact.py --npu` once; they
-skip with that instruction otherwise. `slow` and `large_model` still select nothing.
+`intel_gpu` and `intel_npu` now select real tests in `tests/hardware/`. When this item closed on
+2026-09-24 there were three on the GPU (generation with metrics, compile-cache reuse, the probe
+service with the tokenizer routed to CPU) and five on the NPU (node access, raw-compile deferral, a
+typed pipeline failure, generation with manifest-shaped properties, and the probe service passing
+an NPU LLM), all passing on the reference host. Streaming, `serve` and GPU-against-CPU logits
+followed, and `slow` and `large_model` now select the GGUF import and VLM chat tests;
+`TESTING.md` §6, "What the hardware suites run", lists the current set. The NPU generation tests
+need `python tools/make_test_artifact.py --npu` once; they skip with that instruction otherwise.
 
 **0.2 — Reconcile the NPU acceptance signature. [done]**
 The signature `SPEC.md` §20 records does reproduce — on the pipeline path, not on a raw
@@ -104,9 +116,10 @@ now records `job.cancelled`.
 **1.4 — Bug-report bundles. [done]**
 `IMPLEMENTATION_PLAN.md` milestone 11. `yonga logs JOB_ID --bundle` writes a `.tar.gz` with the job
 log and state, the artifact manifest and validation record, and a `doctor --json` host report, plus
-a README listing the contents. Every file is redacted again and the home directory, hostname and
-login name are anonymised, because a bundle is meant to be attached to public issues. Building it
-against the reference host's oldest logs found that a hostname embedding the login name
+a README listing the contents. Every file is redacted again and the home directory, hostname,
+login name and the Hugging Face account name the `doctor` report carries are anonymised (to `~`,
+`<host>`, `<user>` and `<hf-user>`), because a bundle is meant to be attached to public issues.
+Building it against the reference host's oldest logs found that a hostname embedding the login name
 (`<user>-x1carbon`) leaked both, so the hostname is anonymised first.
 
 ---
@@ -171,11 +184,11 @@ infrastructure, not code.
   of about 0.03 nats against an optimum FP16 export even from an F16 GGUF
   (`PROFILE_COMPARISON.md` §9), whose cause was not isolated. The NPU cannot reshape a GGUF-built
   graph (`npu.pipeline.static_reshape_failed`).
-- **More architectures in the registry. [ongoing]** Twelve architecture rules now ship. Ten
-  families have device claims measured on the reference host with one small model each,
-  prepared and generating on GPU and NPU and benchmarked on the CPU: qwen3, qwen2, llama,
-  gemma3-text, gemma2, olmo2, granite, smollm3, lfm2 and qwen2.5-vl (whose NPU compile is refused).
-  Doing it found four defects, all fixed:
+- **More architectures in the registry. [ongoing]** Ten families have device claims measured on
+  the reference host with one small model each, prepared and generating on GPU and NPU and
+  benchmarked on the CPU: qwen3, qwen2, llama, gemma3-text, gemma2, olmo2, granite, smollm3, lfm2
+  and qwen2.5-vl (whose NPU compile is refused). Beside them the registry has rules for qwen3.5,
+  phi3 and a generic text-generation fallback. Measuring the ten found four defects, all fixed:
   - models were exported stateless when no rule named a task (OLMo-2: "beam_idx was not found");
   - optimum-intel's own per-architecture Transformers ranges were ignored until the export failed
     (Gemma, LFM2, Qwen2.5-VL); they are now read and satisfied by a managed environment;

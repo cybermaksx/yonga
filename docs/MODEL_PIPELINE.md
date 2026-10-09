@@ -66,10 +66,9 @@ Case B — source is already a compatible OpenVINO IR artifact: download/use dir
 
 Case C — source is GGUF-only:
 
-1. check whether current backend supports the GGUF architecture directly;
-2. if not, check registry for declared derivative source;
-3. require confirmation for third-party derivative;
-4. otherwise stop with `source_format_unsupported` and suggest options.
+1. check the registry for a declared derivative source; the trust policy applies, so a third-party derivative under `suggest` requires confirmation and a `never_auto` one is only informational;
+2. if no derivative is usable, import the GGUF file directly, but only when a registry `gguf` rule (`REGISTRY_SPEC.md` section 8a) covers the installed OpenVINO GenAI and the chosen file's own header shows an architecture and tensor types that rule lists as verified;
+3. otherwise stop with `source_format_unsupported` and suggest options.
 
 Never scrape model names and auto-pick search results.
 
@@ -136,6 +135,8 @@ TEMP=<managed temp>
 ```
 
 Build Optimum argv from profile.
+
+`optimum-cli` in the examples stands for the launcher. In a managed export environment yonga runs `<env python> -P -m optimum.commands.optimum_cli`; in its own environment it runs `<python> -P -m optimum.commands.optimum_cli` when that module is importable and falls back to the `optimum-cli` executable on `PATH` otherwise. `-P` keeps the current directory off `sys.path`, so a module of the same name there cannot stand in for a real one.
 
 Example GPU profile:
 

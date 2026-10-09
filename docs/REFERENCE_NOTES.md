@@ -97,4 +97,4 @@ OpenVINO GenAI, OpenVINO Tokenizers and OpenVINO package versions must be kept A
 
 - OpenVINO Model Server generative endpoints: https://docs.openvino.ai/2026/model-server/ovms_docs_clients_genai.html
 
-OVMS provides OpenAI-compatible generative endpoints and is a candidate for the future `yonga serve` implementation.
+OVMS provides OpenAI-compatible generative endpoints. It was considered for `yonga serve`, which shipped instead as a FastAPI layer over the chat runtime (the optional `serve` extra; see ROADMAP.md item 2.1). OVMS remains a possible alternative backend.

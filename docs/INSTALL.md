@@ -35,15 +35,16 @@ environment.
 
 ### The AppImage
 
-Every GitHub release carries `yonga-X.Y.Z-x86_64.AppImage` and its `.sha256`. It holds yonga, a
-relocatable CPython ([python-build-standalone](https://github.com/astral-sh/python-build-standalone))
-and the `openvino` and `serve` extras, and runs on x86_64 Linux with glibc 2.28 or newer (Ubuntu
-20.04, Debian 11, Fedora 29 and later). The build fails if any bundled library needs a newer glibc.
+Every GitHub release carries `yonga-X.Y.Z-x86_64.AppImage` and its `.sha256`, where X.Y.Z is the
+release's version. The image holds yonga, a relocatable CPython
+([python-build-standalone](https://github.com/astral-sh/python-build-standalone)) and the `openvino`
+and `serve` extras, and runs on x86_64 Linux with glibc 2.28 or newer (Ubuntu 20.04, Debian 11,
+Fedora 29 and later). The build fails if any bundled library needs a newer glibc.
 
 ```bash
-sha256sum --check yonga-0.2.0-x86_64.AppImage.sha256
-chmod +x yonga-0.2.0-x86_64.AppImage
-mv yonga-0.2.0-x86_64.AppImage ~/.local/bin/yonga
+sha256sum --check yonga-X.Y.Z-x86_64.AppImage.sha256
+chmod +x yonga-X.Y.Z-x86_64.AppImage
+mv yonga-X.Y.Z-x86_64.AppImage ~/.local/bin/yonga
 yonga doctor
 ```
 
@@ -57,17 +58,23 @@ yonga doctor
   Python kept under `~/.cache/yonga/envs`, because the image's own mount point changes every time it
   runs. Prepared OpenVINO and GGUF models need no toolchain at all.
 
-It is built by `tools/build_appimage.sh`, which pins and checksums every download.
+It is built by `tools/build_appimage.sh`. The interpreter, `appimagetool` and the AppImage runtime
+are pinned and checked against their SHA-256. The Python packages are not pinned: pip resolves the
+ranges in `pyproject.toml` against PyPI when the image is built, so two builds of one release can
+bundle different versions. Each build therefore records what it bundled, as
+`usr/share/yonga/packages.txt` inside the image and, from 0.3.0 on, as the release asset
+`yonga-X.Y.Z-x86_64.AppImage.packages.txt`: the interpreter, the yonga wheel with its SHA-256, and
+every package version.
 
 ### pip
 
-`yonga` is **not on PyPI yet**; publishing is set up and runs once the repository is public. Until
-then, install from a clone of this repository, into a virtual environment:
+From PyPI, into a virtual environment. PyPI carries yonga from 0.3.0 on; earlier releases are on
+GitHub only.
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -e ".[openvino,export]"
+pip install "yonga[openvino,export]"
 ```
 
 On a machine without an NVIDIA GPU, install the CPU build of torch first. The `export` extra pulls
@@ -76,7 +83,20 @@ plus 3.2 GB of NVIDIA libraries that an Intel AI PC never uses. The CPU wheel is
 
 ```bash
 pip install torch --index-url https://download.pytorch.org/whl/cpu
-pip install -e ".[openvino,export]"
+pip install "yonga[openvino,export]"
+```
+
+Add `serve` to the extras for the HTTP API: `pip install "yonga[openvino,export,serve]"`.
+
+To work on `yonga` itself, install from a clone of this repository instead, in editable mode and
+with the development tools:
+
+```bash
+git clone https://github.com/ooguz/yonga.git
+cd yonga
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[openvino,export,serve,dev]"
 ```
 
 The extras map to what you intend to do:
@@ -86,8 +106,8 @@ The extras map to what you intend to do:
 | `openvino` | `openvino`, `openvino-genai`, `openvino-tokenizers` | `probe`, `chat`, `bench`, and the device/NPU sections of `doctor` |
 | `export` | `optimum-intel[openvino]`, `nncf` (pulling in `transformers` and `torch`) | `prepare` (download, convert, quantize) |
 | `serve` | `fastapi`, `uvicorn` | `serve` (the OpenAI-compatible HTTP API) |
-| `dev` | pytest, pytest-cov, pytest-mock, pytest-timeout, ruff, mypy | running the test suite |
-| `all` | all of the above | |
+| `dev` | `pytest`, `pytest-cov`, `pytest-mock`, `pytest-timeout`, `ruff`, `mypy`, `build`, `twine` | running the test suite and the linters, building and checking a release |
+| `all` | `openvino`, `export` and `serve` (not `dev`) | everything a user can run |
 
 Without any extras the package still installs and runs. `inspect`, `list`, `logs`, `registry` and
 `doctor` work; `doctor` exits **10** and names the missing package and the extra that provides it
@@ -115,6 +135,10 @@ yonga doctor
 
 Exit code 0 means everything is usable, 2 means usable with warnings (a small `/tmp` alone produces
 this — see section 5), 10 means something is missing that `yonga` cannot work around.
+
+With yonga installed, [`USAGE.md`](USAGE.md) walks through every command, from the first `doctor`
+to preparing, chatting with and serving a model. The rest of this document covers the host setup
+that decides whether those commands work.
 
 ## 3. The Intel NPU on Linux
 
@@ -267,7 +291,7 @@ Storage
                         yonga does not use it.
                         → No action is required. Do not enlarge the tmpfs for yonga's sake; other
                         tools that honour TMPDIR may still need it.
-✓  managed temp         disk-backed (ext4)  /home/m3rcury/.cache/yonga/tmp
+✓  managed temp         disk-backed (ext4)  /home/user/.cache/yonga/tmp
 ```
 
 This warning is why `doctor` exits 2 rather than 0 on an otherwise perfect host.
@@ -306,8 +330,9 @@ between releases, the exported graph changes with it, so **an architecture can r
 Transformers version** — not merely a minimum.
 
 The registry records that requirement per architecture. Qwen3.5 is the shipped example: it declares
-`transformers ==5.2.*`, which is why the reference host has 5.2.0 installed rather than the newest
-release. `yonga inspect` states the requirement whether or not it is currently met (verified):
+`transformers ==5.2.*`, while the reference host runs transformers 5.5.4; yonga meets the pin with a
+managed export environment (below). `yonga inspect` states the requirement whether or not it is
+currently met (verified):
 
 ```text
 Known limitations

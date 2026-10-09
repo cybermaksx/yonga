@@ -22,7 +22,7 @@ Use:
 - pytest-timeout for hardware/runtime tests;
 - respx only if HTTP mocking is truly needed (prefer mocking Hub adapter);
 - ruff;
-- mypy or pyright (choose one; mypy recommended for broad ecosystem familiarity).
+- mypy in strict mode (configured under `[tool.mypy]` in `pyproject.toml`).
 
 Markers:
 
@@ -197,9 +197,14 @@ pytest -m "openvino or intel_gpu or intel_npu or slow or large_model"
 `YONGA_TEST_BROKEN_ARTIFACT` and `YONGA_TEST_NPU_ARTIFACT` override the
 generated artifacts' locations.
 
-## 7. Qwen3.5 acceptance fixture
+## 7. Qwen3.5 manual acceptance procedure
 
-Large-model test, opt-in only.
+A hand-run procedure on a real machine; there is no automated test that performs the whole flow.
+Its parts are covered separately: offline, by the resolver, planning, repair, classifier and
+fallback unit tests (`tests/unit/test_source_resolver.py`, `test_prepare_planning.py`,
+`test_repair_tokenizer_precision.py`, `test_registry_classifier.py`, `test_prepare_fallback.py`),
+and on hardware by `tests/hardware/test_vlm.py`, which chats through a prebuilt VLM artifact. The
+commands are in `USAGE.md`, "The full reference case".
 
 Environment expected to resemble:
 
@@ -221,7 +226,7 @@ Flow:
 9. VLM pipeline generates a response;
 10. hidden reasoning does not render in default chat display.
 
-This test is not required on public CI due bandwidth/time.
+The procedure is not part of CI: it downloads about 17.5 GiB and needs the hardware above.
 
 ## 8. Chat tests
 
@@ -263,14 +268,21 @@ tests          unit and integration, Python 3.11-3.14, full toolchain (OpenVINO 
 base-install   unit and integration with no OpenVINO or export extras, Python 3.11 and 3.14
 package        build, twine check --strict, and a smoke test of the wheel in a clean venv
 appimage       the AppImage built from that wheel, then --version, registry validate and a
-               doctor whose OpenVINO runtime must be usable, run outside the checkout
+               doctor whose OpenVINO runtime must be usable, run outside the checkout from a
+               directory holding a decoy typer.py the image must not import
 ```
 
 No job passes `-m`: the default `addopts` deselect `network`, `intel_gpu`, `intel_npu`,
 `large_model` and `slow`, and overriding that is how a CI run would start depending on hardware or
 a network it does not have. The `appimage` job is the exception to "no network in CI": building
-the image downloads its pinned, checksummed inputs. `.github/workflows/release.yml` publishes a
-tagged version (`docs/RELEASING.md`).
+the image downloads the interpreter and the AppImage tools, which are pinned and checked against
+their SHA-256, and installs yonga's Python dependencies from PyPI. Those are resolved at build time
+within the ranges in `pyproject.toml`, not pinned, so the build records what it bundled in
+`usr/share/yonga/packages.txt` inside the image and in `yonga-X.Y.Z-x86_64.AppImage.packages.txt`
+beside it, which the job uploads. `.github/workflows/release.yml` publishes a tagged version
+(`docs/RELEASING.md`); it builds the image with the same script from the released wheel, smoke-tests
+`--version` and `registry validate` beside the same decoy `typer.py`, and attaches the package list
+to the release.
 
 Hardware CI can be self-hosted later and must not block ordinary contributor PRs unless specifically required.
 

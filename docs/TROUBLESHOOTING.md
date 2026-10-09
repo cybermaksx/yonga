@@ -56,13 +56,31 @@ From `docs/CLI_SPEC.md` section 15; the mapping from category to code lives in
 
 A closed stdout is **0**, not 99: see section 8.
 
-Codes 40, 41, 42 and 52 say *where* a job died rather than *why*, so they appear only when the
-category itself is uninformative. A conversion that fails for a classified reason exits with that
-reason's code: the NNCF group-size failure in section 5.4 exits **70**, not 40.
+Codes 40, 42 and 52 say *where* a job died rather than *why* (conversion, repair, generation), so
+they appear only when the category is `unknown_runtime_error`, and from `bench` when none of its
+runs produced a measurement. Code 41 is the validation stage's
+code in the same way, and also the category code of `unsupported_ir_type` and
+`tokenizer_ir_incompatible`, so a classified tokenizer or IR-type failure exits 41 too. A conversion
+that fails for a classified reason exits with that reason's code: the NNCF group-size failure in
+section 5.4 exits **70**, not 40.
+
+`prepare` is the exception for device failures. When it cannot use a device it exits **50**,
+whatever the category: a `--device` that is not present or fails its probe, and an automatic run
+that has tried every fallback, end the same way. A failure whose diagnostic marks the environment
+as broken is different: no permission on the device node (`npu.device.permission_denied`,
+`device.permission_denied`) or a driver that does not initialise (`device.driver_missing`).
+`prepare` does not fall back from those, and exits **10**, because the host needs fixing before any
+choice of device matters. The diagnostic still carries its own code and category, in the message
+and in `--json` output, so the reason is not lost. `probe`, `chat` and `bench` exit with the
+category's code, so the same NPU compiler refusal is 50 from `prepare` and 51 from `probe`, while a
+denied NPU node is 10 from all of them.
 
 ## 3. Registry issue codes
 
-Fifteen rules ship today.
+The table lists every rule that ships; the command at the top of this document prints the same
+set. The Exit column is the category's code, which is what `probe`, `chat` and `bench` return. A
+`prepare` that fails on the device probe exits 50 instead, except for a broken environment such as
+`npu.device.permission_denied`, which exits 10 there as well (section 2).
 
 | Code | Rule id | Category | Exit | Means | Do this |
 |---|---|---|---|---|---|
@@ -82,9 +100,10 @@ Fifteen rules ship today.
 | `export.transformers.symbol_missing` | `exporter-transformers-symbol-mismatch` | `package_abi_mismatch` | 10 | Generic form of the above: `optimum/exporters/openvino/model_patcher.py` looked for something the installed Transformers does not provide, for any architecture. | Install the Transformers release the architecture requires; the failing import is in `yonga logs JOB_ID --raw`. |
 
 The last two are a backstop, not the usual path. When the registry declares the architecture's
-Transformers pin, preflight refuses before the download (section 5.6) and the export never runs.
-They classify what comes back when it runs anyway — under `--ignore-exporter-requirements`, or for
-an architecture whose pin the registry does not know.
+Transformers pin, `prepare` exports in a managed environment that satisfies it, or with
+`--no-managed-env` refuses at preflight before the download (section 5.6). Either way the export
+never runs against the wrong Transformers. They classify what comes back when it runs anyway —
+under `--ignore-exporter-requirements`, or for an architecture whose pin the registry does not know.
 
 ## 4. Built-in signature codes
 
@@ -127,8 +146,12 @@ to_shape was called on a dynamic shape.
 
 `ZE_RESULT_ERROR_INVALID_ARGUMENT` looks like a driver failure and is not one. Read the sequence:
 the Level Zero driver *answered*, the NPU compiler *ran*, and it *returned a message*. A missing or
-broken driver looks different: the NPU is absent from `openvino.Core().available_devices`, or the
-error is `ZE_RESULT_ERROR_UNINITIALIZED`. Only those are classified as `device.driver_missing`.
+broken driver looks different: the NPU is absent from `openvino.Core().available_devices` (then
+`prepare --device npu` stops with `device.not_present`, exit 50), or the error is
+`ZE_RESULT_ERROR_UNINITIALIZED`, classified as `device.driver_missing`. That is a broken
+environment: `prepare` exits 10 and does not try another device. A graph the compiler refuses is a
+compatibility failure instead: `--device auto` moves on to GPU or CPU, and an explicit
+`--device npu` exits 50 and names them.
 
 This particular message is also not evidence about the *model*. A raw `Core.compile_model` keeps
 an LLM's dynamic shapes, so it fails this way on the NPU for every stateful LLM — including ones the
@@ -173,8 +196,10 @@ shapes. Shape [1, 1, 8, 1], Unsupported distribution: #VPU.DistributedTensor<mod
 [ERROR] [vpux-compiler] Failed Pass MultiClusterStrategyAssignment on Operation
 ```
 
-The reasoning is the same and so is the verdict: `npu.compiler.pass_failed`, exit 51, GPU and CPU
-offered as fallbacks, and no suggestion that anything is wrong with the driver.
+The reasoning is the same and so is the verdict: `npu.compiler.pass_failed`, exit 51 from `chat`
+(50 from `prepare --device npu`; `--device auto` moves on to the GPU), GPU and CPU offered as
+fallbacks, and no suggestion that anything is wrong with
+the driver.
 
 ### 5.2 The tokenizer IR cannot be read back (`STRiNG`)
 

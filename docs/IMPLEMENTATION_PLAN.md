@@ -1,5 +1,12 @@
 # IMPLEMENTATION_PLAN.md
 
+> This is the milestone plan yonga's first build followed, in September 2026, kept as a record of
+> the order the work was done in and what each step had to deliver. It is not a status page:
+> serving, publication and the remote registry from "Phase 2" have shipped, and so has GGUF support
+> in the form of a direct OpenVINO GGUF import; a llama.cpp backend and a GUI have not. What is done
+> and what is still open is in [ROADMAP.md](ROADMAP.md); how the commands behave now is in
+> [USAGE.md](USAGE.md) and [CLI_SPEC.md](CLI_SPEC.md).
+
 ## Milestone 0 — repository bootstrap
 
 Deliver:
@@ -211,5 +218,5 @@ A desktop/web UI can consume the same application services/progress events.
 - Never skip a milestone dependency by hard-coding a one-off model path.
 - Keep the Qwen3.5 case as a fixture/rule, not special-case application code.
 - Prefer a complete vertical slice over broad unfinished commands.
-- Commit after coherent milestones if the agent environment permits commits; do not rewrite user history.
+- Commit after coherent milestones; do not rewrite published history.
 - Keep docs synchronized with behavior.

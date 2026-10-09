@@ -11,19 +11,26 @@ codes and remediation see [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md).
 
 ## 0. Setup
 
+To use yonga, install it from PyPI with `pip install "yonga[openvino,export,serve]"` or take the
+AppImage; [`INSTALL.md`](INSTALL.md) covers both. This tour also runs the test suite (section 8),
+so it starts from a clone of the repository with the development tools:
+
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -e ".[openvino,export,dev]"
+pip install -e ".[openvino,export,serve,dev]"
 ```
 
 `openvino` is needed to probe, chat and benchmark. `export` (optimum-intel, nncf, transformers,
-torch) is needed to *convert* a model. Without either, `doctor`, `inspect`, `list`, `logs` and
-`registry` still work and `doctor` tells you what is missing.
+torch) is needed to *convert* a model. `serve` (FastAPI, uvicorn) is needed for `yonga serve`.
+Without `openvino` and `export`, `doctor`, `inspect`, `list`, `logs` and `registry` still work and
+`doctor` tells you what is missing.
 
-Every command accepts `--json`, `--verbose`, `--debug`, `--offline`, `--config`, `--data-dir`,
-`--cache-dir` — with one exception: `chat` rejects `--json`, because a conversation is not one
-document.
+Global options go before the command name, e.g. `yonga --offline --debug prepare …`: `--config`,
+`--data-dir`, `--cache-dir`, `--offline`, `--verbose`/`-v`, `--debug`, `--json`. Most commands also
+accept `--json` after the command name (`yonga list --json`). Two long-running commands reject
+`--json`: `chat`, because a conversation is not one document, and `serve`, which reports its state
+as JSON at `GET /health` instead.
 
 ---
 
@@ -250,7 +257,7 @@ never leave the machine.
 
 ### Serve it to other tools
 
-`pip install -e ".[serve]"` once, then:
+It needs the `serve` extra (installed above; the AppImage includes it). Then:
 
 ```bash
 yonga serve ARTIFACT --device gpu              # http://127.0.0.1:8000/v1, model loaded at startup
@@ -265,9 +272,18 @@ opens: same chat profile, generation defaults and hidden reasoning, including wh
 client owns the conversation and sends all of it each time; nothing is kept between requests.
 Requests are answered one at a time, and a streaming client that disconnects stops its generation.
 
-Binding anything but loopback (`--host 0.0.0.0`) prints a warning. Set `YONGA_API_KEY` in the
-environment to require `Authorization: Bearer <key>` on every endpoint except `/health`; it is read
-from the environment only, so it never shows up in the process list.
+Binding anything but loopback (`--host 0.0.0.0`) prints a warning, and a stronger one when no key
+is set. Set `YONGA_API_KEY` in the environment whenever you bind beyond loopback: every endpoint
+except `/health` then requires `Authorization: Bearer <key>`. The key is read from the environment
+only, so it never shows up in the process list.
+
+Requests are bounded. A body over 8 MiB is refused with 413 and error code `request_too_large`,
+counted on the bytes received, so a chunked upload without a `Content-Length` is held to it too.
+More than 4096 messages in one request is a 400 with `param` set to `messages`. With a key set,
+authentication runs first, so a client without the key is refused before its body is read. Error
+responses use OpenAI's shape, `{"error": {"message", "type", "param", "code"}}`; a failure in the
+middle of a stream arrives as a final `data: {"error": ...}` event instead. `docs/CLI_SPEC.md`
+section 14 lists the codes.
 
 `bench` writes a reproducible JSON result under `~/.local/share/yonga/benchmarks/` recording the
 hardware, package versions, device properties, generation settings and their fingerprint, the exact
@@ -297,8 +313,10 @@ repository from section 2, the architecture section reads:
 
 Specificity is not fixed per rule: `arch-qwen3_5` scores 50 here because it matched on a GGUF alias
 rather than on a `config.json` identity, which is the weaker evidence of the two. Ask the same
-question about `Qwen/Qwen3-0.6B` and the two rows swap: `arch-qwen3_5` is rejected at specificity
-60 and `arch-generic-text-generation` wins with `model identity qwen3 is listed`. There are further
+question about `Qwen/Qwen3-0.6B` and the picture changes: `arch-qwen3_5` is rejected at
+specificity 60, `arch-qwen3` wins with `model identity qwen3 is listed`, and
+`arch-generic-text-generation` matches on the same identity at the same specificity but loses on
+priority (10 against 100). There are further
 sections below it — model rule, profile, chat profile, derivative sources and candidates, and the
 per-device verdict with the rule that produced each one.
 
@@ -312,8 +330,11 @@ yonga registry reset                                 # back to the built-in rule
 ```
 
 A bundle is verified completely before it is installed, and again every time it is used. It must
-be signed by a trusted key, current, not older than the installed one, and plain YAML naming only
-repairs yonga already contains. A bundle that stops verifying is ignored, never trusted.
+be signed by a trusted key, current (its timestamps carry a UTC offset), not older than the
+installed one, and plain YAML naming only repairs yonga already contains. Its export arguments
+cannot override what yonga decides itself: a rule that passes the model, task, remote-code, cache,
+token or quantization options to the exporter fails to load. A bundle that stops verifying is
+ignored, never trusted.
 
 Note that `registry validate` checks *structure and internal consistency*, not that device names or
 weight formats are ones OpenVINO actually supports — an override declaring `device: MARS` validates
@@ -336,9 +357,10 @@ when the terminal shows a short explanation. `--debug` adds the raw exception to
 `--bundle` packs the job log, its state, the artifact's manifest and validation record when there
 is one, and a `doctor --json` host report into a single archive, with a `README.txt` listing what
 went in. It is built to be shareable, including publicly: every file is redacted again for secrets,
-and your home directory, hostname and login name are rewritten to `~`, `<host>` and `<user>`. It only
-reads yonga's own directories. Still read it before you share it. `--output PATH` chooses where it
-goes; otherwise it lands in the current directory as `yonga-report-<job>.tar.gz`.
+and your home directory, hostname and login name are rewritten to `~`, `<host>` and `<user>`. The
+Hugging Face account name `doctor` reports for your token becomes `<hf-user>` wherever it appears.
+It only reads yonga's own directories. Still read it before you share it. `--output PATH` chooses
+where it goes; otherwise it lands in the current directory as `yonga-report-<job>.tar.gz`.
 
 ---
 
@@ -379,7 +401,8 @@ every LLM. For a small model that takes seconds; for a 9B model it is a full NPU
 take well over ten minutes and several GiB of RAM.
 
 In `--device auto` yonga *may* fall back — but only for a compatibility failure. A broken
-environment (permission denied, missing driver) stops instead of being hidden behind another device.
+environment (permission denied, missing driver) stops instead of being hidden behind another device:
+`prepare` exits 10 for it, where a device that cannot run the model exits 50.
 
 **Nothing leaks secrets.**
 
@@ -399,7 +422,7 @@ up; nothing can be mistaken for a usable model. `yonga list --clean` retires the
 ## 8. Running the test suite
 
 ```bash
-pytest                       # 1824 of 1843 tests; network and hardware markers excluded by default
+pytest                       # network, hardware, slow and large_model markers excluded by default
 ruff check . && ruff format --check .
 mypy src tests
 ```
@@ -407,21 +430,30 @@ mypy src tests
 Markers: `network`, `openvino`, `intel_gpu`, `intel_npu`, `slow`, `large_model`.
 
 ```bash
-pytest -m openvino           # 25 tests, needs OpenVINO (the 17 CPU ones plus the hardware ones)
-pytest -m network            # 11 tests, hits the real Hub
-pytest -m intel_gpu          # 3 tests on a real Intel GPU
-pytest -m intel_npu          # 5 tests on a real Intel NPU
+pytest -m openvino           # needs OpenVINO: the CPU tests plus the hardware ones
+pytest -m network            # hits the real Hub
+pytest -m intel_gpu          # on a real Intel GPU
+pytest -m intel_npu          # on a real Intel NPU
+pytest -m slow               # the real GGUF import, from a cached GGUF file
+pytest -m large_model        # VLM chat, needs a prepared VLM artifact
 ```
 
-The hardware tests run against real devices and skip, with the command that fixes it, when the
-device or their artifact is missing. On the GPU they cover generation with metrics, compile-cache
-reuse, and the probe routing the tokenizer to CPU. On the NPU they cover node access, a raw compile
-being deferred rather than taken as the verdict, a pipeline failure coming out typed instead of as
-exit 99, generation with string-valued properties, and yonga's own probe passing an NPU LLM.
+`pytest --collect-only -q -m MARKER` prints what a marker selects today.
 
-**Be aware of what is not covered.** `slow` and `large_model` still select zero tests, and CI has no
-Intel hardware, so the hardware suites only run where someone runs them. The large-model results in
-this repository — the Qwen3.5 reference case above all — are still hand-run.
+The hardware tests run against real devices and skip, with the command that fixes it, when the
+device or their input is missing; they never download anything. On the GPU they cover generation
+with metrics, compile-cache reuse, the probe, streaming, `serve` (plain and SSE) and GPU logits
+against CPU. On the NPU they cover node access, a raw compile being deferred rather than taken as
+the verdict, a pipeline failure coming out typed instead of as exit 99, generation with
+string-valued properties, yonga's own probe passing an NPU LLM, and streaming with a second turn.
+`slow` selects `tests/hardware/test_gguf_import.py`, the real GGUF import from a cached GGUF file;
+`large_model` selects `tests/hardware/test_vlm.py`, text chat through the VLM pipeline on the GPU.
+`docs/TESTING.md` section 6 lists each file and the input it needs.
+
+**Be aware of what is not covered.** CI has no Intel hardware and runs only `tests/unit` and
+`tests/integration`, so the hardware, `slow` and `large_model` tests run only on a host with the
+devices, when someone runs them there. No test runs the full Qwen3.5 flow in "The full reference
+case" above; it is still run by hand.
 
 Some tests need artifacts that are generated rather than committed, so a clone does not carry binary
 weights:

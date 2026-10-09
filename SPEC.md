@@ -1,9 +1,10 @@
 # SPEC.md — yonga
 
-Status: Draft for implementation  
-Version: 0.1  
-Audience: coding agents and maintainers  
-Scope: Linux-first MVP
+Status: Design specification, kept up to date  
+Audience: contributors and maintainers  
+Scope: Linux-first
+
+> This is the specification yonga was originally built from. It records the requirements and the reasoning behind them, and sections are revised when the behaviour they describe changes, but words such as "MVP", "milestone" and "phase" reflect the order of the first build. The commands as they behave now are documented in [docs/USAGE.md](docs/USAGE.md) and [docs/CLI_SPEC.md](docs/CLI_SPEC.md), the registry format in [docs/REGISTRY_SPEC.md](docs/REGISTRY_SPEC.md), and what is done and what is still open in [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## 1. Product statement
 
@@ -26,7 +27,7 @@ The tool's value is in making these parts work together reliably and explainably
 7. If the requested device is unsupported but another local Intel device is viable, the tool may offer or perform a policy-approved fallback and explain it.
 8. The terminal chat UX is pleasant: Markdown output, hidden reasoning by default, conversation history, reset/clear/help commands, generation controls, and performance metrics.
 9. The tool can benchmark prepared models using reproducible prompts and save structured results.
-10. The design allows an OpenAI-compatible local serving layer in a later milestone without changing model preparation semantics.
+10. The design allows an OpenAI-compatible local serving layer (`yonga serve`, section 22) without changing model preparation semantics.
 
 ### 2.2 Secondary goals
 
@@ -87,15 +88,17 @@ Other Linux distributions may work but must be reported as unverified until test
 
 ### 5.2 Tested dependency family
 
-The implementation must represent dependency compatibility centrally. Initial tested family:
+The implementation must represent dependency compatibility centrally. Tested family:
 
 - OpenVINO: `2026.4.x`;
 - OpenVINO GenAI: matching `2026.4.x` family;
 - OpenVINO Tokenizers: matching `2026.4.x` family;
-- Optimum Intel: `2.x` (tested baseline 2.1.x);
-- NNCF: `2.x` (tested baseline 2.19.x);
-- Transformers: architecture-dependent; Qwen3.5 export specifically requires `5.2.x` in current OpenVINO GenAI guidance;
+- Optimum Intel: `>=2.1` (tested 2.2.0);
+- NNCF: `>=2.19` (tested 3.4.0);
+- Transformers: architecture-dependent; Qwen3.5 export specifically requires `5.2.x` in current OpenVINO GenAI guidance (tested 5.2.0);
 - huggingface_hub: `1.x` preferred.
+
+When yonga's own environment has no export toolchain, a managed export environment is built from a reference toolchain (`REFERENCE_TOOLCHAIN` in `src/yonga/domain/environments.py`: optimum-intel 2.2.0, NNCF 3.4.0, Transformers 5.5.4), and an architecture's declared exporter requirement overrides it.
 
 Do not assume all architectures use the same Transformers version. The registry must support model-family-specific exporter requirements.
 
@@ -666,9 +669,9 @@ This fixture is used to test:
 
 Do not hard-code this model's behavior into generic code; encode it through registry data and fixtures.
 
-## 21. Publication support (post-MVP / optional MVP utility)
+## 21. Publication support
 
-A prepared artifact may be publishable to Hugging Face. Add a future `yonga publish` command only after manifests are stable.
+A prepared artifact can be published to the Hugging Face Hub with `yonga publish` ([docs/CLI_SPEC.md](docs/CLI_SPEC.md) section 14a). Each requirement below is either checked before anything is uploaded, with a refusal of its own when it does not hold, or carried by the generated model card and manifest.
 
 Requirements before publication:
 
@@ -682,19 +685,16 @@ Requirements before publication:
 - no claim that weights were fine-tuned unless they actually were;
 - artifact file hashes available.
 
-## 22. OpenAI-compatible serving (phase 2)
+## 22. OpenAI-compatible serving
 
-`yonga serve` should expose at least:
+`yonga serve` ([docs/CLI_SPEC.md](docs/CLI_SPEC.md) section 14) exposes at least:
 
 - `GET /v1/models`;
 - `POST /v1/chat/completions`;
 - optional SSE streaming;
 - health endpoint.
 
-Implementation options:
-
-1. lightweight FastAPI adapter over the same local runtime abstraction;
-2. OpenVINO Model Server integration where it materially reduces custom code.
+It is a lightweight FastAPI adapter over the same local runtime abstraction `chat` uses, installed with the optional `serve` extra. OpenVINO Model Server integration was the other option considered; it remains possible where it would materially reduce custom code.
 
 The runtime/model selection and artifact manifest semantics must be shared with `chat`; do not create a second preparation stack.
 
@@ -709,7 +709,7 @@ The runtime/model selection and artifact manifest semantics must be shared with 
 - subprocess wrapper isolated behind an interface;
 - no parsing of human-readable command output where a Python/API/property interface exists;
 - tests required for every repair and failure classifier;
-- ruff + mypy/pyright (choose one and configure it) + pytest;
+- ruff + mypy (strict, configured in `pyproject.toml`) + pytest;
 - use `pathlib` rather than string path manipulation;
 - all destructive filesystem operations scoped to tool-owned directories.
 

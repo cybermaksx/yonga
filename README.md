@@ -1,4 +1,4 @@
-# yonga — Local Intel AI Model Manager (Working Title)
+# yonga — Local Intel AI Model Manager
 
 `yonga` is a Linux-first local AI model manager for Intel AI PCs. Its primary goal is to make Hugging Face models usable on Intel NPU/GPU/CPU without requiring the user to manually understand model formats, OpenVINO conversion flags, NPU compiler limitations, tokenizer IR quirks, or device-specific quantization trade-offs.
 
@@ -10,10 +10,9 @@ The tool is **NPU-first, not NPU-only**. If a model cannot compile on the NPU, `
 
 ## Status: MVP
 
-This is the 0.2.0 release. It prepares, validates, runs and benchmarks OpenVINO artifacts on one machine, and it is honest about the parts that do not exist yet:
+`yonga` prepares, validates, runs and benchmarks OpenVINO artifacts on one machine, and it is honest about the parts that do not exist yet:
 
 - **`serve` is deliberately small.** It serves one artifact, text only, one request at a time, and refuses what it cannot honour (`n` > 1, stop sequences, tools, JSON response formats, images) with a 400 rather than ignoring it.
-- **Not on PyPI yet.** Publishing is set up and runs when the repository goes public; until then, use the AppImage from a GitHub release or install from a clone (see below).
 - **Windows is not supported yet.** The architecture keeps the door open, but every device, driver and path probe is written and tested against Linux only.
 - The registry ships knowledge for a small number of architectures. Everything else resolves through generic rules, which is why `inspect` says `inferred` rather than `official` for most models.
 
@@ -33,10 +32,10 @@ Everything in this README was executed on one machine, and nothing here is a pro
 | OpenVINO Tokenizers | 2026.4.0.0 |
 | optimum-intel | 2.2.0 |
 | nncf | 3.4.0 |
-| transformers | 5.2.0 |
+| transformers | 5.5.4 on the host; Qwen3.5 exports used 5.2.0, the version the registry pins for that architecture (the earlier ones with 5.2.0 installed on the host, the later CPU export in a managed export environment) |
 | huggingface_hub | 1.21.0 |
 
-The end-to-end path (`prepare` → `probe` → `chat` → `bench`) has been exercised on **CPU** with `Qwen/Qwen3-0.6B` quantized to INT4 asymmetric, group size 128, and on **GPU** with the Qwen3.5-9B VLM of the reference case quantized to INT4 asymmetric, group size 128. The same VLM has also been prepared, probed and benchmarked on the GPU under the channel-wise `npu-int4-sym-cw` profile, for the size-and-speed comparison in [`docs/PROFILE_COMPARISON.md`](docs/PROFILE_COMPARISON.md). On the **NPU**, `Qwen/Qwen3-0.6B` quantized to INT4 symmetric, group size 128 (`npu-int4-sym-g128`) has been prepared, chatted with and benchmarked end to end. The Qwen3.5-9B VLM does not run there: its NPU pipeline is rejected by the compiler (`OneShotBufferizeVPU2VPUIP failed : Only supports FP16.`), which yonga classifies and answers with a GPU recommendation rather than a driver complaint. Note that a *raw* compile of any LLM's language submodel fails on the NPU — that is a property of raw compiles, not of the model, and is why yonga lets the GenAI pipeline decide. No other CPU, GPU, NPU, distribution or OpenVINO release has been tested. Treat the version list as *what was verified*, not as a support matrix.
+The end-to-end path (`prepare` → `probe` → `chat` → `bench`) has been exercised on **CPU** with `Qwen/Qwen3-0.6B` quantized to INT4 asymmetric, group size 128, and on **GPU** with the Qwen3.5-9B VLM of the reference case quantized to INT4 asymmetric, group size 128. The same VLM has also been prepared, probed and benchmarked on the GPU under the channel-wise `npu-int4-sym-cw` profile, for the comparison in [`docs/PROFILE_COMPARISON.md`](https://github.com/ooguz/yonga/blob/main/docs/PROFILE_COMPARISON.md). On the **NPU**, `Qwen/Qwen3-0.6B` quantized to INT4 symmetric, group size 128 (`npu-int4-sym-g128`) has been prepared, chatted with and benchmarked end to end. The Qwen3.5-9B VLM does not run there: its NPU pipeline is rejected by the compiler (`OneShotBufferizeVPU2VPUIP failed : Only supports FP16.`), which yonga classifies and answers with a GPU recommendation rather than a driver complaint. Note that a *raw* compile of any LLM's language submodel fails on the NPU — that is a property of raw compiles, not of the model, and is why yonga lets the GenAI pipeline decide. No other CPU, GPU, NPU, distribution or OpenVINO release has been tested. Treat the version list as *what was verified*, not as a support matrix.
 
 #### Architecture families verified on that machine
 
@@ -62,7 +61,7 @@ on the NPU, and benchmarked on the CPU. The registry's device claims for these f
 CPU figures are single-run INT4 throughput on the short prompt. Gemma, LFM2 and Qwen2.5-VL need an
 older Transformers than the one installed; `prepare` read that range from optimum-intel and
 exported them in managed environments. GGUF import is verified separately (see
-`docs/PROFILE_COMPARISON.md` §9).
+[`docs/PROFILE_COMPARISON.md`](https://github.com/ooguz/yonga/blob/main/docs/PROFILE_COMPARISON.md#9-gguf-imports-against-the-original-weights) section 9).
 
 ## What works today
 
@@ -95,35 +94,42 @@ Global flags: `--json`, `--verbose`, `--debug`, `--offline`, `--config`, `--data
 
 ### AppImage: one file, nothing else to install
 
-Each GitHub release carries `yonga-X.Y.Z-x86_64.AppImage`: yonga, its own Python and the OpenVINO runtime in a single file, for x86_64 Linux with glibc 2.28 or newer.
+Each [GitHub release](https://github.com/ooguz/yonga/releases) carries `yonga-X.Y.Z-x86_64.AppImage` and its `.sha256`: yonga, its own Python and the OpenVINO runtime in a single file, for x86_64 Linux with glibc 2.28 or newer. With `X.Y.Z` replaced by the release you downloaded:
 
 ```bash
-chmod +x yonga-0.2.0-x86_64.AppImage
-./yonga-0.2.0-x86_64.AppImage doctor
+sha256sum --check yonga-X.Y.Z-x86_64.AppImage.sha256
+chmod +x yonga-X.Y.Z-x86_64.AppImage
+./yonga-X.Y.Z-x86_64.AppImage doctor
 ```
 
 Rename it to `yonga` somewhere on your `PATH` to use it like the installed command. Without FUSE, set `APPIMAGE_EXTRACT_AND_RUN=1`. The GPU and NPU still need the host's Intel drivers, which no package can carry (`doctor` says what is missing). The conversion toolchain is not in the file, because it is about 1.5 GB and depends on the model: the first `prepare` that converts a model builds a managed export environment for it under `~/.cache/yonga/envs` and reuses it afterwards.
 
+The Python packages in the image are resolved from PyPI when it is built, so each release also carries `yonga-X.Y.Z-x86_64.AppImage.packages.txt`: the exact package versions that AppImage bundles and the sha256 of the yonga wheel inside it. The same list is in the image as `usr/share/yonga/packages.txt`.
+
 ### pip
 
-Requires Linux x86_64 and Python 3.11-3.14. From a clone of this repository (or, once it is published, `pip install "yonga[openvino,export]"` from PyPI):
+Requires Linux x86_64 and Python 3.11-3.14. Install from PyPI into a virtual environment:
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -e ".[openvino,export]"
+pip install "yonga[openvino,export]"
 ```
+
+`pip install yonga` alone installs the core without any extra. On a machine without an NVIDIA GPU, installing the CPU build of torch first saves about 4 GB of CUDA libraries that an Intel AI PC never uses; [`docs/INSTALL.md`](https://github.com/ooguz/yonga/blob/main/docs/INSTALL.md#pip) has the command.
+
+To work on `yonga` itself, install from a clone of this repository instead: `pip install -e ".[openvino,export,serve,dev]"`.
 
 The extras are separate because they cost very different amounts of disk:
 
 - **`openvino`** — `openvino`, `openvino-genai`, `openvino-tokenizers`. Needed by `probe`, `chat`, `bench` and by the device section of `doctor`.
 - **`export`** — `optimum-intel[openvino]`, `nncf` (which pull in `transformers` and `torch`). Used by `prepare` to convert and quantize a model. Without it, `prepare` converts in a managed export environment instead, built on first use with the toolchain yonga is tested with.
 - **`serve`** — FastAPI and uvicorn. Needed by `serve` only.
-- **`dev`** — pytest, ruff, mypy.
+- **`dev`** — pytest, pytest-cov, pytest-mock, pytest-timeout, ruff, mypy, build, twine. For working on `yonga` itself, not for running it.
 
-Without the extras `yonga` still runs: `doctor`, `inspect`, `list`, `logs` and `registry` work, and `doctor` exits 10 and tells you which package is missing and which extra installs it. `yonga` never installs, upgrades or removes a package in the environment you installed it into; it prints the command for you to run. (When a model's exporter needs different package versions, `prepare` builds an isolated environment for that export instead — see `docs/INSTALL.md` section 6.)
+Without the extras `yonga` still runs: `doctor`, `inspect`, `list`, `logs` and `registry` work, and `doctor` exits 10 and tells you which package is missing and which extra installs it. `yonga` never installs, upgrades or removes a package in the environment you installed it into; it prints the command for you to run. (When a model's exporter needs different package versions, `prepare` builds an isolated environment for that export instead — see [`docs/INSTALL.md`](https://github.com/ooguz/yonga/blob/main/docs/INSTALL.md#6-the-transformers-version-caveat) section 6.)
 
-Full prerequisites, the Intel NPU driver situation on Linux, and the version rules that actually bite are in [`docs/INSTALL.md`](docs/INSTALL.md).
+Full prerequisites, the Intel NPU driver situation on Linux, and the version rules that actually bite are in [`docs/INSTALL.md`](https://github.com/ooguz/yonga/blob/main/docs/INSTALL.md).
 
 ## Quick start
 
@@ -182,20 +188,20 @@ Below 5B parameters each device's default profile keeps a fifth of the layers at
 group-wise INT4), because measured over twelve models that loses far less quality for 9-18 % more
 disk; larger models, models whose size is unknown and the VLM families keep plain INT4, and the
 NPU keeps channel-wise INT4 for the families never tried with group-wise. `--profile` overrides
-either way, and [`docs/PROFILE_COMPARISON.md`](docs/PROFILE_COMPARISON.md) section 10 has the
-numbers.
+either way, and [`docs/PROFILE_COMPARISON.md`](https://github.com/ooguz/yonga/blob/main/docs/PROFILE_COMPARISON.md#10-small-model-defaults-twelve-models-three-devices)
+section 10 has the numbers.
 
 Those numbers are one real run of one small model on this host's CPU. They are an illustration of the output, not a performance claim.
 
 Inside `chat`: `/help`, `/reset`, `/clear`, `/tokens N`, `/temp X`, `/top-p X`, `/top-k N`, `/reasoning on|off`, `/stats on|off`, `/model`, `/exit`.
 
-When something fails, the diagnostic carries a stable code, remediation and a job log path. [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) maps every code the shipped registry can produce.
+When something fails, the diagnostic carries a stable code, remediation and a job log path. [`docs/TROUBLESHOOTING.md`](https://github.com/ooguz/yonga/blob/main/docs/TROUBLESHOOTING.md) maps every code the shipped registry can produce.
 
 ## Initial target environment
 
-The first supported platform is Linux x86_64, with Ubuntu 24.04/26.04 as the primary tested distributions and Intel Core Ultra systems with CPU, Arc iGPU, and NPU. The architecture must permit Windows support later without rewriting the core model and compatibility logic.
+The first supported platform is Linux x86_64, with Ubuntu 26.04 (verified) and 24.04 (intended, not yet tested) as the primary target distributions and Intel Core Ultra systems with CPU, Arc iGPU, and NPU. The core model and compatibility logic is kept platform-neutral so Windows support can be added later.
 
-The tested software baseline is OpenVINO 2026.4.x, OpenVINO GenAI 2026.4.x, OpenVINO Tokenizers 2026.4.x, Optimum Intel 2.2, NNCF 3.4, Transformers 5.x, and `huggingface_hub` 1.x. Version compatibility is represented as registry data rather than scattered hard-coded checks, which is why a model can declare, for example, that its export needs `transformers ==5.2.*` while the host has some other release — `yonga` stops at preflight instead of silently exporting something wrong, and only `--ignore-exporter-requirements` overrides it.
+The tested software baseline is OpenVINO 2026.4.x, OpenVINO GenAI 2026.4.x, OpenVINO Tokenizers 2026.4.x, Optimum Intel 2.2, NNCF 3.4, Transformers 5.x, and `huggingface_hub` 1.x. Version compatibility is represented as registry data rather than scattered hard-coded checks, which is why a model can declare, for example, that its export needs `transformers ==5.2.*` while the host has some other release. When the installed packages cannot meet such a pin, `prepare` does not silently export something wrong: it shows an isolated export environment in the preparation plan and, once you confirm, builds it under the cache directory. Your own environment is never modified. `--no-managed-env` (or `managed_export_envs = false` in `config.toml`) makes preflight refuse instead (exit 10, naming the pin), and `--ignore-exporter-requirements` exports in your own environment anyway and records the override in the artifact's manifest. `--yes` approves building the environment but never implies the override. [`docs/INSTALL.md`](https://github.com/ooguz/yonga/blob/main/docs/INSTALL.md#6-the-transformers-version-caveat) section 6 has the details.
 
 ## Core user experience
 
@@ -257,24 +263,26 @@ the first whose every tensor type OpenVINO GenAI can read, and produces an ordin
 
 ## Repository documentation
 
-Read these documents before implementation:
+Design and specification documents:
 
-- [`SPEC.md`](SPEC.md) — normative product and technical specification.
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — components, boundaries, state, and data flow.
-- [`docs/CLI_SPEC.md`](docs/CLI_SPEC.md) — command-line behavior and UX contract.
-- [`docs/REGISTRY_SPEC.md`](docs/REGISTRY_SPEC.md) — compatibility registry schema and resolution rules.
-- [`docs/MODEL_PIPELINE.md`](docs/MODEL_PIPELINE.md) — inspect/download/convert/repair/probe/run pipeline.
-- [`docs/TESTING.md`](docs/TESTING.md) — unit, integration, fixture, and hardware testing strategy.
-- [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md) — ordered milestones and acceptance criteria.
+- [`SPEC.md`](https://github.com/ooguz/yonga/blob/main/SPEC.md) — the design specification.
+- [`docs/ARCHITECTURE.md`](https://github.com/ooguz/yonga/blob/main/docs/ARCHITECTURE.md) — components, boundaries, state, and data flow.
+- [`docs/CLI_SPEC.md`](https://github.com/ooguz/yonga/blob/main/docs/CLI_SPEC.md) — command-line behavior and UX contract.
+- [`docs/REGISTRY_SPEC.md`](https://github.com/ooguz/yonga/blob/main/docs/REGISTRY_SPEC.md) — compatibility registry schema and resolution rules.
+- [`docs/MODEL_PIPELINE.md`](https://github.com/ooguz/yonga/blob/main/docs/MODEL_PIPELINE.md) — inspect/download/convert/repair/probe/run pipeline.
+- [`docs/TESTING.md`](https://github.com/ooguz/yonga/blob/main/docs/TESTING.md) — unit, integration, fixture, and hardware testing strategy.
+- [`docs/IMPLEMENTATION_PLAN.md`](https://github.com/ooguz/yonga/blob/main/docs/IMPLEMENTATION_PLAN.md) — the historical milestone plan of the first build.
+- [`docs/ROADMAP.md`](https://github.com/ooguz/yonga/blob/main/docs/ROADMAP.md) — what is done, what is still open, and what comes next.
 
 User-facing documentation:
 
-- [`docs/INSTALL.md`](docs/INSTALL.md) — Ubuntu prerequisites, extras, NPU driver and permissions, version rules.
-- [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) — every diagnostic code, exit codes, and how to read a job log.
-- [`docs/PROFILE_COMPARISON.md`](docs/PROFILE_COMPARISON.md) — two INT4 quantizations of the same Qwen3.5-9B weights measured on this host: size and speed only, with the caveats spelled out.
-- [`CHANGELOG.md`](CHANGELOG.md) — what changed in each release.
+- [`docs/USAGE.md`](https://github.com/ooguz/yonga/blob/main/docs/USAGE.md) — a hands-on tour of every command and how to check what it does.
+- [`docs/INSTALL.md`](https://github.com/ooguz/yonga/blob/main/docs/INSTALL.md) — Ubuntu prerequisites, extras, NPU driver and permissions, version rules.
+- [`docs/TROUBLESHOOTING.md`](https://github.com/ooguz/yonga/blob/main/docs/TROUBLESHOOTING.md) — every diagnostic code, exit codes, and how to read a job log.
+- [`docs/PROFILE_COMPARISON.md`](https://github.com/ooguz/yonga/blob/main/docs/PROFILE_COMPARISON.md) — profile measurements on this host: size, speed and output quality (`yonga eval`) for two INT4 quantizations of Qwen3.5-9B, GGUF imports against the original weights, and the twelve-model, three-device measurements behind the small-model defaults, with the caveats spelled out.
+- [`CHANGELOG.md`](https://github.com/ooguz/yonga/blob/main/CHANGELOG.md) — what changed in each release.
 
-An example compatibility entry for the real-world Qwen3.5 case used to derive this design is in [`registry/examples/qwen3_5.yaml`](registry/examples/qwen3_5.yaml).
+An example compatibility entry for the real-world Qwen3.5 case used to derive this design is in [`registry/examples/qwen3_5.yaml`](https://github.com/ooguz/yonga/blob/main/registry/examples/qwen3_5.yaml).
 
 ## Non-goals for the MVP
 
@@ -292,7 +300,3 @@ The MVP also does not aim to support every Hugging Face task. Focus first on tex
 6. **Graceful fallback:** distinguish unsupported model/device combinations from broken installations.
 7. **Useful diagnostics:** collapse known failures into actionable messages while preserving raw logs.
 8. **Upstream-friendly:** model repairs and compatibility rules should be narrow, traceable, and suitable for turning into upstream bug reports.
-
-## Working title
-
-`yonga` is a working CLI/package name. Treat branding and trademark review as a pre-public-release task; do not couple internal module names so tightly that renaming becomes expensive.

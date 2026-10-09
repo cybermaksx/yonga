@@ -30,7 +30,13 @@ yonga [GLOBAL OPTIONS] COMMAND ...
 --help
 ```
 
-`--json` suppresses decorative UI and emits one JSON document for commands that support it.
+Global options go before the command name: `yonga --offline --debug prepare MODEL`, not
+`yonga prepare MODEL --offline`. `--json` is the one global option that commands also accept after
+their own name (`yonga list --json`).
+
+`--json` suppresses decorative UI and emits one JSON document for commands that support it. `chat`
+and `serve` reject it (exit 70): a conversation is not one document, and `serve` reports its state
+as JSON at `GET /health` instead.
 
 ## 3. `doctor`
 
@@ -117,7 +123,7 @@ No multi-GB download.
 ## 5. `search`
 
 ```bash
-yonga search QUERY [--limit 20] [--device npu|gpu|cpu|auto]
+yonga search QUERY [--limit 20] [--device npu|gpu|cpu|auto] [--json]
 ```
 
 This command is optional in milestone 1 but desired for MVP.
@@ -215,15 +221,19 @@ Output final artifact ID/path.
 ## 7. `list`
 
 ```bash
-yonga list [--json]
+yonga list [--clean] [--json]
 ```
 
 Shows prepared artifacts, source revision, profile, recommended device, size, last benchmark.
 
+`--clean` retires stale staging and temporary directories under the retention policy
+(`workspace_retention_hours`, `workspace_retention_max`) and never touches a running job's
+directories.
+
 ## 8. `remove`
 
 ```bash
-yonga remove ARTIFACT
+yonga remove ARTIFACT [--yes] [--json]
 ```
 
 Only removes tool-owned prepared artifact and compile cache references. It must not delete Hugging Face global cache unless a future explicit cache command is used.
@@ -309,7 +319,7 @@ Save full JSON and print its path.
 Advanced command:
 
 ```bash
-yonga probe MODEL_OR_ARTIFACT [--device DEVICE] [--all-submodels]
+yonga probe MODEL_OR_ARTIFACT [--device DEVICE] [--all-submodels] [--json]
 ```
 
 Shows per-submodel read/compile result. This is the productized form of the manual diagnostic script used during development.
@@ -364,7 +374,7 @@ only by the export subprocess, and never modify the environment yonga runs in.
 ## 13. `logs`
 
 ```bash
-yonga logs [JOB_ID]
+yonga logs [JOB_ID] [--json]
 yonga logs JOB_ID --raw
 yonga logs JOB_ID --bundle [--output PATH]
 ```
@@ -372,7 +382,7 @@ yonga logs JOB_ID --bundle [--output PATH]
 Useful after failed conversion. `--bundle` writes a redacted, anonymised archive of the job log, job
 state, artifact manifest and host report for attaching to a bug report.
 
-## 14. `serve` (phase 2)
+## 14. `serve`
 
 ```bash
 yonga serve MODEL_OR_ARTIFACT \
@@ -410,9 +420,40 @@ non-empty `stop`, non-zero `presence_penalty` / `frequency_penalty`, `tools` / `
 last message is not from the user. A runtime failure is a 500 whose `error.code` is the diagnostic
 code.
 
+Request limits (`DEFAULT_MAX_BODY_BYTES` in `src/yonga/api/app.py`, `MAX_MESSAGES` in
+`src/yonga/api/openai.py`):
+
+- A request body over 8 MiB is refused with 413 `request_too_large`. A declared `Content-Length`
+  over the limit is refused before the body is read; otherwise the bytes are counted as they
+  arrive, so a chunked body without a length is held to the same limit.
+- More than 4096 messages in one request is refused with 400, `param` `messages`.
+
+Every error response uses OpenAI's shape, `{"error": {"message", "type", "param", "code"}}`:
+
+| Status | `code` | When |
+|---|---|---|
+| 400 | `invalid_request` | The body does not validate (missing or mistyped fields, too many messages); `param` names the field. |
+| 400 | `unsupported_parameter` | A parameter yonga cannot honour (above); `param` names it. |
+| 400 | the diagnostic code (`serve.request.*`) | A generation setting outside the ranges `chat` accepts. |
+| 401 | `invalid_api_key` | A key is configured and the request does not carry it. |
+| 404 | `model_not_found` | `model` does not name the served model. |
+| 404 | `not_found` | No such path. |
+| 405 | `method_not_allowed` | The path exists but not for this method. |
+| 413 | `request_too_large` | The body passed the size limit. |
+| 500 | the diagnostic code | Generation failed for any other classified reason. |
+
+Other HTTP errors raised by routing carry `invalid_request`.
+
+With `stream: true`, a request refused before generation starts gets the same status and body as
+above. A generation failure after the stream has begun cannot change the status, which is already
+200: it arrives as one event, `data: {"error": {"message", "code"}}`, where `code` is the
+diagnostic code or `internal_error`, followed by `data: [DONE]`.
+
 When `YONGA_API_KEY` is set in the environment, every endpoint except `/health` requires
-`Authorization: Bearer <key>` (401 otherwise). The key is never logged or echoed. Binding a
-non-loopback address prints a warning, a stronger one without a key.
+`Authorization: Bearer <key>` (401 otherwise). Authentication runs before the size limit, so a
+client without the key is refused before any body is read. The key is read from the environment
+only, never from an option, and is never logged or echoed. Binding a non-loopback address prints a
+warning, a stronger one without a key; set `YONGA_API_KEY` whenever `--host` is not loopback.
 
 ## 13a. `eval`
 
@@ -522,6 +563,23 @@ Reserve stable classes:
 70  registry/configuration error
 99  unexpected internal error
 ```
+
+A failure exits with its category's code (`CATEGORY_EXIT_CODES` in
+`src/yonga/domain/diagnostics.py`). Codes 40, 42 and 52 are no category's code: they name the stage
+a job died in (conversion, repair, generation) and appear only when the category is
+`unknown_runtime_error`, except that `bench` exits 52 when none of its runs produced a measurement. Code 41 is both: the validation stage's code for an
+`unknown_runtime_error`, and the category code of `unsupported_ir_type` and
+`tokenizer_ir_incompatible`.
+
+`prepare` exits 50 when it cannot use a device, whatever the diagnostic's category: an explicit
+`--device` that is not present or whose probe fails, and an automatic run with no fallback left. The
+exception is a failure whose diagnostic marks the environment as broken (`environment_broken`), such
+as `npu.device.permission_denied` or `device.driver_missing`: no fallback is attempted, and
+`prepare` exits 10, because the host has to be fixed before any device choice matters. `probe`,
+`chat` and `bench` keep the category's code (a `probe` failure that stays `unknown_runtime_error`
+exits 51, not 99), so an NPU compiler refusal is 51 there and 50 from
+`prepare`. The diagnostic's code and category are in the message and the `--json` document either
+way.
 
 ## 16. Localization
 

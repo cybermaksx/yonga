@@ -8,18 +8,31 @@ The registry is advisory + policy input. Runtime probes remain important when ev
 
 ## 2. Files
 
-Suggested built-in layout:
+The built-in rules ship inside the package, in `src/yonga/registry/builtin/`, and load in this order
+as one layer:
 
 ```text
-registry/
+src/yonga/registry/builtin/
   architectures.yaml
   profiles.yaml
   issues.yaml
   derivatives.yaml
-  models.yaml
+  repairs.yaml
+  chat.yaml
+  gguf.yaml
 ```
 
-For development it is acceptable to combine them, but the loader must normalize them into typed records.
+Each file is one registry document: a top-level `schema_version` and one or more lists of rules
+under the section names `architectures`, `profiles`, `issues`, `repairs`, `derivatives`, `models`,
+`chat` (also accepted as `chat_profiles`) and `gguf`. The file name does not decide what a document
+may contain, so a document can mix sections; there is no built-in `models.yaml`, and exact model
+rules (section 9) can go in any document. A remote bundle (section 12.1) and the user's
+`registry-overrides/` directory hold documents of the same shape. `registry/examples/qwen3_5.yaml`
+in the repository is a complete example document for the Qwen3.5 reference case. The loader
+normalizes every document into typed records.
+
+The examples in sections 3 to 7 (except 5.1) and 9 show single rules; in a document each sits as a
+list item under its section, as the examples in sections 5.1, 8 and 8a do.
 
 ## 3. Common fields
 
@@ -104,6 +117,24 @@ priority: 100
 Profiles may contain runtime properties separately from export properties: `runtime` holds
 OpenVINO GenAI pipeline properties (`ATTENTION_BACKEND`, `MAX_PROMPT_LEN`), and
 `export_extra_args` extra `optimum-cli` arguments. `rationale` says why the profile exists.
+
+`export_extra_args` tunes an export; it never decides what is exported, where it is written or
+whether a repository's code runs. It may not name:
+
+- `--model` or `-m` (also with its value attached to `-m`), `--task`,
+  `--trust-remote-code`, `--model-kwargs`, `--cache_dir` (or `--cache-dir`), `--token` or
+  `--quantization-statistics-path`, which yonga either sets itself or keeps out of registry data;
+- the quantization options yonga derives from the profile's `quantization` section:
+  `--weight-format`, `--sym`, `--ratio`, `--group-size`, `--backup-precision`, `--dataset`,
+  `--all-layers`, `--awq` and `--scale-estimation`;
+- a bare `--`, which would turn the arguments after it into positionals.
+
+The check reads an argument the way `argparse` does: `--name=value` counts as `--name`, and a long
+option that is a prefix of a reserved one (`--trust-remote`, `--weight`) counts as that option.
+Arguments without a leading dash are values and are not checked. The same restriction applies to
+`export.extra_args` in an architecture rule (section 4). A file that breaks it fails to load with
+`registry.schema_violation`; a profile built in code rather than loaded from a file is refused when
+the export command is built, with `export.reserved_extra_args`.
 
 ### 5.1 Model-size bands (schema version 2)
 
@@ -198,17 +229,22 @@ The YAML selects a code implementation; arbitrary find/replace instructions must
 ## 8. Derivative source rule
 
 ```yaml
-id: hauhaucs-qwen35-safetensors-derivative
-schema_version: 1
-requested_repo: HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive
-sources:
-  - repo_id: nDimensional/Qwen3.5-9B-Uncensored-Safetensors
-    relationship: lossless_conversion
-    trust: suggest
-    evidence:
-      - kind: model_card
-        url: https://huggingface.co/nDimensional/Qwen3.5-9B-Uncensored-Safetensors
+derivatives:
+  - id: hauhaucs-qwen35-safetensors
+    schema_version: 1
+    requested_repo: HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive
+    candidates:
+      - repo_id: nDimensional/Qwen3.5-9B-Uncensored-Safetensors
+        relationship: lossless_conversion
+        trust: suggest
+        evidence:
+          - kind: model_card
+            url: https://huggingface.co/nDimensional/Qwen3.5-9B-Uncensored-Safetensors
 ```
+
+`candidates` lists the repositories that may stand in for `requested_repo`, each with its own
+`evidence`. The rule's own `sources` (section 3) remain available for the provenance of the rule
+itself.
 
 `trust` values:
 
@@ -216,7 +252,7 @@ sources:
 - `auto_if_trusted`: may be selected in auto mode only when registry source itself is trusted and lineage constraints pass;
 - `never_auto`: informational only.
 
-MVP should use `suggest` for all third-party derivatives.
+The built-in registry uses `suggest` for every third-party derivative.
 
 ## 8a. GGUF rule
 
@@ -308,7 +344,7 @@ If two same-specificity rules conflict and priority does not resolve them, regis
 
 Built-in rules are shipped with the package and covered by tests. Every compatibility claim should have at least one provenance entry when practical.
 
-A future remote registry must be authenticated/signed before automatic use. MVP should not fetch executable repair logic from the network.
+A remote registry is used only when it is signed by a trusted key (section 12.1). yonga never fetches executable repair logic from the network: a repair rule can only name an implementation compiled into yonga.
 
 ### 12.1 Remote bundles (implemented)
 
@@ -329,6 +365,10 @@ A remote registry is distributed as one JSON document plus a detached signature:
 ```json
 {"format": 1, "key_id": "40eb0328d070643d", "signature": "<base64 Ed25519 signature of the bundle bytes>"}
 ```
+
+`created_at` and `expires_at` must carry a UTC offset, such as the `+00:00` that
+`tools/registry_bundle.py build` writes, or `Z`. A naive timestamp is ambiguous between time zones,
+so a bundle with one is refused as malformed (`registry.remote.invalid`).
 
 A bundle is used only when all of the following hold, and they are checked again on every load:
 

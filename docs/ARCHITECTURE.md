@@ -334,11 +334,11 @@ Registry data should be loaded into typed schema objects, normalized, validated,
 Support:
 
 - built-in package registry;
-- optional remote signed/update registry later;
+- signed remote registry bundles, layered between the built-in rules and user overrides (`yonga registry update`, `REGISTRY_SPEC.md` section 12.1);
 - user override directory;
 - debug command to explain rule matching.
 
-Potential future command:
+Rule matching is explained by:
 
 ```bash
 yonga registry explain MODEL --device NPU
@@ -397,12 +397,12 @@ Chat generation remains synchronous initially. Ctrl+C should cancel the current 
 
 ## 15. Future plugin points
 
+Some of the extension points this section first listed have been filled: the remote registry updater (`yonga registry update`), the model publication adapter (`yonga publish`) and an OpenVINO GGUF import for architectures and tensor types a registry `gguf` rule verifies (`REGISTRY_SPEC.md` section 8a).
+
 Keep interfaces open for:
 
 - Windows hardware probe;
-- llama.cpp/OpenVINO GGUF backend;
+- llama.cpp backend;
 - OpenVINO Model Server adapter;
-- remote compatibility registry updater;
-- model publication adapter;
 - GUI frontend;
 - additional accelerator vendors only if the project intentionally expands scope later.
