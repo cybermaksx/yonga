@@ -29,6 +29,7 @@ from yonga.domain.models import ModelFormat, ModelIdentity, ModelMetadata, Resol
 from yonga.registry.loader import load_registry_from_documents, parse_document, validate_registry
 from yonga.registry.remote import TrustedKey, key_id, verify_bundle
 from yonga.registry.resolver import RegistryResolver
+from yonga.registry.schema import SCHEMA_MIN_TOOL_VERSION, SCHEMA_VERSION
 from yonga.ui.tables import inspect_report, preparation_plan, registry_explanation
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -308,8 +309,9 @@ def test_an_undeclared_schema_version_is_read_as_the_loader_reads_it(bundle_tool
     """No ``schema_version`` means the build's own, so the bundle must need this build."""
     banded = re.sub(r"(?m)^\s*schema_version: 2\n", "", BANDED_REGISTRY)
     assert "schema_version" not in banded
-    assert bundle_tool.schema_versions({"p.yaml": banded}) == {2}
-    assert bundle_tool.required_tool_version({"p.yaml": banded}, None) == "0.3.0"
+    assert bundle_tool.schema_versions({"p.yaml": banded}) == {SCHEMA_VERSION}
+    expected = SCHEMA_MIN_TOOL_VERSION[SCHEMA_VERSION]
+    assert bundle_tool.required_tool_version({"p.yaml": banded}, None) == expected
 
 
 def test_required_tool_version_for_a_schema_2_profile(bundle_tool: ModuleType):

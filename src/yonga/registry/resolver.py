@@ -346,6 +346,8 @@ class RegistryExplanation(BaseModel):
     profile: ResolutionExplanation | None = None
     chat_profile_id: str | None = None
     chat: ResolutionExplanation
+    chat_tool_calling: str | None = None
+    """The winning chat profile's tool-call format, described; ``None`` when it declares none."""
     derivatives: list[DerivativeCandidate] = Field(default_factory=list)
     derivative_resolution: ResolutionExplanation
     device_compatibility: list[DeviceCompatibility] = Field(default_factory=list)
@@ -1394,6 +1396,11 @@ class RegistryResolver:
             profile=profile_explanation,
             chat_profile_id=chat_rule.id if chat_rule is not None else None,
             chat=chat_explanation,
+            chat_tool_calling=(
+                chat_rule.tool_calling.describe()
+                if chat_rule is not None and chat_rule.tool_calling is not None
+                else None
+            ),
             derivatives=derivatives,
             derivative_resolution=derivative_explanation,
             device_compatibility=compatibility,

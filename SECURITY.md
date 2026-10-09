@@ -42,3 +42,7 @@ offered only those four decoders, with the pixel count checked from the header b
 decoded, and only the request that holds the pipeline holds decoded pixels. A way to make `serve`
 open a connection or a file, or to make a decoder other than those four read request bytes, is in
 scope; a vulnerability inside Pillow's own decoders is Pillow's.
+
+Tool calls are read, never run: `yonga serve` returns the calls a model writes to the client, which
+decides whether to execute them. The format a model's answer is read in is chosen by registry data
+from parsers compiled into yonga, and a registry file or remote bundle can never supply a parser.

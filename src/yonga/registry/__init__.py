@@ -37,6 +37,7 @@ from yonga.registry.resolver import (
 )
 from yonga.registry.schema import (
     IDENTITY_HINT_SOURCE,
+    KNOWN_TOOL_CALL_FORMATS,
     SCHEMA_VERSION,
     SPECIFICITY_ARCHITECTURE,
     SPECIFICITY_ARCHITECTURE_ALIAS,
@@ -73,6 +74,7 @@ from yonga.registry.schema import (
     RuleStatus,
     SourceKind,
     SourceRef,
+    ToolCallingRule,
     TrustPolicy,
     subject_from_metadata,
 )
@@ -82,6 +84,7 @@ __all__ = [
     "GENERIC_SIGNATURES",
     "IDENTITY_HINT_SOURCE",
     "KNOWN_REPAIR_IMPLEMENTATIONS",
+    "KNOWN_TOOL_CALL_FORMATS",
     "SCHEMA_VERSION",
     "SPECIFICITY_ARCHITECTURE",
     "SPECIFICITY_ARCHITECTURE_ALIAS",
@@ -120,6 +123,7 @@ __all__ = [
     "RuleStatus",
     "SourceKind",
     "SourceRef",
+    "ToolCallingRule",
     "TrustPolicy",
     "builtin_registry_dir",
     "installed_registry_versions",

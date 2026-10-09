@@ -993,6 +993,9 @@ def registry_explanation(explanation: RegistryExplanation) -> RenderableType:
                     ("Chosen because  ", "bold"), (resolution.profile_selection.sentence, "dim")
                 )
             )
+        if resolution is explanation.chat and explanation.chat_profile_id is not None:
+            tools = explanation.chat_tool_calling or "not declared; serve refuses tools"
+            blocks.append(Text.assemble(("Tool calling  ", "bold"), (tools, "dim")))
 
     if explanation.derivatives:
         blocks.extend((Text(""), Text("Derivative candidates", style="bold")))

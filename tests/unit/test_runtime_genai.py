@@ -25,6 +25,7 @@ from yonga.adapters.runtime_genai import (
     ChatRuntime,
     GenAIChatRuntime,
     GenerationResult,
+    ToolCall,
     build_generation_config,
     collect_metrics,
     open_runtime,
@@ -108,9 +109,13 @@ class FakeChatHistory:
         self.messages = []
         self.extra_context = None
         self.extra_context_error = None
+        self.tools = None
 
     def append(self, message):
         self.messages.append(message)
+
+    def set_tools(self, tools):
+        self.tools = tools
 
     def set_extra_context(self, context):
         if self.extra_context_error is not None:
@@ -245,7 +250,57 @@ def test_chat_history_helpers():
 
 def test_chat_message_rejects_an_unknown_role():
     with pytest.raises(ValueError, match="role"):
-        ChatMessage(role=cast(Any, "tool"), content="x")
+        ChatMessage(role=cast(Any, "function"), content="x")
+
+
+WEATHER_TOOL = {
+    "type": "function",
+    "function": {"name": "get_weather", "parameters": {"type": "object", "properties": {}}},
+}
+
+
+def tool_conversation() -> ChatHistory:
+    call = ToolCall(id="call_1", name="get_weather", arguments='{"city": "Ankara"}')
+    return ChatHistory(
+        messages=[
+            ChatMessage(role="user", content="Weather in Ankara?"),
+            ChatMessage(role="assistant", content="", tool_calls=[call]),
+            ChatMessage(role="tool", content="21 C", tool_call_id="call_1", name="get_weather"),
+        ],
+        tools=[WEATHER_TOOL],
+    )
+
+
+def test_tool_turns_take_the_chat_template_convention():
+    """Arguments become an object, which templates writing ``arguments | tojson`` need."""
+    payload = tool_conversation().to_payload()
+
+    assert payload[1] == {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "get_weather", "arguments": {"city": "Ankara"}},
+            }
+        ],
+    }
+    assert payload[2] == {
+        "role": "tool",
+        "content": "21 C",
+        "tool_call_id": "call_1",
+        "name": "get_weather",
+    }
+
+
+def test_arguments_that_are_not_a_json_object_stay_text():
+    call = ToolCall(id="call_1", name="f", arguments="[1, 2")
+    assert call.as_payload()["function"] == {"name": "f", "arguments": "[1, 2"}
+
+
+def test_tools_are_never_serialised_with_the_history():
+    assert "tools" not in tool_conversation().model_dump()
 
 
 # --- chat profile ---------------------------------------------------------------------
@@ -903,6 +958,38 @@ def test_vlm_sends_the_whole_history_when_the_pipeline_accepts_one(artifact, set
     ]
     assert "generation_config" in kwargs
     assert pipeline.chat_events == [], "the deprecated lifecycle is never touched"
+
+
+def test_tools_and_tool_turns_reach_the_genai_history(artifact, settings, genai):
+    runtime = make_runtime(artifact, settings)
+
+    runtime.generate(tool_conversation(), GenerationSettings())
+
+    (args, _kwargs) = genai.pipelines[0].generate_calls[0]
+    sent = args[0]
+    assert sent.tools == [WEATHER_TOOL]
+    assert [m["role"] for m in sent.messages] == ["user", "assistant", "tool"]
+    assert sent.messages[1]["tool_calls"][0]["function"]["arguments"] == {"city": "Ankara"}
+
+
+def test_a_history_without_tools_sets_none(artifact, settings, genai):
+    runtime = make_runtime(artifact, settings)
+    history = ChatHistory()
+    history.add_user("Hello")
+
+    runtime.generate(history, GenerationSettings())
+
+    (args, _kwargs) = genai.pipelines[0].generate_calls[0]
+    assert args[0].tools is None
+
+
+def test_the_legacy_vlm_lifecycle_refuses_tools_rather_than_drop_them(artifact, settings, genai):
+    runtime = make_runtime(artifact, settings, pipeline=PipelineKind.VLM)
+
+    with pytest.raises(GenerationError) as caught:
+        runtime.generate(tool_conversation(), GenerationSettings())
+    assert caught.value.diagnostic.code == "runtime.genai.tools_unsupported"
+    assert genai.pipelines[0].chat_events == []
 
 
 def test_vlm_falls_back_to_the_lifecycle_once_and_remembers(artifact, settings, genai):

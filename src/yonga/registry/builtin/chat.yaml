@@ -12,7 +12,17 @@
 # supports_thinking_flag explicitly overrides that decision in either direction:
 # `true` applies `thinking_template_variable` unconditionally, `false` vetoes
 # every variable.
-schema_version: 1
+#
+# `tool_calling` (schema 3) says how a family writes tool calls, and only a
+# family seen doing it on the reference host gets one: `yonga serve` refuses
+# `tools` for every other model. The format is one of the parsers compiled
+# into yonga; `template_contains` keeps the entry off an artifact whose own
+# chat template does not ask for that format. Measured and left undeclared on
+# 2026-10-09 because their output was not a parseable call: Llama-3.2-1B
+# (echoed the schema), LFM2-350M (degenerate output), gemma-3-1b and OLMo-2-1B
+# (GenAI's generic tool prompt, answered with fenced JSON and wrong or
+# invented arguments). Qwen3.5 was not measured.
+schema_version: 3
 
 chat:
   - id: chat-qwen3_5
@@ -49,7 +59,7 @@ chat:
           different sampling defaults for thinking and non-thinking modes.
 
   - id: chat-qwen3
-    schema_version: 1
+    schema_version: 3
     status: active
     priority: 100
     summary: Qwen3 sampling defaults; the thinking variable comes from the template
@@ -76,6 +86,21 @@ chat:
       temperature: 0.6
       top_p: 0.95
       top_k: 20
+    tool_calling:
+      format: tagged_json
+      open: "<tool_call>"
+      close: "</tool_call>"
+      template_contains: "<tool_call>"
+      evidence: tested
+      sources:
+        - kind: tested
+          note: >-
+            2026-10-09, reference host, OpenVINO GenAI 2026.4, CPU, Qwen3-0.6B
+            and Qwen3-1.7B: offered one get_weather tool and asked for the
+            weather in Ankara (max_new_tokens 120), each answered
+            <tool_call>{"name": "get_weather", "arguments": {"city": "Ankara"}}</tool_call>.
+            One prompt per model, one turn; a second turn carrying the tool
+            result, GPU, NPU and the Qwen3 MoE models were not run.
     sources:
       - kind: model_card
         url: https://huggingface.co/Qwen/Qwen3-0.6B
@@ -88,6 +113,102 @@ chat:
           Qwen3 chat_template.jinja emits an empty <think> block when
           enable_thinking is false, which is why the wrapper is stripped as well
           as suppressed.
+
+  # The three rules below keep chat-default's conservative policy exactly (the
+  # family documents nothing yonga applies yet) and add the measured tool-call
+  # format; a model of these families behaved the same before they existed.
+  - id: chat-qwen2
+    schema_version: 3
+    status: active
+    priority: 100
+    summary: Qwen2 and Qwen2.5 with chat-default's policy, plus measured tool calls
+    match:
+      model_types:
+        - qwen2
+      architectures:
+        - Qwen2ForCausalLM
+    default_thinking: false
+    reasoning_wrappers:
+      - ["<think>", "</think>"]
+    defaults:
+      max_new_tokens: 4096
+    tool_calling:
+      format: tagged_json
+      open: "<tool_call>"
+      close: "</tool_call>"
+      # Distilled models built on qwen2 (such as DeepSeek-R1-Distill-Qwen) ship
+      # another template, which does not ask for this format.
+      template_contains: "<tool_call>"
+      evidence: tested
+      sources:
+        - kind: tested
+          note: >-
+            2026-10-09, reference host, OpenVINO GenAI 2026.4, CPU,
+            Qwen2.5-0.5B-Instruct: offered one get_weather tool and asked for
+            the weather in Ankara (max_new_tokens 120), it answered
+            <tool_call>{"name": "get_weather", "arguments": {"city": "Ankara"}}</tool_call>.
+            One prompt, one turn; GPU, NPU and a second turn were not run.
+
+  - id: chat-smollm3
+    schema_version: 3
+    status: active
+    priority: 100
+    summary: SmolLM3 with chat-default's policy, plus measured tool calls
+    match:
+      model_types:
+        - smollm3
+      architectures:
+        - SmolLM3ForCausalLM
+    default_thinking: false
+    reasoning_wrappers:
+      - ["<think>", "</think>"]
+    defaults:
+      max_new_tokens: 4096
+    tool_calling:
+      format: tagged_json
+      open: "<tool_call>"
+      close: "</tool_call>"
+      template_contains: "<tool_call>"
+      evidence: tested
+      sources:
+        - kind: tested
+          note: >-
+            2026-10-09, reference host, OpenVINO GenAI 2026.4, CPU, SmolLM3-3B:
+            offered one get_weather tool and asked for the weather in Ankara
+            (max_new_tokens 120), it answered
+            <tool_call>{"name": "get_weather", "arguments": {"city": "Ankara"}}</tool_call>.
+            One prompt, one turn; GPU, NPU and a second turn were not run.
+
+  - id: chat-granite
+    schema_version: 3
+    status: active
+    priority: 100
+    summary: Granite with chat-default's policy, plus measured tool calls
+    match:
+      model_types:
+        - granite
+      architectures:
+        - GraniteForCausalLM
+    default_thinking: false
+    reasoning_wrappers:
+      - ["<think>", "</think>"]
+    defaults:
+      max_new_tokens: 4096
+    tool_calling:
+      # <|tool_call|> is a special token, so the detokenizer removes it and the
+      # answer is the bare JSON list; it is still accepted when present.
+      format: json_list
+      open: "<|tool_call|>"
+      template_contains: "<|tool_call|>"
+      evidence: tested
+      sources:
+        - kind: tested
+          note: >-
+            2026-10-09, reference host, OpenVINO GenAI 2026.4, CPU,
+            granite-3.3-2b-instruct: offered one get_weather tool and asked for
+            the weather in Ankara (max_new_tokens 120), it answered
+            [{"name": "get_weather", "arguments": {"city": "Ankara"}}].
+            One prompt, one turn; GPU, NPU and a second turn were not run.
 
   - id: chat-default
     schema_version: 1

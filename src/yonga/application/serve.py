@@ -26,6 +26,13 @@ short note saying so (see :func:`carry_images_forward`). That trades accuracy
 about *when* an image was shown for compatibility with clients that resend
 every image of the conversation on each follow-up.
 
+Tools reach only a model whose registry chat profile declares a measured
+tool-call format (see :attr:`ChatSession.tool_calling
+<yonga.application.chat.ChatSession.tool_calling>`); every other model refuses
+a request that offers them, rather than hand a model functions nobody has seen
+it call and then never read its answer as a call. An answer that cannot be read
+as calls is returned as text and logged as such, without its content.
+
 An image waits for the pipeline undecoded. The wire layer checks what an
 image's header says and hands over a :class:`PendingImage`; its pixels are
 decoded only once the request holds the pipeline, so however many requests are
@@ -35,11 +42,13 @@ memory than its body.
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 import uuid
 from collections.abc import Callable, Sequence
 from datetime import datetime
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -56,6 +65,7 @@ from yonga.application.chat import (
     ChatTurn,
     TextSink,
 )
+from yonga.application.tool_calls import TOOL_CALLS_REASON
 from yonga.domain.benchmarks import GenerationSettings
 from yonga.domain.diagnostics import ConfigurationError, FailureCategory, diagnostic
 from yonga.domain.models import PipelineKind
@@ -68,14 +78,19 @@ __all__ = [
     "MAX_IMAGE_PIXELS",
     "MAX_STOP_LENGTH",
     "MAX_STOP_SEQUENCES",
+    "MAX_TOOLS",
+    "TOOLS_UNSUPPORTED",
     "TOO_MANY_IMAGES",
     "CompletionRequest",
     "ImagePolicy",
     "ModelServer",
     "PendingImage",
     "ServedModel",
+    "ToolPolicy",
     "carry_images_forward",
 ]
+
+_LOG = logging.getLogger(__name__)
 
 #: Most stop sequences one request may carry, as OpenAI allows.
 MAX_STOP_SEQUENCES = 4
@@ -90,11 +105,16 @@ MAX_IMAGES = 4
 #: scaled down, so the model never sees something other than what was sent.
 MAX_IMAGE_PIXELS = 4096 * 4096
 
+#: Most tools one request may offer, as OpenAI allows.
+MAX_TOOLS = 128
+
 #: Diagnostic codes of the image refusals, shared with the wire layer so a
 #: request gets the same code whichever layer catches it.
 IMAGES_UNSUPPORTED = "serve.request.images_unsupported"
 IMAGES_EARLIER_TURN = "serve.request.images_earlier_turn"
 TOO_MANY_IMAGES = "serve.request.too_many_images"
+#: Diagnostic code of a request offering tools to a model that takes none.
+TOOLS_UNSUPPORTED = "serve.request.tools_unsupported"
 
 #: The why of :data:`IMAGES_EARLIER_TURN`, for both layers' messages.
 EARLIER_TURN_REASON = (
@@ -138,6 +158,17 @@ class ImagePolicy(BaseModel):
     max_pixels: int = MAX_IMAGE_PIXELS
 
 
+class ToolPolicy(BaseModel):
+    """Whether a server accepts ``tools``; the wire layer checks a request against it."""
+
+    model_config = ConfigDict(frozen=True)
+
+    accepted: bool
+    """Whether the served model's chat profile declares a tool-call format it can use."""
+    refusal: str = ""
+    """Why it takes no tools, in a sentence, when it takes none."""
+
+
 class PendingImage(BaseModel):
     """An accepted image whose pixels are not decoded yet.
 
@@ -169,6 +200,12 @@ class CompletionRequest(BaseModel):
     """The client's stop sequences, matched on the visible answer (see ``ChatSession.respond``)."""
     images: list[PendingImage] = Field(default_factory=list)
     """Images to decode onto their messages, after any those already carry."""
+    tools: list[dict[str, Any]] = Field(default_factory=list, max_length=MAX_TOOLS)
+    """Function definitions in OpenAI's ``tools`` shape, already validated."""
+    tool_choice: Literal["auto", "none"] = "auto"
+    """``none`` keeps the tools from the model and its answer is not read for calls."""
+    parallel_tool_calls: bool = True
+    """``False`` keeps only the first call of an answer that makes several."""
 
 
 def _invalid(code: str, detail: str) -> ConfigurationError:
@@ -193,6 +230,10 @@ class ModelServer:
         self._image_policy = ImagePolicy(
             accepted=session.pipeline is PipelineKind.VLM,
             carry_forward=carry_images_forward,
+        )
+        self._tool_policy = ToolPolicy(
+            accepted=session.tool_calling is not None,
+            refusal=session.tool_calling_refusal or "",
         )
         self._lock = threading.Lock()
         manifest = session.manifest
@@ -226,6 +267,11 @@ class ModelServer:
     def image_policy(self) -> ImagePolicy:
         """Which images this server accepts."""
         return self._image_policy
+
+    @property
+    def tool_policy(self) -> ToolPolicy:
+        """Whether this server accepts tools."""
+        return self._tool_policy
 
     @property
     def loaded(self) -> bool:
@@ -308,11 +354,27 @@ class ModelServer:
         """
         settings = self.generation_for(request)
         self._check_images(request)
+        if request.tools and not self._tool_policy.accepted:
+            raise _invalid(TOOLS_UNSUPPORTED, self._tool_policy.refusal)
+        offered = request.tools if request.tool_choice == "auto" else []
         with self._lock:
             # Decoded only now, so that requests waiting for the pipeline hold
             # their encoded images and nothing more.
-            history = ChatHistory(messages=self._conversation(request))
-            return self._session.respond(history, settings, on_text=on_text, stop=request.stop)
+            history = ChatHistory(messages=self._conversation(request), tools=offered)
+            turn = self._session.respond(
+                history,
+                settings,
+                on_text=on_text,
+                stop=request.stop,
+                parallel_tool_calls=request.parallel_tool_calls,
+            )
+        if turn.result is not None and turn.result.tool_calls_unparsed:
+            # Never the text: a request's content is not logged.
+            _LOG.warning(
+                "The answer began like a tool call that could not be read as one; "
+                "it was returned as text."
+            )
+        return turn
 
     def _check_images(self, request: CompletionRequest) -> None:
         """Refuse the request's images unless the policy allows them.
@@ -385,14 +447,17 @@ def completion_id() -> str:
 
 
 def finish_reason(turn: ChatTurn, settings_limit: int) -> str:
-    """OpenAI's ``finish_reason`` for a finished turn: ``length`` or ``stop``.
+    """OpenAI's ``finish_reason`` for a finished turn: ``tool_calls``, ``length`` or ``stop``.
 
     A turn a stop sequence ended is ``stop`` even when the runtime went on to
-    its token limit, as one that cannot stream early does.
+    its token limit, as one that cannot stream early does. A turn that made
+    calls is ``tool_calls``.
     """
     result = turn.result
     if result is None:
         return "stop"
+    if result.tool_calls:
+        return TOOL_CALLS_REASON
     reason = (result.stop_reason or "").lower()
     if reason == STOP_SEQUENCE_REASON:
         return "stop"

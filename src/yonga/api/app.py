@@ -1,8 +1,9 @@
 """The FastAPI application: ``/health``, ``/v1/models`` and ``/v1/chat/completions``.
 
 Streaming follows OpenAI's server-sent events shape: a first chunk carrying the
-assistant role, one chunk per released piece of text, a final chunk with the
-``finish_reason``, an optional usage chunk, and ``data: [DONE]``. Generation
+assistant role, one chunk per released piece of text, one chunk per tool call
+(whole, once generation has ended), a final chunk with the ``finish_reason``,
+an optional usage chunk, and ``data: [DONE]``. Generation
 runs on a worker thread; a client that disconnects makes the next chunk ask
 the pipeline to stop, so an abandoned request does not hold the accelerator
 for the rest of its token budget.
@@ -46,7 +47,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from yonga import __version__
-from yonga.api.openai import ChatCompletionRequest, ParameterError
+from yonga.api.openai import ChatCompletionRequest, ParameterError, wire_tool_call
 from yonga.application.chat import ChatTurn
 from yonga.application.serve import (
     CompletionRequest,
@@ -139,13 +140,15 @@ def create_app(
     async def chat_completions(body: ChatCompletionRequest) -> JSONResponse | StreamingResponse:
         if not server.model.answers_to(body.model):
             return _model_not_found(body.model)
-        policy, check = server.image_policy, server.generation_for
+        policy, tools, check = server.image_policy, server.tool_policy, server.generation_for
         try:
             if body.has_images:
                 # Reading image headers takes CPU time; it must not hold up the event loop.
-                completion = await asyncio.to_thread(body.to_completion, policy, check=check)
+                completion = await asyncio.to_thread(
+                    body.to_completion, policy, tools=tools, check=check
+                )
             else:
-                completion = body.to_completion(policy, check=check)
+                completion = body.to_completion(policy, tools=tools, check=check)
             limit = server.generation_for(completion).max_new_tokens
         except ParameterError as error:
             return _error(400, str(error), error.code, param=error.param)
@@ -203,6 +206,15 @@ def _completion(server: ModelServer, turn: ChatTurn, *, limit: int) -> dict[str,
     # Stripped exactly as a streamed answer is (see StreamingSanitizer), so the
     # same request gives the same content whether or not it streams.
     text = result.display_text.strip() if result is not None else ""
+    message: dict[str, object] = {"role": "assistant", "content": text}
+    calls = result.tool_calls if result is not None else []
+    if calls:
+        # OpenAI's shape: no text beside the calls is null, not "".
+        message = {
+            "role": "assistant",
+            "content": text or None,
+            "tool_calls": [wire_tool_call(call) for call in calls],
+        }
     payload: dict[str, object] = {
         "id": completion_id(),
         "object": "chat.completion",
@@ -211,7 +223,7 @@ def _completion(server: ModelServer, turn: ChatTurn, *, limit: int) -> dict[str,
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": text},
+                "message": message,
                 "finish_reason": finish_reason(turn, limit),
             }
         ],
@@ -226,7 +238,7 @@ def _chunk(
     identifier: str,
     created: int,
     model: str,
-    delta: dict[str, str],
+    delta: dict[str, object],
     reason: str | None = None,
 ) -> str:
     payload = {
@@ -279,6 +291,10 @@ async def _stream(
                 yield _chunk(identifier, created, model, {"content": str(value)})
                 continue
             if kind == "done" and isinstance(value, ChatTurn) and value.diagnostic is None:
+                calls = value.result.tool_calls if value.result is not None else []
+                for index, call in enumerate(calls):
+                    delta: dict[str, object] = {"tool_calls": [wire_tool_call(call, index=index)]}
+                    yield _chunk(identifier, created, model, delta)
                 yield _chunk(identifier, created, model, {}, finish_reason(value, limit))
                 usage = _usage(value)
                 if include_usage and usage is not None:

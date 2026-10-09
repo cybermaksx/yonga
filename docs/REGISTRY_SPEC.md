@@ -40,7 +40,8 @@ All rules have:
 
 ```yaml
 id: unique-stable-id
-schema_version: 2        # 1 still loads; 2 adds profile size bands (section 5.1)
+schema_version: 3        # 1 and 2 still load; 2 adds profile size bands (section 5.1),
+                         # 3 adds a chat profile's tool_calling (section 8b)
 status: active           # active | deprecated | experimental
 summary: short text
 sources:
@@ -279,7 +280,7 @@ a remote bundle or a user override can extend support without a code change.
 ## 8b. Chat profile rule
 
 How a model family expects a conversation to be driven: its thinking variable, reasoning wrappers,
-generation defaults and end markers. `chat` and `serve` use the matching rule; without one, the
+generation defaults, end markers and, when measured, how it writes tool calls. `chat` and `serve` use the matching rule; without one, the
 copy `prepare` recorded in the artifact's manifest (which includes `stop_strings`), and otherwise a
 conservative built-in default.
 
@@ -306,6 +307,62 @@ list only markers that end the model's turn wherever they appear. A client's `st
 different thing, matched by yonga on the visible answer (`docs/CLI_SPEC.md` section 14). An empty
 list leaves generation and a benchmark's settings fingerprint exactly as they were; no built-in rule
 declares any yet.
+
+### 8b.1 Tool calling (schema version 3)
+
+`tool_calling` says how a family writes tool calls. `yonga serve` accepts OpenAI `tools` only for a
+model whose chat profile carries one (`docs/CLI_SPEC.md` section 14), so the entry is a claim that
+the format was seen, not a template's promise:
+
+```yaml
+schema_version: 3
+chat:
+  - id: chat-qwen3
+    schema_version: 3
+    match:
+      model_types: [qwen3, qwen3_moe]
+    tool_calling:
+      format: tagged_json              # a parser compiled into yonga: tagged_json | json_list
+      open: "<tool_call>"              # the marker in front of a call (or of the call list)
+      close: "</tool_call>"            # the marker after it
+      name_field: name                 # default; the call object's key for the function name
+      arguments_field: arguments       # default; its key for the arguments
+      template_contains: "<tool_call>" # optional; the artifact's chat template must contain it
+      evidence: tested                 # tested | official, required
+      sources:                         # at least one, required
+        - kind: tested
+          note: 2026-10-09, reference host, ... answered <tool_call>{...}</tool_call>
+```
+
+- **Formats.** `format` names one of the parsers compiled into yonga (`KNOWN_TOOL_CALL_FORMATS` in
+  `src/yonga/registry/schema.py`); registry data selects and parameterises a parser and can never
+  describe one. `tagged_json`: each call is one JSON object between `open` and `close` (both
+  required), repeatable, with text allowed around the blocks. `json_list`: the whole answer is one
+  JSON array of call objects, after `open` when it is present (a marker that is a special token is
+  removed by the detokenizer, so it may be absent) and before `close` when that is set. A call
+  object names the function under `name_field` and carries an object of arguments, or JSON text of
+  one, under `arguments_field`; missing arguments mean none.
+- **Reading.** Calls are read from the visible answer, after the reasoning sanitiser, and only calls
+  to the functions the request offered count. Anything that cannot be read that way is the answer's
+  text, never a guessed call.
+- **Template check.** With `template_contains`, tool calling is enabled for an artifact only when
+  its own chat template contains that literal, as the thinking variable is detected: a family rule
+  then cannot switch tools on for a repackaged model whose template asks for another format.
+- **Evidence.** `evidence` must be `tested` or `official`, and `sources` must say where the format
+  was seen; an unmeasured family gets no entry and refuses `tools`.
+- **Unknown format.** A rule naming a format this yonga has no parser for still loads (a layer may
+  be written for a newer release), its model refuses `tools`, and `yonga registry validate` reports
+  it. A remote bundle naming one is refused (`registry.remote.unknown_tool_call_format`), as a
+  bundle naming an unknown repair is.
+- **Version.** A chat profile with `tool_calling` needs `schema_version: 3`. A rule without its own
+  `schema_version` takes its document's, and no rule may declare a newer version than its document,
+  as for size bands (section 5.1). A schema-2 yonga refuses a schema-3 file as too new rather than
+  as a schema violation.
+
+`yonga registry explain` prints the winning chat profile's format under "Tool calling", or says
+that none is declared. The built-in registry declares `tagged_json` for `chat-qwen3`, `chat-qwen2`
+and `chat-smollm3` and `json_list` for `chat-granite`; `chat.yaml` records which families were
+measured and left out, and why.
 
 ## 9. Exact model rules
 
@@ -408,17 +465,20 @@ A bundle is used only when all of the following hold, and they are checked again
 - `min_tool_version`, when set, is not newer than the running yonga;
 - every file is a relative `.yaml`/`.yml` path and parses with `yaml.safe_load` into the strict
   schema;
-- every repair rule names an implementation already compiled into yonga. Registry data selects a
-  built-in repair; it can never deliver one.
+- every repair rule names an implementation already compiled into yonga, and every chat profile's
+  `tool_calling` names a tool-call parser compiled into it. Registry data selects a built-in repair
+  or parser; it can never deliver one.
 
 The bundle forms one layer after the built-in rules and before user overrides: it may replace a
 shipped rule by id, and a user override replaces either.
 
 `tools/registry_bundle.py build` sets `min_tool_version` from the newest `schema_version` in the
-bundle (schema 2 needs yonga 0.3.0), and refuses a lower `--min-tool-version`. An older yonga then
-refuses the bundle at `registry update` and keeps the one it has, instead of installing data it
-cannot parse. A schema-2 bundle therefore cuts older releases off from every remote update,
-including issue signatures; keep bundles at schema 1 until a band itself must change remotely.
+bundle (schema 2 needs yonga 0.3.0, schema 3 needs 0.4.0), and refuses a lower
+`--min-tool-version`. An older yonga then refuses the bundle at `registry update` and keeps the one
+it has, instead of installing data it cannot parse. A schema-2 or schema-3 bundle therefore cuts
+older releases off from every remote update, including issue signatures; keep bundles at schema 1
+until a band or a tool-call format itself must change remotely. A file that declares no
+`schema_version` is read at the building yonga's own version, so declare one.
 
 ## 13. Registry tests
 

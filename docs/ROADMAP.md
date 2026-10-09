@@ -150,8 +150,17 @@ loop and only while the request holds the pipeline, and only with the last user 
 GenAI 2026.4 binds images to the newest turn of a stateless history; `--carry-images-forward`
 moves earlier ones there with a note, and `--max-body-mb` raises the 8 MiB body limit. Covered by
 unit tests with fake runtimes; the checks through serve on a GPU artifact, for stop sequences and
-for images (Qwen2.5-VL-3B and Qwen3.5-9B), are still to be run. Not done: tool calls, concurrent
-generation, `detail`-driven image resizing.
+for images (Qwen2.5-VL-3B and Qwen3.5-9B), are still to be run. Tool calls followed as well,
+driven by registry data: a chat profile's `tool_calling` (schema 3) selects one of the parsers
+compiled into yonga (`tagged_json`, `json_list`), declared for Qwen2/Qwen2.5, Qwen3, SmolLM3 and
+Granite, the families seen producing parseable calls on the reference host in the scoping study
+(CPU, one prompt each); every other model refuses `tools`. Calls are read after the reasoning
+sanitiser, streamed as whole deltas once complete, and an unreadable call is returned as text.
+Covered by unit tests with fake runtimes; a two-turn round trip through serve on real artifacts
+(Qwen3 on the GPU, Granite, the NPU's prompt-length limit with tool schemas) is still to be run.
+Not done: `tool_choice` `required` or a named function (needs GenAI's constrained decoding,
+unmeasured on GPU and NPU), Qwen3.5's XML tool-call format (unmeasured), concurrent generation,
+`detail`-driven image resizing.
 
 **2.2 — `yonga publish`. [done]**
 One-commit upload of the manifest's files, the source's license files, a generated model card and

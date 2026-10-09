@@ -277,8 +277,39 @@ on the visible answer, so a stop such as `"\n\n"` cannot fire inside a hidden re
 leave an empty answer; with `--show-reasoning` the reasoning block is part of the visible answer, so
 a stop sequence can end it there. The answer ends before the first stop sequence to complete, and
 without the whitespace in front of it, with `finish_reason` `stop`, streamed or not, and generation
-stops there. `n` above 1, tools, penalties and JSON response formats are still refused with a
-400.
+stops there. `n` above 1, penalties, JSON response formats and the legacy `functions` are still
+refused with a 400.
+
+Tools work on the families the registry has seen calling them on the reference host: Qwen2 and
+Qwen2.5, Qwen3, SmolLM3 and Granite (`yonga registry explain MODEL` shows "Tool calling" under the
+chat profile). Send OpenAI `tools`; the answer comes back as `message.tool_calls` with
+`finish_reason` `tool_calls`, and the follow-up carries the assistant's `tool_calls` and a `tool`
+message with each result, exactly as with OpenAI:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="unused")
+tools = [{"type": "function", "function": {"name": "get_weather",
+          "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}]
+messages = [{"role": "user", "content": "Weather in Ankara?"}]
+reply = client.chat.completions.create(model="ARTIFACT", messages=messages, tools=tools)
+call = reply.choices[0].message.tool_calls[0]
+messages += [reply.choices[0].message,
+             {"role": "tool", "tool_call_id": call.id, "content": '{"celsius": 21}'}]
+print(client.chat.completions.create(model="ARTIFACT", messages=messages, tools=tools)
+      .choices[0].message.content)
+```
+
+Any other model refuses `tools` with `serve.request.tools_unsupported` rather than pretend:
+Llama-3.2-1B, LFM2-350M, gemma-3-1b and OLMo-2-1B were tried and did not write usable calls.
+`tool_choice` may be `auto` or `none`; `required` or a named function is refused, since forcing a
+call would need constrained decoding. `parallel_tool_calls: false` keeps the first call. Streamed,
+text arrives until a call could begin and each call then arrives whole, so the stream pauses while
+the model writes it. An answer that looks like a call but is not a valid one (broken JSON, a
+function you did not offer) comes back as plain text, never as a guessed call. Small models call
+tools unreliably; the offered schemas also lengthen every prompt, which matters on the NPU, whose
+prompt length is fixed when the model is compiled.
 
 A VLM artifact (Qwen2.5-VL, Qwen3.5) also takes images, as OpenAI `image_url` content parts holding
 a `data:` URL; an LLM artifact refuses them with `serve.request.images_unsupported`:

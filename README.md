@@ -12,7 +12,7 @@ The tool is **NPU-first, not NPU-only**. If a model cannot compile on the NPU, `
 
 `yonga` prepares, validates, runs and benchmarks OpenVINO artifacts on one machine, and it is honest about the parts that do not exist yet:
 
-- **`serve` is deliberately small.** It serves one artifact, one request at a time, and refuses what it cannot honour (`n` > 1, tools, JSON response formats) with a 400 rather than ignoring it. Stop sequences are honoured, matched on the visible answer so a hidden reasoning block cannot trigger one. A VLM artifact takes images, but only embedded as `data:` URLs (yonga never fetches a URL) and only with the last user message, a limit of OpenVINO GenAI's stateless chat history.
+- **`serve` is deliberately small.** It serves one artifact, one request at a time, and refuses what it cannot honour (`n` > 1, JSON response formats, tools on a model the registry has not seen calling them) with a 400 rather than ignoring it. Tool calls work on Qwen2/Qwen2.5, Qwen3, SmolLM3 and Granite, read in the format the registry records for each family. Stop sequences are honoured, matched on the visible answer so a hidden reasoning block cannot trigger one. A VLM artifact takes images, but only embedded as `data:` URLs (yonga never fetches a URL) and only with the last user message, a limit of OpenVINO GenAI's stateless chat history.
 - **Windows is not supported yet.** The architecture keeps the door open, but every device, driver and path probe is written and tested against Linux only.
 - The registry ships knowledge for a small number of architectures. Everything else resolves through generic rules, which is why `inspect` says `inferred` rather than `official` for most models.
 

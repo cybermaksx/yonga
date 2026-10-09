@@ -38,6 +38,30 @@ manifest may change in any minor release.
   conversation. The model then no longer knows which words each image went with.
 - **`serve --max-body-mb N`** sets the request body limit, 1 to 64 MiB (8 by default), since
   embedded images count towards it.
+- **`serve` takes OpenAI `tools` on models the registry has seen calling them.** A chat profile's
+  new `tool_calling` entry (registry schema 3, below) says how a family writes calls; only a model
+  whose profile declares one, and whose own chat template contains the entry's
+  `template_contains` literal, accepts `tools`. Built in: Qwen2/Qwen2.5, Qwen3 and SmolLM3
+  (`<tool_call>{json}</tool_call>`) and Granite (a JSON list), each seen producing a parseable call
+  on the reference host on 2026-10-09 (CPU, one prompt each). Every other model refuses `tools`
+  with a 400 `serve.request.tools_unsupported` naming `tools` and saying why. The tools, an
+  assistant's `tool_calls` and `tool` results reach the artifact's own chat template through
+  GenAI's `ChatHistory.set_tools`; a conversation may end on a tool result. The answer is read for
+  calls after the reasoning sanitiser and returned as `message.tool_calls` with `finish_reason`
+  `tool_calls`; streamed, text is released until a call could begin and each call then arrives as
+  one complete delta. An answer that cannot be read as calls to the offered functions is returned
+  as text, never as a guessed call, and logged as such without its content. `tool_choice` `auto`
+  and `none` are honoured; `required` and a named function are refused (they need constrained
+  decoding). `parallel_tool_calls: false` keeps the first call. `stop` sequences match only the
+  text outside the calls. `docs/CLI_SPEC.md` section 14.
+- **Registry schema version 3: `tool_calling` on a chat profile.** It selects one of the tool-call
+  parsers compiled into yonga (`tagged_json`, `json_list`), fills in its markers and field names,
+  and must state `evidence` `tested` or `official` with at least one source. Older files load
+  unchanged. A rule using it needs `schema_version: 3`, inherited from its document as size bands
+  are; `tools/registry_bundle.py` gives a schema-3 bundle `min_tool_version` 0.4.0, so older
+  releases refuse it at `registry update`. `registry validate` and remote bundles refuse a format
+  this yonga has no parser for. `yonga registry explain` shows the chosen profile's tool-call
+  format. `docs/REGISTRY_SPEC.md` section 8b.
 - **`yonga probe --quick` and `--timeout SECONDS`.** Settling a deferred NPU compile means building
   the GenAI pipeline, which for a 9B model ran past 15 minutes. `--quick` never builds it;
   `--timeout` builds it in a child process (`python -P -m yonga.adapters.smoke_child`) and stops it
@@ -51,6 +75,14 @@ manifest may change in any minor release.
 
 ### Changed
 
+- **Qwen2/Qwen2.5, SmolLM3 and Granite have their own chat profiles** (`chat-qwen2`,
+  `chat-smollm3`, `chat-granite`) instead of `chat-default`. They copy its policy exactly (thinking
+  detection, `<think>` stripping, 4096 new tokens, no sampling defaults) and add only
+  `tool_calling`, so `chat` behaves as before; `registry explain` names the new rule.
+- **`serve` accepts `tool` messages and assistant `tool_calls` in a conversation**, alongside
+  `tools`. They used to be dropped without an error when no `tools` came with them; now that is a
+  400 naming the message. The legacy `functions` and `function_call` are refused by their own name
+  instead of as `tools`.
 - **The registry chat profile's `stop_strings` is applied.** The field was parsed and never used; it
   now reaches OpenVINO GenAI's `GenerationConfig.stop_strings` as model-level end markers, left out
   of the answer. Empty and duplicate entries are dropped when a rule loads. A benchmark's settings

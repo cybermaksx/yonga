@@ -364,7 +364,8 @@ yonga registry status [--json]
 yonga registry reset
 ```
 
-`explain` prints matched rules and why they won.
+`explain` prints matched rules and why they won, and under the chat profile its tool-call format
+("Tool calling"), or that it declares none and `serve` refuses tools.
 
 `update` installs a remote registry bundle (`REGISTRY_SPEC.md` section 12). The URL defaults to
 `registry_url` in the configuration, which is unset: yonga contacts no registry server unless told
@@ -374,6 +375,7 @@ rules it adds or replaces, and installs it after confirmation (`--yes` approves)
 `registry.remote.no_trusted_keys`, `untrusted_key`, `bad_signature`, `signature_malformed`,
 `expired`, `rollback` (older than the installed bundle), `tool_too_old`, `unsafe_path`,
 `unknown_repair_implementation` (a repair rule naming code this yonga does not contain),
+`unknown_tool_call_format` (a chat profile naming a tool-call parser this yonga does not contain),
 `too_large`, `insecure_url`. `registry_update_policy = "never"` refuses updates and ignores an
 installed bundle.
 
@@ -444,12 +446,13 @@ serialised; a streaming client that disconnects stops its generation.
 `model` must be the name given to `serve`, the artifact id, or the source repository (404
 `model_not_found` otherwise). Accepted parameters: `max_tokens` / `max_completion_tokens`,
 `temperature` (0 is greedy), `top_p`, `top_k`, `seed`, `repetition_penalty`, validated with the same
-ranges as `chat`'s slash commands, and `stop` (below). Unknown fields are ignored. Parameters that
-would change the answer in a way yonga cannot honour are refused with 400 and `param` set: `n`
-other than 1, non-zero `presence_penalty` / `frequency_penalty`, `tools` / `functions`, a
-`response_format` other than text, `logprobs`, content parts other than `text` and `image_url`
-(below), and a conversation whose last message is not from the user. A runtime failure is a 500
-whose `error.code` is the diagnostic code.
+ranges as `chat`'s slash commands, `stop`, and `tools` with `tool_choice` and
+`parallel_tool_calls` (below). Unknown fields are ignored. Parameters that would change the answer
+in a way yonga cannot honour are refused with 400 and `param` set: `n` other than 1, non-zero
+`presence_penalty` / `frequency_penalty`, the legacy `functions` / `function_call` (also a message's
+`function_call`), a `response_format` other than text, `logprobs`, content parts other than `text`
+and `image_url` (below), and a conversation whose last message is neither the user's nor a `tool`
+result. A runtime failure is a 500 whose `error.code` is the diagnostic code.
 
 `stop` is a string or a list of at most 4 strings (`MAX_STOP_SEQUENCES` in
 `src/yonga/application/serve.py`), each non-empty and at most 256 characters (`MAX_STOP_LENGTH`).
@@ -471,6 +474,55 @@ same place.
 The registry chat profile's `stop_strings` (`docs/REGISTRY_SPEC.md` section 8b) are separate:
 model-level end markers OpenVINO GenAI applies natively and leaves out of the answer.
 
+Tools are accepted only by a model whose registry chat profile declares a measured
+`tool_calling` format (`docs/REGISTRY_SPEC.md` section 8b), and only when this artifact's own chat
+template contains the literal the profile names in `template_contains`; `yonga registry explain`
+shows the format under the chat profile. In the built-in registry that is Qwen2/Qwen2.5, Qwen3,
+SmolLM3 and Granite, the families seen producing parseable calls on the reference host. Any other
+model refuses a non-empty `tools` with 400 `serve.request.tools_unsupported`, `param` `tools`, and
+the message says why (no format declared, a format this yonga lacks, or a template that does not
+ask for it). A model never offered tools it cannot use, and an answer is never read in a format
+nobody saw that model write.
+
+- `tools` holds at most 128 entries (`MAX_TOOLS`), each `{"type": "function", "function": {"name",
+  "description"?, "parameters"?}}`: a name of 1 to 64 letters, digits, `_` or `-`, unique in the
+  request, and parameters that are a JSON Schema object of type `object`. Anything else is a 400
+  naming the entry (`tools[i]`, `tools[i].function.name`, ...). `strict` is ignored, and arguments
+  are not checked against the schema.
+- `tool_choice` `auto` (the default) and `none` are honoured. `none` keeps the tools out of the
+  prompt and the answer is not read for calls. `required` and a named function would need
+  constrained decoding and are refused with 400 `unsupported_parameter`, `param` `tool_choice`.
+- `parallel_tool_calls: false` keeps only the first call of an answer that makes several.
+- The tools reach the artifact's own chat template through OpenVINO GenAI's
+  `ChatHistory.set_tools`, and so do an assistant message's `tool_calls` (arguments as an object,
+  the convention templates expect) and `tool` messages. A `tool` message needs the `tool_call_id`
+  of a call made by the assistant message before it (other tool results may sit between them) and
+  takes that call's function name; anything else is a 400 naming `messages[i].tool_call_id`.
+  `tool_calls` belong to assistant messages only, and each needs an `id`, type `function` and a
+  function `name`. A conversation that carries calls or results needs `tools` in the same request
+  (400 naming `messages[i].tool_calls` or `messages[i].role`): dropping them would answer a
+  different conversation than the one sent. The last message may be a `tool` result.
+- The answer is read for calls after the reasoning sanitiser, so a call drafted in hidden reasoning
+  is neither shown nor made. The profile's format names one of the parsers compiled into yonga:
+  `tagged_json` (each call one JSON object between the profile's `open` and `close` markers, such
+  as `<tool_call>` and `</tool_call>`) or `json_list` (the whole answer one JSON array of calls,
+  after an optional `open` marker). A call names an offered function and carries an object of
+  arguments (or JSON text of one). The calls come back as `message.tool_calls`, each `{"id":
+  "call_…", "type": "function", "function": {"name", "arguments": "<JSON text>"}}`, with the text
+  around them as `content` (`null` when there is none), and `finish_reason` is `tool_calls`.
+- An answer that begins like a call but cannot be read as calls to the offered functions (broken
+  JSON, an unclosed block, a function that was not offered, arguments that are not an object) is
+  returned whole as text, never as a guessed call, with `finish_reason` `stop` or `length`. The
+  server logs a warning that this happened, without the text.
+- Streamed, text is released until a call could begin; from there everything is held until the
+  model finishes, so no marker or partial call is ever sent as content. Each call then arrives as
+  one delta, `{"tool_calls": [{"index", "id", "type", "function": {"name", "arguments"}}]}`,
+  complete rather than in fragments, before the final chunk with `finish_reason` `tool_calls`. An
+  answer held this way that turns out not to be calls is released as text at the end. A
+  `json_list` answer is held from its first character when that is `[` or the marker.
+- `stop` sequences are matched on the text outside the calls only. One that completes before the
+  first call ends the answer there, with no calls and `finish_reason` `stop`, streamed or not.
+
 Images (`image_url` content parts) are accepted by a VLM artifact only; the checks below run in
 this order, each refusal naming the content part in `param`:
 
@@ -485,7 +537,8 @@ this order, each refusal naming the content part in `param`:
   turn of a stateless conversation: an image in an earlier turn fails with "Missing image/video
   with index 0", and list content in an earlier turn is rejected outright. So an image in any
   earlier message is a 400 `serve.request.images_earlier_turn` that says so, unless the server
-  runs with `--carry-images-forward` (below).
+  runs with `--carry-images-forward` (below) and the last message is the user's (not a `tool`
+  result, which takes no image).
 - Then `stop` and the generation settings are checked, before any image is read.
 - `image_url.url` must be a `data:image/(png|jpeg|webp|gif);base64,` URL. `http`, `https`, `file`
   and every other scheme are refused with 400 `unsupported_parameter`, `param`
@@ -539,9 +592,9 @@ Every error response uses OpenAI's shape, `{"error": {"message", "type", "param"
 
 | Status | `code` | When |
 |---|---|---|
-| 400 | `invalid_request` | The body does not validate (missing or mistyped fields, too many messages, `stop` outside its limits, an image that does not decode or is too large); `param` names the field. |
-| 400 | `unsupported_parameter` | A parameter yonga cannot honour (above), including an image URL that is not an accepted `data:` URL; `param` names it. |
-| 400 | the diagnostic code (`serve.request.*`) | A generation setting outside the ranges `chat` accepts, or an image refused by `images_unsupported`, `too_many_images` or `images_earlier_turn` (above, with `param`). |
+| 400 | `invalid_request` | The body does not validate (missing or mistyped fields, too many messages, `stop` outside its limits, an image that does not decode or is too large, a malformed tool or tool turn); `param` names the field. |
+| 400 | `unsupported_parameter` | A parameter yonga cannot honour (above), including an image URL that is not an accepted `data:` URL and a `tool_choice` that forces a call; `param` names it. |
+| 400 | the diagnostic code (`serve.request.*`) | A generation setting outside the ranges `chat` accepts, an image refused by `images_unsupported`, `too_many_images` or `images_earlier_turn`, or tools refused by `tools_unsupported` (above, with `param`). |
 | 401 | `invalid_api_key` | A key is configured and the request does not carry it. |
 | 404 | `model_not_found` | `model` does not name the served model. |
 | 404 | `not_found` | No such path. |

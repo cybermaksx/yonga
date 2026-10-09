@@ -20,6 +20,7 @@ import yaml
 from yonga.domain.diagnostics import Diagnostic, FailureCategory, RegistryError, Severity
 from yonga.registry.schema import (
     KNOWN_REPAIR_IMPLEMENTATIONS,
+    KNOWN_TOOL_CALL_FORMATS,
     SCHEMA_VERSION,
     AnyRule,
     ArchitectureRule,
@@ -573,6 +574,17 @@ def _beats_everywhere(rival: RuleMatch, banded: RuleMatch) -> bool:
     return True
 
 
+def _validate_tool_calling(registry: Registry, problems: list[str]) -> None:
+    """Check every chat profile's ``tool_calling`` selects a parser compiled into yonga."""
+    for rule in registry.chat:
+        tool_calling = rule.tool_calling
+        if tool_calling is not None and tool_calling.format not in KNOWN_TOOL_CALL_FORMATS:
+            problems.append(
+                f"{_describe_rule(rule)}: unknown tool-call format {tool_calling.format!r} "
+                f"(known: {', '.join(sorted(KNOWN_TOOL_CALL_FORMATS))})"
+            )
+
+
 def _validate_size_bands(registry: Registry, problems: list[str]) -> None:
     """Check that size bands leave every model a profile and can actually win.
 
@@ -630,7 +642,7 @@ def validate_registry(
     """Return every human-readable problem found in ``registry``.
 
     This powers ``yonga registry validate``. It reports unknown repair
-    implementation names, unparsable version specifiers, dangling profile,
+    implementation names and tool-call formats, unparsable version specifiers, dangling profile,
     chat-profile and repair references, unknown failure categories, and rule
     pairs that share a priority and a specificity they can both resolve at
     (which would make resolution ambiguous). Specificity is compared over every
@@ -658,4 +670,5 @@ def validate_registry(
     _validate_repairs(registry, implementations, problems)
     _validate_conflicts(registry, problems)
     _validate_size_bands(registry, problems)
+    _validate_tool_calling(registry, problems)
     return problems

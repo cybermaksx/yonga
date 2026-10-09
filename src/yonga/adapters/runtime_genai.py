@@ -90,6 +90,7 @@ __all__ = [
     "GenerationMetrics",
     "GenerationResult",
     "Role",
+    "ToolCall",
     "build_generation_config",
     "collect_metrics",
     "open_runtime",
@@ -120,8 +121,9 @@ _DEFAULT_DEVICE = "CPU"
 _CACHE_DIR_PROPERTY = "CACHE_DIR"
 _LENIENT = ConfigDict(extra="ignore")
 
-#: The three conversation roles the chat template contract uses.
-Role = Literal["system", "user", "assistant"]
+#: The conversation roles the chat template contract uses. ``tool`` carries a
+#: tool's result back to the model; only ``yonga serve`` sends one.
+Role = Literal["system", "user", "assistant", "tool"]
 
 
 # --- conversation types ---------------------------------------------------------------
@@ -150,12 +152,48 @@ class ChatImage(BaseModel):
         return self
 
 
+class ToolCall(BaseModel):
+    """One function call the assistant made, in OpenAI's terms.
+
+    ``arguments`` is JSON text, as OpenAI carries it on the wire; it is parsed
+    into an object only where a chat template needs one (see
+    :meth:`ChatMessage.as_payload`).
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    id: str
+    name: str
+    arguments: str = "{}"
+
+    def as_payload(self) -> dict[str, object]:
+        """The call in the Hugging Face chat-template convention, arguments as an object.
+
+        Templates such as Qwen's write ``arguments | tojson``, which would quote
+        JSON text a second time; text that is not a JSON object stays text.
+        """
+        arguments: object = self.arguments
+        with suppress(ValueError):
+            parsed = json.loads(self.arguments)
+            if isinstance(parsed, dict):
+                arguments = parsed
+        return {
+            "id": self.id,
+            "type": "function",
+            "function": {"name": self.name, "arguments": arguments},
+        }
+
+
 class ChatMessage(BaseModel):
     """One turn in a conversation.
 
     ``images`` only ever travels to a VLM pipeline, and only on the newest user
     turn (see :meth:`GenAIChatRuntime._generate_vlm`). It is excluded from
     serialisation, so no image is ever written wherever a conversation is.
+
+    ``tool_calls`` belongs to an assistant turn that called functions;
+    ``tool_call_id`` and ``name`` to a ``tool`` turn carrying one call's result.
+    The interactive chat never sets them.
     """
 
     model_config = _LENIENT
@@ -163,10 +201,20 @@ class ChatMessage(BaseModel):
     role: Role
     content: str
     images: list[ChatImage] = Field(default_factory=list, exclude=True)
+    tool_calls: list[ToolCall] = Field(default_factory=list)
+    tool_call_id: str | None = None
+    name: str | None = None
 
-    def as_payload(self) -> dict[str, str]:
-        """Return the ``{"role": ..., "content": ...}`` mapping GenAI expects."""
-        return {"role": self.role, "content": self.content}
+    def as_payload(self) -> dict[str, object]:
+        """Return the mapping GenAI expects: ``role`` and ``content``, plus any tool fields."""
+        payload: dict[str, object] = {"role": self.role, "content": self.content}
+        if self.tool_calls:
+            payload["tool_calls"] = [call.as_payload() for call in self.tool_calls]
+        if self.tool_call_id is not None:
+            payload["tool_call_id"] = self.tool_call_id
+        if self.name is not None:
+            payload["name"] = self.name
+        return payload
 
 
 class ChatHistory(BaseModel):
@@ -180,6 +228,12 @@ class ChatHistory(BaseModel):
     model_config = _LENIENT
 
     messages: list[ChatMessage] = Field(default_factory=list)
+    tools: list[dict[str, Any]] = Field(default_factory=list, exclude=True)
+    """Function definitions offered to the model, in OpenAI's ``tools`` shape.
+
+    They reach the chat template through ``ChatHistory.set_tools``; only
+    ``yonga serve`` sets them, and they are never serialised with the history.
+    """
 
     def __len__(self) -> int:
         """Return the number of messages in the conversation."""
@@ -209,7 +263,7 @@ class ChatHistory(BaseModel):
         """The first system message's content, when the conversation has one."""
         return next((m.content for m in self.messages if m.role == "system"), None)
 
-    def to_payload(self) -> list[dict[str, str]]:
+    def to_payload(self) -> list[dict[str, object]]:
         """Return the conversation as a list of role/content mappings."""
         return [message.as_payload() for message in self.messages]
 
@@ -270,6 +324,15 @@ class GenerationResult(BaseModel):
     wall_seconds: float = 0.0
     load_seconds: float | None = None
     stop_reason: str | None = None
+    tool_calls: list[ToolCall] = Field(default_factory=list)
+    """Calls read out of the answer by the chat service; ``display_text`` is then what is left."""
+
+    tool_calls_unparsed: bool = False
+    """True when the answer began like a tool call that could not be read as one.
+
+    It is then returned as text, as the model wrote it; the flag lets a server
+    log that it happened without logging the text.
+    """
 
 
 # --- chat profile ---------------------------------------------------------------------
@@ -1233,14 +1296,22 @@ class GenAIChatRuntime:
         )
 
     def _genai_history(self, history: ChatHistory) -> Any:
-        """Our history as an ``openvino_genai.ChatHistory``, with the template variables."""
+        """Our history as an ``openvino_genai.ChatHistory``, with the template variables.
+
+        Tool definitions go in through ``set_tools`` and tool turns as the
+        message fields the chat template reads (``tool_calls``,
+        ``tool_call_id``), so the artifact's own template renders them. GenAI
+        2026.4 fills in for a template that has no tool support of its own.
+        """
         genai_history = self._genai.ChatHistory()
         vlm = self._pipeline_kind is PipelineKind.VLM
         for message in history.messages:
             payload = message.as_payload()
             if vlm:
-                payload["content"] = _without_media_tags(payload["content"])
+                payload["content"] = _without_media_tags(message.content)
             genai_history.append(payload)
+        if history.tools:
+            genai_history.set_tools([dict(tool) for tool in history.tools])
         extra = thinking_extra_context(
             self._chat_profile, thinking=self._thinking, template=self._chat_template
         )
@@ -1289,6 +1360,17 @@ class GenAIChatRuntime:
             else:
                 self._vlm_accepts_history = True
                 return result
+        if history.tools or any(m.role == "tool" or m.tool_calls for m in history.messages):
+            # The fallback hands the pipeline bare user text: a tool definition,
+            # call or result would be dropped without a word.
+            raise GenerationError(
+                diagnostic(
+                    "runtime.genai.tools_unsupported",
+                    FailureCategory.CONFIGURATION_ERROR,
+                    "This OpenVINO GenAI build cannot pass tools to a VLM",
+                    "Tool calling on a VLM needs a VLMPipeline that accepts a ChatHistory.",
+                )
+            )
         prompt = self._vlm_turn_prompt(history)
         return self._pipeline.generate(prompt, generation_config=generation_config, **extra)
 

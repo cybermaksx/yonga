@@ -18,9 +18,10 @@ through. Verification, all of which must pass before a byte is trusted:
    forged one can inject a fault;
 3. the content is safe regardless of who signed it: relative ``.yaml`` paths
    only, bounded size, every document parses with ``yaml.safe_load`` into the
-   strict schema, and every repair rule names an implementation that is
-   already compiled into this yonga. The YAML can choose which built-in repair
-   applies where; it can never supply one.
+   strict schema, every repair rule names an implementation that is already
+   compiled into this yonga, and every chat profile's ``tool_calling`` names a
+   tool-call parser compiled into it. The YAML can choose which built-in repair
+   or parser applies where; it can never supply one.
 
 The installed bundle is verified again every time the registry is loaded, so
 editing the cached file on disk disables it rather than trusting it.
@@ -44,7 +45,7 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, ValidationErro
 from yonga import __version__
 from yonga.config.paths import Paths
 from yonga.domain.diagnostics import FailureCategory, RegistryError, diagnostic
-from yonga.registry.schema import RegistryDocument
+from yonga.registry.schema import KNOWN_TOOL_CALL_FORMATS, RegistryDocument
 from yonga.util.versions import parse_version
 
 __all__ = [
@@ -305,6 +306,16 @@ def _documents(bundle: RegistryBundle) -> list[RegistryDocument]:
                     f"Repair rule {repair.id!r} names {repair.implementation!r}. Registry data "
                     "can only select a repair compiled into yonga, never supply one.",
                     "Upgrade yonga if a newer release has that repair.",
+                )
+        for chat in document.chat:
+            tool_calling = chat.tool_calling
+            if tool_calling is not None and tool_calling.format not in KNOWN_TOOL_CALL_FORMATS:
+                raise _error(
+                    "registry.remote.unknown_tool_call_format",
+                    "The registry bundle names a tool-call format this yonga does not have",
+                    f"Chat profile {chat.id!r} names {tool_calling.format!r}. Registry data "
+                    "can only select a tool-call parser compiled into yonga, never supply one.",
+                    "Upgrade yonga if a newer release has that format.",
                 )
         documents.append(document)
     return documents

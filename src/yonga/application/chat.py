@@ -13,7 +13,8 @@ the *prompt* opened a block, leaving a reply that contains no wrapper at all;
 that state arrives as ``starts_in_reasoning``, established by
 :func:`yonga.adapters.runtime_genai.resolve_starts_in_reasoning` from the
 artifact's own chat template. A client's stop sequences are matched after it,
-on the visible text only, by :class:`StopMatcher`.
+on the visible text only, by :class:`StopMatcher`, and so are tool calls
+(:mod:`yonga.application.tool_calls`), in the format the chat profile declares.
 
 *The session.* :class:`ChatSession` owns one conversation: the pipeline is built
 once by the injected ``runtime_factory`` and reused for every turn, generation
@@ -54,11 +55,20 @@ from yonga.adapters.runtime_genai import (
     GenerationResult,
     Role,
     StreamingChatRuntime,
+    ToolCall,
     read_chat_template,
     resolve_starts_in_reasoning,
     resolve_thinking_variable,
 )
 from yonga.application.progress import ProgressEvent, ProgressKind, ProgressSink, null_sink
+from yonga.application.tool_calls import (
+    TOOL_CALLS_REASON,
+    ParsedAnswer,
+    ToolCallGate,
+    parse_tool_calls,
+    supported_format,
+    tool_names,
+)
 from yonga.config.settings import DevicePolicy, Settings
 from yonga.domain.artifacts import ArtifactManifest, manifest_path
 from yonga.domain.benchmarks import GenerationSettings
@@ -72,7 +82,7 @@ from yonga.domain.diagnostics import (
 from yonga.domain.hardware import normalise_device
 from yonga.domain.models import ModelIdentity, ModelMetadata, PipelineKind
 from yonga.registry.resolver import RegistryResolver
-from yonga.registry.schema import ChatProfileRule, GenerationDefaults
+from yonga.registry.schema import ChatProfileRule, GenerationDefaults, ToolCallingRule
 from yonga.util.redaction import redact_text
 
 __all__ = [
@@ -107,6 +117,7 @@ __all__ = [
     "StopMatcher",
     "StreamingSanitizer",
     "TextSink",
+    "ToolCall",
     "chat_history_filename",
     "sanitize_answer",
     "sanitize_reasoning",
@@ -779,6 +790,8 @@ class ChatProfileView(BaseModel):
     defaults: GenerationDefaults = Field(default_factory=GenerationDefaults)
     thinking_defaults: GenerationDefaults = Field(default_factory=GenerationDefaults)
     stop_strings: list[str] = Field(default_factory=list)
+    tool_calling: ToolCallingRule | None = None
+    """How the family writes tool calls, when the registry has measured it."""
 
     @classmethod
     def from_rule(cls, rule: ChatProfileRule) -> ChatProfileView:
@@ -794,6 +807,7 @@ class ChatProfileView(BaseModel):
             defaults=rule.defaults.model_copy(deep=True),
             thinking_defaults=rule.thinking_defaults.model_copy(deep=True),
             stop_strings=list(rule.stop_strings),
+            tool_calling=rule.tool_calling.model_copy(deep=True) if rule.tool_calling else None,
         )
 
     @classmethod
@@ -1041,6 +1055,46 @@ def _empty_prompt_diagnostic() -> Diagnostic:
     )
 
 
+def _tools_unsupported_diagnostic(reason: str | None) -> Diagnostic:
+    """The diagnostic for a conversation offering tools to a model that takes none."""
+    return diagnostic(
+        "chat.tools_unsupported",
+        FailureCategory.CONFIGURATION_ERROR,
+        "This model takes no tools",
+        reason or "Its chat profile declares no tool-call format.",
+        remediation=["Run `yonga registry explain` for the model to see its chat profile."],
+    )
+
+
+def _resolve_tool_calling(
+    profile: ChatProfileView, *, template: str | None
+) -> tuple[ToolCallingRule | None, str | None]:
+    """The tool-call format a session uses, or ``None`` and why there is none.
+
+    Three things must hold: the chat profile declares a measured format, this
+    build has its parser, and the artifact's own chat template contains the
+    profile's ``template_contains`` literal when it names one. The last one is
+    evidence about *this* artifact, as the thinking variable is: a family rule
+    must not switch tools on for a model whose template asks for another format.
+    """
+    rule = profile.tool_calling
+    name = profile.id or "the built-in default"
+    if rule is None:
+        return None, f"Its chat profile ({name}) declares no tool-call format."
+    if not supported_format(rule):
+        return None, (
+            f"Its chat profile ({name}) names the tool-call format {rule.format!r}, "
+            "which this yonga does not have."
+        )
+    needed = rule.template_contains
+    if needed and (template is None or needed not in template):
+        return None, (
+            f"Its chat profile ({name}) expects {needed!r} in the chat template, "
+            "and this artifact's template does not contain it."
+        )
+    return rule, None
+
+
 def _unexpected_diagnostic(error: BaseException, *, device: str) -> Diagnostic:
     """Wrap an untyped failure from a runtime so the turn can still report it."""
     detail = redact_text(f"{type(error).__name__}: {error}")
@@ -1119,6 +1173,9 @@ class ChatSession:
             profile,
             template=self._chat_template,
             thinking=self._thinking,
+        )
+        self._tool_calling, self._tool_calling_refusal = _resolve_tool_calling(
+            profile, template=self._chat_template
         )
         self._show_reasoning = (
             chosen.show_reasoning if chosen.show_reasoning is not None else settings.show_reasoning
@@ -1221,6 +1278,21 @@ class ChatSession:
         and ``/reasoning on`` both undo it.
         """
         return self._starts_in_reasoning
+
+    @property
+    def tool_calling(self) -> ToolCallingRule | None:
+        """How this model writes tool calls, or ``None`` when it takes no tools.
+
+        The chat profile's measured format, provided this build has its parser
+        and the artifact's own chat template contains what the profile says it
+        must (see :func:`_resolve_tool_calling`).
+        """
+        return self._tool_calling
+
+    @property
+    def tool_calling_refusal(self) -> str | None:
+        """Why this model takes no tools, in a sentence; ``None`` when it takes them."""
+        return self._tool_calling_refusal
 
     @property
     def stats(self) -> bool:
@@ -1390,6 +1462,7 @@ class ChatSession:
         *,
         on_text: TextSink | None = None,
         stop: Sequence[str] = (),
+        parallel_tool_calls: bool = True,
     ) -> ChatTurn:
         """Answer one complete conversation without touching this session's own.
 
@@ -1411,9 +1484,26 @@ class ChatSession:
         and its ``stop_reason`` is :data:`STOP_SEQUENCE_REASON`. A runtime that
         can stream is streamed even without ``on_text`` then, so generation
         ends at the match instead of running on to its token limit.
+
+        When ``history`` offers tools, the visible answer is read for calls in
+        the format of :attr:`tool_calling` (a model without one gets a
+        diagnostic instead). The calls go to the result's ``tool_calls``, its
+        ``display_text`` keeps the text around them, and its ``stop_reason``
+        is :data:`~yonga.application.tool_calls.TOOL_CALLS_REASON`; with
+        ``parallel_tool_calls`` false only the first call is kept. Streamed,
+        a :class:`~yonga.application.tool_calls.ToolCallGate` between the
+        sanitiser and the stop matcher releases text until a call could
+        begin, so stop sequences are matched on that text only, and a stop
+        that completes before the first call ends the answer without calls.
+        An answer that cannot be read as calls is returned as text.
         """
         if not any(m.role == "user" and (m.content.strip() or m.images) for m in history.messages):
             return ChatTurn(diagnostic=_empty_prompt_diagnostic())
+        rule = self._tool_calling if history.tools else None
+        if history.tools and rule is None:
+            return ChatTurn(diagnostic=_tools_unsupported_diagnostic(self._tool_calling_refusal))
+        names = tool_names(history.tools)
+        gate = ToolCallGate(rule, names) if rule is not None else None
         streaming = StreamingSanitizer(
             self._profile.reasoning_wrappers,
             show=self._show_reasoning,
@@ -1424,6 +1514,8 @@ class ChatSession:
 
         def visible(chunk: str) -> str:
             released = streaming.feed(chunk)
+            if gate is not None and released:
+                released = gate.feed(released)
             return matcher.feed(released) if stops and released else released
 
         try:
@@ -1451,6 +1543,8 @@ class ChatSession:
             return ChatTurn(diagnostic=error.diagnostic)
         if on_text is not None:
             rest = streaming.finish()
+            if gate is not None:
+                rest = (gate.feed(rest) if rest else "") + gate.finish()
             if stops:
                 rest = (matcher.feed(rest) if rest else "") + matcher.finish()
             if rest:
@@ -1461,11 +1555,31 @@ class ChatSession:
             "reasoning_hidden": answer.reasoning_hidden,
             "reasoning_unterminated": answer.reasoning_unterminated,
         }
+        if rule is None and not stops:
+            return ChatTurn(result=raw.model_copy(update=update))
+        parsed = (
+            parse_tool_calls(answer.display_text, rule, names)
+            if rule is not None
+            else ParsedAnswer(answer.display_text.strip(), [], answer.display_text.strip())
+        )
+        content, calls = parsed.content, parsed.calls
         if stops:
-            text, matched = truncate_at_stop(answer.display_text.strip(), stops)
+            # The same cut StopMatcher makes after the gate: a stop that completes
+            # before the first call ends the answer there, and there is no call.
+            cut, matched = truncate_at_stop(parsed.prefix, stops)
             if matched:
-                update["display_text"] = text
+                content, calls = cut, []
+            else:
+                content, matched = truncate_at_stop(content, stops)
+            if matched:
                 update["stop_reason"] = STOP_SEQUENCE_REASON
+        update["display_text"] = content
+        if calls:
+            update["tool_calls"] = calls if parallel_tool_calls else calls[:1]
+            if "stop_reason" not in update:
+                update["stop_reason"] = TOOL_CALLS_REASON
+        elif parsed.unparsed and "stop_reason" not in update:
+            update["tool_calls_unparsed"] = True
         return ChatTurn(result=raw.model_copy(update=update))
 
     def _rollback_user_turn(self) -> None:

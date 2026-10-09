@@ -61,7 +61,7 @@ def registry_from(text: str) -> Registry:
 
 
 def test_schema_version_two_introduces_bands_and_names_a_tool_floor():
-    assert SCHEMA_VERSION == 2
+    assert SCHEMA_VERSION >= 2
     assert PARAMETER_BAND_SCHEMA_VERSION == 2
     assert SCHEMA_MIN_TOOL_VERSION[2]
 
@@ -492,10 +492,11 @@ def test_unbanded_profile_needs_neither_schema_two_nor_evidence():
 
 
 def test_a_newer_document_with_unknown_fields_reports_the_version_not_the_fields():
-    """A schema-3 file is expected to carry fields this build does not know."""
+    """A file from a newer schema is expected to carry fields this build does not know."""
+    newer = SCHEMA_VERSION + 1
     text = textwrap.dedent(
-        """
-        schema_version: 3
+        f"""
+        schema_version: {newer}
         future_section:
           - id: something
         profiles:
@@ -508,7 +509,7 @@ def test_a_newer_document_with_unknown_fields_reports_the_version_not_the_fields
         parse_document(text, origin="future.yaml")
     diagnostic = excinfo.value.diagnostic
     assert diagnostic.code == "registry.schema_version_unsupported"
-    assert "schema_version 3" in diagnostic.message
+    assert f"schema_version {newer}" in diagnostic.message
     assert "future.yaml" in diagnostic.message
 
 

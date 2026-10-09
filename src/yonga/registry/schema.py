@@ -96,17 +96,21 @@ from yonga.domain.plans import (
 #: Schema version understood by this build of the loader.
 #:
 #: Version 2 added :attr:`RuleMatch.parameter_count` (a profile's model-size
-#: band) and :attr:`ProfileRule.evidence`. A version-1 file still loads
-#: unchanged: every new field defaults to "no constraint".
-SCHEMA_VERSION: int = 2
+#: band) and :attr:`ProfileRule.evidence`. Version 3 added
+#: :attr:`ChatProfileRule.tool_calling`. Older files still load unchanged:
+#: every new field defaults to "no constraint" or "not declared".
+SCHEMA_VERSION: int = 3
 
 #: Oldest yonga release that understands each registry schema version, written
 #: into a remote bundle as ``min_tool_version`` so an older yonga refuses the
 #: bundle at ``registry update`` instead of failing to parse it.
-SCHEMA_MIN_TOOL_VERSION: dict[int, str] = {2: "0.3.0"}
+SCHEMA_MIN_TOOL_VERSION: dict[int, str] = {2: "0.3.0", 3: "0.4.0"}
 
 #: The schema version a rule must declare to use a parameter-count band.
 PARAMETER_BAND_SCHEMA_VERSION: int = 2
+
+#: The schema version a chat profile must declare to carry ``tool_calling``.
+TOOL_CALLING_SCHEMA_VERSION: int = 3
 
 #: Specificity of a rule that names an exact repository id.
 SPECIFICITY_REPO_ID: int = 100
@@ -136,6 +140,23 @@ IDENTITY_HINT_SOURCE: str = "GGUF metadata"
 #: The name is a key into the Python repair registry; YAML must never describe
 #: the transformation itself. ``validate_registry`` rejects unknown names.
 KNOWN_REPAIR_IMPLEMENTATIONS: frozenset[str] = frozenset({"tokenizer_string_precision"})
+
+#: Tool-call output formats a chat profile's ``tool_calling`` may select.
+#:
+#: Each is a generic parser compiled into yonga
+#: (:mod:`yonga.application.tool_calls`), parameterised by the rule's markers
+#: and field names; registry data selects one and can never describe a new one.
+#: ``validate_registry`` reports an unknown name, and a chat profile naming one
+#: this build lacks has no tool calling.
+#:
+#: ``tagged_json``
+#:     Each call is one JSON object between the ``open`` and ``close`` markers,
+#:     repeatable, with ordinary text allowed around the blocks.
+#: ``json_list``
+#:     The whole answer is one JSON array of call objects, optionally after the
+#:     ``open`` marker (which a detokenizer may already have removed, when the
+#:     marker is a special token) and before the ``close`` marker.
+KNOWN_TOOL_CALL_FORMATS: frozenset[str] = frozenset({"tagged_json", "json_list"})
 
 #: Distribution names whose versions may appear in a ``constraints`` block.
 KNOWN_CONSTRAINT_KEYS: frozenset[str] = frozenset(
@@ -1340,6 +1361,77 @@ class GenerationDefaults(BaseModel):
         return data
 
 
+class ToolCallingRule(BaseModel):
+    """How a model family writes tool calls, as measured; part of a chat profile.
+
+    ``yonga serve`` accepts OpenAI ``tools`` only for a model whose chat profile
+    carries one of these, because a family that has not been seen producing
+    calls in a known shape would be handed tools it cannot use, and its
+    answers would never be read back as calls. The entry selects one of the
+    parsers compiled into yonga (:data:`KNOWN_TOOL_CALL_FORMATS`) and fills in
+    its markers and field names; it never describes a parser.
+
+    ``evidence`` must be ``tested`` or ``official`` and ``sources`` must say
+    where the format was seen: tool calling is enabled from measurements, not
+    from a template's promise. ``template_contains``, when set, is a literal
+    the artifact's own chat template must contain before tools are enabled for
+    it, which keeps a family rule from switching tools on for a repackaged
+    model whose template does not ask for this format.
+    """
+
+    model_config = _STRICT
+
+    format: str
+    """A key of :data:`KNOWN_TOOL_CALL_FORMATS`."""
+    open: str | None = None
+    """The marker in front of a call (``tagged_json``) or of the call list (``json_list``)."""
+    close: str | None = None
+    """The marker after a call (``tagged_json``) or after the call list (``json_list``)."""
+    name_field: str = "name"
+    """The key of a call object that holds the function's name."""
+    arguments_field: str = "arguments"
+    """The key of a call object that holds its arguments: an object, or JSON text of one."""
+    template_contains: str | None = None
+    evidence: EvidenceLevel
+    sources: list[SourceRef] = Field(min_length=1)
+
+    @field_validator("format", "name_field", "arguments_field")
+    @classmethod
+    def _not_blank(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("must not be empty")
+        return cleaned
+
+    @field_validator("open", "close", "template_contains")
+    @classmethod
+    def _empty_is_unset(cls, value: str | None) -> str | None:
+        """Markers are literals, kept as written; only an empty one means "none"."""
+        return value or None
+
+    @model_validator(mode="after")
+    def _measured_and_complete(self) -> ToolCallingRule:
+        if self.evidence not in (EvidenceLevel.TESTED, EvidenceLevel.OFFICIAL):
+            raise ValueError(
+                "tool_calling needs evidence tested or official: tools are enabled only "
+                "for a measured format"
+            )
+        if self.format == "tagged_json" and not (self.open and self.close):
+            raise ValueError("tool_calling format tagged_json needs both open and close")
+        return self
+
+    def describe(self) -> str:
+        """One line for ``registry explain``: the format, its markers and the evidence."""
+        markers = " and ".join(marker for marker in (self.open, self.close) if marker)
+        parts = [self.format]
+        if markers:
+            parts.append(f"({markers})")
+        parts.append(f"[{self.evidence.value}]")
+        if self.template_contains:
+            parts.append(f"when the chat template contains {self.template_contains!r}")
+        return " ".join(parts)
+
+
 #: Thinking variables tried against an artifact's own chat template when a chat
 #: profile names none of its own. One entry, because ``enable_thinking`` is the
 #: spelling the Jinja templates in the wild actually use; a family that spells it
@@ -1401,6 +1493,12 @@ class ChatProfileRule(BaseRule):
     visible answer.
     """
 
+    tool_calling: ToolCallingRule | None = None
+    """How the family writes tool calls, when that has been measured (schema 3).
+
+    Without it ``yonga serve`` refuses a request that offers ``tools``.
+    """
+
     @field_validator("stop_strings", mode="after")
     @classmethod
     def _clean_stop_strings(cls, value: list[str]) -> list[str]:
@@ -1431,6 +1529,16 @@ class ChatProfileRule(BaseRule):
         """A declared thinking flag is useless without the variable that drives it."""
         if self.supports_thinking_flag and not self.thinking_template_variable:
             raise ValueError("supports_thinking_flag requires thinking_template_variable")
+        return self
+
+    @model_validator(mode="after")
+    def _tool_calling_needs_schema_three(self) -> ChatProfileRule:
+        """An older reader rejects the unknown key, so an older rule must not carry it."""
+        if self.tool_calling is not None and self.schema_version < TOOL_CALLING_SCHEMA_VERSION:
+            raise ValueError(
+                f"chat profile {self.id}: tool_calling needs schema_version "
+                f"{TOOL_CALLING_SCHEMA_VERSION}"
+            )
         return self
 
     @property
