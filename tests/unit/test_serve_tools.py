@@ -22,7 +22,7 @@ from fastapi.testclient import TestClient
 
 from tests.unit.test_chat_service import SECRET, build_service, make_manifest, write_artifact
 from tests.unit.test_serve_api import StreamingRuntime, content_of, events, final_reason
-from yonga.adapters.runtime_genai import ChatHistory, GenerationResult
+from yonga.adapters.runtime_genai import ChatHistory, GenerationResult, ToolCall
 from yonga.api.app import create_app
 from yonga.api.openai import ChatCompletionRequest, UnsupportedParameter
 from yonga.application.chat import ChatMessage
@@ -80,6 +80,7 @@ def make_server(
     model_type: str = "qwen3",
     template: str | None = QWEN3_TEMPLATE,
     chunk: int = 3,
+    show_reasoning: bool = False,
 ) -> tuple[ModelServer, RecordingRuntime]:
     service, factory, _ = build_service(tmp_path)
     runtime = RecordingRuntime(answers, chunk)
@@ -92,6 +93,7 @@ def make_server(
     if template is not None:
         (artifact / "chat_template.jinja").write_text(template, encoding="utf-8")
     session = service.open_artifact(artifact)
+    session.set_reasoning(show_reasoning)
     server = ModelServer(session, name="qwen")
     server.load()
     return server, runtime
@@ -268,6 +270,111 @@ def test_a_stop_sequence_does_not_match_inside_a_call(tmp_path: Path) -> None:
 
     assert plain["finish_reason"] == final_reason(streamed.text) == "tool_calls"
     assert len(plain["message"]["tool_calls"]) == len(tool_deltas(streamed.text)) == 1
+
+
+# --- shown reasoning ----------------------------------------------------------------------
+
+
+DRAFTED = "<think>I will write " + CALL + "</think>"
+MENTIONED = "<think>Use the <tool_call> tags.</think>"
+
+
+@pytest.mark.parametrize("reasoning", [DRAFTED, MENTIONED])
+@pytest.mark.parametrize("chunk", [1, 3, 1000])
+def test_with_shown_reasoning_only_the_call_after_it_is_made(
+    tmp_path: Path, reasoning: str, chunk: int
+) -> None:
+    """A call drafted or a marker mentioned while thinking changes nothing."""
+    server, _ = make_server(
+        tmp_path, [reasoning + "\n\n" + CALL] * 2, chunk=chunk, show_reasoning=True
+    )
+    plain = post(server, ask()).json()["choices"][0]
+    streamed = post(server, ask(stream=True))
+
+    assert plain["message"]["content"] == content_of(streamed.text) == reasoning
+    (call,) = plain["message"]["tool_calls"]
+    (delta,) = tool_deltas(streamed.text)
+    assert call["function"]["name"] == delta["function"]["name"] == "get_weather"
+    assert plain["finish_reason"] == final_reason(streamed.text) == "tool_calls"
+
+
+@pytest.mark.parametrize("chunk", [1, 3, 1000])
+def test_with_shown_reasoning_a_call_it_decided_against_is_not_made(
+    tmp_path: Path, chunk: int
+) -> None:
+    answer = f"<think>Maybe {SECOND}? No.</think>The answer is 4."
+    server, _ = make_server(tmp_path, [answer] * 2, chunk=chunk, show_reasoning=True)
+    plain = post(server, ask()).json()["choices"][0]
+    streamed = post(server, ask(stream=True))
+
+    shown = f"<think>Maybe {SECOND}? No.</think>\n\nThe answer is 4."
+    assert plain["message"] == {"role": "assistant", "content": shown}
+    assert content_of(streamed.text) == shown
+    assert tool_deltas(streamed.text) == []
+    assert plain["finish_reason"] == final_reason(streamed.text) == "stop"
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_with_shown_reasoning_a_stop_can_still_end_the_reasoning(
+    tmp_path: Path, stream: bool
+) -> None:
+    """As without tools: shown reasoning is visible text, so a stop matches there."""
+    server, _ = make_server(
+        tmp_path, ["<think>Plan.\n\nMore.</think>\n\n" + CALL], show_reasoning=True
+    )
+    response = post(server, ask(stop="\n\n", stream=stream))
+
+    if stream:
+        assert content_of(response.text) == "<think>Plan."
+        assert tool_deltas(response.text) == []
+        assert final_reason(response.text) == "stop"
+    else:
+        (choice,) = response.json()["choices"]
+        assert choice["message"] == {"role": "assistant", "content": "<think>Plan."}
+        assert choice["finish_reason"] == "stop"
+
+
+# --- a client that goes away ------------------------------------------------------------
+
+
+def test_a_held_call_still_notices_a_client_that_went_away(tmp_path: Path) -> None:
+    """Nothing is released while a call is held, yet generation must stop."""
+    long_call = CALL.replace("Ankara", "Ankara " * 200)
+    server, runtime = make_server(tmp_path, [long_call], chunk=4)
+    released: list[str] = []
+    asked = 0
+
+    def should_stop() -> bool:
+        nonlocal asked
+        asked += 1
+        return asked > 10
+
+    request = ChatCompletionRequest.model_validate(ask(stream=True))
+    completion = request.to_completion(tools=server.tool_policy)
+    turn = server.complete(completion, on_text=released.append, should_stop=should_stop)
+
+    assert runtime.stopped_early, "asked to stop long before the last chunk"
+    assert asked == 11
+    # Nothing came out while the call was held; the unfinished call is text at the end.
+    assert len(released) == 1 and released[0].startswith("<tool_call>")
+    assert turn.diagnostic is None
+
+
+def test_the_stream_asks_the_server_to_stop_once_the_client_is_gone(tmp_path: Path) -> None:
+    server, _ = make_server(tmp_path, [CALL])
+    seen: list[object] = []
+    complete = server.complete
+
+    def recording(*args: Any, **kwargs: Any) -> Any:
+        seen.append(kwargs.get("should_stop"))
+        return complete(*args, **kwargs)
+
+    server.complete = recording  # type: ignore[method-assign]
+    post(server, ask(stream=True))
+
+    (should_stop,) = seen
+    assert callable(should_stop)
+    assert should_stop() is True, "the response has ended, so the client is gone"
 
 
 # --- a conversation that carries calls and results --------------------------------------
@@ -478,6 +585,37 @@ def test_tool_turns_that_do_not_fit_together_are_refused(
     else:
         assert error["param"] == param
     assert runtime.histories == []
+
+
+def test_history_arguments_nested_too_deeply_are_a_400(tmp_path: Path) -> None:
+    server, runtime = make_server(tmp_path, ["Hi."])
+    body = round_trip()
+    messages: list[dict[str, Any]] = body["messages"]  # type: ignore[assignment]
+    messages[1]["tool_calls"][0]["function"]["arguments"] = "[" * 100_000 + "]" * 100_000
+
+    error = refused(server, body)
+
+    assert error["param"] == "messages[1].tool_calls[0].function.arguments"
+    assert runtime.histories == []
+
+
+def test_history_arguments_that_are_not_json_reach_the_template_as_text(tmp_path: Path) -> None:
+    server, runtime = make_server(tmp_path, ["It is sunny."])
+    body = round_trip()
+    messages: list[dict[str, Any]] = body["messages"]  # type: ignore[assignment]
+    messages[1]["tool_calls"][0]["function"]["arguments"] = "city=Ankara"
+
+    assert post(server, body).status_code == 200
+    (payload,) = runtime.payloads
+    (call,) = payload[1]["tool_calls"]  # type: ignore[misc]
+    assert call["function"]["arguments"] == "city=Ankara"
+
+
+def test_a_call_s_payload_survives_json_nested_too_deeply() -> None:
+    deep = "[" * 100_000 + "]" * 100_000
+    payload = ToolCall(id="call_1", name="f", arguments=deep).as_payload()
+
+    assert payload["function"] == {"name": "f", "arguments": deep}
 
 
 def test_the_last_message_may_not_be_the_assistant_s(tmp_path: Path) -> None:

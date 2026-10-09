@@ -244,19 +244,20 @@ def qwen3_metadata(model_type: str = "qwen3", architecture: str = "Qwen3ForCausa
 
 
 @pytest.mark.parametrize(
-    ("model_type", "architecture"),
+    ("model_type", "architecture", "rule_id"),
     [
-        ("qwen3", "Qwen3ForCausalLM"),
-        ("qwen3_moe", "Qwen3MoeForCausalLM"),
-        ("", "Qwen3ForCausalLM"),
+        ("qwen3", "Qwen3ForCausalLM", "chat-qwen3"),
+        ("qwen3_moe", "Qwen3MoeForCausalLM", "chat-qwen3_moe"),
+        ("", "Qwen3ForCausalLM", "chat-qwen3"),
+        ("", "Qwen3MoeForCausalLM", "chat-qwen3_moe"),
     ],
 )
-def test_the_qwen3_family_resolves_to_the_qwen3_chat_profile(model_type, architecture):
+def test_the_qwen3_family_resolves_to_the_qwen3_chat_profile(model_type, architecture, rule_id):
     resolver = RegistryResolver(load_builtin_registry())
     meta = qwen3_metadata(model_type=model_type, architecture=architecture)
     rule = resolver.chat_profile(meta=meta)
     assert rule is not None
-    assert rule.id == "chat-qwen3"
+    assert rule.id == rule_id
 
 
 def test_the_qwen3_profile_carries_the_documented_sampling_defaults():

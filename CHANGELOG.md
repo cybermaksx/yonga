@@ -41,15 +41,16 @@ manifest may change in any minor release.
 - **`serve` takes OpenAI `tools` on models the registry has seen calling them.** A chat profile's
   new `tool_calling` entry (registry schema 3, below) says how a family writes calls; only a model
   whose profile declares one, and whose own chat template contains the entry's
-  `template_contains` literal, accepts `tools`. Built in: Qwen2/Qwen2.5, Qwen3 and SmolLM3
+  `template_contains` literal, accepts `tools`. Built in: Qwen2.5, Qwen3 and SmolLM3
   (`<tool_call>{json}</tool_call>`) and Granite (a JSON list), each seen producing a parseable call
   on the reference host on 2026-10-09 (CPU, one prompt each). Every other model refuses `tools`
   with a 400 `serve.request.tools_unsupported` naming `tools` and saying why. The tools, an
   assistant's `tool_calls` and `tool` results reach the artifact's own chat template through
   GenAI's `ChatHistory.set_tools`; a conversation may end on a tool result. The answer is read for
-  calls after the reasoning sanitiser and returned as `message.tool_calls` with `finish_reason`
-  `tool_calls`; streamed, text is released until a call could begin and each call then arrives as
-  one complete delta. An answer that cannot be read as calls to the offered functions is returned
+  calls outside reasoning, also with `--show-reasoning`, and returned as `message.tool_calls` with
+  `finish_reason` `tool_calls`; streamed, text is released until a call could begin and each call
+  then arrives as one complete delta, and a client that disconnects meanwhile still stops
+  generation. An answer that cannot be read as calls to the offered functions is returned
   as text, never as a guessed call, and logged as such without its content. `tool_choice` `auto`
   and `none` are honoured; `required` and a named function are refused (they need constrained
   decoding). `parallel_tool_calls: false` keeps the first call. `stop` sequences match only the
@@ -75,13 +76,19 @@ manifest may change in any minor release.
 
 ### Changed
 
-- **Qwen2/Qwen2.5, SmolLM3 and Granite have their own chat profiles** (`chat-qwen2`,
-  `chat-smollm3`, `chat-granite`) instead of `chat-default`. They copy its policy exactly (thinking
-  detection, `<think>` stripping, 4096 new tokens, no sampling defaults) and add only
-  `tool_calling`, so `chat` behaves as before; `registry explain` names the new rule.
+- **Qwen2, SmolLM3 and Granite have their own chat profiles** (`chat-qwen2`, `chat-smollm3`,
+  `chat-granite`) instead of `chat-default`. They copy its policy exactly (thinking detection,
+  `<think>` stripping, 4096 new tokens, no sampling defaults) and add only `tool_calling`, so `chat`
+  behaves as before; `registry explain` names the new rule. `chat-qwen2` matches the whole qwen2
+  model type, but only Qwen2.5 was measured, and only an artifact whose template carries
+  `<tool_call>` (the Qwen2.5 Instruct models, not the original Qwen2 Instruct) accepts tools.
+- **Qwen3 MoE has its own chat profile, `chat-qwen3_moe`**, split from `chat-qwen3` with the same
+  policy and no `tool_calling`: the MoE models share the template but were not measured writing
+  calls, so they refuse `tools`. `chat` behaves as before.
 - **`serve` accepts `tool` messages and assistant `tool_calls` in a conversation**, alongside
-  `tools`. They used to be dropped without an error when no `tools` came with them; now that is a
-  400 naming the message. The legacy `functions` and `function_call` are refused by their own name
+  `tools`. Assistant `tool_calls` used to be dropped without an error, and `tool` messages were
+  refused as an unknown role; now both are accepted alongside `tools`, and without `tools` they are
+  a 400 naming the message. The legacy `functions` and `function_call` are refused by their own name
   instead of as `tools`.
 - **The registry chat profile's `stop_strings` is applied.** The field was parsed and never used; it
   now reaches OpenVINO GenAI's `GenerationConfig.stop_strings` as model-level end markers, left out

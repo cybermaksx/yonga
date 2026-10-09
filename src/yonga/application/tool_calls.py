@@ -6,8 +6,10 @@ data: a chat profile's :class:`~yonga.registry.schema.ToolCallingRule` names one
 of the parsers here (:data:`~yonga.registry.schema.KNOWN_TOOL_CALL_FORMATS`) and
 fills in its markers and field names. No family is named in this module.
 
-Everything here runs on the *visible* answer, after the reasoning sanitiser,
-so a call drafted inside a hidden reasoning block is never read as one.
+Everything here runs on the answer with its reasoning removed, after the
+reasoning sanitiser, so a call drafted inside a reasoning block is never read
+as one; with ``--show-reasoning`` the chat service reads the answer after the
+shown reasoning the same way (:func:`yonga.application.chat.split_leading_reasoning`).
 
 The parsers are total and conservative. An answer that cannot be read as calls
 to the offered functions -- malformed JSON, an unclosed block, a function that
@@ -242,7 +244,7 @@ def _parse_json_list(
         body = body[: -len(rule.close)].strip()
     try:
         items = json.loads(body)
-    except ValueError:
+    except (ValueError, RecursionError):
         return _unparsed(text)
     if not isinstance(items, list) or not items:
         return _unparsed(text)
@@ -265,7 +267,7 @@ def _call(
 ) -> ToolCall | None:
     try:
         item = json.loads(body)
-    except ValueError:
+    except (ValueError, RecursionError):
         return None
     return _from_object(item, rule, names, new_id)
 
@@ -283,7 +285,7 @@ def _from_object(
     if isinstance(arguments, str):
         try:
             arguments = json.loads(arguments) if arguments.strip() else {}
-        except ValueError:
+        except (ValueError, RecursionError):
             return None
     if not isinstance(arguments, dict):
         return None

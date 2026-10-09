@@ -277,7 +277,8 @@ async def _stream(
 
     def work() -> None:
         try:
-            deliver("done", server.complete(completion, on_text=on_text))
+            turn = server.complete(completion, on_text=on_text, should_stop=abandoned.is_set)
+            deliver("done", turn)
         except BaseException as error:
             deliver("error", error)
 

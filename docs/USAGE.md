@@ -280,11 +280,11 @@ without the whitespace in front of it, with `finish_reason` `stop`, streamed or 
 stops there. `n` above 1, penalties, JSON response formats and the legacy `functions` are still
 refused with a 400.
 
-Tools work on the families the registry has seen calling them on the reference host: Qwen2 and
-Qwen2.5, Qwen3, SmolLM3 and Granite (`yonga registry explain MODEL` shows "Tool calling" under the
-chat profile). Send OpenAI `tools`; the answer comes back as `message.tool_calls` with
-`finish_reason` `tool_calls`, and the follow-up carries the assistant's `tool_calls` and a `tool`
-message with each result, exactly as with OpenAI:
+Tools work on the families the registry has seen calling them on the reference host: Qwen2.5,
+Qwen3 (not its MoE models), SmolLM3 and Granite (`yonga registry explain MODEL` shows "Tool
+calling" under the chat profile). Send OpenAI `tools`; the answer comes back as
+`message.tool_calls` with `finish_reason` `tool_calls`, and the follow-up carries the assistant's
+`tool_calls` and a `tool` message with each result, exactly as with OpenAI:
 
 ```python
 from openai import OpenAI
@@ -307,7 +307,9 @@ Llama-3.2-1B, LFM2-350M, gemma-3-1b and OLMo-2-1B were tried and did not write u
 call would need constrained decoding. `parallel_tool_calls: false` keeps the first call. Streamed,
 text arrives until a call could begin and each call then arrives whole, so the stream pauses while
 the model writes it. An answer that looks like a call but is not a valid one (broken JSON, a
-function you did not offer) comes back as plain text, never as a guessed call. Small models call
+function you did not offer) comes back as plain text, never as a guessed call. A call the model
+only drafted while reasoning is never made, also with `--show-reasoning`, which then shows the
+opening reasoning block in front of the content. Small models call
 tools unreliably; the offered schemas also lengthen every prompt, which matters on the NPU, whose
 prompt length is fixed when the model is compiled.
 

@@ -410,6 +410,14 @@ def _tool_calls(index: int, message: WireMessage) -> list[ToolCall]:
             raise InvalidParameter(
                 f"{param}.function.arguments", "Tool call arguments are JSON text."
             )
+        try:
+            json.loads(arguments)
+        except RecursionError:
+            raise InvalidParameter(
+                f"{param}.function.arguments", "Tool call arguments are nested too deeply."
+            ) from None
+        except ValueError:
+            pass  # not JSON: it reaches the chat template as text
         calls.append(ToolCall(id=item["id"], name=function["name"], arguments=arguments))
     return calls
 

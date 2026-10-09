@@ -209,6 +209,7 @@ UNDECLARED = [
     ("olmo2", "Olmo2ForCausalLM"),
     ("qwen3_5", "Qwen3_5ForConditionalGeneration"),
     ("qwen2_5_vl", "Qwen2_5_VLForConditionalGeneration"),
+    ("qwen3_moe", "Qwen3MoeForCausalLM"),
 ]
 
 
@@ -258,6 +259,25 @@ def test_the_new_family_rules_change_nothing_but_tool_calling(rule_id: str) -> N
         "stop_strings",
     }
     assert rule.model_dump(include=policy) == default.model_dump(include=policy)
+
+
+def test_qwen3_moe_keeps_the_qwen3_policy_without_tool_calling() -> None:
+    """Split from chat-qwen3 only because the MoE models were not measured calling tools."""
+    registry = load_builtin_registry()
+    moe, dense = registry.chat_profile("chat-qwen3_moe"), registry.chat_profile("chat-qwen3")
+    assert moe is not None and dense is not None
+    everything_but_identity = {
+        "id",
+        "summary",
+        "match",
+        "sources",
+        "tool_calling",
+        "schema_version",
+    }
+    assert moe.model_dump(exclude=everything_but_identity) == dense.model_dump(
+        exclude=everything_but_identity
+    )
+    assert moe.tool_calling is None and dense.tool_calling is not None
 
 
 def test_registry_explain_shows_the_tool_call_format() -> None:

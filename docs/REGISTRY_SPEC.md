@@ -320,7 +320,7 @@ chat:
   - id: chat-qwen3
     schema_version: 3
     match:
-      model_types: [qwen3, qwen3_moe]
+      model_types: [qwen3]
     tool_calling:
       format: tagged_json              # a parser compiled into yonga: tagged_json | json_list
       open: "<tool_call>"              # the marker in front of a call (or of the call list)
@@ -362,7 +362,8 @@ chat:
 `yonga registry explain` prints the winning chat profile's format under "Tool calling", or says
 that none is declared. The built-in registry declares `tagged_json` for `chat-qwen3`, `chat-qwen2`
 and `chat-smollm3` and `json_list` for `chat-granite`; `chat.yaml` records which families were
-measured and left out, and why.
+measured and left out, and why. `chat-qwen3_moe` keeps `chat-qwen3`'s policy without
+`tool_calling`, because the Qwen3 MoE models were not measured.
 
 ## 9. Exact model rules
 

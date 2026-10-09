@@ -345,12 +345,20 @@ class ModelServer:
             settings.repetition_penalty = request.repetition_penalty
         return settings
 
-    def complete(self, request: CompletionRequest, *, on_text: TextSink | None = None) -> ChatTurn:
+    def complete(
+        self,
+        request: CompletionRequest,
+        *,
+        on_text: TextSink | None = None,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> ChatTurn:
         """Answer ``request``, streaming through ``on_text`` when one is given.
 
         Waits for any generation already running. Invalid parameters raise; so
         does what a pending image's ``decode`` raises. A runtime failure comes
-        back as a turn carrying its diagnostic.
+        back as a turn carrying its diagnostic. ``should_stop`` is asked on
+        every streamed chunk, so a client that went away ends generation even
+        while nothing is being released to it.
         """
         settings = self.generation_for(request)
         self._check_images(request)
@@ -367,6 +375,7 @@ class ModelServer:
                 on_text=on_text,
                 stop=request.stop,
                 parallel_tool_calls=request.parallel_tool_calls,
+                should_stop=should_stop,
             )
         if turn.result is not None and turn.result.tool_calls_unparsed:
             # Never the text: a request's content is not logged.

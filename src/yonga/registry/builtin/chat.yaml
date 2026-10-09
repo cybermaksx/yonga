@@ -66,10 +66,8 @@ chat:
     match:
       model_types:
         - qwen3
-        - qwen3_moe
       architectures:
         - Qwen3ForCausalLM
-        - Qwen3MoeForCausalLM
     # supports_thinking_flag is deliberately unset: Qwen3 chat templates guard
     # the reasoning prelude with `enable_thinking is defined and enable_thinking
     # is false`, so the template itself is the evidence. A repackaged Qwen3 whose
@@ -100,7 +98,8 @@ chat:
             weather in Ankara (max_new_tokens 120), each answered
             <tool_call>{"name": "get_weather", "arguments": {"city": "Ankara"}}</tool_call>.
             One prompt per model, one turn; a second turn carrying the tool
-            result, GPU, NPU and the Qwen3 MoE models were not run.
+            result, GPU and NPU were not run. The Qwen3 MoE models were not
+            run either, so chat-qwen3_moe declares no tool calling.
     sources:
       - kind: model_card
         url: https://huggingface.co/Qwen/Qwen3-0.6B
@@ -114,6 +113,36 @@ chat:
           enable_thinking is false, which is why the wrapper is stripped as well
           as suppressed.
 
+  # Qwen3 MoE keeps chat-qwen3's policy exactly, without its tool_calling: the
+  # MoE models share the template but were not measured writing calls.
+  - id: chat-qwen3_moe
+    schema_version: 1
+    status: active
+    priority: 100
+    summary: Qwen3 MoE with chat-qwen3's policy; tool calls not measured
+    match:
+      model_types:
+        - qwen3_moe
+      architectures:
+        - Qwen3MoeForCausalLM
+    default_thinking: false
+    reasoning_wrappers:
+      - ["<think>", "</think>"]
+    defaults:
+      temperature: 0.7
+      top_p: 0.8
+      top_k: 20
+      max_new_tokens: 4096
+    thinking_defaults:
+      temperature: 0.6
+      top_p: 0.95
+      top_k: 20
+    sources:
+      - kind: community
+        note: >-
+          chat-qwen3 matched the Qwen3 MoE models until it declared tool
+          calling; this rule keeps the policy they had then, unchanged.
+
   # The three rules below keep chat-default's conservative policy exactly (the
   # family documents nothing yonga applies yet) and add the measured tool-call
   # format; a model of these families behaved the same before they existed.
@@ -121,7 +150,7 @@ chat:
     schema_version: 3
     status: active
     priority: 100
-    summary: Qwen2 and Qwen2.5 with chat-default's policy, plus measured tool calls
+    summary: Qwen2 family with chat-default's policy, plus tool calls measured on Qwen2.5
     match:
       model_types:
         - qwen2
@@ -136,8 +165,10 @@ chat:
       format: tagged_json
       open: "<tool_call>"
       close: "</tool_call>"
-      # Distilled models built on qwen2 (such as DeepSeek-R1-Distill-Qwen) ship
-      # another template, which does not ask for this format.
+      # Only Qwen2.5 Instruct was measured, and only templates that ask for
+      # this format accept tools: the original Qwen2 Instruct templates are
+      # plain ChatML, and distilled models built on qwen2 (such as
+      # DeepSeek-R1-Distill-Qwen) ship another template.
       template_contains: "<tool_call>"
       evidence: tested
       sources:

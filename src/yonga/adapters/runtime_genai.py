@@ -170,10 +170,11 @@ class ToolCall(BaseModel):
         """The call in the Hugging Face chat-template convention, arguments as an object.
 
         Templates such as Qwen's write ``arguments | tojson``, which would quote
-        JSON text a second time; text that is not a JSON object stays text.
+        JSON text a second time; text that is not a JSON object stays text,
+        and so does JSON nested too deeply to parse.
         """
         arguments: object = self.arguments
-        with suppress(ValueError):
+        with suppress(ValueError, RecursionError):
             parsed = json.loads(self.arguments)
             if isinstance(parsed, dict):
                 arguments = parsed

@@ -14,6 +14,7 @@ from itertools import count
 import pytest
 
 from yonga.application import tool_calls as module
+from yonga.application.chat import LeadingReasoning, join_after_reasoning, split_leading_reasoning
 from yonga.application.tool_calls import (
     ToolCallGate,
     new_call_id,
@@ -278,3 +279,88 @@ def test_prose_passes_the_list_gate_as_it_arrives() -> None:
     assert gate.feed("<|to") == ""  # could still be the marker
     assert gate.feed("ol is a word") == "<|tool is a word"
     assert gate.feed(" [x]") == " [x]"
+
+
+def test_json_nested_too_deeply_is_text_rather_than_an_error() -> None:
+    deep = "[" * 100_000 + "]" * 100_000
+    answer = parse(f"<tool_call>{deep}</tool_call>")
+
+    assert answer.calls == []
+    assert answer.unparsed
+    assert parse(deep, LISTED).unparsed
+
+
+# --- shown reasoning in front of an answer read for calls -------------------------------
+
+THINK = [("<think>", "</think>")]
+
+SHOWN_ANSWERS = [
+    ("<think>Plan.</think>\n\nAnswer.", "<think>Plan.</think>", "\n\nAnswer."),
+    (
+        f"<think>Draft <tool_call>{WEATHER}</tool_call></think>",
+        f"<think>Draft <tool_call>{WEATHER}</tool_call></think>",
+        "",
+    ),
+    ("No reasoning at all.", "", "No reasoning at all."),
+    (
+        "<think>a</think><think>b</think> Then text.",
+        "<think>a</think><think>b</think>",
+        " Then text.",
+    ),
+    ("<think>Never closed <tool_call>", "<think>Never closed <tool_call>", ""),
+    ("<think>a</think>\n\n<thinking is a word", "<think>a</think>", "\n\n<thinking is a word"),
+    ("Text first <think>x</think> then.", "", "Text first <think>x</think> then."),
+]
+
+
+@pytest.mark.parametrize(("text", "lead", "rest"), SHOWN_ANSWERS)
+def test_the_leading_reasoning_is_split_off(text: str, lead: str, rest: str) -> None:
+    assert split_leading_reasoning(text, THINK) == (lead, rest)
+
+
+def test_a_prompt_opened_block_leads_up_to_its_closer() -> None:
+    text = "Thinking.</think>\n\nAnswer."
+    assert split_leading_reasoning(text, THINK, starts_in_reasoning=True) == (
+        "Thinking.</think>",
+        "\n\nAnswer.",
+    )
+    assert split_leading_reasoning("Still thinking", THINK, starts_in_reasoning=True) == (
+        "Still thinking",
+        "",
+    )
+
+
+@pytest.mark.parametrize(("text", "lead", "rest"), SHOWN_ANSWERS)
+@pytest.mark.parametrize("seed", range(5))
+def test_streamed_leading_reasoning_matches_the_split(
+    text: str, lead: str, rest: str, seed: int
+) -> None:
+    splitter = LeadingReasoning(THINK)
+    shown, after = [], []
+    for piece in chunked(text, random.Random(seed)):
+        reasoning, answer = splitter.feed(piece)
+        shown.append(reasoning)
+        after.append(answer)
+    reasoning, answer = splitter.finish()
+
+    assert "".join(shown) + reasoning == lead.strip()
+    assert "".join(after) + answer == rest
+
+
+def test_nothing_after_the_reasoning_is_released_as_reasoning() -> None:
+    splitter = LeadingReasoning(THINK)
+
+    assert splitter.feed("<think>a</think>\n\n<th") == ("<think>a</think>", "")
+    assert splitter.feed("e answer") == ("", "\n\n<the answer")
+    assert splitter.join("<the answer") == "\n\n<the answer"
+    assert splitter.join(" more") == " more"
+
+
+def test_the_separator_is_only_put_after_shown_reasoning() -> None:
+    splitter = LeadingReasoning(THINK)
+
+    assert splitter.feed("Plain.") == ("", "Plain.")
+    assert splitter.join("Plain.") == "Plain."
+    assert join_after_reasoning("", "Plain.") == "Plain."
+    assert join_after_reasoning("<think>a</think>", "") == "<think>a</think>"
+    assert join_after_reasoning("<think>a</think>", "B") == "<think>a</think>\n\nB"

@@ -441,7 +441,8 @@ The server opens the same `ChatSession` `chat` does (registry chat profile, devi
 compile cache, reasoning policy) and loads the model before it starts listening, so a model that
 cannot load fails `serve` itself. A port already in use is refused before the model is loaded.
 Each request carries its whole conversation and nothing is kept between requests. Generation is
-serialised; a streaming client that disconnects stops its generation.
+serialised; a streaming client that disconnects stops its generation, checked on every generated
+chunk, also while the answer is being held back (hidden reasoning, a pending tool call).
 
 `model` must be the name given to `serve`, the artifact id, or the source repository (404
 `model_not_found` otherwise). Accepted parameters: `max_tokens` / `max_completion_tokens`,
@@ -477,8 +478,11 @@ model-level end markers OpenVINO GenAI applies natively and leaves out of the an
 Tools are accepted only by a model whose registry chat profile declares a measured
 `tool_calling` format (`docs/REGISTRY_SPEC.md` section 8b), and only when this artifact's own chat
 template contains the literal the profile names in `template_contains`; `yonga registry explain`
-shows the format under the chat profile. In the built-in registry that is Qwen2/Qwen2.5, Qwen3,
-SmolLM3 and Granite, the families seen producing parseable calls on the reference host. Any other
+shows the format under the chat profile. In the built-in registry that is Qwen2.5, Qwen3, SmolLM3
+and Granite, the families seen producing parseable calls on the reference host. `chat-qwen2`
+matches the whole qwen2 model type, but only artifacts whose template carries `<tool_call>` (the
+Qwen2.5 Instruct models) accept tools; the Qwen3 MoE models have their own profile,
+`chat-qwen3_moe`, without tool calling, because they were not measured. Any other
 model refuses a non-empty `tools` with 400 `serve.request.tools_unsupported`, `param` `tools`, and
 the message says why (no format declared, a format this yonga lacks, or a template that does not
 ask for it). A model never offered tools it cannot use, and an answer is never read in a format
@@ -499,11 +503,16 @@ nobody saw that model write.
   of a call made by the assistant message before it (other tool results may sit between them) and
   takes that call's function name; anything else is a 400 naming `messages[i].tool_call_id`.
   `tool_calls` belong to assistant messages only, and each needs an `id`, type `function` and a
-  function `name`. A conversation that carries calls or results needs `tools` in the same request
-  (400 naming `messages[i].tool_calls` or `messages[i].role`): dropping them would answer a
-  different conversation than the one sent. The last message may be a `tool` result.
-- The answer is read for calls after the reasoning sanitiser, so a call drafted in hidden reasoning
-  is neither shown nor made. The profile's format names one of the parsers compiled into yonga:
+  function `name`; `arguments` that are not JSON reach the template as text, and JSON nested too
+  deeply to parse is a 400 naming `messages[i].tool_calls[j].function.arguments`. A conversation
+  that carries calls or results needs `tools` in the same request (400 naming
+  `messages[i].tool_calls` or `messages[i].role`): dropping them would answer a different
+  conversation than the one sent. The last message may be a `tool` result.
+- The answer is read for calls outside reasoning only, so a call drafted while the model reasons is
+  never made, whether the reasoning is shown or not. With `--show-reasoning` the reasoning block
+  that opens the answer is passed through as before and the content after it is read for calls as
+  if the reasoning were hidden; a later reasoning block is then left out, and the two parts are
+  joined by a blank line. The profile's format names one of the parsers compiled into yonga:
   `tagged_json` (each call one JSON object between the profile's `open` and `close` markers, such
   as `<tool_call>` and `</tool_call>`) or `json_list` (the whole answer one JSON array of calls,
   after an optional `open` marker). A call names an offered function and carries an object of

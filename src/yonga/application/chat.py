@@ -109,6 +109,7 @@ __all__ = [
     "ChatTurn",
     "CommandOutcome",
     "GenerationResult",
+    "LeadingReasoning",
     "LoadClassifier",
     "ParsedCommand",
     "Role",
@@ -119,8 +120,10 @@ __all__ = [
     "TextSink",
     "ToolCall",
     "chat_history_filename",
+    "join_after_reasoning",
     "sanitize_answer",
     "sanitize_reasoning",
+    "split_leading_reasoning",
     "truncate_at_stop",
 ]
 
@@ -556,6 +559,125 @@ class StreamingSanitizer:
             # Only reachable if the policy rewrote text already released; holding
             # back is the one safe answer, since nothing sent can be retracted.
             return ""
+        delta = settled[len(self._released) :]
+        self._released = settled
+        return delta
+
+
+#: What separates shown leading reasoning from the answer after it.
+_REASONING_SEPARATOR = "\n\n"
+
+
+def split_leading_reasoning(
+    text: str,
+    wrappers: Sequence[tuple[str, str]],
+    *,
+    starts_in_reasoning: bool = False,
+) -> tuple[str, str]:
+    """Split raw model output into the reasoning that opens it and the rest.
+
+    The leading part ends after the last closing wrapper that still has
+    nothing visible in front of it, by :func:`sanitize_answer`'s reading of the
+    text; it is empty when the answer opens with visible text, and the whole
+    text when nothing in it is visible. With ``--show-reasoning`` the leading
+    part is what is shown as reasoning while tool calls are read from the rest
+    only, so a call drafted while thinking is never made.
+    """
+    whole = sanitize_answer(text, wrappers, show=False, starts_in_reasoning=starts_in_reasoning)
+    if not whole.display_text.strip():
+        return text, ""
+    closings = {closing for _, closing in _normalise_wrappers(wrappers)}
+    ends: set[int] = set()
+    for closing in closings:
+        position = text.find(closing)
+        while position >= 0:
+            ends.add(position + len(closing))
+            position = text.find(closing, position + 1)
+    lead = 0
+    for end in sorted(ends):
+        prefix = sanitize_answer(
+            text[:end], wrappers, show=False, starts_in_reasoning=starts_in_reasoning
+        )
+        if prefix.display_text.strip():
+            break
+        if not prefix.reasoning_unterminated:
+            lead = end
+    return text[:lead], text[lead:]
+
+
+def join_after_reasoning(reasoning: str, text: str) -> str:
+    """Put shown leading ``reasoning`` in front of ``text``, the answer after it."""
+    if not reasoning:
+        return text
+    return f"{reasoning}{_REASONING_SEPARATOR}{text}" if text else reasoning
+
+
+class LeadingReasoning:
+    """Release the reasoning that opens a shown answer, and pass on the rest.
+
+    The streaming half of :func:`split_leading_reasoning`, for a shown answer
+    that is read for tool calls. Raw text is released as reasoning, exactly as
+    ``--show-reasoning`` releases it, until something visible appears; the rest
+    from there is returned raw, for the caller to sanitise and read as an
+    answer, and :meth:`join` puts the separator in front of the first piece of
+    it. Released reasoning followed by the joined answer equals
+    :func:`join_after_reasoning` of the two halves, however it was chunked.
+    """
+
+    def __init__(
+        self, wrappers: Sequence[tuple[str, str]], *, starts_in_reasoning: bool = False
+    ) -> None:
+        """Bind the splitter to one reply's reasoning policy."""
+        self._wrappers = list(wrappers)
+        self._openers = [opening for opening, _ in _normalise_wrappers(wrappers)]
+        self._starts_in_reasoning = starts_in_reasoning
+        self._probe = StreamingSanitizer(wrappers, starts_in_reasoning=starts_in_reasoning)
+        self._raw = ""
+        self._released = ""
+        self._settled = False
+        self._joined = False
+
+    def feed(self, chunk: str) -> tuple[str, str]:
+        """Take one raw chunk; return the reasoning to release and the raw answer after it."""
+        if self._settled:
+            return "", chunk
+        self._raw += chunk
+        if self._probe.feed(chunk):
+            return self._settle()
+        # A tail that could still open a block is held: it may yet be visible text.
+        held = max(
+            (
+                size
+                for opener in self._openers
+                for size in range(1, len(opener))
+                if self._raw.endswith(opener[:size])
+            ),
+            default=0,
+        )
+        return self._release(self._raw[: len(self._raw) - held]), ""
+
+    def finish(self) -> tuple[str, str]:
+        """Settle the split once generation has ended; return what :meth:`feed` would."""
+        return ("", "") if self._settled else self._settle()
+
+    def join(self, text: str) -> str:
+        """Prefix the first non-empty piece of the answer with the separator."""
+        if not text or self._joined:
+            return text
+        self._joined = True
+        return _REASONING_SEPARATOR + text if self._released else text
+
+    def _settle(self) -> tuple[str, str]:
+        self._settled = True
+        lead, rest = split_leading_reasoning(
+            self._raw, self._wrappers, starts_in_reasoning=self._starts_in_reasoning
+        )
+        return self._release(lead), rest
+
+    def _release(self, text: str) -> str:
+        settled = text.strip()
+        if not settled.startswith(self._released):
+            return ""  # unreachable: the leading part only ever grows
         delta = settled[len(self._released) :]
         self._released = settled
         return delta
@@ -1463,6 +1585,7 @@ class ChatSession:
         on_text: TextSink | None = None,
         stop: Sequence[str] = (),
         parallel_tool_calls: bool = True,
+        should_stop: Callable[[], bool] | None = None,
     ) -> ChatTurn:
         """Answer one complete conversation without touching this session's own.
 
@@ -1495,7 +1618,15 @@ class ChatSession:
         sanitiser and the stop matcher releases text until a call could
         begin, so stop sequences are matched on that text only, and a stop
         that completes before the first call ends the answer without calls.
-        An answer that cannot be read as calls is returned as text.
+        An answer that cannot be read as calls is returned as text. Calls
+        are read outside reasoning whether it is shown or not: with
+        ``--show-reasoning`` the reasoning that opens the answer is shown in
+        front of the content (:func:`split_leading_reasoning`) and the rest is
+        read as a hidden-reasoning answer would be.
+
+        ``should_stop`` is asked on every chunk the runtime streams, whatever
+        is released: a client that went away ends generation even while the
+        answer is being held back.
         """
         if not any(m.role == "user" and (m.content.strip() or m.images) for m in history.messages):
             return ChatTurn(diagnostic=_empty_prompt_diagnostic())
@@ -1504,18 +1635,31 @@ class ChatSession:
             return ChatTurn(diagnostic=_tools_unsupported_diagnostic(self._tool_calling_refusal))
         names = tool_names(history.tools)
         gate = ToolCallGate(rule, names) if rule is not None else None
+        wrappers = self._profile.reasoning_wrappers
+        # Shown reasoning is passed through in front of the answer; calls are
+        # read from the rest only, as they would be with the reasoning hidden.
+        leading = (
+            LeadingReasoning(wrappers, starts_in_reasoning=self._starts_in_reasoning)
+            if gate is not None and self._show_reasoning
+            else None
+        )
         streaming = StreamingSanitizer(
-            self._profile.reasoning_wrappers,
-            show=self._show_reasoning,
-            starts_in_reasoning=self._starts_in_reasoning,
+            wrappers,
+            show=self._show_reasoning and leading is None,
+            starts_in_reasoning=self._starts_in_reasoning and leading is None,
         )
         stops = [text for text in stop if text]
         matcher = StopMatcher(stops)
 
         def visible(chunk: str) -> str:
-            released = streaming.feed(chunk)
+            shown = ""
+            if leading is not None:
+                shown, chunk = leading.feed(chunk)
+            released = streaming.feed(chunk) if chunk else ""
             if gate is not None and released:
                 released = gate.feed(released)
+            if leading is not None:
+                released = shown + leading.join(released)
             return matcher.feed(released) if stops and released else released
 
         try:
@@ -1523,6 +1667,8 @@ class ChatSession:
             if (on_text is not None or stops) and isinstance(runtime, StreamingChatRuntime):
 
                 def forward(chunk: str) -> bool | None:
+                    if should_stop is not None and should_stop():
+                        return True
                     released = visible(chunk)
                     wants_stop = on_text(released) if on_text is not None and released else None
                     return True if matcher.hit else wants_stop
@@ -1535,16 +1681,19 @@ class ChatSession:
                     on_text(released)
             answer = sanitize_answer(
                 raw.text,
-                self._profile.reasoning_wrappers,
+                wrappers,
                 show=self._show_reasoning,
                 starts_in_reasoning=self._starts_in_reasoning,
             )
         except YongaError as error:
             return ChatTurn(diagnostic=error.diagnostic)
         if on_text is not None:
-            rest = streaming.finish()
+            shown, tail = leading.finish() if leading is not None else ("", "")
+            rest = (streaming.feed(tail) if tail else "") + streaming.finish()
             if gate is not None:
                 rest = (gate.feed(rest) if rest else "") + gate.finish()
+            if leading is not None:
+                rest = shown + leading.join(rest)
             if stops:
                 rest = (matcher.feed(rest) if rest else "") + matcher.finish()
             if rest:
@@ -1557,11 +1706,21 @@ class ChatSession:
         }
         if rule is None and not stops:
             return ChatTurn(result=raw.model_copy(update=update))
-        parsed = (
-            parse_tool_calls(answer.display_text, rule, names)
-            if rule is not None
-            else ParsedAnswer(answer.display_text.strip(), [], answer.display_text.strip())
-        )
+        if rule is None:
+            parsed = ParsedAnswer(answer.display_text.strip(), [], answer.display_text.strip())
+        elif leading is None:
+            parsed = parse_tool_calls(answer.display_text, rule, names)
+        else:
+            lead, after = split_leading_reasoning(
+                raw.text, wrappers, starts_in_reasoning=self._starts_in_reasoning
+            )
+            hidden = sanitize_answer(after, wrappers, show=False).display_text
+            parsed = parse_tool_calls(hidden, rule, names)
+            shown = lead.strip()
+            parsed = parsed._replace(
+                content=join_after_reasoning(shown, parsed.content),
+                prefix=join_after_reasoning(shown, parsed.prefix),
+            )
         content, calls = parsed.content, parsed.calls
         if stops:
             # The same cut StopMatcher makes after the gate: a stop that completes

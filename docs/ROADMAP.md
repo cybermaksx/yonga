@@ -152,10 +152,11 @@ moves earlier ones there with a note, and `--max-body-mb` raises the 8 MiB body 
 unit tests with fake runtimes; the checks through serve on a GPU artifact, for stop sequences and
 for images (Qwen2.5-VL-3B and Qwen3.5-9B), are still to be run. Tool calls followed as well,
 driven by registry data: a chat profile's `tool_calling` (schema 3) selects one of the parsers
-compiled into yonga (`tagged_json`, `json_list`), declared for Qwen2/Qwen2.5, Qwen3, SmolLM3 and
-Granite, the families seen producing parseable calls on the reference host in the scoping study
-(CPU, one prompt each); every other model refuses `tools`. Calls are read after the reasoning
-sanitiser, streamed as whole deltas once complete, and an unreadable call is returned as text.
+compiled into yonga (`tagged_json`, `json_list`), declared for Qwen2.5, Qwen3 (not Qwen3 MoE),
+SmolLM3 and Granite, the families seen producing parseable calls on the reference host in the
+scoping study (CPU, one prompt each); every other model refuses `tools`. Calls are read outside
+reasoning, shown or hidden, streamed as whole deltas once complete, and an unreadable call is
+returned as text.
 Covered by unit tests with fake runtimes; a two-turn round trip through serve on real artifacts
 (Qwen3 on the GPU, Granite, the NPU's prompt-length limit with tool schemas) is still to be run.
 Not done: `tool_choice` `required` or a named function (needs GenAI's constrained decoding,
