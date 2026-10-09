@@ -11,6 +11,17 @@ Security posture: the server binds to loopback unless told otherwise (the CLI
 decides that), keeps no request content anywhere, and when an API key is
 configured compares it in constant time. The key itself is never logged or
 echoed back.
+
+Request size is bounded so one request cannot exhaust memory before it is even
+validated. A body larger than ``max_body_bytes`` (by default
+:data:`DEFAULT_MAX_BODY_BYTES`, far more than any model's context holds as
+text) is refused with ``413`` and the error code ``request_too_large``. The
+limit is enforced on the bytes actually received, not only on the declared
+``Content-Length``, so a chunked upload is held to it too. The number of
+messages in one request is bounded separately (see
+:data:`yonga.api.openai.MAX_MESSAGES`) and refused with ``400``. With an API
+key configured, authentication runs first, so the server answers ``401``
+without reading the body of a request that lacks the key.
 """
 
 from __future__ import annotations
@@ -24,10 +35,11 @@ from collections.abc import AsyncIterator
 from contextlib import suppress
 from typing import Any
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from yonga import __version__
 from yonga.api.openai import ChatCompletionRequest, UnsupportedParameter
@@ -40,14 +52,35 @@ from yonga.application.serve import (
 )
 from yonga.domain.diagnostics import Diagnostic, FailureCategory, YongaError
 
-__all__ = ["create_app"]
+__all__ = ["DEFAULT_MAX_BODY_BYTES", "create_app"]
+
+#: Largest request body accepted by default: 8 MiB. A chat history long enough
+#: to fill a large context window is a small fraction of this as JSON text.
+DEFAULT_MAX_BODY_BYTES = 8 * 1024 * 1024
 
 #: Categories that describe the request rather than the server.
 _CLIENT_ERRORS = frozenset({FailureCategory.CONFIGURATION_ERROR})
 
+#: The OpenAI-style ``code`` for an HTTP error raised by routing or by a limit.
+_HTTP_ERROR_CODES = {
+    404: "not_found",
+    405: "method_not_allowed",
+    413: "request_too_large",
+}
 
-def create_app(server: ModelServer, *, api_key: str | None = None) -> FastAPI:
-    """Build the application for ``server``; ``api_key`` enables bearer authentication."""
+
+def create_app(
+    server: ModelServer,
+    *,
+    api_key: str | None = None,
+    max_body_bytes: int = DEFAULT_MAX_BODY_BYTES,
+) -> FastAPI:
+    """Build the application for ``server``.
+
+    ``api_key`` enables bearer authentication. ``max_body_bytes`` caps the size
+    of a request body; a larger one is refused with ``413`` (see the module
+    docstring).
+    """
     app = FastAPI(
         title="yonga",
         version=__version__,
@@ -55,6 +88,8 @@ def create_app(server: ModelServer, *, api_key: str | None = None) -> FastAPI:
         redoc_url=None,
         openapi_url=None,
     )
+    # Added before the authentication middleware, so it runs inside it.
+    app.add_middleware(_BodyLimit, max_bytes=max_body_bytes)
 
     @app.middleware("http")
     async def authenticate(request: Request, call_next: Any) -> Any:
@@ -77,7 +112,8 @@ def create_app(server: ModelServer, *, api_key: str | None = None) -> FastAPI:
 
     @app.exception_handler(StarletteHTTPException)
     async def http_error(_request: Request, error: StarletteHTTPException) -> JSONResponse:
-        return _error(error.status_code, str(error.detail), "not_found")
+        code = _HTTP_ERROR_CODES.get(error.status_code, "invalid_request")
+        return _error(error.status_code, str(error.detail), code)
 
     @app.get("/health")
     def health() -> dict[str, object]:
@@ -252,6 +288,70 @@ async def _stream(
             return
     finally:
         abandoned.set()
+
+
+# --- request limits -------------------------------------------------------------------
+
+
+class _BodyTooLarge(HTTPException):
+    """Raised from ``receive`` once a body passes the limit.
+
+    FastAPI's own ``HTTPException`` on purpose: FastAPI turns any other error
+    raised while reading a body into a generic ``400``.
+    """
+
+    def __init__(self, limit: int) -> None:
+        super().__init__(413, _too_large_message(limit))
+
+
+def _too_large_message(limit: int) -> str:
+    return f"The request body is larger than this server accepts ({limit} bytes)."
+
+
+class _BodyLimit:
+    """Pure ASGI middleware that refuses request bodies larger than ``max_bytes``.
+
+    A declared ``Content-Length`` above the limit is refused before any of the
+    body is read; otherwise the bytes are counted as they arrive, which also
+    covers chunked uploads that declare no length.
+    """
+
+    def __init__(self, app: ASGIApp, *, max_bytes: int) -> None:
+        self._app = app
+        self._max_bytes = max_bytes
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self._app(scope, receive, send)
+            return
+        declared = _content_length(scope)
+        if declared is not None and declared > self._max_bytes:
+            response = _error(413, _too_large_message(self._max_bytes), "request_too_large")
+            await response(scope, receive, send)
+            return
+        received = 0
+
+        async def limited() -> Message:
+            nonlocal received
+            message = await receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > self._max_bytes:
+                    raise _BodyTooLarge(self._max_bytes)
+            return message
+
+        await self._app(scope, limited, send)
+
+
+def _content_length(scope: Scope) -> int | None:
+    """The declared ``Content-Length``, or ``None`` when absent or unreadable."""
+    for name, value in scope.get("headers", ()):
+        if name == b"content-length":
+            try:
+                return int(value)
+            except ValueError:
+                return None
+    return None
 
 
 # --- errors ---------------------------------------------------------------------------

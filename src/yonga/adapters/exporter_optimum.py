@@ -49,6 +49,7 @@ from yonga.domain.plans import (
     ExportRequest,
     ExportResult,
     QuantizationSettings,
+    export_extra_arg_problems,
 )
 from yonga.util.redaction import redact_argv, redact_env, redact_text
 from yonga.util.versions import installed_version, satisfies
@@ -161,14 +162,35 @@ def build_export_argv(request: ExportRequest, *, launcher: Sequence[str]) -> lis
     The output directory is always the **last** positional argument, matching the
     ``optimum-cli export openvino ... OUTPUT`` signature. ``--model`` receives a
     local snapshot path, so the exporter never re-downloads anything.
+
+    The profile's ``export_extra_args`` are checked again here, not only when the
+    registry is loaded, so a profile built in code cannot slip ``--trust-remote-code``,
+    another ``--model`` or a ``--`` past the request either: any of them raises
+    :class:`ConfigurationError`.
     """
+    extras = [str(extra) for extra in request.profile.export_extra_args]
+    problems = export_extra_arg_problems(extras)
+    if problems:
+        raise ConfigurationError(
+            diagnostic(
+                "export.reserved_extra_args",
+                FailureCategory.CONFIGURATION_ERROR,
+                "The conversion profile passes export arguments yonga reserves",
+                f"Profile {request.profile.id}: " + "; ".join(problems) + ".",
+                remediation=[
+                    "Remove those arguments from the profile's export_extra_args.",
+                    "Remote code is enabled only by --trust-remote-code on the command line.",
+                ],
+                context={"profile": request.profile.id},
+            )
+        )
     argv: list[str] = [*launcher, "export", "openvino", "--model", request.resolved_model_ref]
     if request.task:
         argv += ["--task", request.task]
     argv += quantization_flags(request.profile.quantization)
     if request.trust_remote_code:
         argv.append("--trust-remote-code")
-    argv += [str(extra) for extra in request.profile.export_extra_args]
+    argv += extras
     argv.append(str(request.output_path))
     return argv
 
@@ -205,12 +227,14 @@ def missing_exporter_diagnostic() -> Diagnostic:
 def resolve_launcher() -> list[str]:
     """Return the argv prefix that runs the Optimum CLI, or raise ``ConfigurationError``.
 
-    ``[sys.executable, "-m", "optimum.commands.optimum_cli"]`` is preferred because
-    it pins the export to the interpreter yonga is running in — no ``PATH`` games,
-    no second virtual environment. ``shutil.which("optimum-cli")`` is the fallback.
+    ``[sys.executable, "-P", "-m", "optimum.commands.optimum_cli"]`` is preferred
+    because it pins the export to the interpreter yonga is running in — no ``PATH``
+    games, no second virtual environment. ``-P`` keeps the current directory off
+    ``sys.path``, so a module of the same name there cannot stand in for a real one.
+    ``shutil.which("optimum-cli")`` is the fallback.
     """
     if _module_importable(OPTIMUM_CLI_MODULE):
-        return [sys.executable, "-m", OPTIMUM_CLI_MODULE]
+        return [sys.executable, "-P", "-m", OPTIMUM_CLI_MODULE]
     executable = shutil.which(OPTIMUM_CLI_EXECUTABLE)
     if executable:
         return [executable]
@@ -309,7 +333,7 @@ class OptimumExporter:
         if self._launcher is not None:
             return list(self._launcher)
         if request is not None and request.interpreter is not None:
-            return [str(request.interpreter), "-m", OPTIMUM_CLI_MODULE]
+            return [str(request.interpreter), "-P", "-m", OPTIMUM_CLI_MODULE]
         return resolve_launcher()
 
     def build_argv(self, request: ExportRequest) -> list[str]:
@@ -403,7 +427,7 @@ class OptimumExporter:
             "                  'max': text(getattr(cls, 'MAX_TRANSFORMERS_VERSION', None)),\n"
             "                  'config': cls.__name__}))\n"
         )
-        result = self._runner.run([str(python), "-c", script, model_type, task or ""])
+        result = self._runner.run([str(python), "-P", "-c", script, model_type, task or ""])
         if result.returncode != 0:
             return None
         for line in reversed(list(result.stdout_lines)):

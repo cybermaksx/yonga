@@ -19,9 +19,15 @@ from yonga.application.chat import ChatMessage
 from yonga.application.serve import CompletionRequest
 
 __all__ = [
+    "MAX_MESSAGES",
     "ChatCompletionRequest",
     "UnsupportedParameter",
 ]
+
+#: Most messages one request may carry. Far beyond any real conversation; it
+#: exists so a request cannot make the server build millions of objects. A
+#: request over it is refused with ``400`` naming ``messages``.
+MAX_MESSAGES = 4096
 
 
 class UnsupportedParameter(ValueError):
@@ -55,7 +61,7 @@ class ChatCompletionRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     model: str
-    messages: list[WireMessage] = Field(min_length=1)
+    messages: list[WireMessage] = Field(min_length=1, max_length=MAX_MESSAGES)
     stream: bool = False
     stream_options: StreamOptions | None = None
     max_tokens: int | None = None

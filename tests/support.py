@@ -114,7 +114,7 @@ class SimulatedPipRunner:
     ) -> CompletedCommand:
         command = [str(part) for part in argv]
         self.calls.append(command)
-        if command[1:3] == ["-m", "venv"]:
+        if command[1:4] == ["-P", "-m", "venv"]:
             python = Path(command[-1]) / "bin" / "python"
             python.parent.mkdir(parents=True, exist_ok=True)
             python.write_text("#!/bin/sh\n")
@@ -123,7 +123,7 @@ class SimulatedPipRunner:
                 match = re.match(r"^([A-Za-z0-9._-]+)(.*)$", part)
                 if match and not part.startswith("-") and "://" not in part:
                     self.requirements[match.group(1)] = match.group(2)
-        elif command[1:2] == ["-c"]:
+        elif command[1:3] == ["-P", "-c"]:
             reported = {name: _satisfying(spec) for name, spec in self.requirements.items()}
             return CompletedCommand(
                 argv=command,

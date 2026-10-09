@@ -87,7 +87,11 @@ from pydantic import (
 from yonga.domain.compatibility import DeviceStatus, EvidenceLevel
 from yonga.domain.hardware import normalise_device
 from yonga.domain.models import ModelFormat, PipelineKind, SourceEvidence, SourceRelationship
-from yonga.domain.plans import ConversionProfile, QuantizationSettings
+from yonga.domain.plans import (
+    ConversionProfile,
+    QuantizationSettings,
+    export_extra_arg_problems,
+)
 
 #: Schema version understood by this build of the loader.
 #:
@@ -151,6 +155,14 @@ KNOWN_CONSTRAINT_KEYS: frozenset[str] = frozenset(
 
 _STRICT = ConfigDict(extra="forbid")
 _STRICT_ALIASED = ConfigDict(extra="forbid", populate_by_name=True)
+
+
+def _checked_export_args(value: list[str]) -> list[str]:
+    """Refuse export arguments that would override what yonga decides itself."""
+    problems = export_extra_arg_problems(value)
+    if problems:
+        raise ValueError("export arguments not allowed in registry data: " + "; ".join(problems))
+    return value
 
 
 def _normalise_key(value: str) -> str:
@@ -779,6 +791,11 @@ class ExportSpec(BaseModel):
     """
     extra_args: list[str] = Field(default_factory=list)
 
+    @field_validator("extra_args")
+    @classmethod
+    def _no_reserved_options(cls, value: list[str]) -> list[str]:
+        return _checked_export_args(value)
+
     @model_validator(mode="after")
     def _native_excludes_remote_code(self) -> ExportSpec:
         if self.native_implementation and self.trust_remote_code:
@@ -942,6 +959,11 @@ class ProfileRule(BaseRule):
         if self.evidence is EvidenceLevel.UNKNOWN:
             raise ValueError(f"profile {self.id}: a size-banded profile must state its evidence")
         return self
+
+    @field_validator("export_extra_args")
+    @classmethod
+    def _no_reserved_options(cls, value: list[str]) -> list[str]:
+        return _checked_export_args(value)
 
     @field_validator("runtime")
     @classmethod

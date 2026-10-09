@@ -1,0 +1,15 @@
+# Keeps the actions the workflows use current. release.yml pins each action to a
+# commit sha with its release tag in a comment (docs/RELEASING.md); Dependabot
+# moves the sha and the comment together, so a pin never stays on an old commit
+# unnoticed. ci.yml's tag pins are updated the same way.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: ci

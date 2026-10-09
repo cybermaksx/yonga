@@ -102,7 +102,7 @@ def test_the_importer_is_given_a_link_in_staging_never_the_cached_file(
 
     assert result.success
     assert runner.link_seen == (True, cached.resolve())
-    assert runner.calls[0][:3] == ["python3", "-m", "yonga.adapters.gguf_import"]
+    assert runner.calls[0][:4] == ["python3", "-P", "-m", "yonga.adapters.gguf_import"]
     assert sorted(p.name for p in cached.parent.iterdir()) == ["model-Q4_0.gguf"], (
         "nothing was written next to the cached file"
     )

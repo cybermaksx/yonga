@@ -1,12 +1,17 @@
 #!/bin/sh
-# Entry point of the yonga AppImage: the bundled CPython runs `python -m yonga`.
+# Entry point of the yonga AppImage: the bundled CPython runs `python -B -P -m yonga`.
 #
 # Nothing from the host's Python leaks in: PYTHONHOME and PYTHONPATH are
-# dropped, and the user site directory is ignored (also by the child processes
-# yonga starts with the same interpreter, such as the GGUF import). The image
-# is read-only, so the main process does not try to write bytecode into it.
+# dropped, and the user site directory is ignored. Nothing from the current
+# directory does either: `-m` would otherwise put it first on sys.path, so a
+# `typer.py` in the directory yonga is run from would be imported in place of
+# the real one. PYTHONSAFEPATH removes that entry; `-P` is the same for this
+# process. Both environment variables also reach the child processes yonga
+# starts with the same interpreter, such as the GGUF import. The image is
+# read-only, so the main process does not try to write bytecode into it.
 HERE="$(dirname "$(readlink -f "$0")")"
 export APPDIR="${APPDIR:-$HERE}"
 unset PYTHONHOME PYTHONPATH
 export PYTHONNOUSERSITE=1
-exec "$HERE/usr/python/bin/python3" -B -m yonga "$@"
+export PYTHONSAFEPATH=1
+exec "$HERE/usr/python/bin/python3" -B -P -m yonga "$@"

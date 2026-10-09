@@ -20,6 +20,7 @@ from yonga.registry.schema import (
     DerivativeCandidate,
     DerivativeRule,
     DeviceSupport,
+    ExportSpec,
     GenerationDefaults,
     IssueClassification,
     IssueMatch,
@@ -119,6 +120,38 @@ def test_profile_rule_converts_to_domain_conversion_profile():
     assert profile.runtime_properties == {"ATTENTION_BACKEND": "SDPA"}
     assert profile.constraints == {"openvino": ">=2026.2"}
     assert profile.sources == [{"kind": "model_card", "url": "https://example.invalid"}]
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["--trust-remote-code"],
+        ["--trust-remote"],
+        ["--model=attacker/repo"],
+        ["--mod", "attacker/repo"],
+        ["-m", "attacker/repo"],
+        ["--", "/elsewhere"],
+        ["--cache_dir", "/elsewhere"],
+        ["--token", "x"],
+        ["--quantization-statistics-path", "/elsewhere"],
+        ["--group-size=64"],
+    ],
+)
+def test_profile_rule_refuses_reserved_export_args(extra: list[str]) -> None:
+    """Registry data tunes an export; it never picks the model, the output or remote code."""
+    with pytest.raises(ValidationError, match="export arguments not allowed"):
+        ProfileRule(id="p", device="cpu", export_extra_args=extra)
+
+
+def test_export_spec_refuses_reserved_extra_args() -> None:
+    with pytest.raises(ValidationError, match="export arguments not allowed"):
+        ExportSpec(extra_args=["--trust-remote-code"])
+
+
+def test_profile_rule_keeps_ordinary_export_args() -> None:
+    extra = ["--disable-stateful", "--num-samples", "32", "--group-size-fallback", "ignore"]
+    rule = ProfileRule(id="p", device="cpu", export_extra_args=extra)
+    assert rule.to_conversion_profile().export_extra_args == extra
 
 
 def test_profile_rule_rejects_empty_device():

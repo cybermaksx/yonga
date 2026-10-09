@@ -81,10 +81,13 @@ class ExitCode(IntEnum):
 #: Complete, explicit mapping from failure category to process exit code.
 #:
 #: Every member of :class:`FailureCategory` must appear here; the unit tests
-#: assert that. Exit codes 40 (conversion), 41 (validation), 42 (repair denied)
-#: and 52 (generation) describe *where* a job died rather than *why*, so they are
-#: not reachable from a category alone: the typed errors below supply them via
-#: ``fallback_exit_code`` when the category is merely ``unknown_runtime_error``.
+#: assert that. Exit codes 40 (conversion), 42 (repair denied) and 52
+#: (generation) describe *where* a job died rather than *why*, so no category
+#: maps to them: the typed errors below supply them via ``fallback_exit_code``
+#: when the category is merely ``unknown_runtime_error`` (and ``bench`` returns
+#: 52 itself when no run produced a measurement). Exit code 41
+#: (validation) is both: it is the category code for ``unsupported_ir_type`` and
+#: ``tokenizer_ir_incompatible``, and the fallback of :class:`ValidationError`.
 CATEGORY_EXIT_CODES: Mapping[FailureCategory, ExitCode] = MappingProxyType(
     {
         FailureCategory.DEVICE_UNAVAILABLE: ExitCode.DEVICE_UNSUPPORTED,

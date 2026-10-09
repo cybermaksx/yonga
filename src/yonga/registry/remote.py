@@ -39,7 +39,7 @@ from pathlib import Path, PurePosixPath
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, ValidationError
 
 from yonga import __version__
 from yonga.config.paths import Paths
@@ -92,8 +92,9 @@ class RegistryBundle(BaseModel):
     format: int
     version: int = Field(ge=1)
     """Monotonic; a host refuses a bundle older than the one it has."""
-    created_at: datetime
-    expires_at: datetime
+    created_at: AwareDatetime
+    expires_at: AwareDatetime
+    """Both carry a UTC offset; a naive timestamp is refused as malformed."""
     min_tool_version: str | None = None
     description: str = ""
     files: dict[str, str]
@@ -353,8 +354,8 @@ class RemoteRegistryState(BaseModel):
     key_id: str
     sha256: str
     source: str
-    installed_at: datetime
-    expires_at: datetime
+    installed_at: AwareDatetime
+    expires_at: AwareDatetime
     description: str = ""
 
 

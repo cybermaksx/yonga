@@ -92,6 +92,12 @@ NPU_UNSUPPORTED_GRAPH = (
     "OneShotBufferizeVPU2VPUIP failed : Only supports FP16."
 )
 
+#: A host problem rather than a compatibility limit: the kernel refused the NPU node.
+NPU_PERMISSION_DENIED = (
+    "Exception from src/inference/src/cpp/core.cpp:117:\n"
+    "Failed to open /dev/accel/accel0: Permission denied"
+)
+
 #: Job id of the multi-megabyte log the closed-pipe tests write and then read.
 LARGE_LOG_JOB_ID = "11111111-2222-3333-4444-555555555555"
 
@@ -790,6 +796,35 @@ def test_explicit_npu_never_falls_back_and_exits_fifty(
     assert result.exit_code == int(ExitCode.DEVICE_UNSUPPORTED)
     assert "--device gpu" in result.stderr
     assert "will not silently prepare for another device" in result.stderr
+    assert {device for _name, device in runtime.compiled} == {"NPU"}
+
+
+@pytest.mark.parametrize("device", ["npu", "auto"])
+def test_a_permission_denied_npu_in_prepare_exits_ten(
+    runner: CliRunner, home: Path, tmp_path: Path, device: str
+) -> None:
+    """A device the host will not let yonga open is an unusable environment, not code 50.
+
+    The NPU would work once the user is given access to the device node, so
+    ``prepare`` answers with :data:`ExitCode.ENVIRONMENT_UNUSABLE`, whether the
+    device was requested explicitly or chosen by auto mode, and never falls back.
+    """
+    runtime = FakeRuntimeProbe(compile_failures={"NPU": NPU_PERMISSION_DENIED})
+    wiring_for = lambda settings: FakeWiring(  # noqa: E731 - one-line factory
+        settings,
+        hub=hub_with(tmp_path=tmp_path),
+        runtime=runtime,
+        resolver=builtin_resolver([NPU_FIRST_REGISTRY]),
+    )
+    result = invoke(
+        runner,
+        home,
+        ["prepare", SAFETENSORS_REPO, "--device", device, "--yes"],
+        factory=wiring_for,
+    )
+    assert result.exit_code == int(ExitCode.ENVIRONMENT_UNUSABLE)
+    assert "No permission to use the NPU device node" in result.stderr
+    assert "--device auto" not in result.stderr
     assert {device for _name, device in runtime.compiled} == {"NPU"}
 
 

@@ -97,6 +97,57 @@ def test_home_hostname_and_login_are_anonymised(paths: Paths, tmp_path: Path) ->
     assert "alice" not in log and "run by <user>" in log
 
 
+def test_the_hugging_face_account_name_never_reaches_the_bundle(
+    paths: Paths, tmp_path: Path
+) -> None:
+    """``doctor`` asks the Hub who the token belongs to; a public bundle must not say."""
+    write_job(paths, extra="as hubperson")
+    host_report: dict[str, object] = {
+        "hardware": {"hf_auth": {"logged_in": True, "user": "hubperson", "auth_source": "env"}},
+        "sections": [
+            {
+                "id": "huggingface",
+                "checks": [{"id": "huggingface.auth", "value": "signed in as hubperson"}],
+            }
+        ],
+    }
+    files = bundle(paths, tmp_path, host_report=host_report)
+
+    assert all("hubperson" not in text for text in files.values())
+    host = json.loads(files["host.json"])
+    assert host["hardware"]["hf_auth"] == {
+        "logged_in": True,
+        "user": "<hf-user>",
+        "auth_source": "env",
+    }
+    assert host["sections"][0]["checks"][0]["value"] == "signed in as <hf-user>"
+    assert "as <hf-user>" in files["job.jsonl"]
+    assert host_report["hardware"]["hf_auth"]["user"] == "hubperson"  # type: ignore[index]
+
+
+def test_a_short_hugging_face_name_is_still_hidden_in_the_host_report(
+    paths: Paths, tmp_path: Path
+) -> None:
+    """Too short for the free-text rule, but the structured fields are replaced regardless."""
+    write_job(paths)
+    host_report: dict[str, object] = {
+        "hardware": {"hf_auth": {"logged_in": True, "user": "xq"}},
+        "sections": [{"checks": [{"id": "huggingface.auth", "value": "signed in as xq"}]}],
+    }
+    host = json.loads(bundle(paths, tmp_path, host_report=host_report)["host.json"])
+
+    assert host["hardware"]["hf_auth"]["user"] == "<hf-user>"
+    assert host["sections"][0]["checks"][0]["value"] == "signed in as <hf-user>"
+
+
+def test_a_full_name_starting_with_the_login_is_rewritten_whole() -> None:
+    text = "signed in as alice smith, run by alice"
+    assert anonymise(text, user="alice", hf_user="alice smith") == (
+        "signed in as <hf-user>, run by <user>"
+    )
+    assert anonymise("run by alice", user="alice", hf_user="alice") == "run by <user>"
+
+
 def test_a_short_login_is_not_rewritten() -> None:
     """A one- or two-letter name as a whole word would mangle unrelated text."""
     assert anonymise("al is here", user="al") == "al is here"

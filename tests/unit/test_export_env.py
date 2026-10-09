@@ -90,7 +90,7 @@ class FakeRunner:
 
     @staticmethod
     def _step(command: list[str]) -> str:
-        if command[1:3] == ["-m", "venv"]:
+        if command[1:4] == ["-P", "-m", "venv"]:
             return "venv"
         if "--index-url" in command:
             return "torch"
@@ -203,15 +203,15 @@ def test_a_build_runs_venv_then_cpu_torch_then_the_pins_then_verifies(
     environment = envs.ensure(spec, ctx)
 
     venv, torch, packages, verify = runner.calls
-    assert venv[:3] == ["/usr/bin/python3", "-m", "venv"]
+    assert venv[:4] == ["/usr/bin/python3", "-P", "-m", "venv"]
     python = str(environment.python)
-    assert torch[:4] == [python, "-m", "pip", "install"]
+    assert torch[:5] == [python, "-P", "-m", "pip", "install"]
     assert torch[torch.index("--index-url") + 1] == TORCH_CPU_INDEX
     assert torch[-2:] == ["torch==2.14.0", "torchvision==0.29.0"]
     assert "transformers==5.2.*" in packages
     # Built against torch: a PyPI torchvision is the CUDA build and breaks the CPU torch.
     assert not any(part.startswith(("torch==", "torchvision")) for part in packages)
-    assert verify[:2] == [python, "-c"]
+    assert verify[:3] == [python, "-P", "-c"]
     assert environment.installed["transformers"] == "5.2.0"
     assert (environment.path / MARKER_FILENAME).is_file()
 
@@ -288,7 +288,7 @@ def test_an_interrupted_build_is_never_used_and_is_rebuilt(paths: Paths, ctx: Jo
     envs.ensure(spec, ctx)
 
     assert not (leftover / "half-installed").exists()
-    assert runner.calls[0][1:3] == ["-m", "venv"]
+    assert runner.calls[0][1:4] == ["-P", "-m", "venv"]
 
 
 def test_a_failed_install_is_typed_and_leaves_nothing_behind(paths: Paths, ctx: JobContext) -> None:
@@ -370,3 +370,20 @@ def test_remove_deletes_by_prefix_and_refuses_unknown_keys(paths: Paths, ctx: Jo
     assert not built.path.exists()
     assert not (paths.envs_dir / f"{built.spec.name}.lock").exists()
     assert envs.environments() == []
+
+
+def test_the_safe_path_flag_keeps_a_planted_module_from_running(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Why every child interpreter gets ``-P``: ``-c`` and ``-m`` put the cwd first."""
+    import subprocess
+
+    (tmp_path / "json.py").write_text("print('PLANTED')\n")
+    monkeypatch.chdir(tmp_path)
+    probe = "import json"
+
+    exposed = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True)
+    guarded = subprocess.run([sys.executable, "-P", "-c", probe], capture_output=True, text=True)
+
+    assert "PLANTED" in exposed.stdout
+    assert "PLANTED" not in guarded.stdout and guarded.returncode == 0

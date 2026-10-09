@@ -3050,9 +3050,10 @@ class PrepareService:
             f"--device {name.lower()}"
             for name in alternatives
         )
-        remediation.append(
-            f"Or let yonga choose: yonga prepare {plan.requested.repo_id} --device auto"
-        )
+        if not failure.environment_broken:
+            remediation.append(
+                f"Or let yonga choose: yonga prepare {plan.requested.repo_id} --device auto"
+            )
         return failure.model_copy(
             update={
                 "message": (

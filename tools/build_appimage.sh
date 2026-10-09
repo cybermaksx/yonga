@@ -2,7 +2,7 @@
 # Build dist/yonga-<version>-x86_64.AppImage: one file that runs yonga with no
 # Python, pip or OpenVINO installed on the host.
 #
-#   tools/build_appimage.sh [--wheel dist/yonga-X.Y.Z-py3-none-any.whl]
+#   tools/build_appimage.sh [--wheel dist/yonga-X.Y.Z-py3-none-any.whl [--wheel-sha256 HEX]]
 #
 # Why an AppImage around a real interpreter, not a frozen executable: yonga
 # starts child processes with its own interpreter (`python -m
@@ -11,15 +11,22 @@
 # `python` to hand them; an embedded relocatable CPython does. The image holds
 #
 #   usr/python/   python-build-standalone CPython with yonga[openvino,serve]
-#   AppRun        runs `python -m yonga`
+#   AppRun        runs `python -P -m yonga`
 #
 # Conversion (optimum-intel, torch) is deliberately not bundled: it is ~1.5 GB
 # and model-specific. `prepare` builds a managed export environment for it on
 # first use, from a lasting copy of the bundled interpreter.
 #
-# Every download is pinned and checked against its SHA-256. Host needs: bash,
-# curl, tar, sha256sum and a Python with `build` when no wheel is given. The
-# result runs on x86_64 Linux with glibc 2.28 or newer.
+# The interpreter, appimagetool and the AppImage runtime are pinned and checked
+# against their SHA-256; `--wheel-sha256` does the same for the yonga wheel. The
+# Python packages yonga depends on are not pinned: pip resolves the ranges in
+# pyproject.toml against PyPI at build time, so two builds of one wheel can
+# bundle different versions. Every build therefore records what it bundled, as
+# `usr/share/yonga/packages.txt` inside the image and as
+# `yonga-X.Y.Z-x86_64.AppImage.packages.txt` beside it, and prints the list.
+#
+# Host needs: bash, curl, tar, sha256sum and a Python with `build` when no
+# wheel is given. The result runs on x86_64 Linux with glibc 2.28 or newer.
 set -euo pipefail
 
 PBS_RELEASE=20260924
@@ -37,10 +44,12 @@ work="${YONGA_APPIMAGE_WORK:-$root/build/appimage}"
 dist="${YONGA_APPIMAGE_DIST:-$root/dist}"
 downloads="$work/downloads"
 wheel=""
+wheel_sha256=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --wheel) wheel="$(realpath "$2")"; shift 2 ;;
+        --wheel-sha256) wheel_sha256="$2"; shift 2 ;;
         -h|--help) sed -n '2,5p' "$0"; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
@@ -72,8 +81,12 @@ if [ -z "$wheel" ]; then
     python3 -m build --wheel --outdir "$work/wheel" "$root"
     wheel="$(ls "$work"/wheel/yonga-*.whl)"
 fi
+if [ -n "$wheel_sha256" ]; then
+    echo "$wheel_sha256  $wheel" | sha256sum --check --quiet
+fi
+wheel_sum="$(sha256sum "$wheel" | cut -d' ' -f1)"
 version="$(basename "$wheel" | cut -d- -f2)"
-echo "building yonga $version from $(basename "$wheel")"
+echo "building yonga $version from $(basename "$wheel") (sha256 $wheel_sum)"
 
 appdir="$work/AppDir"
 rm -rf "$appdir"
@@ -99,6 +112,17 @@ py_tag="$("$python" -c 'import sys; print(f"{sys.version_info[0]}{sys.version_in
     --target "$site" --upgrade \
     "yonga[openvino,serve] @ file://$wheel"
 rm -rf "$site/bin"   # console scripts with a build-time shebang; AppRun is the entry point
+
+# What was bundled, exactly: the audit trail for dependencies resolved at build
+# time. Written before pip removes itself; the list leaves pip out for that reason.
+packages="$appdir/usr/share/yonga/packages.txt"
+mkdir -p "$(dirname "$packages")"
+{
+    echo "# Python packages bundled in yonga-${version}-x86_64.AppImage"
+    echo "# interpreter: CPython ${PYTHON_VERSION} (python-build-standalone ${PBS_RELEASE})"
+    echo "# wheel: $(basename "$wheel") sha256=${wheel_sum}"
+    "$python" -m pip list --disable-pip-version-check --format=freeze --exclude pip
+} > "$packages"
 "$python" -m pip uninstall --yes --disable-pip-version-check pip >/dev/null
 # The image is read-only at run time, so bytecode is compiled now or never.
 "$python" -m compileall -q -j 0 "$appdir/usr/python/lib" >/dev/null || true
@@ -123,6 +147,9 @@ rm -f "$output"
 ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 "$downloads/appimagetool-x86_64.AppImage" \
     --no-appstream --runtime-file "$downloads/runtime-x86_64" "$appdir" "$output"
 (cd "$dist" && sha256sum "$(basename "$output")" > "$(basename "$output").sha256")
+cp "$packages" "$output.packages.txt"
+echo "bundled packages:"
+sed 's/^/    /' "$packages"
 
 # Smoke test: the image starts, reports its version and finds its runtime.
 APPIMAGE_EXTRACT_AND_RUN=1 "$output" --version

@@ -11,6 +11,9 @@ A bundle is meant to be shared, possibly publicly, so it is built defensively:
   written -- older logs predate some redaction rules, and a second pass is cheap;
 * the home directory is rewritten to ``~``, the hostname to ``<host>`` and the
   login name to ``<user>``, so paths do not identify the person or machine;
+* the Hugging Face account name the host report carries (``doctor`` asks the
+  Hub who the token belongs to) is rewritten to ``<hf-user>`` wherever it
+  appears, so a public issue is not tied to a Hub identity;
 * nothing outside yonga's own managed directories is read.
 
 The archive's ``README.txt`` lists exactly what went in, so the recipient -- and
@@ -50,6 +53,9 @@ __all__ = [
 #: two-letter name as a whole word would mangle unrelated text.
 _MIN_USER_LENGTH = 3
 
+#: What a Hugging Face account name is rewritten to.
+_HF_USER_PLACEHOLDER = "<hf-user>"
+
 _README = """\
 {app} bug-report bundle
 =======================
@@ -64,8 +70,8 @@ so is safe:
 
 - every text file was redacted for secrets (tokens, Authorization headers, URL
   credentials, and the literal values of secret environment variables);
-- the home directory was rewritten to `~`, the hostname to `<host>` and the
-  login name to `<user>`.
+- the home directory was rewritten to `~`, the hostname to `<host>`, the
+  login name to `<user>` and the Hugging Face account name to `<hf-user>`.
 
 Please still read it before sharing. Contents:
 
@@ -139,13 +145,17 @@ def anonymise(
     home: str | None = None,
     user: str | None = None,
     host: str | None = None,
+    hf_user: str | None = None,
 ) -> str:
     """Rewrite the home directory to ``~``, the hostname to ``<host>``, the login to ``<user>``.
 
     The hostname goes first: hostnames commonly embed the login name (for
     example ``alice-laptop``), and the login rule deliberately leaves a name
     followed by a hyphen alone so it cannot mangle identifiers such as
-    ``bob-builder``.
+    ``bob-builder``. ``hf_user``, the Hugging Face account name, becomes
+    ``<hf-user>``; it goes before the login so a full name that starts with the
+    login (``alice smith``) is rewritten whole, and is left to the login rule
+    when the two are the same.
     """
     result = text
     if home and home not in ("/", ""):
@@ -154,6 +164,8 @@ def anonymise(
         for name in dict.fromkeys((host, host.split(".", 1)[0])):
             if len(name) >= _MIN_USER_LENGTH:
                 result = re.sub(rf"(?<![\w.-]){re.escape(name)}(?![\w-])", "<host>", result)
+    if hf_user and hf_user != user and len(hf_user) >= _MIN_USER_LENGTH:
+        result = re.sub(rf"(?<![\w.-]){re.escape(hf_user)}(?![\w-])", _HF_USER_PLACEHOLDER, result)
     if user and len(user) >= _MIN_USER_LENGTH:
         result = re.sub(rf"(?<![\w.-]){re.escape(user)}(?![\w-])", "<user>", result)
     return result
@@ -173,8 +185,10 @@ def build_bundle(
     """Write a redacted, anonymised ``.tar.gz`` for one job and describe it.
 
     ``host_report`` is the ``doctor`` JSON, gathered by the caller: this module
-    does not probe hardware itself. ``env``, ``home`` and ``user`` default to the
-    current process and exist so tests can pin them.
+    does not probe hardware itself. The Hugging Face account name it may carry
+    is replaced in its structured fields and rewritten in every member's text.
+    ``env``, ``home`` and ``user`` default to the current process and exist so
+    tests can pin them.
     """
     log_path = find_job_log(paths.logs_dir, job_reference)
     job_id = log_path.name.removesuffix(".jsonl")
@@ -182,10 +196,17 @@ def build_bundle(
     home_dir = home if home is not None else str(Path.home())
     login = user if user is not None else _login_name()
     hostname = host if host is not None else _hostname()
+    hf_user: str | None = None
+    if host_report is not None:
+        host_report, hf_user = _hide_hf_account(host_report)
 
     def clean(text: str) -> str:
         return anonymise(
-            redact_text(text, extra_secrets=secrets), home=home_dir, user=login, host=hostname
+            redact_text(text, extra_secrets=secrets),
+            home=home_dir,
+            user=login,
+            host=hostname,
+            hf_user=hf_user,
         )
 
     members: list[tuple[str, str, bytes]] = []
@@ -257,6 +278,32 @@ def _login_name() -> str | None:
         return getpass.getuser()
     except Exception:  # getpass raises several unrelated types on odd hosts
         return None
+
+
+def _hide_hf_account(report: Mapping[str, object]) -> tuple[dict[str, object], str | None]:
+    """A copy of a ``doctor`` report without the Hugging Face account name, and that name.
+
+    The name sits in ``hardware.hf_auth.user`` and in the ``huggingface.auth``
+    check's value (``signed in as <name>``). Both are replaced structurally, so
+    even a name too short for the free-text rule in :func:`anonymise` is hidden.
+    """
+    copy: dict[str, object] = json.loads(json.dumps(report, default=str))
+    name: str | None = None
+    hardware = copy.get("hardware")
+    auth = hardware.get("hf_auth") if isinstance(hardware, dict) else None
+    if isinstance(auth, dict) and isinstance(auth.get("user"), str) and auth["user"]:
+        name = auth["user"]
+        auth["user"] = _HF_USER_PLACEHOLDER
+    sections = copy.get("sections")
+    for section in sections if isinstance(sections, list) else []:
+        checks = section.get("checks") if isinstance(section, dict) else None
+        for check in checks if isinstance(checks, list) else []:
+            if not isinstance(check, dict) or check.get("id") != "huggingface.auth":
+                continue
+            value = check.get("value")
+            if isinstance(value, str) and value.startswith("signed in as "):
+                check["value"] = f"signed in as {_HF_USER_PLACEHOLDER}"
+    return copy, name
 
 
 def _read_text(path: Path, clean: Callable[[str], str]) -> str:

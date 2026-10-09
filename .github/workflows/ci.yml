@@ -5,9 +5,7 @@
 # deselects `network`, `intel_gpu`, `intel_npu`, `large_model` and `slow`. No job
 # here passes `-m`: overriding that expression is how a CI run would start
 # depending on a device it does not have. Verified locally with every outbound
-# connection refused, as the two steps below invoke it: `pytest tests/unit` is
-# 1627 passed and 1 skipped, `pytest tests/integration` is 44 passed and 10
-# deselected.
+# connection refused, as the steps below invoke it.
 name: CI
 
 on:
@@ -204,21 +202,27 @@ jobs:
           path: dist/
 
       # The same script the release runs, from the wheel `package` just built.
-      # It pins and checksums every download and fails if a bundled library
-      # needs a newer glibc than the image supports.
+      # It pins and checksums the interpreter and the AppImage tools, records
+      # the Python packages pip resolved in the image and beside it (they are
+      # not pinned), and fails if a bundled library needs a newer glibc than the
+      # image supports.
       - name: Build the AppImage
         run: tools/build_appimage.sh --wheel dist/yonga-*.whl
 
-      # Outside the checkout, so nothing can resolve against the source tree.
-      # Runners have no FUSE; extract-and-run is how the image starts there.
-      # doctor exits 2 on a host without a GPU or NPU; what must hold is that the
-      # bundled OpenVINO runtime is usable.
+      # Outside the checkout, so nothing can resolve against the source tree,
+      # and beside a decoy `typer.py`: the image must import its own modules,
+      # never one from the directory it is run in. Runners have no FUSE;
+      # extract-and-run is how the image starts there. doctor exits 2 on a host
+      # without a GPU or NPU; what must hold is that the bundled OpenVINO runtime
+      # is usable.
       - name: Smoke-test the image
         working-directory: /tmp
         env:
           APPIMAGE_EXTRACT_AND_RUN: "1"
         run: |
           app="$(ls "$GITHUB_WORKSPACE"/dist/yonga-*-x86_64.AppImage)"
+          mkdir decoy && cd decoy
+          echo 'raise SystemExit("imported typer.py from the current directory")' > typer.py
           "$app" --version
           "$app" registry validate
           "$app" doctor --json > doctor.json || true
@@ -230,4 +234,5 @@ jobs:
           path: |
             dist/*.AppImage
             dist/*.AppImage.sha256
+            dist/*.AppImage.packages.txt
           retention-days: 14

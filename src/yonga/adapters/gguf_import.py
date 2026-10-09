@@ -66,7 +66,7 @@ class GGUFImporter:
         if link.is_symlink() or link.exists():
             link.unlink()
         link.symlink_to(gguf.resolve())
-        argv = [self._python, "-m", "yonga.adapters.gguf_import", str(link)]
+        argv = [self._python, "-P", "-m", "yonga.adapters.gguf_import", str(link)]
         ctx.logger.argv("gguf.import.command", argv, source=str(gguf))
         ctx.emit(
             ProgressKind.EXPORT, f"Importing {gguf.name} with OpenVINO GenAI", status="started"

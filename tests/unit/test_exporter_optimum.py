@@ -309,6 +309,44 @@ def test_extra_args_sit_between_flags_and_the_output_directory(tmp_path: Path) -
     assert argv[-4:] == ["--disable-stateful", "--num-samples", "32", str(tmp_path / "o")]
 
 
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["--trust-remote-code"],
+        ["--trust-remote"],
+        ["--model", "attacker/repo"],
+        ["--model=attacker/repo"],
+        ["-m", "attacker/repo"],
+        ["-mattacker/repo"],
+        ["--model-kwargs", '{"trust_remote_code": true}'],
+        ["--", "/elsewhere"],
+        ["--weight-format", "fp16"],
+    ],
+)
+def test_reserved_extra_args_are_refused_when_the_argv_is_built(
+    tmp_path: Path, extra: list[str]
+) -> None:
+    """A profile built in code never passes the registry's validator; the argv guard holds."""
+    profile = make_profile("gpu-int4-asym-g128").model_copy(update={"export_extra_args": extra})
+    request = ExportRequest(source_path=tmp_path / "s", output_path=tmp_path / "o", profile=profile)
+
+    with pytest.raises(ConfigurationError) as caught:
+        build_export_argv(request, launcher=LAUNCHER)
+    assert caught.value.diagnostic.code == "export.reserved_extra_args"
+
+
+def test_a_profile_with_reserved_extra_args_is_refused_without_running(job: JobContext) -> None:
+    runner = FakeRunner()
+    request = make_request(job, extra_args=["--trust-remote-code"])
+
+    result = OptimumExporter(runner, launcher=LAUNCHER).export(request, job)
+
+    assert runner.calls == []
+    assert not result.success
+    assert result.diagnostic is not None
+    assert result.diagnostic.code == "export.reserved_extra_args"
+
+
 # --- launcher discovery --------------------------------------------------
 
 
@@ -319,7 +357,25 @@ def test_resolve_launcher_prefers_the_module_in_this_interpreter(
         "yonga.adapters.exporter_optimum._module_importable",
         lambda name: name == OPTIMUM_CLI_MODULE,
     )
-    assert resolve_launcher()[1:] == ["-m", OPTIMUM_CLI_MODULE]
+    assert resolve_launcher()[1:] == ["-P", "-m", OPTIMUM_CLI_MODULE]
+
+
+def test_a_managed_interpreter_runs_without_the_current_directory_on_sys_path(
+    tmp_path: Path,
+) -> None:
+    python = tmp_path / "env" / "bin" / "python"
+    request = ExportRequest(
+        source_path=tmp_path / "s",
+        output_path=tmp_path / "o",
+        profile=make_profile("gpu-int4-asym-g128"),
+        interpreter=python,
+    )
+    assert OptimumExporter().resolve_launcher(request) == [
+        str(python),
+        "-P",
+        "-m",
+        OPTIMUM_CLI_MODULE,
+    ]
 
 
 def test_resolve_launcher_falls_back_to_the_console_script(
@@ -562,7 +618,8 @@ def test_secrets_are_redacted_in_argv_and_captured_output(job: JobContext) -> No
         stdout=[f"Authorization: Bearer {token}"],
         stderr=[f"failed using {token}"],
     )
-    request = make_request(job, extra_args=["--token", token])
+    # Any argument will do: redaction is by pattern, and --token itself is reserved.
+    request = make_request(job, extra_args=["--pad-token-id", token])
     result = OptimumExporter(runner, launcher=LAUNCHER).export(request, job)
 
     assert token not in " ".join(result.argv)

@@ -1,39 +1,54 @@
 name: Release
 
-# A release is a version tag, e.g. `git tag v0.2.0 && git push origin v0.2.0`.
+# A release is a version tag, e.g. `git tag v0.3.0 && git push origin v0.3.0`.
 # The tag builds the sdist, the wheel and the AppImage and attaches them to a
 # GitHub release whose notes are that version's CHANGELOG section.
 #
 # PyPI publishing uses trusted publishing, so no token is stored anywhere. The
 # PyPI project must list this repository, `release.yml` and the `pypi`
-# environment as a trusted publisher first (docs/RELEASING.md). It runs only
-# while the repository is public: an sdist is the source code, and publishing
-# one from a private repository would publish what the repository keeps
-# private. A tag pushed while private is published later, once the repository
-# is public, by running this workflow by hand with that tag.
+# environment as a trusted publisher first, and the environment must admit only
+# `v*` tags and wait for a reviewer (docs/RELEASING.md). It runs only while the
+# repository is public: an sdist is the source code, and publishing one from a
+# private repository would publish what the repository keeps private. On a tag
+# push it also waits for the AppImage built from the same wheel to pass its
+# smoke test, because PyPI never takes the same version twice.
+#
+# A tag pushed while private is published later, once the repository is
+# public, by running this workflow by hand on that tag:
+# `gh workflow run release.yml --ref vX.Y.Z`. That run rebuilds the sdist and
+# wheel and publishes them; it builds no AppImage and creates no GitHub release.
+# It runs the copy of this file stored in the tag, so it works only for tags
+# that carry this version of it: v0.2.0 does not, and is not published to PyPI.
+#
+# Every action is pinned to a full commit sha, with its release tag beside it:
+# the publish job holds an `id-token: write` permission and the release job a
+# `contents: write` one, and a moved tag must not change what runs in either.
+# Dependabot (.github/dependabot.yml) proposes new pins weekly.
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
-    inputs:
-      tag:
-        description: "Existing version tag to publish to PyPI, e.g. v0.2.0"
-        required: true
 
 permissions:
   contents: read
 
 env:
-  TAG: ${{ inputs.tag || github.ref_name }}
+  TAG: ${{ github.ref_name }}
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    outputs:
+      wheel_sha256: ${{ steps.sums.outputs.wheel_sha256 }}
     steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ env.TAG }}
-      - uses: actions/setup-python@v5
+      - name: A release runs on a version tag
+        run: |
+          test "$GITHUB_REF_TYPE" = tag || {
+            echo "run this workflow on a tag: gh workflow run release.yml --ref vX.Y.Z"
+            exit 1
+          }
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.14"
       - run: pip install build twine
@@ -41,9 +56,16 @@ jobs:
         run: |
           version=$(python -c "import tomllib;print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
           test "v$version" = "$TAG" || { echo "tag $TAG != v$version"; exit 1; }
+      # Before anything is published: the GitHub release needs these notes, and
+      # a version already on PyPI cannot be published again with them added.
+      - name: The changelog must have a section for this version
+        run: python tools/release_notes.py "${TAG#v}" > /dev/null
       - run: python -m build
       - run: twine check --strict dist/*
-      - uses: actions/upload-artifact@v4
+      - name: Record the wheel's sha256 for the AppImage job
+        id: sums
+        run: echo "wheel_sha256=$(sha256sum dist/*.whl | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: dist
           path: dist/
@@ -53,33 +75,47 @@ jobs:
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ env.TAG }}
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: dist
           path: dist/
+      # The image is built from exactly the wheel the build job made, which is
+      # also the one PyPI gets.
       - name: Build the AppImage from the released wheel
+        env:
+          WHEEL_SHA256: ${{ needs.build.outputs.wheel_sha256 }}
         run: |
-          tools/build_appimage.sh --wheel dist/yonga-*.whl
-          mkdir appimage && mv dist/*.AppImage dist/*.AppImage.sha256 appimage/
+          tools/build_appimage.sh --wheel dist/yonga-*.whl --wheel-sha256 "$WHEEL_SHA256"
+          mkdir appimage
+          mv dist/*.AppImage dist/*.AppImage.sha256 dist/*.AppImage.packages.txt appimage/
+      # From a directory holding a decoy `typer.py`: the image must import its
+      # own modules, never one from the directory it is run in.
       - name: Smoke-test it
         working-directory: /tmp
         env:
           APPIMAGE_EXTRACT_AND_RUN: "1"
         run: |
           app="$(ls "$GITHUB_WORKSPACE"/appimage/*.AppImage)"
+          mkdir decoy && cd decoy
+          echo 'raise SystemExit("imported typer.py from the current directory")' > typer.py
           test "$("$app" --version)" = "yonga ${TAG#v}"
           "$app" registry validate
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: appimage
           path: appimage/
 
   publish-pypi:
-    needs: build
-    if: github.event.repository.visibility == 'public'
+    needs: [build, appimage]
+    # On a tag push, only once the AppImage passed. A manual run skips the
+    # AppImage (the tag's own push built and released it) and must not wait.
+    if: >-
+      github.event.repository.visibility == 'public'
+      && !cancelled()
+      && needs.build.result == 'success'
+      && (needs.appimage.result == 'success'
+      || (github.event_name == 'workflow_dispatch' && needs.appimage.result == 'skipped'))
     runs-on: ubuntu-latest
     environment:
       name: pypi
@@ -87,11 +123,11 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: dist
           path: dist/
-      - uses: pypa/gh-action-pypi-publish@release/v1
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
 
   github-release:
     needs: [build, appimage]
@@ -100,14 +136,12 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ env.TAG }}
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: dist
           path: dist/
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: appimage
           path: dist/

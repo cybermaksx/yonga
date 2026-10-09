@@ -63,7 +63,11 @@ export = [
     "nncf>=2.19",
 ]
 serve = [
-    "fastapi>=0.115",
+    # 0.132 is the first FastAPI that does not read a body sent without a
+    # Content-Type as JSON (`strict_content_type`). Before it, any web page could
+    # post a chat request to `yonga serve` on 127.0.0.1, since a browser sends
+    # such a body without a CORS preflight.
+    "fastapi>=0.132",
     "uvicorn>=0.30",
 ]
 dev = [
@@ -76,11 +80,11 @@ dev = [
     "build>=1.2",
     "twine>=5.1",
 ]
+# Everything a user can run; the development tools stay in `dev`.
 all = [
     "yonga[openvino]",
     "yonga[export]",
     "yonga[serve]",
-    "yonga[dev]",
 ]
 
 [project.scripts]

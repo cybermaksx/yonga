@@ -8,6 +8,7 @@ model naming is what the shipped chat profile produces.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -25,6 +26,7 @@ from tests.unit.test_chat_service import (
 )
 from yonga.adapters.runtime_genai import ChatHistory, GenerationResult, TextCallback
 from yonga.api.app import create_app
+from yonga.api.openai import MAX_MESSAGES
 from yonga.application.serve import ModelServer
 from yonga.domain.benchmarks import GenerationSettings
 from yonga.domain.diagnostics import FailureCategory, GenerationError, diagnostic
@@ -65,8 +67,12 @@ def make_server(
     return server, runtime
 
 
-def client_for(server: ModelServer, **kwargs: str) -> TestClient:
-    return TestClient(create_app(server, **kwargs))
+def client_for(
+    server: ModelServer, *, api_key: str | None = None, max_body_bytes: int | None = None
+) -> TestClient:
+    if max_body_bytes is None:
+        return TestClient(create_app(server, api_key=api_key))
+    return TestClient(create_app(server, api_key=api_key, max_body_bytes=max_body_bytes))
 
 
 def ask(content: str | list[dict[str, object]] = "Hello", **extra: object) -> dict[str, object]:
@@ -330,3 +336,105 @@ def test_an_api_key_is_required_when_configured(tmp_path: Path) -> None:
     assert right.status_code == 200
     assert len(runtime.histories) == 1
     assert client.get("/health").status_code == 200, "health stays open for supervisors"
+
+
+# --- request limits -------------------------------------------------------------------
+
+
+def test_a_declared_oversized_body_is_refused_before_it_is_read(tmp_path: Path) -> None:
+    server, runtime = make_server(tmp_path, ["Hi."])
+    client = client_for(server, max_body_bytes=1024)
+
+    response = client.post("/v1/chat/completions", json=ask("x" * 2048))
+
+    assert response.status_code == 413
+    error = response.json()["error"]
+    assert error["code"] == "request_too_large"
+    assert error["type"] == "invalid_request_error"
+    assert "1024 bytes" in error["message"]
+    assert runtime.histories == []
+
+
+def test_a_chunked_body_is_held_to_the_same_limit(tmp_path: Path) -> None:
+    """No ``Content-Length`` to check up front, so the bytes are counted as they arrive."""
+    server, runtime = make_server(tmp_path, ["Hi."])
+    client = client_for(server, max_body_bytes=1024)
+    payload = json.dumps(ask("x" * 4096)).encode()
+
+    def chunks() -> Iterator[bytes]:
+        for index in range(0, len(payload), 256):
+            yield payload[index : index + 256]
+
+    response = client.post(
+        "/v1/chat/completions", content=chunks(), headers={"Content-Type": "application/json"}
+    )
+
+    assert response.status_code == 413
+    assert response.json()["error"]["code"] == "request_too_large"
+    assert runtime.histories == []
+
+
+def test_a_body_within_the_limit_is_served(tmp_path: Path) -> None:
+    server, _ = make_server(tmp_path, ["Hi."])
+    response = client_for(server, max_body_bytes=4096).post("/v1/chat/completions", json=ask())
+    assert response.status_code == 200
+
+
+def test_the_default_limit_leaves_room_for_a_long_chat(tmp_path: Path) -> None:
+    """Several hundred kilobytes of history is an ordinary long conversation."""
+    server, _ = make_server(tmp_path, ["Hi."])
+    history = [{"role": "user", "content": "word " * 200}] * 999 + [
+        {"role": "user", "content": "Hello"}
+    ]
+    response = client_for(server).post(
+        "/v1/chat/completions", json={"model": "qwen", "messages": history}
+    )
+    assert response.status_code == 200
+
+
+def test_too_many_messages_are_refused_naming_the_parameter(tmp_path: Path) -> None:
+    server, runtime = make_server(tmp_path, ["Hi."])
+    history = [{"role": "user", "content": "x"}] * (MAX_MESSAGES + 1)
+
+    response = client_for(server).post(
+        "/v1/chat/completions", json={"model": "qwen", "messages": history}
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["param"] == "messages"
+    assert runtime.histories == []
+
+
+@pytest.mark.parametrize("content_type", [None, "text/plain"])
+def test_a_json_body_without_a_json_content_type_is_refused(
+    tmp_path: Path, content_type: str | None
+) -> None:
+    """A well-formed request is still refused unless it says it is JSON.
+
+    The case without a ``Content-Type`` is what the ``fastapi>=0.132`` floor
+    guards: older releases read such a body as JSON, and a browser sends one
+    without a CORS preflight, so any web page could have a chat request run by a
+    server on localhost. The server answers the validation failure with ``400``
+    and the code ``invalid_request``.
+    """
+    server, runtime = make_server(tmp_path, ["Hi."])
+    headers = {} if content_type is None else {"Content-Type": content_type}
+
+    response = client_for(server).post(
+        "/v1/chat/completions", content=json.dumps(ask()).encode(), headers=headers
+    )
+
+    assert response.status_code == 400
+    error = response.json()["error"]
+    assert error["code"] == "invalid_request"
+    assert error["type"] == "invalid_request_error"
+    assert runtime.histories == []
+
+
+def test_authentication_comes_before_the_size_limit(tmp_path: Path) -> None:
+    server, _ = make_server(tmp_path, ["Hi."])
+    client = client_for(server, api_key="s3cret-key", max_body_bytes=1024)
+
+    response = client.post("/v1/chat/completions", json=ask("x" * 2048))
+
+    assert response.status_code == 401

@@ -6,6 +6,7 @@ did) and must stay JSON-serialisable so a plan can be printed, stored and replay
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
@@ -35,6 +36,59 @@ SECURITY_SENSITIVE_CONFIRMATION_CODES: frozenset[str] = frozenset({CONFIRMATION_
 
 #: Environment variables that carry the managed temporary directory into subprocesses.
 TEMP_ENV_KEYS: tuple[str, ...] = ("TMPDIR", "TMP", "TEMP")
+
+_QUANTIZATION_SECTION = "set it in the profile's quantization section"
+
+#: ``optimum-cli export openvino`` options that a profile's ``export_extra_args``
+#: may not pass, and why. Registry data -- built in, a signed bundle or a local
+#: override -- tunes an export; it never chooses what is exported, where it goes,
+#: or whether a repository's code runs.
+RESERVED_EXPORT_OPTIONS: dict[str, str] = {
+    "model": "yonga passes the verified local snapshot itself",
+    "task": "yonga sets the task itself",
+    "trust-remote-code": "remote code is enabled only by yonga's --trust-remote-code flag",
+    "model-kwargs": "it reaches the model loader, which could enable remote code",
+    "cache_dir": "the export reads only the local snapshot yonga passes",
+    "cache-dir": "the export reads only the local snapshot yonga passes",
+    "token": "registry data never carries a credential",
+    "quantization-statistics-path": "it writes outside the output directory",
+    "weight-format": _QUANTIZATION_SECTION,
+    "sym": _QUANTIZATION_SECTION,
+    "ratio": _QUANTIZATION_SECTION,
+    "group-size": _QUANTIZATION_SECTION,
+    "backup-precision": _QUANTIZATION_SECTION,
+    "dataset": _QUANTIZATION_SECTION,
+    "all-layers": _QUANTIZATION_SECTION,
+    "awq": _QUANTIZATION_SECTION,
+    "scale-estimation": _QUANTIZATION_SECTION,
+}
+
+
+def export_extra_arg_problems(arguments: Sequence[str]) -> list[str]:
+    """Say why each of ``arguments`` may not be appended to an export command line.
+
+    An empty list means the arguments are acceptable. The check follows how
+    ``argparse`` reads a command line rather than comparing strings: a long
+    option is refused when it is a prefix of a reserved one (``--trust-remote``
+    is accepted as an abbreviation), ``--name=value`` is read as ``--name``, a
+    bare ``--`` is refused because it turns what follows into positionals, and
+    ``-m`` is refused with its value attached as well. Tokens without a leading
+    dash are values and are left alone.
+    """
+    problems: list[str] = []
+    for argument in arguments:
+        text = str(argument)
+        if text == "--":
+            problems.append("'--' would turn the arguments after it into positionals")
+        elif text.startswith("--"):
+            name = text[2:].split("=", 1)[0]
+            reserved = [option for option in RESERVED_EXPORT_OPTIONS if option.startswith(name)]
+            if reserved:
+                option = reserved[0]
+                problems.append(f"{text!r} names --{option}: {RESERVED_EXPORT_OPTIONS[option]}")
+        elif text.startswith("-m"):
+            problems.append(f"{text!r} names -m: {RESERVED_EXPORT_OPTIONS['model']}")
+    return problems
 
 
 def _json_safe(value: object) -> object:

@@ -21,7 +21,9 @@ mechanical part:
 
 Environments are addressed only through the interpreter at ``bin/python``
 (``python -m pip``, ``python -m optimum.commands.optimum_cli``), never through
-console scripts, whose shebangs would pin an absolute build path.
+console scripts, whose shebangs would pin an absolute build path. Every such
+interpreter runs with ``-P``, so the directory yonga was started from is not put
+first on ``sys.path``: a stray ``json.py`` or ``pip/`` there cannot run in its place.
 """
 
 from __future__ import annotations
@@ -275,11 +277,12 @@ class ExportEnvironmentManager:
         python = path / "bin" / "python"
         base = self._base_python if self._explicit_base else self._lasting_interpreter(ctx)
         steps: Sequence[tuple[str, list[str]]] = (
-            ("creating the virtual environment", [str(base), "-m", "venv", str(path)]),
+            ("creating the virtual environment", [str(base), "-P", "-m", "venv", str(path)]),
             (
                 "installing torch and torchvision (CPU builds)",
                 [
                     str(python),
+                    "-P",
                     "-m",
                     "pip",
                     "install",
@@ -293,6 +296,7 @@ class ExportEnvironmentManager:
                 "installing the export packages",
                 [
                     str(python),
+                    "-P",
                     "-m",
                     "pip",
                     "install",
@@ -373,7 +377,7 @@ class ExportEnvironmentManager:
         """Import the export entry point inside the environment and check every pin."""
         ctx.emit(ProgressKind.LOG, "Export environment: verifying", status="env")
         script = _VERIFY_SCRIPT % (list(ENVIRONMENT_PACKAGES),)
-        result = self._runner.run([str(python), "-c", script], ctx=ctx)
+        result = self._runner.run([str(python), "-P", "-c", script], ctx=ctx)
         self._check(result, spec, "verifying the environment")
         versions = _parse_versions(result.stdout_lines)
         problems = (

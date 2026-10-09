@@ -194,6 +194,18 @@ def test_an_expired_bundle_is_refused(paths: Paths, key: Ed25519PrivateKey) -> N
     assert code_of(caught) == "registry.remote.expired"
 
 
+def test_a_naive_expiry_is_refused_as_malformed(paths: Paths, key: Ed25519PrivateKey) -> None:
+    """A timestamp without a UTC offset is a typed refusal, not a comparison crash."""
+    trust(paths, key)
+    document = json.loads(bundle())
+    document["expires_at"] = "2030-01-01T00:00:00"
+    payload = json.dumps(document).encode()
+
+    with pytest.raises(RegistryError) as caught:
+        verify_bundle(payload, sign_bundle(payload, key), trusted_keys(paths), now=NOW)
+    assert code_of(caught) == "registry.remote.invalid"
+
+
 def test_an_older_bundle_never_replaces_a_newer_one(paths: Paths, key: Ed25519PrivateKey) -> None:
     trust(paths, key)
     payload, signature = signed(key, version=3)
@@ -232,6 +244,52 @@ def test_a_signed_bundle_can_never_supply_repair_code(paths: Paths, key: Ed25519
     with pytest.raises(RegistryError) as caught:
         verify_bundle(payload, signature, trusted_keys(paths), now=NOW)
     assert code_of(caught) == "registry.remote.unknown_repair_implementation"
+
+
+def profile_with_export_args(arguments: str) -> str:
+    """A signed-bundle profile whose only notable field is ``export_extra_args``."""
+    return f"""\
+schema_version: 1
+profiles:
+  - id: remote-profile
+    schema_version: 1
+    status: active
+    priority: 100
+    summary: Passes its own arguments to the exporter
+    device: cpu
+    export_extra_args: {arguments}
+"""
+
+
+def test_a_signed_bundle_cannot_turn_on_remote_code_through_a_profile(
+    paths: Paths, key: Ed25519PrivateKey
+) -> None:
+    """Only the command-line flag enables remote code; a profile's export args never do."""
+    trust(paths, key)
+    profile = profile_with_export_args('["--trust-remote-code", "--model", "attacker/repo"]')
+    payload, signature = signed(key, files={"profiles.yaml": profile})
+
+    with pytest.raises(RegistryError) as caught:
+        verify_bundle(payload, signature, trusted_keys(paths), now=NOW)
+    # Refused by the export-argument guard, not by some unrelated schema slip.
+    assert code_of(caught) == "registry.schema_violation"
+    message = caught.value.diagnostic.message
+    assert "export arguments not allowed in registry data" in message
+    assert "'--trust-remote-code' names --trust-remote-code" in message
+    assert "'--model' names --model" in message
+
+
+def test_a_signed_bundle_may_pass_an_unreserved_export_argument(
+    paths: Paths, key: Ed25519PrivateKey
+) -> None:
+    """The control for the test above: the same profile with an allowed flag verifies."""
+    trust(paths, key)
+    profile = profile_with_export_args('["--disable-stateful"]')
+    payload, signature = signed(key, files={"profiles.yaml": profile})
+
+    verified = verify_bundle(payload, signature, trusted_keys(paths), now=NOW)
+
+    assert [rule.id for d in verified.documents for rule in d.rules()] == ["remote-profile"]
 
 
 def test_yaml_is_parsed_safely_even_when_signed(paths: Paths, key: Ed25519PrivateKey) -> None:

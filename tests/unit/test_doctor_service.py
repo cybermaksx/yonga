@@ -263,7 +263,7 @@ def npu_node(
         writable=writable,
         group_name=group_name,
         user_in_group=user_in_group,
-        user_groups=["m3rcury", "render"] if user_in_group else ["m3rcury"],
+        user_groups=["alice", "render"] if user_in_group else ["alice"],
         driver_version=None,
         compiler_libraries=[
             "/usr/lib/x86_64-linux-gnu/libopenvino_intel_npu_compiler.so",

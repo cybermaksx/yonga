@@ -232,8 +232,17 @@ def exit_code_for(error: YongaError) -> ExitCode:
     reserves code 50 for, whatever the underlying category (a compiler that
     cannot build the graph classifies as ``compiler_unsupported_graph``, but the
     answer the user needs is still "this device will not work, use that one").
+
+    The exception is a diagnostic that marks the environment as broken (a device
+    node the user may not open, a driver that is not initialised): the device
+    would work once the host is fixed, so the answer is code 10, environment
+    unusable, and not 50. Only ``prepare`` raises
+    :class:`~yonga.domain.diagnostics.DeviceUnsupportedError`; ``probe``,
+    ``chat`` and ``bench`` report the category's own code.
     """
     if isinstance(error, DeviceUnsupportedError):
+        if error.diagnostic.environment_broken:
+            return ExitCode.ENVIRONMENT_UNUSABLE
         return ExitCode.DEVICE_UNSUPPORTED
     return error.exit_code()
 
@@ -2080,8 +2089,8 @@ def _log_bundle(state: CliState, job_id: str, *, output: Path | None) -> ExitCod
     for note in result.notes:
         state.console.print_error(note, style="dim")
     state.console.print(
-        "Secrets were redacted; your home directory, hostname and login name anonymised. "
-        "Read it before sharing.",
+        "Secrets were redacted; your home directory, hostname, login name and Hugging Face "
+        "account name anonymised. Read it before sharing.",
         style="dim",
     )
     return ExitCode.SUCCESS

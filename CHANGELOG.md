@@ -9,41 +9,6 @@ manifest may change in any minor release.
 
 ## [Unreleased]
 
-### Changed
-
-- **Small models get a more accurate default quantization.** Below 5B parameters, `prepare`
-  now chooses `cpu-int4-asym-g128-r08` on the CPU, the new `gpu-int4-asym-g128-r08` on the GPU
-  (both INT4 with a fifth of the layers at INT8) and `npu-int4-sym-g128` on the NPU. Measured
-  against INT8 on twelve models from nine families, 350M to 8B: ratio 0.8 lowers the divergence on
-  every one by 16-42 % for 9-18 % more disk and up to about a fifth of the GPU's tokens per second (Qwen3-1.7B's perplexity increase goes
-  from +23.7 % to +8.5 %), and group-wise INT4 on the NPU roughly halves channel-wise's divergence
-  or better (Qwen2.5-0.5B: +107 % perplexity to +38 %). Models of 5B and above and models whose
-  size is unknown get the unbanded defaults. `docs/PROFILE_COMPARISON.md` section 10 has the
-  tables, and `tools/measure_profiles.py` reproduces them.
-- **Exceptions, kept on purpose.** The VLM families (Qwen3.5, Qwen2.5-VL) keep their CPU and GPU
-  pins to ratio 1.0: no VLM was measured. The generic rule (Mistral and other unrecognised members
-  of common families) and Phi-3 keep the NPU on channel-wise INT4: group-wise was never probed on
-  the NPU for them.
-- **Qwen3 on the NPU at 5B and above now uses channel-wise INT4.** It was group-wise for every
-  size, from a test of the 0.6B model only. At 8B channel-wise is a third faster (13.9 against
-  10.6 tok/s) and much less accurate (+42.7 % against +9.4 % perplexity); the default follows the
-  NPU documentation, and `--profile npu-int4-sym-g128` keeps the accurate one. A Qwen3 OpenVINO
-  copy for the NPU is now stored under `npu-int4-sym-cw` too, so it is copied again once.
-- A changed default is a new artifact, never a replacement. Preparing a model already prepared
-  under the old default exports again under the new profile id, keeps the old artifact, and the
-  plan says so beforehand with the `--profile` that would reuse it. `chat`, `bench` and `probe` given
-  a model id use the newest ready artifact.
-- A profile named by an architecture or model rule is now a preference, not an override: it must
-  be usable, satisfy its constraints and match its own `applies_to`, or resolution falls through to
-  scoring. Before, a deprecated profile named by a rule was used anyway.
-- The text-model architecture rules no longer name the CPU and GPU profiles (they named the
-  defaults), and the measured families no longer pin the NPU, so the size bands decide.
-- **Upgrading with registry overrides.** The banded profiles sit at priority 110. An override
-  profile on the same device at exactly 110 now ties with them for models below 5B, and `prepare`
-  stops with `registry.ambiguous_rules` (`yonga registry validate` names the pair): raise it above
-  110. One between 101 and 110 still beats the unbanded default but now loses to the band below
-  5B. One above 110 wins for every family that does not name a profile.
-
 ### Added
 
 - **Registry size bands (schema version 2).** A conversion profile can apply to a range of model
@@ -60,11 +25,96 @@ manifest may change in any minor release.
   resumably.
 - `tools/registry_bundle.py` fills `min_tool_version` from the registry schema a bundle uses
   (`--min-tool-version` to raise it), so an older yonga refuses a bundle it cannot parse.
+- `SECURITY.md`, for reporting a vulnerability privately through a GitHub security advisory, and
+  `CONTRIBUTING.md`.
+- Every AppImage release carries `yonga-X.Y.Z-x86_64.AppImage.packages.txt`, the exact Python
+  packages the image bundles and the sha256 of the yonga wheel; the image holds the same list as
+  `usr/share/yonga/packages.txt`.
+
+### Changed
+
+- **Small models get a more accurate default quantization.** Below 5B parameters, `prepare`
+  now chooses `cpu-int4-asym-g128-r08` on the CPU, the new `gpu-int4-asym-g128-r08` on the GPU
+  (both INT4 with a fifth of the layers at INT8) and `npu-int4-sym-g128` on the NPU. Measured
+  against INT8 on twelve models from nine families, 350M to 8B: ratio 0.8 lowers the divergence on
+  every one by 16-42 % for 9-18 % more disk and up to about a fifth of the GPU's tokens per second
+  (Qwen3-1.7B's perplexity increase goes from +23.7 % to +8.5 %), and group-wise INT4 on the NPU
+  roughly halves channel-wise's divergence or better (Qwen2.5-0.5B: +107 % perplexity to +38 %).
+  Models of 5B and above and models whose size is unknown get the unbanded defaults.
+  `docs/PROFILE_COMPARISON.md` section 10 has the tables, and `tools/measure_profiles.py`
+  reproduces them.
+- **Exceptions, kept on purpose.** The VLM families (Qwen3.5, Qwen2.5-VL) keep their CPU and GPU
+  pins to ratio 1.0: no VLM was measured. The generic rule (Mistral and other unrecognised members
+  of common families) and Phi-3 keep the NPU on channel-wise INT4: group-wise was never probed on
+  the NPU for them.
+- **Qwen3 on the NPU at 5B and above now uses channel-wise INT4.** It was group-wise for every
+  size, from a test of the 0.6B model only. At 8B channel-wise is a third faster (13.9 against
+  10.6 tok/s) and much less accurate (+42.7 % against +9.4 % perplexity); the default follows the
+  NPU documentation, and `--profile npu-int4-sym-g128` keeps the accurate one. A Qwen3 OpenVINO
+  copy for the NPU is now stored under `npu-int4-sym-cw` too, so it is copied again once.
+- A changed default is a new artifact, never a replacement. Preparing a model already prepared
+  under the old default exports again under the new profile id, keeps the old artifact, and the
+  plan says so beforehand with the `--profile` that would reuse it. `chat`, `bench` and `probe`
+  given a model id use the newest ready artifact.
+- A profile named by an architecture or model rule is now a preference, not an override: it must
+  be usable, satisfy its constraints and match its own `applies_to`, or resolution falls through to
+  scoring. Before, a deprecated profile named by a rule was used anyway.
+- The text-model architecture rules no longer name the CPU and GPU profiles (they named the
+  defaults), and the measured families no longer pin the NPU, so the size bands decide.
+- **Upgrading with registry overrides.** The banded profiles sit at priority 110. An override
+  profile on the same device at exactly 110 now ties with them for models below 5B, and `prepare`
+  stops with `registry.ambiguous_rules` (`yonga registry validate` names the pair): raise it above
+  110. One between 101 and 110 still beats the unbanded default but now loses to the band below
+  5B. One above 110 wins for every family that does not name a profile.
+- The `all` extra no longer installs the development tools (pytest, ruff, mypy, build, twine);
+  they stay in `dev`.
+- Releases publish to PyPI only after the AppImage built from the same wheel passes its smoke
+  test and the `pypi` environment is approved. A manual publish runs on the tag itself
+  (`gh workflow run release.yml --ref vX.Y.Z`; `docs/RELEASING.md`).
+- **`prepare` exits 10 when the host keeps it from using a device.** A device failure whose
+  diagnostic marks the environment as broken, such as `npu.device.permission_denied` or
+  `device.driver_missing`, now exits 10 (environment unusable) instead of 50: the device would work
+  once the host is fixed. Other device failures in `prepare` still exit 50, and `probe`, `chat` and
+  `bench` keep the category's code.
 
 ### Fixed
 
 - A registry file declaring a schema version newer than this build reports "too new" instead of a
   schema violation.
+- A signed registry bundle whose `created_at` or `expires_at` carries no UTC offset is refused as
+  `registry.remote.invalid`. Before, a naive `expires_at` crashed verification.
+- `serve` gave every HTTP error the error code `not_found`, a wrong method included. A 404 now
+  carries `not_found`, a 405 `method_not_allowed`, a 413 `request_too_large` and any other
+  `invalid_request`.
+
+### Security
+
+- **The AppImage imported Python modules from the current directory.** Run inside a directory
+  holding, say, a `typer.py`, it imported that file instead of its own. The image now runs
+  `python -P -m yonga`, and every Python child process yonga starts (the `optimum-cli` export run as
+  a module, `venv` and `pip` for managed export environments, the exporter-range lookup, the GGUF import)
+  runs with `-P` too, so none of them puts the current directory on `sys.path`.
+- **Registry data can no longer pass optimum-cli the options yonga controls.** A profile's
+  `export_extra_args` and an architecture's or model's `export.extra_args` may not name
+  `--model`/`-m`, `--task`, `--trust-remote-code`, `--model-kwargs`, `--cache_dir`, `--token`,
+  `--quantization-statistics-path` or a bare `--`, nor the quantization options yonga derives from
+  the profile's `quantization` section (`--weight-format`, `--sym`, `--ratio`, `--group-size`,
+  `--backup-precision`, `--dataset`, `--all-layers`, `--awq`, `--scale-estimation`). Abbreviations
+  argparse accepts, the `--name=value` form and `-m` with its value attached count as well. A
+  registry file that does fails to load with `registry.schema_violation`; a profile built in code
+  is refused at export time with `export.reserved_extra_args`. Before, a profile could enable
+  remote code without `--trust-remote-code`.
+- `yonga logs JOB_ID --bundle` rewrites the Hugging Face account name to `<hf-user>`, as it already
+  rewrote the home directory to `~`, the hostname to `<host>` and the login name to `<user>`; the
+  host report included the account name.
+- `serve` read a request body of any size. A body over 8 MiB is now refused with 413 and the
+  error code `request_too_large`, counted on the bytes received, so a chunked body is held to it
+  too; with an API key configured, authentication runs first. A request with more than 4096
+  messages is refused with 400 and `param` `messages`.
+- The `serve` extra requires FastAPI 0.132 or newer, the first that does not read a body sent
+  without a Content-Type as JSON. With an older one and no `YONGA_API_KEY`, any web page could send
+  a chat request to `serve` on 127.0.0.1, since a browser sends such a body without a CORS
+  preflight.
 
 ## [0.2.0] - 2026-09-28
 
@@ -158,21 +208,21 @@ manifest may change in any minor release.
   and validation record, and a host report, redacted again and with the home directory, hostname and
   login name anonymised. `yonga logs` and the bundle now share one job resolver.
 - `probe` says before the wait when a pipeline build will compile more than 2 GiB of weights.
-
 - **`docs/PROFILE_COMPARISON.md`** — the same Qwen3.5-9B weights quantized twice
-  (`gpu-int4-asym-g128` and `npu-int4-sym-cw`), both converted and benchmarked on this
-  host's GPU, with artifact sizes, conversion duration, cold-compile and warm-load
-  times and per-prompt TTFT/tok/s/TPOT. It measures size and speed only and says so:
-  output quality was not evaluated, and the two profiles differ in pipeline properties
-  as well as in quantization, so the timings are not a clean comparison of the two
-  quantizations.
+  (`gpu-int4-asym-g128` and `npu-int4-sym-cw`), both converted and benchmarked on the
+  reference host's GPU (`docs/INSTALL.md`), with artifact sizes, conversion duration,
+  cold-compile and warm-load times and per-prompt TTFT/tok/s/TPOT. Section 8, added later
+  in this release with `yonga eval`, measures output quality. The two profiles differ in
+  pipeline properties as well as in quantization, so the timings are not a clean
+  comparison of the two quantizations.
 - **AppImage.** Every release carries `yonga-X.Y.Z-x86_64.AppImage`: yonga, a relocatable CPython
   3.14 and the `openvino` and `serve` extras in one 135 MB file, for x86_64 Linux with glibc 2.28 or
-  newer and nothing else installed. `tools/build_appimage.sh` builds it with every download pinned
-  and checksummed, chooses wheels for glibc 2.28 rather than the build host, and fails if a bundled
-  library needs anything newer. CI builds and smoke-tests it on every push. Verified on the
-  reference host from the image: `doctor`, `bench` on the GPU and the NPU, a GGUF import, a full
-  conversion through managed environments, and `serve`.
+  newer and nothing else installed. `tools/build_appimage.sh` builds it with the interpreter and the
+  AppImage tools pinned and checksummed (the Python packages are resolved at build time), chooses
+  wheels for glibc 2.28 rather than the build host, and fails if a bundled library needs anything
+  newer. CI builds and smoke-tests it on every push. Verified on the reference host from the image:
+  `doctor`, `bench` on the GPU and the NPU, a GGUF import, a full conversion through managed
+  environments, and `serve`.
 - **Conversion without an export toolchain.** When no optimum-intel sits beside yonga -- a plain
   `pip install yonga`, or the AppImage -- `prepare` builds a managed export environment with the
   toolchain yonga is tested with instead of failing at the export. Once it exists, the Transformers
@@ -231,7 +281,6 @@ manifest may change in any minor release.
   exits 51 for an unclassified probe failure. The Qwen3.5 NPU failure now classifies as
   `npu.compiler.unsupported_graph.qwen35`, the code the specification pins. Capturing native output
   also keeps compiler log lines out of `--json` output.
-
 - **A VLM artifact can be benchmarked with more than one run, and `/reset` really
   resets it.** `VLMPipeline` has no chat-history overload in this build, so the
   runtime adapter keeps a hidden session and hands the pipeline only the turns it
@@ -338,4 +387,4 @@ printing compiler tracebacks. Linux x86_64 only.
 
 [Unreleased]: https://github.com/ooguz/yonga/compare/v0.2.0...HEAD
 [0.2.0]: https://github.com/ooguz/yonga/releases/tag/v0.2.0
-[0.1.0]: https://github.com/ooguz/yonga/releases/tag/v0.1.0
+[0.1.0]: https://github.com/ooguz/yonga/tree/941cf2e8029624ba78a93a8a8e4eed94cc9c2dc2

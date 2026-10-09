@@ -256,6 +256,7 @@ def test_the_adapter_asks_the_environments_interpreter(tmp_path: Path) -> None:
 
     assert found is not None and found.transformers == ">=4.57,<=5.0"
     assert runner.argv[0] == str(python)
+    assert runner.argv[1:3] == ["-P", "-c"], "the current directory stays off sys.path"
 
 
 @pytest.mark.parametrize(

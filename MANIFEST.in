@@ -1,9 +1,12 @@
 # The source distribution is what a downstream packager builds and tests from:
 # everything needed to run the test suite and read the documentation.
-include LICENSE README.md CHANGELOG.md SPEC.md
+include LICENSE README.md CHANGELOG.md CONTRIBUTING.md SECURITY.md SPEC.md
 recursive-include docs *.md
 recursive-include tests *.py *.xml *.json *.yaml *.yml *.txt *.bin *.jinja
 recursive-include tools *.py *.sh
 recursive-include packaging *
 recursive-include registry *.yaml *.yml
+# The test artifacts tools/make_test_artifact.py writes locally (git-ignored;
+# the NPU one holds a real model's weights) are not part of the source.
+prune tests/fixtures/.cache
 global-exclude __pycache__ *.py[cod]
