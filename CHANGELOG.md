@@ -9,6 +9,8 @@ manifest may change in any minor release.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-09
+
 ### Added
 
 - **`serve` honours OpenAI `stop`.** A string or up to 4 non-empty strings of at most 256
@@ -573,7 +575,8 @@ printing compiler tracebacks. Linux x86_64 only.
 - `yonga` never installs, upgrades or removes packages, and never runs `sudo`. When
   the environment is wrong it prints the command for you to run.
 
-[Unreleased]: https://github.com/ooguz/yonga/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/ooguz/yonga/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/ooguz/yonga/releases/tag/v0.4.0
 [0.3.0]: https://github.com/ooguz/yonga/releases/tag/v0.3.0
 [0.2.0]: https://github.com/ooguz/yonga/releases/tag/v0.2.0
 [0.1.0]: https://github.com/ooguz/yonga/tree/941cf2e8029624ba78a93a8a8e4eed94cc9c2dc2
