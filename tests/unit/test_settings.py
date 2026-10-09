@@ -225,6 +225,19 @@ def test_explicit_directories_override_the_environment(tmp_path: Path) -> None:
     assert settings.paths.data_dir == tmp_path / "custom"
 
 
+def test_a_relative_data_dir_override_is_made_absolute(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    settings = load_settings(
+        config_file=tmp_path / "missing.toml",
+        env={"HOME": str(tmp_path)},
+        overrides={"data_dir": Path("relative") / "data"},
+    )
+
+    assert settings.paths.data_dir == tmp_path / "relative" / "data"
+
+
 def test_config_dir_override_moves_the_default_config_file(tmp_path: Path) -> None:
     config_dir = tmp_path / "cfg"
     config_dir.mkdir()

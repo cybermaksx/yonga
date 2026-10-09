@@ -112,6 +112,10 @@ manifest may change in any minor release.
   it runs; the line now reads `deferred`, and the pipeline's result is the verdict.
 - `python -m yonga.application.probe` settles a deferred device by building the GenAI pipeline, as
   `yonga probe` does. It had no smoke tester, so it reported every NPU LLM as failed.
+- A relative `--data-dir` or `--cache-dir`, or a relative directory in `config.toml` or the
+  environment, is made absolute against the current directory. A relative one broke `prepare`:
+  the exporter wrote the model to the right place and the tokenizer to another, and validation
+  refused the artifact for having no tokenizer.
 - The export failure "NormalizedConfig.__init__() got multiple values for argument 'allow_new'"
   is now attributed to its real cause: on Python 3.14, optimum 2.3.0 cannot build the export
   config of mistral, phi3 and several other architectures (fixed upstream in optimum pull request

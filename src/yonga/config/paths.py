@@ -211,24 +211,26 @@ def default_paths(
 ) -> Paths:
     """Build :class:`Paths` from the environment, with optional explicit overrides.
 
-    ``env`` defaults to ``os.environ``. Explicit arguments win over XDG variables
-    and are expanded (``~``) but otherwise used verbatim.
+    ``env`` defaults to ``os.environ``. Explicit arguments win over XDG variables,
+    are expanded (``~``) and made absolute against the current directory: the
+    exporter and other child processes run elsewhere, and a relative path would
+    point them at a different place than yonga itself.
     """
     if env is None:
         env = os.environ
 
     resolved_config = (
-        config_dir.expanduser()
+        config_dir.expanduser().absolute()
         if config_dir is not None
         else _xdg_dir(env, XDG_CONFIG_HOME, DEFAULT_CONFIG_HOME) / APP_SLUG
     )
     resolved_cache = (
-        cache_dir.expanduser()
+        cache_dir.expanduser().absolute()
         if cache_dir is not None
         else _xdg_dir(env, XDG_CACHE_HOME, DEFAULT_CACHE_HOME) / APP_SLUG
     )
     resolved_data = (
-        data_dir.expanduser()
+        data_dir.expanduser().absolute()
         if data_dir is not None
         else _xdg_dir(env, XDG_DATA_HOME, DEFAULT_DATA_HOME) / APP_SLUG
     )

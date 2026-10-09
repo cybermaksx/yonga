@@ -195,7 +195,8 @@ class Settings(BaseSettings):
         for name in ("config_dir", "cache_dir", "data_dir", "hf_home"):
             current: Path | None = getattr(self, name)
             if current is not None:
-                setattr(self, name, current.expanduser())
+                # Absolute, because child processes do not share yonga's cwd.
+                setattr(self, name, current.expanduser().absolute())
         if self.debug and not self.verbose:
             self.verbose = True
         return self

@@ -64,6 +64,24 @@ def test_explicit_overrides_beat_xdg(tmp_path: Path) -> None:
     assert paths.cache_dir == tmp_path / ".cache" / "yonga"
 
 
+def test_a_relative_explicit_directory_is_made_absolute(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The exporter runs as a child process; a relative --data-dir once sent its
+    tokenizer to a different directory than the model, and validation failed."""
+    monkeypatch.chdir(tmp_path)
+    paths = default_paths(
+        {"HOME": str(tmp_path)},
+        data_dir=Path("data"),
+        cache_dir=Path("cache"),
+        config_dir=Path("cfg"),
+    )
+
+    assert paths.data_dir == tmp_path / "data"
+    assert paths.cache_dir == tmp_path / "cache"
+    assert paths.config_dir == tmp_path / "cfg"
+
+
 def test_derived_paths(tmp_path: Path) -> None:
     paths = Paths(
         config_dir=tmp_path / "cfg",
