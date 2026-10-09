@@ -9,6 +9,8 @@ manifest may change in any minor release.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-09
+
 ### Added
 
 - **Registry size bands (schema version 2).** A conversion profile can apply to a range of model
@@ -39,8 +41,9 @@ manifest may change in any minor release.
   against INT8 on twelve models from nine families, 350M to 8B: ratio 0.8 lowers the divergence on
   every one by 16-42 % for 9-18 % more disk and up to about a fifth of the GPU's tokens per second
   (Qwen3-1.7B's perplexity increase goes from +23.7 % to +8.5 %), and group-wise INT4 on the NPU
-  roughly halves channel-wise's divergence or better (Qwen2.5-0.5B: +107 % perplexity to +38 %).
-  Models of 5B and above and models whose size is unknown get the unbanded defaults.
+  roughly halves channel-wise's divergence or better (Qwen2.5-0.5B: +107 % perplexity to +38 %)
+  for a tenth to a third of the NPU's tokens per second (`--profile npu-int4-sym-cw` is the fast
+  choice). Models of 5B and above and models whose size is unknown get the unbanded defaults.
   `docs/PROFILE_COMPARISON.md` section 10 has the tables, and `tools/measure_profiles.py`
   reproduces them.
 - **Exceptions, kept on purpose.** The VLM families (Qwen3.5, Qwen2.5-VL) keep their CPU and GPU
@@ -385,6 +388,7 @@ printing compiler tracebacks. Linux x86_64 only.
 - `yonga` never installs, upgrades or removes packages, and never runs `sudo`. When
   the environment is wrong it prints the command for you to run.
 
-[Unreleased]: https://github.com/ooguz/yonga/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/ooguz/yonga/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/ooguz/yonga/releases/tag/v0.3.0
 [0.2.0]: https://github.com/ooguz/yonga/releases/tag/v0.2.0
 [0.1.0]: https://github.com/ooguz/yonga/tree/941cf2e8029624ba78a93a8a8e4eed94cc9c2dc2

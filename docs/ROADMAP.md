@@ -211,10 +211,14 @@ as a reference against FP16 on Qwen3-0.6B.
 
 ## Known defects still open
 
-None at the moment. The last one, the default INT4 profiles on small models, is resolved: below 5B
-parameters every device now defaults to the more accurate profile, from a registry size condition
-and measurements on twelve models (`PROFILE_COMPARISON.md` section 10). What it leaves open is
-listed there: no VLM was measured, so the VLM families keep ratio 1.0, and nothing was measured
+- **Granite is slow on the NPU.** `ibm-granite/granite-3.3-2b-instruct` generates about 4.5 tokens
+  per second on the NPU in both INT4 formats, where other models of its size reach 25-40
+  (`PROFILE_COMPARISON.md` section 10.4). It runs to completion; the cause was not isolated.
+
+The previous defect, the default INT4 profiles on small models, is resolved: below 5B parameters
+every device now defaults to the more accurate profile, from a registry size condition and
+measurements on twelve models (`PROFILE_COMPARISON.md` section 10). What it leaves open is listed
+there: no VLM was measured, so the VLM families keep ratio 1.0, and nothing was measured
 between 4B and 8B.
 
 ---

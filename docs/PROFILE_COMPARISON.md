@@ -569,6 +569,29 @@ cost as "up to about a fifth", not as a precise figure. Group-wise INT4
 on the NPU costs 14 % at 0.6B, nothing at 1.7B, and a third at 4B with twice the time to first
 token, which is the size where the NPU documentation starts recommending channel-wise.
 
+The other families on the NPU, measured on 2026-10-09 the same way (`--suite standard`, one warmup,
+two measured runs); tokens per second with time to first token:
+
+| Model | `npu-int4-sym-cw` | `npu-int4-sym-g128` | Change |
+|---|---|---|---|
+| `LiquidAI/LFM2-350M` | 110.2 (70 ms) | 94.7 (91 ms) | -14 % |
+| `Qwen/Qwen2.5-0.5B-Instruct` | 68.0 (136 ms) | 54.2 (216 ms) | -20 % |
+| `unsloth/gemma-3-1b-it` | 48.3 (270 ms) | 41.3 (314 ms) | -14 % |
+| `unsloth/Llama-3.2-1B-Instruct` | 71.2 (188 ms) | 57.8 (301 ms) | -19 % |
+| `allenai/OLMo-2-0425-1B-Instruct` | 44.5 (268 ms) | 40.3 (469 ms) | -9 % |
+| `ibm-granite/granite-3.3-2b-instruct` | 4.6 (660 ms) | 4.4 (950 ms) | -4 % |
+| `unsloth/gemma-2-2b-it` | 36.1 (362 ms) | 26.6 (541 ms) | -26 % |
+| `HuggingFaceTB/SmolLM3-3B` | 33.8 (549 ms) | 23.8 (842 ms) | -30 % |
+
+So group-wise costs these families a tenth to a third of the NPU's tokens per second, more than it
+cost Qwen3 at the same sizes, and up to about one and a half times the time to first token. The
+default keeps it: the divergence it removes (section 10.3) is two to five times larger, and
+`--profile npu-int4-sym-cw` is the fast choice. The gemma-2, Llama and SmolLM3 rows are a second
+session on an idle NPU; the first, which may have shared the NPU with a test run, measured
+22.8, 48.1 and 24.2 tok/s with group-wise, so read the costs as approximate. Granite is slow on the
+NPU in both formats, about 4.5 tok/s where models of its size reach 25-40; the cause was not
+isolated.
+
 ### 10.5 What the registry does with it
 
 Below 5B parameters each device now defaults to the more accurate profile: `cpu-int4-asym-g128-r08`,
