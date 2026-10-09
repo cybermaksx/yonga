@@ -507,7 +507,13 @@ nobody saw that model write.
   deeply to parse is a 400 naming `messages[i].tool_calls[j].function.arguments`. A conversation
   that carries calls or results needs `tools` in the same request (400 naming
   `messages[i].tool_calls` or `messages[i].role`): dropping them would answer a different
-  conversation than the one sent. The last message may be a `tool` result.
+  conversation than the one sent. The last message may be a `tool` result. OpenVINO GenAI 2026.4's
+  stateful LLM pipelines (`ATTENTION_BACKEND=SDPA`, and every NPU LLM) refuse a `ChatHistory`
+  whose last turn is not the user's, so on an LLM artifact such a conversation is rendered with
+  the artifact's own chat template, with the same tools and template variables and the assistant
+  turn opened, and handed to the pipeline as tokens, once templated and without a second BOS. It
+  takes this route on every device, so a tool round trip does not depend on the attention
+  backend. A VLM takes it as a `ChatHistory` as it is.
 - The answer is read for calls outside reasoning only, so a call drafted while the model reasons is
   never made, whether the reasoning is shown or not. With `--show-reasoning` the reasoning block
   that opens the answer is passed through as before and the content after it is read for calls as

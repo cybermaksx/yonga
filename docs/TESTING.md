@@ -183,7 +183,8 @@ input skips the test with the command that produces it.
 
 | Marker | File | Covers | Input |
 |---|---|---|---|
-| `intel_gpu` | `test_intel_gpu.py` | generation and metrics, compile-cache reuse, probe, streaming, `serve` (plain and SSE, real runtime), GPU logits against CPU f32 | tiny artifact (`tools/make_test_artifact.py`) |
+| `intel_gpu` | `test_intel_gpu.py` | generation and metrics, compile-cache reuse, probe, streaming, a history ending with the assistant on the stateful (`SDPA`) pipeline, `serve` (plain and SSE, real runtime), GPU logits against CPU f32 | tiny artifact (`tools/make_test_artifact.py`) |
+| `intel_gpu`, `large_model` | `test_intel_gpu.py` | a two-turn tool round trip through `serve` (the call, then the answer to its result, plain and SSE) | `YONGA_TEST_TOOL_ARTIFACT`: a GPU LLM artifact whose chat profile calls tools |
 | `intel_npu` | `test_intel_npu.py` | device access, deferred raw compiles, typed pipeline failures, generation with manifest-shaped properties, probe, `probe --quick` and `--timeout` (inconclusive, or a pass through the child process), streaming and a second turn | NPU artifact (`tools/make_test_artifact.py --npu`) |
 | `intel_gpu`, `intel_npu`, `slow` | `test_gguf_import.py` | the real GGUF import child process, GPU generation from its IR, and the NPU refusal named by `npu-static-reshape-broadcast` | a cached `Qwen/Qwen2.5-0.5B-Instruct-GGUF` Q4_0 file, or `YONGA_TEST_GGUF` |
 | `intel_gpu`, `large_model` | `test_vlm.py` | text chat through the VLM pipeline, with history; a data-URL image through `serve` | `YONGA_TEST_VLM_ARTIFACT` |

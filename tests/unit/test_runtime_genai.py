@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import math
 import types
+import warnings
 from pathlib import Path
 from typing import Any, cast
 
@@ -123,6 +124,60 @@ class FakeChatHistory:
         self.extra_context = context
 
 
+class FakeTokenizedInputs:
+    """Stand-in for ``openvino_genai.TokenizedInputs``: remembers what was encoded."""
+
+    def __init__(self, prompt: str, add_special_tokens: bool) -> None:
+        self.prompt = prompt
+        self.add_special_tokens = add_special_tokens
+
+
+class FakeEncodedResults:
+    """What GenAI returns for tokenized inputs: token ids, not texts."""
+
+    def __init__(self, tokens: list[int], finish_reasons: Any, perf_metrics: Any) -> None:
+        self.tokens = [tokens]
+        self.scores = [0.0]
+        self.finish_reasons = finish_reasons
+        self.perf_metrics = perf_metrics
+
+
+#: Token ids the fake pipeline "generates" for tokenized inputs.
+ENCODED_TOKENS = [11, 12, 13]
+
+
+class FakeTokenizer:
+    """Stand-in for the pipeline's ``openvino_genai.Tokenizer``."""
+
+    RENDERED = "<|rendered chat|>"
+
+    def __init__(self, module: Any) -> None:
+        self.module = module
+        self.template_calls: list[dict[str, Any]] = []
+        self.decode_calls: list[tuple[list[int], bool]] = []
+
+    def apply_chat_template(
+        self, history, add_generation_prompt, chat_template="", tools=None, extra_context=None
+    ):
+        self.template_calls.append(
+            {
+                "history": history,
+                "add_generation_prompt": add_generation_prompt,
+                "chat_template": chat_template,
+                "tools": tools,
+                "extra_context": extra_context,
+            }
+        )
+        return self.RENDERED
+
+    def encode(self, prompt, add_special_tokens=True):
+        return FakeTokenizedInputs(prompt, add_special_tokens)
+
+    def decode(self, tokens, skip_special_tokens=True):
+        self.decode_calls.append((list(tokens), skip_special_tokens))
+        return self.module.result.texts[0]
+
+
 class FakePipeline:
     def __init__(self, module: Any, kind: Any, path: Any, device: Any, properties: Any) -> None:
         self.module = module
@@ -132,6 +187,12 @@ class FakePipeline:
         self.properties = properties
         self.generate_calls: list[tuple[Any, ...]] = []
         self.chat_events: list[tuple[str, Any]] = []
+        #: Every generate and lifecycle call, in order, to check what came first.
+        self.events: list[str] = []
+        self.tokenizer = FakeTokenizer(module)
+
+    def get_tokenizer(self):
+        return self.tokenizer
 
     def generate(self, *args, **kwargs):
         if (
@@ -143,6 +204,7 @@ class FakePipeline:
             # What pybind11 raises for a missing overload, before anything runs.
             raise TypeError("generate(): incompatible function arguments.")
         self.generate_calls.append((args, kwargs))
+        self.events.append("generate")
         if self.module.generate_error is not None:
             raise self.module.generate_error
         streamer = kwargs.get("streamer")
@@ -150,13 +212,25 @@ class FakePipeline:
             for chunk in self.module.stream_chunks:
                 if streamer(chunk):
                     break
+        if args and isinstance(args[0], FakeTokenizedInputs):
+            result = self.module.result
+            return FakeEncodedResults(
+                list(ENCODED_TOKENS), result.finish_reasons, result.perf_metrics
+            )
         return self.module.result
 
     def start_chat(self, system_message=None):
         self.chat_events.append(("start", system_message))
+        self.events.append("start_chat")
 
     def finish_chat(self):
         self.chat_events.append(("finish", None))
+        self.events.append("finish_chat")
+        if self.module.finish_chat_warns:
+            # What the GenAI 2026.4 binding does on every call.
+            warnings.warn(
+                "start_chat() / finish_chat() API is deprecated", DeprecationWarning, stacklevel=2
+            )
 
 
 class FakeGenAI:
@@ -173,6 +247,7 @@ class FakeGenAI:
         #: the legacy-lifecycle tests run against that shape.
         self.vlm_accepts_history = False
         self.stream_chunks: list[str] = []
+        self.finish_chat_warns = False
 
     def _make(self, kind: Any, path: Any, device: Any, properties: Any) -> FakePipeline:
         if self.load_error is not None:
@@ -960,16 +1035,207 @@ def test_vlm_sends_the_whole_history_when_the_pipeline_accepts_one(artifact, set
     assert pipeline.chat_events == [], "the deprecated lifecycle is never touched"
 
 
-def test_tools_and_tool_turns_reach_the_genai_history(artifact, settings, genai):
+def test_tools_reach_the_genai_history_on_a_user_turn(artifact, settings, genai):
+    runtime = make_runtime(artifact, settings)
+    history = ChatHistory(
+        messages=[ChatMessage(role="user", content="Weather in Ankara?")], tools=[WEATHER_TOOL]
+    )
+
+    runtime.generate(history, GenerationSettings())
+
+    (args, _kwargs) = genai.pipelines[0].generate_calls[0]
+    assert isinstance(args[0], FakeChatHistory)
+    assert args[0].tools == [WEATHER_TOOL]
+
+
+def test_tools_and_tool_turns_reach_the_chat_template(artifact, settings, genai):
     runtime = make_runtime(artifact, settings)
 
     runtime.generate(tool_conversation(), GenerationSettings())
 
-    (args, _kwargs) = genai.pipelines[0].generate_calls[0]
-    sent = args[0]
+    (call,) = genai.pipelines[0].tokenizer.template_calls
+    sent = call["history"]
     assert sent.tools == [WEATHER_TOOL]
     assert [m["role"] for m in sent.messages] == ["user", "assistant", "tool"]
     assert sent.messages[1]["tool_calls"][0]["function"]["arguments"] == {"city": "Ankara"}
+
+
+# --- histories that do not end with a user turn ----------------------------------------
+#
+# OpenVINO GenAI 2026.4's stateful LLM pipeline (ATTENTION_BACKEND=SDPA, and the
+# NPU pipeline) refuses generate(ChatHistory) unless the history ends with a user
+# turn: "Chat doesn't support switching between input types". The follow-up of a
+# tool round trip ends with the tool result, so it is rendered with the model's
+# own chat template and handed over as tokens instead.
+
+
+def assistant_last_conversation() -> ChatHistory:
+    return ChatHistory(
+        messages=[
+            ChatMessage(role="user", content="Say hello."),
+            ChatMessage(role="assistant", content="Hel"),
+        ]
+    )
+
+
+@pytest.mark.parametrize(
+    "conversation", [tool_conversation, assistant_last_conversation], ids=["tool", "assistant"]
+)
+def test_a_history_not_ending_with_a_user_turn_is_rendered_once(
+    artifact, settings, genai, conversation
+):
+    profile = ChatProfile(supports_thinking_flag=True, default_thinking=False)
+    runtime = make_runtime(artifact, settings, chat_profile=profile)
+    history = conversation()
+    pipeline = genai.pipelines[0]
+
+    result = runtime.generate(history, GenerationSettings(max_new_tokens=16))
+
+    # The model's own template renders the same GenAI history the history route
+    # would have sent, tools and template variables included, opening the
+    # assistant's turn...
+    (call,) = pipeline.tokenizer.template_calls
+    assert call["add_generation_prompt"] is True
+    sent = call["history"]
+    assert isinstance(sent, FakeChatHistory)
+    assert sent.messages == history.to_payload()
+    assert sent.tools == (list(history.tools) or None)
+    assert sent.extra_context == {"enable_thinking": False}
+    # ...and the pipeline gets that prompt as tokens, never a history or a string
+    # it could template a second time, with no extra BOS.
+    ((args, kwargs),) = pipeline.generate_calls
+    (inputs, config) = args
+    assert isinstance(inputs, FakeTokenizedInputs)
+    assert inputs.prompt == FakeTokenizer.RENDERED
+    assert inputs.add_special_tokens is False
+    assert config.apply_chat_template is False
+    assert "streamer" not in kwargs
+    # The chat the previous history call left open is closed first, and the
+    # state this call leaves behind is reset before the next history call.
+    assert pipeline.events == ["finish_chat", "generate", "finish_chat"]
+    # The tokens come back decoded, with metrics and finish reason intact.
+    assert pipeline.tokenizer.decode_calls == [(ENCODED_TOKENS, True)]
+    assert result.text == "hello there"
+    assert result.input_tokens == 9
+    assert result.output_tokens == 16
+    assert result.stop_reason == "length"
+
+
+def test_a_history_ending_with_a_user_turn_keeps_the_history_route(artifact, settings, genai):
+    runtime = make_runtime(artifact, settings)
+    history = tool_conversation()
+    history.messages.append(ChatMessage(role="assistant", content="It is 21 C."))
+    history.messages.append(ChatMessage(role="user", content="And tomorrow?"))
+    pipeline = genai.pipelines[0]
+
+    runtime.generate(history, GenerationSettings())
+
+    ((args, _kwargs),) = pipeline.generate_calls
+    assert isinstance(args[0], FakeChatHistory)
+    assert args[0].tools == [WEATHER_TOOL]
+    assert not hasattr(args[1], "apply_chat_template")
+    assert pipeline.tokenizer.template_calls == []
+    assert pipeline.events == ["generate"], "no chat is closed on the history route"
+
+
+def test_a_rendered_turn_streams_like_any_other(artifact, settings, genai):
+    genai.stream_chunks = ["It is ", "21 C."]
+    genai.result = FakeResults(text="It is 21 C.", reason="STOP", perf_metrics=FakePerfMetrics())
+    runtime = make_runtime(artifact, settings)
+    seen: list[str] = []
+
+    result = runtime.generate_stream(tool_conversation(), GenerationSettings(), seen.append)
+
+    assert seen == ["It is ", "21 C."]
+    assert result.text == "It is 21 C."
+    assert result.stop_reason == "stop"
+    (args, kwargs) = genai.pipelines[0].generate_calls[0]
+    assert isinstance(args[0], FakeTokenizedInputs)
+    assert "streamer" in kwargs
+
+
+def test_the_route_follows_each_history_turn_by_turn(artifact, settings, genai):
+    """A tool round trip on one pipeline: history, rendered, then history again."""
+    runtime = make_runtime(artifact, settings)
+    pipeline = genai.pipelines[0]
+    first = ChatHistory(messages=tool_conversation().messages[:1], tools=[WEATHER_TOOL])
+
+    runtime.generate(first, GenerationSettings())
+    runtime.generate(tool_conversation(), GenerationSettings())
+    runtime.generate(first, GenerationSettings())
+
+    kinds = [type(call[0][0]) for call in pipeline.generate_calls]
+    assert kinds == [FakeChatHistory, FakeTokenizedInputs, FakeChatHistory]
+    assert pipeline.events == ["generate", "finish_chat", "generate", "finish_chat", "generate"]
+
+
+def test_closing_the_chat_does_not_leak_genai_s_deprecation_warning(artifact, settings, genai):
+    genai.finish_chat_warns = True
+    runtime = make_runtime(artifact, settings)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        runtime.generate(tool_conversation(), GenerationSettings())
+
+    assert genai.pipelines[0].events == ["finish_chat", "generate", "finish_chat"]
+    assert [w for w in caught if issubclass(w.category, DeprecationWarning)] == []
+
+
+def test_a_pipeline_without_finish_chat_still_renders(artifact, settings, genai):
+    """A later GenAI may drop the deprecated call; then there is no chat to close."""
+    runtime = make_runtime(artifact, settings)
+    pipeline = genai.pipelines[0]
+    pipeline.finish_chat = None  # type: ignore[method-assign,assignment]
+
+    result = runtime.generate(tool_conversation(), GenerationSettings())
+
+    assert result.text == "hello there"
+    assert pipeline.events == ["generate"]
+
+
+def test_a_rendered_turn_failure_is_a_generation_failure(artifact, settings, genai):
+    genai.generate_error = RuntimeError("Exception from src/plugins/intel_gpu: device lost")
+    runtime = make_runtime(artifact, settings, device="GPU")
+
+    with pytest.raises(GenerationError) as caught:
+        runtime.generate(tool_conversation(), GenerationSettings())
+    assert caught.value.diagnostic.code == "runtime.genai.generation_failed"
+    assert "device lost" in caught.value.diagnostic.message
+    # The state is reset even so, ready for the next request.
+    assert genai.pipelines[0].events == ["finish_chat", "generate", "finish_chat"]
+
+
+def test_a_failing_reset_after_a_rendered_turn_does_not_hide_the_answer(artifact, settings, genai):
+    runtime = make_runtime(artifact, settings)
+    pipeline = genai.pipelines[0]
+    resets: list[str] = []
+
+    def finish_chat() -> None:
+        resets.append("finish_chat")
+        if len(resets) == 2:
+            raise RuntimeError("reset failed")
+
+    pipeline.finish_chat = finish_chat  # type: ignore[method-assign]
+
+    result = runtime.generate(tool_conversation(), GenerationSettings())
+
+    assert result.text == "hello there"
+    assert resets == ["finish_chat", "finish_chat"]
+
+
+def test_a_vlm_tool_turn_keeps_the_history_route(artifact, settings, genai):
+    """GenAI 2026.4's VLMPipeline takes a tool-last history as it is (verified on GPU)."""
+    genai.vlm_accepts_history = True
+    runtime = make_runtime(artifact, settings, pipeline=PipelineKind.VLM)
+    pipeline = genai.pipelines[0]
+
+    runtime.generate(tool_conversation(), GenerationSettings())
+
+    ((args, _kwargs),) = pipeline.generate_calls
+    assert isinstance(args[0], FakeChatHistory)
+    assert [m["role"] for m in args[0].messages] == ["user", "assistant", "tool"]
+    assert pipeline.tokenizer.template_calls == []
+    assert pipeline.events == ["generate"]
 
 
 def test_a_history_without_tools_sets_none(artifact, settings, genai):

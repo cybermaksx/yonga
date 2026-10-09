@@ -11,8 +11,13 @@ redefine them.
 Two upstream details are hidden here on purpose:
 
 * ``start_chat()``/``finish_chat()`` are deprecated and must not appear in the
-  domain interface. The LLM path does not use them at all: multi-turn state
-  travels as an ``openvino_genai.ChatHistory`` passed to ``generate``. The VLM
+  domain interface. The LLM path does not drive chats with them: multi-turn
+  state travels as an ``openvino_genai.ChatHistory`` passed to ``generate``.
+  A history that does not end with a user turn — the follow-up after a tool
+  result — is refused that way by GenAI 2026.4's stateful pipelines, so it is
+  rendered with the model's own chat template and passed as tokens instead,
+  with ``finish_chat()`` resetting the pipeline's state before and after that
+  call (see :meth:`GenAIChatRuntime._generate_llm_rendered`). The VLM
   path does the same wherever ``VLMPipeline.generate`` accepts a history, which
   OpenVINO GenAI 2026.4 does. Older builds have no such overload, so there the
   adapter falls back to driving the deprecated lifecycle internally and feeding
@@ -45,6 +50,7 @@ import json
 import math
 import re
 import time
+import warnings
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from pathlib import Path
@@ -826,6 +832,31 @@ def _first_text(raw: object) -> str:
     return ""
 
 
+class _RenderedTurnResult:
+    """A GenAI ``EncodedResults``, read as the ``DecodedResults`` it stands for.
+
+    The rendered-prompt route hands the pipeline tokens, so it gets tokens
+    back; this carries their decoded text beside the untouched finish reasons
+    and perf metrics, so the rest of the runtime reads both routes alike.
+    """
+
+    def __init__(self, *, text: str, finish_reasons: Any, perf_metrics: Any) -> None:
+        self.texts = [text]
+        self.finish_reasons = finish_reasons if finish_reasons is not None else []
+        self.perf_metrics = perf_metrics
+
+
+def _decoded_tokens(tokenizer: Any, raw: object) -> str:
+    """Decode the first sequence of an ``EncodedResults``, skipping special tokens.
+
+    Skipping them is what GenAI does when it decodes a string or history call.
+    """
+    sequences = list(raw.tokens)  # type: ignore[attr-defined]
+    if not sequences:
+        return ""
+    return str(tokenizer.decode(list(sequences[0]), skip_special_tokens=True))
+
+
 def _finish_reason(raw: object) -> str | None:
     """Return the first finish reason as a lower-case name, when reported."""
     with suppress(Exception):
@@ -1291,10 +1322,78 @@ class GenAIChatRuntime:
         Passing the history object is what replaces the deprecated
         ``start_chat()``/``finish_chat()`` lifecycle: the whole conversation is
         re-supplied each turn and the pipeline applies the chat template itself.
+
+        That holds only while the history ends with a user turn. OpenVINO GenAI
+        2026.4's stateful and NPU pipelines (``ATTENTION_BACKEND=SDPA``, and
+        every NPU LLM) refuse any other history with "Chat doesn't support
+        switching between input types": a tool result or an assistant prefix in
+        the last place fails, which is the second half of every tool round
+        trip. Such a history goes through :meth:`_generate_llm_rendered`
+        instead, on every backend, so a conversation cannot behave differently
+        on GPU than it did on CPU.
         """
+        genai_history = self._genai_history(history)
+        messages = history.messages
+        if messages and messages[-1].role != "user":
+            return self._generate_llm_rendered(genai_history, generation_config, streamer)
         return self._pipeline.generate(
-            self._genai_history(history), generation_config, **_streamer_kwargs(streamer)
+            genai_history, generation_config, **_streamer_kwargs(streamer)
         )
+
+    def _generate_llm_rendered(
+        self, genai_history: Any, generation_config: Any, streamer: Any
+    ) -> _RenderedTurnResult:
+        """Generate from a history that does not end with a user turn.
+
+        The prompt is what the ``ChatHistory`` route would have built: the
+        pipeline's own tokenizer applies the artifact's chat template to the
+        same GenAI history — with its tools and template variables — adding the
+        generation prompt, and encodes it without special tokens, exactly as
+        GenAI does for a history. Handing the pipeline those tokens rather than
+        a string keeps the template from being applied twice and keeps a BOS
+        token from being added a second time. On the reference host this
+        produces the same tokens, text and stop handling as the history route.
+
+        The pipeline's state is reset on both sides of the call. Before it, the
+        stateful pipeline still holds the previous history call's chat and
+        would read these tokens as a continuation of it. After it, the GPU
+        pipeline keeps this call's state, and the next history call then fails
+        inside the sampler ("token_idx < seq_len") or miscounts its prompt —
+        both seen on the reference host with GenAI 2026.4. ``finish_chat`` is
+        deprecated as an API to drive chats with, but it is the only reset the
+        pipeline exposes; the next history call opens a fresh chat on its own.
+        """
+        tokenizer = self._pipeline.get_tokenizer()
+        prompt = tokenizer.apply_chat_template(genai_history, add_generation_prompt=True)
+        inputs = tokenizer.encode(prompt, add_special_tokens=False)
+        with suppress(Exception):
+            # Encoded inputs are never templated; this only states the intent.
+            generation_config.apply_chat_template = False
+        self._close_llm_chat()
+        try:
+            raw = self._pipeline.generate(inputs, generation_config, **_streamer_kwargs(streamer))
+        finally:
+            # Never let a failed reset hide the answer, or the generation error.
+            with suppress(Exception):
+                self._close_llm_chat()
+        return _RenderedTurnResult(
+            text=_decoded_tokens(tokenizer, raw),
+            finish_reasons=getattr(raw, "finish_reasons", None),
+            perf_metrics=getattr(raw, "perf_metrics", None),
+        )
+
+    def _close_llm_chat(self) -> None:
+        """Reset the LLM pipeline's chat and generation state, quietly.
+
+        A pipeline without ``finish_chat`` (a future GenAI may drop it) is left
+        alone: there is then no chat to close.
+        """
+        finish_chat = getattr(self._pipeline, "finish_chat", None)
+        if finish_chat is None:
+            return
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            finish_chat()
 
     def _genai_history(self, history: ChatHistory) -> Any:
         """Our history as an ``openvino_genai.ChatHistory``, with the template variables.

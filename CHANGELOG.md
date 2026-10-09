@@ -108,6 +108,17 @@ manifest may change in any minor release.
 
 ### Fixed
 
+- **`serve` answers the request that hands a tool's result back** on an LLM artifact that runs
+  OpenVINO GenAI's stateful pipeline (`ATTENTION_BACKEND=SDPA` on the GPU, and every NPU LLM).
+  That pipeline refuses a `ChatHistory` whose last turn is not the user's, so the second half of
+  every tool round trip failed with 500 `runtime.genai.generation_failed` ("Chat doesn't support
+  switching between input types"). Such a conversation, and one ending with an assistant turn, is
+  now rendered with the artifact's own chat template, tools and template variables included, and
+  handed to the pipeline as tokens: once templated and without a second BOS, which on the reference
+  host gives the same prompt tokens and answer as GenAI's own history route. The pipeline's chat
+  state is reset on both sides of that call, because a history call after it otherwise failed
+  inside the sampler ("token_idx < seq_len"). A conversation ending with the user's turn is sent
+  as before. `docs/CLI_SPEC.md` section 14.
 - `yonga probe` no longer prints a deferred raw NPU compile as an error with its diagnostic while
   it runs; the line now reads `deferred`, and the pipeline's result is the verdict.
 - `python -m yonga.application.probe` settles a deferred device by building the GenAI pipeline, as
