@@ -307,8 +307,12 @@ size is smaller than, or not a multiple of, the group size this profile asks for
 the devices and the source model are all fine; the conversion setting is what does not fit this
 model. Nothing had been compiled when this failed, so no device is implicated.
 
-  - Re-run with the channel-wise profile, which has no divisibility requirement: yonga prepare MODEL
-    --profile npu-int4-sym-cw (group size -1, one scale per output channel).
+  - When only a few small layers fail (Qwen3.5 0.8B-4B fail on one one-channel rotary_emb weight),
+    try the ratio-0.8 profile for the device, which keeps a fifth of the weights at INT8: yonga
+    prepare MODEL --profile cpu-int4-asym-g128-r08 (or gpu-int4-asym-g128-r08). It prepared those
+    models; that it skips the failing layer is observed, not guaranteed.
+  - Or re-run with the channel-wise profile, which has no divisibility requirement: yonga prepare
+    MODEL --profile npu-int4-sym-cw (group size -1, one scale per output channel; made for the NPU).
   - Or pick a profile whose group size divides every channel size in the error; the shipped
     group-wise profiles all use 128.
   - The failing nodes and their channel sizes are in the job log: yonga logs JOB_ID --raw
