@@ -1894,7 +1894,8 @@ def test_serve_never_prints_the_api_key(
         env={"YONGA_API_KEY": "k-9f8e7d6c"},
     )
 
-    assert "API key required" in result.stdout
+    # Rich wraps long lines (a long artifact path), so compare with whitespace collapsed.
+    assert "API key required" in " ".join(result.stdout.split())
     assert "k-9f8e7d6c" not in result.stdout + result.stderr
     assert "No YONGA_API_KEY" not in result.stderr
 
