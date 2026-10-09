@@ -19,6 +19,7 @@ import pytest
 from yonga.adapters import runtime_genai as runtime_module
 from yonga.adapters.runtime_genai import (
     ChatHistory,
+    ChatImage,
     ChatMessage,
     ChatProfile,
     ChatRuntime,
@@ -970,3 +971,139 @@ def test_plain_generate_passes_no_streamer(artifact, settings, genai):
 
     assert "streamer" not in genai.pipelines[0].generate_calls[0][1]
     assert isinstance(runtime, runtime_module.StreamingChatRuntime)
+
+
+# --- images on the VLM path -----------------------------------------------------------
+
+
+@pytest.fixture
+def tensors(monkeypatch: pytest.MonkeyPatch) -> list[ChatImage]:
+    """Stand in for ``openvino.Tensor``: each image becomes a tagged tuple."""
+    made: list[ChatImage] = []
+
+    def tensor(image: ChatImage) -> tuple[str, int, int]:
+        made.append(image)
+        return ("tensor", image.width, image.height)
+
+    monkeypatch.setattr(runtime_module, "_image_tensor", tensor)
+    return made
+
+
+def _image(width: int = 2, height: int = 1) -> ChatImage:
+    return ChatImage(width=width, height=height, pixels=b"\x01" * (width * height * 3))
+
+
+def _asking_with_images(*images: ChatImage, text: str = "What is it?") -> ChatHistory:
+    history = ChatHistory()
+    history.add_system("You are terse.")
+    history.messages.append(ChatMessage(role="user", content=text, images=list(images)))
+    return history
+
+
+def test_vlm_images_go_to_the_pipeline_with_the_history(artifact, settings, genai, tensors):
+    genai.vlm_accepts_history = True
+    runtime = make_runtime(artifact, settings, pipeline=PipelineKind.VLM)
+    pipeline = genai.pipelines[0]
+
+    runtime.generate(_asking_with_images(_image(2, 1), _image(1, 3)), GenerationSettings())
+
+    ((args, kwargs),) = pipeline.generate_calls
+    assert kwargs["images"] == [("tensor", 2, 1), ("tensor", 1, 3)]
+    assert [m["content"] for m in args[0].messages] == ["You are terse.", "What is it?"]
+    assert all(set(m) == {"role", "content"} for m in args[0].messages)
+
+
+def test_a_vlm_turn_without_images_passes_no_images_argument(artifact, settings, genai, tensors):
+    genai.vlm_accepts_history = True
+    runtime = make_runtime(artifact, settings, pipeline=PipelineKind.VLM)
+    history = ChatHistory()
+    history.add_user("Hi")
+
+    runtime.generate(history, GenerationSettings())
+
+    ((_, kwargs),) = genai.pipelines[0].generate_calls
+    assert "images" not in kwargs
+    assert tensors == []
+
+
+def test_the_legacy_vlm_path_passes_the_images_too(artifact, settings, genai, tensors):
+    runtime = make_runtime(artifact, settings, pipeline=PipelineKind.VLM)
+
+    runtime.generate(_asking_with_images(_image(), text=""), GenerationSettings())
+
+    ((args, kwargs),) = genai.pipelines[0].generate_calls
+    assert args == ("",), "an image alone is something to answer"
+    assert kwargs["images"] == [("tensor", 2, 1)]
+
+
+def test_genai_media_tags_typed_by_a_client_are_removed(artifact, settings, genai, tensors):
+    """GenAI reads <ov_genai_image_N> anywhere in the text; words must not claim an image."""
+    genai.vlm_accepts_history = True
+    runtime = make_runtime(artifact, settings, pipeline=PipelineKind.VLM)
+    history = ChatHistory()
+    history.add_user("Look <ov_genai_image_0> and <ov_genai_video_12>here")
+
+    runtime.generate(history, GenerationSettings())
+
+    ((args, _),) = genai.pipelines[0].generate_calls
+    assert args[0].messages[0]["content"] == "Look  and here"
+
+
+def test_the_legacy_vlm_prompt_loses_media_tags_too(artifact, settings, genai):
+    runtime = make_runtime(artifact, settings, pipeline=PipelineKind.VLM)
+    history = ChatHistory()
+    history.add_user("<ov_genai_image_3>Describe")
+
+    runtime.generate(history, GenerationSettings())
+
+    assert genai.pipelines[0].generate_calls[0][0] == ("Describe",)
+
+
+def test_an_llm_keeps_media_tag_text_as_it_is(artifact, settings, genai):
+    runtime = make_runtime(artifact, settings)
+    history = ChatHistory()
+    history.add_user("What does <ov_genai_image_0> mean?")
+
+    runtime.generate(history, GenerationSettings())
+
+    ((args, _),) = genai.pipelines[0].generate_calls
+    assert args[0].messages[0]["content"] == "What does <ov_genai_image_0> mean?"
+
+
+def test_images_on_an_llm_pipeline_are_refused(artifact, settings, genai, tensors):
+    runtime = make_runtime(artifact, settings)
+
+    with pytest.raises(GenerationError) as refused:
+        runtime.generate(_asking_with_images(_image()), GenerationSettings())
+
+    assert refused.value.diagnostic.code == "runtime.genai.images_unsupported"
+    assert genai.pipelines[0].generate_calls == []
+
+
+def test_an_image_on_an_earlier_turn_is_refused(artifact, settings, genai, tensors):
+    """GenAI 2026.4 cannot bind it there; the adapter does not move it on its own."""
+    genai.vlm_accepts_history = True
+    runtime = make_runtime(artifact, settings, pipeline=PipelineKind.VLM)
+    history = _asking_with_images(_image())
+    history.add_assistant("A dot.")
+    history.add_user("Sure?")
+
+    with pytest.raises(GenerationError) as refused:
+        runtime.generate(history, GenerationSettings())
+
+    assert refused.value.diagnostic.code == "runtime.genai.images_not_last_turn"
+    assert refused.value.diagnostic.category is FailureCategory.CONFIGURATION_ERROR
+    assert genai.pipelines[0].generate_calls == []
+
+
+def test_an_image_becomes_an_rgb_tensor() -> None:
+    """The real conversion, on host memory only: no device is involved."""
+    pytest.importorskip("numpy")
+    pytest.importorskip("openvino")
+    image = ChatImage(width=3, height=2, pixels=bytes(range(18)))
+
+    tensor = runtime_module._image_tensor(image)
+
+    assert list(tensor.shape) == [2, 3, 3]
+    assert tensor.data.dtype.name == "uint8"
+    assert tensor.data[1, 2].tolist() == [15, 16, 17]

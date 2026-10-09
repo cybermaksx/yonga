@@ -417,11 +417,15 @@ yonga serve MODEL_OR_ARTIFACT \
   [--port 8000] \
   [--device auto] \
   [--max-new-tokens N] \
-  [--show-reasoning]
+  [--show-reasoning] \
+  [--max-body-mb 8] \
+  [--carry-images-forward]
 ```
 
-Default bind must be localhost, not `0.0.0.0`. Requires the `serve` extra (FastAPI, uvicorn);
-without it `serve` exits 10 naming `pip install 'yonga[serve]'`.
+Default bind must be localhost, not `0.0.0.0`. Requires the `serve` extra (FastAPI, uvicorn,
+Pillow); without FastAPI or uvicorn `serve` exits 10 naming `pip install 'yonga[serve]'`. Pillow
+is needed only to decode images: without it a VLM artifact is still served, `serve` prints a
+warning, and a request with an image is a 500 `serve.images.dependency_missing` naming the extra.
 
 Endpoints:
 
@@ -443,9 +447,9 @@ serialised; a streaming client that disconnects stops its generation.
 ranges as `chat`'s slash commands, and `stop` (below). Unknown fields are ignored. Parameters that
 would change the answer in a way yonga cannot honour are refused with 400 and `param` set: `n`
 other than 1, non-zero `presence_penalty` / `frequency_penalty`, `tools` / `functions`, a
-`response_format` other than text, `logprobs`, non-text content parts, and a conversation whose
-last message is not from the user. A runtime failure is a 500 whose `error.code` is the diagnostic
-code.
+`response_format` other than text, `logprobs`, content parts other than `text` and `image_url`
+(below), and a conversation whose last message is not from the user. A runtime failure is a 500
+whose `error.code` is the diagnostic code.
 
 `stop` is a string or a list of at most 4 strings (`MAX_STOP_SEQUENCES` in
 `src/yonga/application/serve.py`), each non-empty and at most 256 characters (`MAX_STOP_LENGTH`).
@@ -467,27 +471,73 @@ same place.
 The registry chat profile's `stop_strings` (`docs/REGISTRY_SPEC.md` section 8b) are separate:
 model-level end markers OpenVINO GenAI applies natively and leaves out of the answer.
 
+Images (`image_url` content parts) are accepted by a VLM artifact only; the checks below run in
+this order, each refusal naming the content part in `param`:
+
+- Only user messages may carry images (400 `unsupported_parameter` otherwise), and an
+  `image_url` part needs `image_url.url` (400 `invalid_request`).
+- On an LLM artifact any image is a 400 `serve.request.images_unsupported`, `param`
+  `messages[i].content[j]`.
+- At most 4 images per request, counted over all messages (`MAX_IMAGES` in
+  `src/yonga/application/serve.py`); more is a 400 `serve.request.too_many_images`, `param`
+  `messages`.
+- Images go with the last message only. OpenVINO GenAI 2026.4 binds images to the newest user
+  turn of a stateless conversation: an image in an earlier turn fails with "Missing image/video
+  with index 0", and list content in an earlier turn is rejected outright. So an image in any
+  earlier message is a 400 `serve.request.images_earlier_turn` that says so, unless the server
+  runs with `--carry-images-forward` (below).
+- `image_url.url` must be a `data:image/(png|jpeg|webp|gif);base64,` URL. `http`, `https`, `file`
+  and every other scheme are refused with 400 `unsupported_parameter`, `param`
+  `messages[i].content[j].image_url.url`: permanently, with no option to allow them. yonga never
+  fetches an image; a server that fetched addresses its clients chose could be made to reach
+  services on its own host or network. Another media type, a data URL that is not base64, or one
+  with parameters such as `charset` is refused the same way.
+- Broken base64, bytes that are not a PNG, JPEG, WebP or GIF image (Pillow is offered no other
+  decoder, whatever the declared type), and an image of more than 4096 x 4096 pixels
+  (`MAX_IMAGE_PIXELS`) are a 400 `invalid_request` with the same `param`. The size is read from
+  the image header and checked before any pixel is decoded, which also stops decompression bombs;
+  a larger image is refused, never scaled down. The encoded size is bounded by the body limit.
+
+Everything that can be refused without decoding is refused first. Decoding runs on a worker
+thread, not on the event loop. An accepted image is used as sent: the first frame of an animation,
+an EXIF rotation applied as a browser shows it, transparency on white; `image_url.detail` is
+ignored. The images go to the pipeline with the last user message, in order, ahead of its text
+(GenAI places untagged images there); a message holding only images is a question too. GenAI reads
+`<ov_genai_image_N>` and `<ov_genai_video_N>` anywhere in a VLM prompt as "image N goes here", so
+those tags are removed from the text of every message sent to a VLM artifact: words a client typed
+can never claim or move an image.
+
+`--carry-images-forward` trades accuracy for compatibility. Clients such as Open WebUI resend every
+image of the conversation with each follow-up question, which the default refuses. With the flag,
+images of earlier messages move onto the last user message, before its own images, and its text
+gains a first line such as `[Image 1 was attached to an earlier message in this conversation.]`.
+The model then sees every image as part of the newest turn: it is told that some came earlier, but
+not with which words, so an answer that depends on *when* an image was shown may be wrong. The
+4-image limit still counts all of them.
+
 Request limits (`DEFAULT_MAX_BODY_BYTES` in `src/yonga/api/app.py`, `MAX_MESSAGES` in
 `src/yonga/api/openai.py`):
 
-- A request body over 8 MiB is refused with 413 `request_too_large`. A declared `Content-Length`
-  over the limit is refused before the body is read; otherwise the bytes are counted as they
-  arrive, so a chunked body without a length is held to the same limit.
+- A request body over 8 MiB is refused with 413 `request_too_large`; `--max-body-mb N` sets the
+  limit from 1 to 64 MiB. Base64 makes an image a third larger, so the default leaves room for
+  about 6 MB of image files. A declared `Content-Length` over the limit is refused before the body
+  is read; otherwise the bytes are counted as they arrive, so a chunked body without a length is
+  held to the same limit.
 - More than 4096 messages in one request is refused with 400, `param` `messages`.
 
 Every error response uses OpenAI's shape, `{"error": {"message", "type", "param", "code"}}`:
 
 | Status | `code` | When |
 |---|---|---|
-| 400 | `invalid_request` | The body does not validate (missing or mistyped fields, too many messages, `stop` outside its limits); `param` names the field. |
-| 400 | `unsupported_parameter` | A parameter yonga cannot honour (above); `param` names it. |
-| 400 | the diagnostic code (`serve.request.*`) | A generation setting outside the ranges `chat` accepts. |
+| 400 | `invalid_request` | The body does not validate (missing or mistyped fields, too many messages, `stop` outside its limits, an image that does not decode or is too large); `param` names the field. |
+| 400 | `unsupported_parameter` | A parameter yonga cannot honour (above), including an image URL that is not an accepted `data:` URL; `param` names it. |
+| 400 | the diagnostic code (`serve.request.*`) | A generation setting outside the ranges `chat` accepts, or an image refused by `images_unsupported`, `too_many_images` or `images_earlier_turn` (above, with `param`). |
 | 401 | `invalid_api_key` | A key is configured and the request does not carry it. |
 | 404 | `model_not_found` | `model` does not name the served model. |
 | 404 | `not_found` | No such path. |
 | 405 | `method_not_allowed` | The path exists but not for this method. |
 | 413 | `request_too_large` | The body passed the size limit. |
-| 500 | the diagnostic code | Generation failed for any other classified reason. |
+| 500 | the diagnostic code | Generation failed for any other classified reason, or an image arrived and Pillow is not installed (`serve.images.dependency_missing`). |
 
 Other HTTP errors raised by routing carry `invalid_request`.
 

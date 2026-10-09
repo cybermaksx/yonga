@@ -277,16 +277,43 @@ on the visible answer, so a stop such as `"\n\n"` cannot fire inside a hidden re
 leave an empty answer; with `--show-reasoning` the reasoning block is part of the visible answer, so
 a stop sequence can end it there. The answer ends before the first stop sequence to complete, and
 without the whitespace in front of it, with `finish_reason` `stop`, streamed or not, and generation
-stops there. `n` above 1, tools, images, penalties and JSON response formats are still refused
-with a 400.
+stops there. `n` above 1, tools, penalties and JSON response formats are still refused with a
+400.
+
+A VLM artifact (Qwen2.5-VL, Qwen3.5) also takes images, as OpenAI `image_url` content parts holding
+a `data:` URL; an LLM artifact refuses them with `serve.request.images_unsupported`:
+
+```bash
+IMG=$(base64 -w0 photo.jpg)
+curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -d @- <<EOF
+{"model":"ARTIFACT","messages":[{"role":"user","content":[
+  {"type":"text","text":"What is in this picture?"},
+  {"type":"image_url","image_url":{"url":"data:image/jpeg;base64,$IMG"}}]}]}
+EOF
+```
+
+Only `data:image/png`, `jpeg`, `webp` and `gif` base64 URLs are accepted. yonga never fetches an
+image, so an `http(s)://` or `file://` URL is refused with a 400, and there is no option to allow
+it: a server that fetched what its clients named could be made to reach anything on its host or
+network. At most 4 images per request, each at most 4096 x 4096 pixels; a larger image is refused,
+not scaled down, so scale it before sending. Images count towards the 8 MiB body limit, and base64
+adds a third, so raise it with `--max-body-mb` (up to 64) for larger photos.
+
+Images go with the last user message only. OpenVINO GenAI cannot attach an image to an earlier turn
+of a conversation, so an image in an earlier message is refused with
+`serve.request.images_earlier_turn`. Chat front ends such as Open WebUI resend the conversation's
+earlier images with every follow-up question; for them, start the server with
+`--carry-images-forward`. Earlier images then move onto the newest message, with a line telling
+the model they were attached earlier. The model no longer knows which words each image went with,
+so a question about "the first picture I sent" may be answered less well; that is the trade.
 
 Binding anything but loopback (`--host 0.0.0.0`) prints a warning, and a stronger one when no key
 is set. Set `YONGA_API_KEY` in the environment whenever you bind beyond loopback: every endpoint
 except `/health` then requires `Authorization: Bearer <key>`. The key is read from the environment
 only, so it never shows up in the process list.
 
-Requests are bounded. A body over 8 MiB is refused with 413 and error code `request_too_large`,
-counted on the bytes received, so a chunked upload without a `Content-Length` is held to it too.
+Requests are bounded. A body over 8 MiB (or `--max-body-mb`) is refused with 413 and error code
+`request_too_large`, counted on the bytes received, so a chunked upload without a `Content-Length` is held to it too.
 More than 4096 messages in one request is a 400 with `param` set to `messages`. With a key set,
 authentication runs first, so a client without the key is refused before its body is read. Error
 responses use OpenAI's shape, `{"error": {"message", "type", "param", "code"}}`; a failure in the
@@ -467,7 +494,7 @@ the verdict, a pipeline failure coming out typed instead of as exit 99, generati
 string-valued properties, yonga's own probe passing an NPU LLM, streaming with a second turn, and
 `probe --quick` and `--timeout` coming back inconclusive rather than passed or failed. `slow`
 selects `tests/hardware/test_gguf_import.py`, the real GGUF import from a cached GGUF file;
-`large_model` selects `tests/hardware/test_vlm.py`, text chat through the VLM pipeline on the GPU.
+`large_model` selects `tests/hardware/test_vlm.py`, text chat through the VLM pipeline on the GPU and an image sent through `serve`.
 `docs/TESTING.md` section 6 lists each file and the input it needs.
 
 **Be aware of what is not covered.** CI has no Intel hardware and runs only `tests/unit` and

@@ -230,7 +230,7 @@ def content_of(response_text: str) -> str:
 
 
 def final_reason(response_text: str) -> str | None:
-    reasons = [
+    reasons: list[str | None] = [
         event["choices"][0]["finish_reason"]
         for event in events(response_text)
         if isinstance(event, dict) and event.get("choices")
@@ -357,15 +357,18 @@ def test_four_stop_sequences_of_the_longest_length_are_accepted(tmp_path: Path) 
     assert response.status_code == 200
 
 
-def test_image_content_is_refused(tmp_path: Path) -> None:
-    server, _ = make_server(tmp_path, ["Hi."])
+def test_content_other_than_text_and_images_is_refused(tmp_path: Path) -> None:
+    """Images have their own tests (test_serve_images.py); audio is not accepted at all."""
+    server, runtime = make_server(tmp_path, ["Hi."])
     parts: list[dict[str, object]] = [
-        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+        {"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}}
     ]
     response = client_for(server).post("/v1/chat/completions", json=ask(parts))
 
     assert response.status_code == 400
     assert response.json()["error"]["param"] == "messages[0].content"
+    assert response.json()["error"]["code"] == "unsupported_parameter"
+    assert runtime.histories == []
 
 
 def test_out_of_range_values_are_refused_like_chat_refuses_them(tmp_path: Path) -> None:

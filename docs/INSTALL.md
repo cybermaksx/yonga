@@ -105,7 +105,7 @@ The extras map to what you intend to do:
 |---|---|---|
 | `openvino` | `openvino`, `openvino-genai`, `openvino-tokenizers` | `probe`, `chat`, `bench`, and the device/NPU sections of `doctor` |
 | `export` | `optimum-intel[openvino]`, `nncf` (pulling in `transformers` and `torch`) | `prepare` (download, convert, quantize) |
-| `serve` | `fastapi`, `uvicorn` | `serve` (the OpenAI-compatible HTTP API) |
+| `serve` | `fastapi`, `uvicorn`, `pillow` | `serve` (the OpenAI-compatible HTTP API; Pillow decodes images sent to a VLM) |
 | `dev` | `pytest`, `pytest-cov`, `pytest-mock`, `pytest-timeout`, `ruff`, `mypy`, `build`, `twine` | running the test suite and the linters, building and checking a release |
 | `all` | `openvino`, `export` and `serve` (not `dev`) | everything a user can run |
 

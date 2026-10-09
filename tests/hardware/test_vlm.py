@@ -1,4 +1,4 @@
-"""Real VLM on the GPU: text chat through the VLM pipeline keeps its history.
+"""Real VLM on the GPU: text chat keeps its history, and serve passes an image.
 
 A VLM export has no single ``openvino_model.xml``; GenAI drives it through
 ``VLMPipeline``, whose chat state yonga replays turn by turn. The artifact is a
@@ -53,3 +53,51 @@ def test_a_vlm_answers_a_follow_up_from_its_history(tmp_path: Path) -> None:
 
     assert first.output_tokens is not None and first.output_tokens > 0
     assert "deniz" in second.text.lower(), second.text
+
+
+def test_serve_passes_an_image_to_the_vlm(tmp_path: Path) -> None:
+    """A solid red PNG as a data URL, through the HTTP layer, reaches the pipeline."""
+    require_device("GPU")
+    pytest.importorskip("fastapi")
+    pytest.importorskip("PIL")
+    import base64
+    import io
+
+    from fastapi.testclient import TestClient
+    from PIL import Image
+
+    from yonga.api.app import create_app
+    from yonga.application.chat import ChatOptions
+    from yonga.application.serve import ModelServer
+    from yonga.application.wiring import Wiring
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (64, 64), (255, 0, 0)).save(buffer, format="PNG")
+    url = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+    service = Wiring(isolated_settings(tmp_path)).chat_service()
+    session = service.open_artifact(_vlm_artifact(), options=ChatOptions(device="gpu"))
+    server = ModelServer(session, name="vlm")
+    server.load()
+    try:
+        response = TestClient(create_app(server)).post(
+            "/v1/chat/completions",
+            json={
+                "model": "vlm",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": url}},
+                            {"type": "text", "text": "What colour is this image? One word."},
+                        ],
+                    }
+                ],
+                "max_tokens": 16,
+                "temperature": 0,
+            },
+        )
+    finally:
+        server.close()
+
+    assert response.status_code == 200, response.text
+    assert "red" in response.json()["choices"][0]["message"]["content"].lower()

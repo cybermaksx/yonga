@@ -3,25 +3,43 @@
 Unknown fields are ignored, the way OpenAI-compatible servers generally treat
 them, so a client that sends ``user`` or ``stream_options`` works unchanged.
 What is *not* ignored is a field whose value would change the answer in a way
-yonga cannot honour -- ``n`` above 1, tools, a JSON response format, image
-content, penalties. Those are refused with a 400 that names the parameter,
-because silently answering a different question than the client asked is worse
-than saying no.
+yonga cannot honour -- ``n`` above 1, tools, a JSON response format, penalties,
+content other than text and images. Those are refused with a 400 that names the
+parameter, because silently answering a different question than the client
+asked is worse than saying no.
 
 ``stop`` is honoured: a string or a list of at most
 :data:`~yonga.application.serve.MAX_STOP_SEQUENCES` non-empty strings of at most
 :data:`~yonga.application.serve.MAX_STOP_LENGTH` characters each. Anything else
 is a 400 naming ``stop``.
+
+``image_url`` content parts are honoured for a VLM artifact, as the server's
+:class:`~yonga.application.serve.ImagePolicy` allows: only inline ``data:`` URLs
+(see :mod:`yonga.api.images`, which never fetches anything), in user messages,
+at most :data:`~yonga.application.serve.MAX_IMAGES` per request, and only in the
+last message unless the server carries earlier images forward. Every refusal
+names the content part. ``image_url.detail`` is a resolution hint and is
+ignored: the image is used as sent.
 """
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from yonga.application.chat import ChatMessage
-from yonga.application.serve import MAX_STOP_LENGTH, MAX_STOP_SEQUENCES, CompletionRequest
+from yonga.api.images import ImageRefused, decode_data_url
+from yonga.application.chat import ChatImage, ChatMessage
+from yonga.application.serve import (
+    EARLIER_TURN_REASON,
+    IMAGES_EARLIER_TURN,
+    IMAGES_UNSUPPORTED,
+    MAX_STOP_LENGTH,
+    MAX_STOP_SEQUENCES,
+    TOO_MANY_IMAGES,
+    CompletionRequest,
+    ImagePolicy,
+)
 
 __all__ = [
     "MAX_MESSAGES",
@@ -42,9 +60,11 @@ class ParameterError(ValueError):
 
     code = "invalid_request"
 
-    def __init__(self, param: str, message: str) -> None:
+    def __init__(self, param: str, message: str, *, code: str | None = None) -> None:
         super().__init__(message)
         self.param = param
+        if code is not None:
+            self.code = code
 
 
 class UnsupportedParameter(ParameterError):
@@ -104,11 +124,27 @@ class ChatCompletionRequest(BaseModel):
         """Whether a streamed response should end with a usage chunk."""
         return self.stream_options is not None and self.stream_options.include_usage
 
-    def to_completion(self) -> CompletionRequest:
-        """Translate into yonga's request, refusing what cannot be honoured."""
+    @property
+    def has_images(self) -> bool:
+        """Whether any message carries an image part, so translating it decodes images."""
+        return any(
+            isinstance(message.content, list)
+            and any(part.get("type") == "image_url" for part in message.content)
+            for message in self.messages
+        )
+
+    def to_completion(self, images: ImagePolicy | None = None) -> CompletionRequest:
+        """Translate into yonga's request, refusing what cannot be honoured.
+
+        ``images`` is what the server accepts; without one, any image is
+        refused. Accepted images are decoded here, which takes CPU time, so a
+        caller on an event loop runs this on a worker thread when
+        :attr:`has_images` says so.
+        """
         self._refuse_unsupported()
+        parsed = [_parse(index, message) for index, message in enumerate(self.messages)]
         return CompletionRequest(
-            messages=[_message(index, message) for index, message in enumerate(self.messages)],
+            messages=_with_images(parsed, images),
             max_tokens=self.max_completion_tokens
             if self.max_completion_tokens is not None
             else self.max_tokens,
@@ -166,28 +202,106 @@ _ROLES: dict[str, Literal["system", "user", "assistant"]] = {
 }
 
 
-def _message(index: int, message: WireMessage) -> ChatMessage:
+class _ImagePart(NamedTuple):
+    """An image content part, located for error messages but not yet decoded."""
+
+    param: str
+    """``messages[i].content[j]``."""
+    url: str
+
+
+class _Parsed(NamedTuple):
+    role: Literal["system", "user", "assistant"]
+    text: str
+    images: list[_ImagePart]
+
+
+def _parse(index: int, message: WireMessage) -> _Parsed:
     role = _ROLES.get(message.role)
     if role is None:
         raise UnsupportedParameter(
             f"messages[{index}].role",
             f"Role {message.role!r} is not supported; use system, user or assistant.",
         )
-    return ChatMessage(role=role, content=_text(index, message.content))
-
-
-def _text(index: int, content: str | list[dict[str, Any]] | None) -> str:
+    content = message.content
     if content is None:
-        return ""
+        return _Parsed(role, "", [])
     if isinstance(content, str):
-        return content
-    parts: list[str] = []
-    for part in content:
+        return _Parsed(role, content, [])
+    texts: list[str] = []
+    images: list[_ImagePart] = []
+    for position, part in enumerate(content):
         kind = part.get("type")
-        if kind != "text":
+        if kind == "text":
+            texts.append(str(part.get("text", "")))
+            continue
+        if kind != "image_url":
             raise UnsupportedParameter(
                 f"messages[{index}].content",
-                f"Content of type {kind!r} is not supported; only text is.",
+                f"Content of type {kind!r} is not supported; only text and image_url are.",
             )
-        parts.append(str(part.get("text", "")))
-    return "".join(parts)
+        param = f"messages[{index}].content[{position}]"
+        if role != "user":
+            raise UnsupportedParameter(param, "Images are accepted in user messages only.")
+        image_url = part.get("image_url")
+        url = image_url.get("url") if isinstance(image_url, dict) else None
+        if not isinstance(url, str):
+            raise InvalidParameter(
+                f"{param}.image_url.url", "An image_url part needs image_url.url, a data: URL."
+            )
+        images.append(_ImagePart(param, url))
+    return _Parsed(role, "".join(texts), images)
+
+
+def _with_images(parsed: list[_Parsed], policy: ImagePolicy | None) -> list[ChatMessage]:
+    """The messages, with their images checked against ``policy`` and then decoded.
+
+    Everything that can be refused without decoding is refused first, so a
+    request that cannot be served costs no decoding at all.
+    """
+    located = [(index, part) for index, message in enumerate(parsed) for part in message.images]
+    if not located:
+        return [ChatMessage(role=message.role, content=message.text) for message in parsed]
+    accepted = _check_images(located, len(parsed) - 1, policy)
+    return [
+        ChatMessage(
+            role=message.role,
+            content=message.text,
+            images=[_decode(part, accepted) for part in message.images],
+        )
+        for message in parsed
+    ]
+
+
+def _check_images(
+    located: list[tuple[int, _ImagePart]], last: int, policy: ImagePolicy | None
+) -> ImagePolicy:
+    """Refuse what ``policy`` does not allow; return it when it allows these images."""
+    first = located[0][1].param
+    if policy is None or not policy.accepted:
+        raise UnsupportedParameter(
+            first,
+            "This model takes text only; images need a vision-language (VLM) artifact.",
+            code=IMAGES_UNSUPPORTED,
+        )
+    if len(located) > policy.max_images:
+        raise InvalidParameter(
+            "messages",
+            f"At most {policy.max_images} images are accepted in one request; "
+            f"this one has {len(located)}.",
+            code=TOO_MANY_IMAGES,
+        )
+    earlier = next((part for index, part in located if index != last), None)
+    if earlier is not None and not policy.carry_forward:
+        raise UnsupportedParameter(earlier.param, EARLIER_TURN_REASON, code=IMAGES_EARLIER_TURN)
+    return policy
+
+
+def _decode(part: _ImagePart, policy: ImagePolicy) -> ChatImage:
+    param = f"{part.param}.image_url.url"
+    try:
+        return decode_data_url(part.url, max_pixels=policy.max_pixels)
+    except ImageRefused as refusal:
+        if refusal.unsupported:
+            raise UnsupportedParameter(param, str(refusal)) from None
+        raise InvalidParameter(param, str(refusal)) from None

@@ -16,6 +16,15 @@ decision testable without a server.
 One pipeline serves every request, so generation is serialised: a second
 request waits for the first rather than sharing a pipeline that is not safe to
 share. That is the honest capacity of one local accelerator.
+
+Images reach a VLM artifact only, and only with the newest user message:
+OpenVINO GenAI 2026.4 binds images to the last user turn of a stateless
+conversation and cannot place one where an earlier turn put it. An image in an
+earlier message is therefore refused, unless the server was started to carry
+earlier images forward, which moves them onto the newest user message with a
+short note saying so (see :func:`carry_images_forward`). That trades accuracy
+about *when* an image was shown for compatibility with clients that resend
+every image of the conversation on each follow-up.
 """
 
 from __future__ import annotations
@@ -23,6 +32,7 @@ from __future__ import annotations
 import threading
 import time
 import uuid
+from collections.abc import Sequence
 from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -41,13 +51,22 @@ from yonga.application.chat import (
 )
 from yonga.domain.benchmarks import GenerationSettings
 from yonga.domain.diagnostics import ConfigurationError, FailureCategory, diagnostic
+from yonga.domain.models import PipelineKind
 
 __all__ = [
+    "EARLIER_TURN_REASON",
+    "IMAGES_EARLIER_TURN",
+    "IMAGES_UNSUPPORTED",
+    "MAX_IMAGES",
+    "MAX_IMAGE_PIXELS",
     "MAX_STOP_LENGTH",
     "MAX_STOP_SEQUENCES",
+    "TOO_MANY_IMAGES",
     "CompletionRequest",
+    "ImagePolicy",
     "ModelServer",
     "ServedModel",
+    "carry_images_forward",
 ]
 
 #: Most stop sequences one request may carry, as OpenAI allows.
@@ -56,6 +75,26 @@ MAX_STOP_SEQUENCES = 4
 #: the tail that may still complete a match, at most one character less than
 #: this, plus the whitespace in front of that tail.
 MAX_STOP_LENGTH = 256
+
+#: Most images one request may carry, across all of its messages.
+MAX_IMAGES = 4
+#: Most pixels one image may have: 4096 x 4096. A larger image is refused, not
+#: scaled down, so the model never sees something other than what was sent.
+MAX_IMAGE_PIXELS = 4096 * 4096
+
+#: Diagnostic codes of the image refusals, shared with the wire layer so a
+#: request gets the same code whichever layer catches it.
+IMAGES_UNSUPPORTED = "serve.request.images_unsupported"
+IMAGES_EARLIER_TURN = "serve.request.images_earlier_turn"
+TOO_MANY_IMAGES = "serve.request.too_many_images"
+
+#: The why of :data:`IMAGES_EARLIER_TURN`, for both layers' messages.
+EARLIER_TURN_REASON = (
+    "Images are accepted only in the last message, which must be the user's: OpenVINO "
+    "GenAI binds images to the newest user turn of a conversation and cannot place one "
+    "in an earlier turn. Send the image with the question about it, or start the server "
+    "with --carry-images-forward to move earlier images onto the last message."
+)
 
 
 class ServedModel(BaseModel):
@@ -76,6 +115,19 @@ class ServedModel(BaseModel):
     def answers_to(self, name: str) -> bool:
         """Whether a request naming ``name`` is asking for this model."""
         return name == self.id or name in self.aliases
+
+
+class ImagePolicy(BaseModel):
+    """What a server accepts as image input; the wire layer checks a request against it."""
+
+    model_config = ConfigDict(frozen=True)
+
+    accepted: bool
+    """Whether the served artifact takes images at all: only a VLM does."""
+    carry_forward: bool = False
+    """Move images of earlier messages onto the newest one instead of refusing them."""
+    max_images: int = MAX_IMAGES
+    max_pixels: int = MAX_IMAGE_PIXELS
 
 
 class CompletionRequest(BaseModel):
@@ -103,9 +155,20 @@ def _invalid(code: str, detail: str) -> ConfigurationError:
 class ModelServer:
     """Answers completion requests with one loaded chat session."""
 
-    def __init__(self, session: ChatSession, *, name: str) -> None:
-        """Serve ``session`` under ``name``. Nothing is loaded until :meth:`load`."""
+    def __init__(
+        self, session: ChatSession, *, name: str, carry_images_forward: bool = False
+    ) -> None:
+        """Serve ``session`` under ``name``. Nothing is loaded until :meth:`load`.
+
+        ``carry_images_forward`` moves images sent with earlier messages onto
+        the newest user message instead of refusing the request (see the
+        module docstring for the trade-off).
+        """
         self._session = session
+        self._image_policy = ImagePolicy(
+            accepted=session.pipeline is PipelineKind.VLM,
+            carry_forward=carry_images_forward,
+        )
         self._lock = threading.Lock()
         manifest = session.manifest
         aliases = {name}
@@ -133,6 +196,11 @@ class ModelServer:
     def model(self) -> ServedModel:
         """The model this server answers for."""
         return self._model
+
+    @property
+    def image_policy(self) -> ImagePolicy:
+        """Which images this server accepts."""
+        return self._image_policy
 
     @property
     def loaded(self) -> bool:
@@ -213,9 +281,57 @@ class ModelServer:
         runtime failure comes back as a turn carrying its diagnostic.
         """
         settings = self.generation_for(request)
-        history = ChatHistory(messages=list(request.messages))
+        history = ChatHistory(messages=self._conversation(request))
         with self._lock:
             return self._session.respond(history, settings, on_text=on_text, stop=request.stop)
+
+    def _conversation(self, request: CompletionRequest) -> list[ChatMessage]:
+        """The request's messages, its images checked against the policy.
+
+        The wire layer has already refused what is checked here, naming the
+        parameter; this holds the same line for any other caller.
+        """
+        messages = list(request.messages)
+        count = sum(len(message.images) for message in messages)
+        if not count:
+            return messages
+        policy = self._image_policy
+        if not policy.accepted:
+            raise _invalid(IMAGES_UNSUPPORTED, "This model takes text only; it is not a VLM.")
+        if count > policy.max_images:
+            raise _invalid(TOO_MANY_IMAGES, f"At most {policy.max_images} images are accepted.")
+        earlier = any(message.images for message in messages[:-1])
+        if earlier and not policy.carry_forward:
+            raise _invalid(IMAGES_EARLIER_TURN, EARLIER_TURN_REASON)
+        if messages[-1].role != "user":
+            raise _invalid(IMAGES_EARLIER_TURN, EARLIER_TURN_REASON)
+        return carry_images_forward(messages) if earlier else messages
+
+
+def carry_images_forward(messages: Sequence[ChatMessage]) -> list[ChatMessage]:
+    """Move every image onto the last message, which must be the user's, with a note.
+
+    The images keep their order, earlier ones first, and the last message's
+    text gains a line saying which of them came with earlier messages, so the
+    model is not told they were all sent just now. The earlier messages keep
+    their text. Messages without images are returned as they are.
+    """
+    earlier = [image for message in messages[:-1] for image in message.images]
+    if not earlier:
+        return list(messages)
+    last = messages[-1]
+    note = (
+        "[Image 1 was attached to an earlier message in this conversation.]"
+        if len(earlier) == 1
+        else f"[Images 1-{len(earlier)} were attached to earlier messages in this conversation.]"
+    )
+    content = f"{note}\n{last.content}" if last.content else note
+    moved = [
+        message.model_copy(update={"images": []}) if message.images else message
+        for message in messages[:-1]
+    ]
+    moved.append(last.model_copy(update={"images": [*earlier, *last.images], "content": content}))
+    return moved
 
 
 def completion_id() -> str:

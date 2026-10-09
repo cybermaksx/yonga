@@ -15,7 +15,9 @@ echoed back.
 Request size is bounded so one request cannot exhaust memory before it is even
 validated. A body larger than ``max_body_bytes`` (by default
 :data:`DEFAULT_MAX_BODY_BYTES`, far more than any model's context holds as
-text) is refused with ``413`` and the error code ``request_too_large``. The
+text, and what ``serve --max-body-mb`` sets) is refused with ``413`` and the
+error code ``request_too_large``. That limit is also what bounds the encoded
+size of the images a request embeds. The
 limit is enforced on the bytes actually received, not only on the declared
 ``Content-Length``, so a chunked upload is held to it too. The number of
 messages in one request is bounded separately (see
@@ -55,7 +57,9 @@ from yonga.domain.diagnostics import Diagnostic, FailureCategory, YongaError
 __all__ = ["DEFAULT_MAX_BODY_BYTES", "create_app"]
 
 #: Largest request body accepted by default: 8 MiB. A chat history long enough
-#: to fill a large context window is a small fraction of this as JSON text.
+#: to fill a large context window is a small fraction of this as JSON text; an
+#: image embedded as base64 takes a third more than its file, so this leaves
+#: room for about 6 MB of images.
 DEFAULT_MAX_BODY_BYTES = 8 * 1024 * 1024
 
 #: Categories that describe the request rather than the server.
@@ -134,7 +138,11 @@ def create_app(
         if not server.model.answers_to(body.model):
             return _model_not_found(body.model)
         try:
-            completion = body.to_completion()
+            if body.has_images:
+                # Decoding images takes CPU time; it must not hold up the event loop.
+                completion = await asyncio.to_thread(body.to_completion, server.image_policy)
+            else:
+                completion = body.to_completion(server.image_policy)
             limit = server.generation_for(completion).max_new_tokens
         except ParameterError as error:
             return _error(400, str(error), error.code, param=error.param)

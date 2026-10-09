@@ -46,6 +46,7 @@ from yonga.adapters.runtime_genai import (
     DEFAULT_REASONING_WRAPPERS,
     DEFAULT_THINKING_VARIABLES,
     ChatHistory,
+    ChatImage,
     ChatMessage,
     ChatProfile,
     ChatProfileLike,
@@ -85,6 +86,7 @@ __all__ = [
     "ChatAction",
     "ChatCommandName",
     "ChatHistory",
+    "ChatImage",
     "ChatMessage",
     "ChatOptions",
     "ChatProfile",
@@ -1410,7 +1412,7 @@ class ChatSession:
         can stream is streamed even without ``on_text`` then, so generation
         ends at the match instead of running on to its token limit.
         """
-        if not any(m.role == "user" and m.content.strip() for m in history.messages):
+        if not any(m.role == "user" and (m.content.strip() or m.images) for m in history.messages):
             return ChatTurn(diagnostic=_empty_prompt_diagnostic())
         streaming = StreamingSanitizer(
             self._profile.reasoning_wrappers,

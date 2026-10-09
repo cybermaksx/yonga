@@ -12,7 +12,7 @@ The tool is **NPU-first, not NPU-only**. If a model cannot compile on the NPU, `
 
 `yonga` prepares, validates, runs and benchmarks OpenVINO artifacts on one machine, and it is honest about the parts that do not exist yet:
 
-- **`serve` is deliberately small.** It serves one artifact, text only, one request at a time, and refuses what it cannot honour (`n` > 1, tools, JSON response formats, images) with a 400 rather than ignoring it. Stop sequences are honoured, matched on the visible answer so a hidden reasoning block cannot trigger one.
+- **`serve` is deliberately small.** It serves one artifact, one request at a time, and refuses what it cannot honour (`n` > 1, tools, JSON response formats) with a 400 rather than ignoring it. Stop sequences are honoured, matched on the visible answer so a hidden reasoning block cannot trigger one. A VLM artifact takes images, but only embedded as `data:` URLs (yonga never fetches a URL) and only with the last user message, a limit of OpenVINO GenAI's stateless chat history.
 - **Windows is not supported yet.** The architecture keeps the door open, but every device, driver and path probe is written and tested against Linux only.
 - The registry ships knowledge for a small number of architectures. Everything else resolves through generic rules, which is why `inspect` says `inferred` rather than `official` for most models.
 
@@ -124,7 +124,7 @@ The extras are separate because they cost very different amounts of disk:
 
 - **`openvino`** — `openvino`, `openvino-genai`, `openvino-tokenizers`. Needed by `probe`, `chat`, `bench` and by the device section of `doctor`.
 - **`export`** — `optimum-intel[openvino]`, `nncf` (which pull in `transformers` and `torch`). Used by `prepare` to convert and quantize a model. Without it, `prepare` converts in a managed export environment instead, built on first use with the toolchain yonga is tested with.
-- **`serve`** — FastAPI and uvicorn. Needed by `serve` only.
+- **`serve`** — FastAPI, uvicorn and Pillow (which decodes images sent to a VLM). Needed by `serve` only.
 - **`dev`** — pytest, pytest-cov, pytest-mock, pytest-timeout, ruff, mypy, build, twine. For working on `yonga` itself, not for running it.
 
 Without the extras `yonga` still runs: `doctor`, `inspect`, `list`, `logs` and `registry` work, and `doctor` exits 10 and tells you which package is missing and which extra installs it. `yonga` never installs, upgrades or removes a package in the environment you installed it into; it prints the command for you to run. (When a model's exporter needs different package versions, `prepare` builds an isolated environment for that export instead — see [`docs/INSTALL.md`](https://github.com/ooguz/yonga/blob/main/docs/INSTALL.md#6-the-transformers-version-caveat) section 6.)

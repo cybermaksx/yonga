@@ -50,7 +50,7 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any, Literal, Protocol, runtime_checkable
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from yonga.adapters.native_output import (
     NativeOutput,
@@ -81,6 +81,7 @@ __all__ = [
     "DEFAULT_REASONING_WRAPPERS",
     "DEFAULT_THINKING_VARIABLES",
     "ChatHistory",
+    "ChatImage",
     "ChatMessage",
     "ChatProfile",
     "ChatProfileLike",
@@ -126,13 +127,42 @@ Role = Literal["system", "user", "assistant"]
 # --- conversation types ---------------------------------------------------------------
 
 
+class ChatImage(BaseModel):
+    """One decoded image: 8-bit RGB pixels, row by row, three bytes per pixel.
+
+    Already decoded on purpose, so this type needs neither Pillow nor numpy and
+    the conversation types stay free of both; the adapter turns it into an
+    ``openvino.Tensor`` immediately before generation. The pixels are kept out
+    of ``repr`` so that a traceback or a log line can never carry an image.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    width: int = Field(gt=0)
+    height: int = Field(gt=0)
+    pixels: bytes = Field(repr=False)
+
+    @model_validator(mode="after")
+    def _pixels_fill_the_frame(self) -> ChatImage:
+        if len(self.pixels) != self.width * self.height * 3:
+            message = f"{len(self.pixels)} bytes cannot be a {self.width}x{self.height} RGB image."
+            raise ValueError(message)
+        return self
+
+
 class ChatMessage(BaseModel):
-    """One turn in a conversation."""
+    """One turn in a conversation.
+
+    ``images`` only ever travels to a VLM pipeline, and only on the newest user
+    turn (see :meth:`GenAIChatRuntime._generate_vlm`). It is excluded from
+    serialisation, so no image is ever written wherever a conversation is.
+    """
 
     model_config = _LENIENT
 
     role: Role
     content: str
+    images: list[ChatImage] = Field(default_factory=list, exclude=True)
 
     def as_payload(self) -> dict[str, str]:
         """Return the ``{"role": ..., "content": ...}`` mapping GenAI expects."""
@@ -765,6 +795,38 @@ def _user_turn_text(messages: Sequence[ChatMessage]) -> str:
     )
 
 
+def _has_user_input(messages: Sequence[ChatMessage]) -> bool:
+    """Whether ``messages`` holds a user turn with something to answer: text or an image."""
+    return any(
+        message.role == "user" and (message.content.strip() or message.images)
+        for message in messages
+    )
+
+
+#: The tags OpenVINO GenAI reads, anywhere in a VLM prompt, as "image N" or
+#: "video N goes here". They are removed from the conversation's text, so words
+#: a client typed can never claim an image that was not attached (GenAI then
+#: fails with "Missing image/video with index N") or move one that was.
+_MEDIA_TAG = re.compile(r"<ov_genai_(?:image|video)_\d+>")
+
+
+def _without_media_tags(text: str) -> str:
+    return _MEDIA_TAG.sub("", text)
+
+
+def _image_tensor(image: ChatImage) -> Any:
+    """``image`` as the ``openvino.Tensor`` a VLM pipeline takes: uint8, height x width x 3.
+
+    Imported here rather than at module level, like ``openvino_genai``, so the
+    module loads without the OpenVINO extra. The tensor copies the pixels.
+    """
+    import numpy as np
+    import openvino as ov
+
+    array = np.frombuffer(image.pixels, dtype=np.uint8).reshape(image.height, image.width, 3)
+    return ov.Tensor(array)
+
+
 def _leading_system(messages: Sequence[ChatMessage]) -> list[ChatMessage]:
     """Return the run of system turns at the head of ``messages``.
 
@@ -1110,9 +1172,43 @@ class GenAIChatRuntime:
         self, history: ChatHistory, generation_config: Any, streamer: Any = None
     ) -> Any:
         """Dispatch to the LLM or VLM generation path."""
+        images = self._turn_images(history)
         if self._pipeline_kind is PipelineKind.VLM:
-            return self._generate_vlm(history, generation_config, streamer)
+            return self._generate_vlm(history, generation_config, streamer, images)
         return self._generate_llm(history, generation_config, streamer)
+
+    def _turn_images(self, history: ChatHistory) -> list[ChatImage]:
+        """The images this turn hands the pipeline: those of the newest user turn.
+
+        OpenVINO GenAI 2026.4 binds images only to the last user message of a
+        stateless history; an image tag in an earlier turn fails with "Missing
+        image/video with index 0". So an image anywhere else is refused here
+        rather than silently moved, and so is any image on an LLM pipeline. The
+        serve layer refuses both before they get this far, naming the parameter.
+        """
+        messages = history.messages
+        if not any(message.images for message in messages):
+            return []
+        if self._pipeline_kind is not PipelineKind.VLM:
+            raise GenerationError(
+                diagnostic(
+                    "runtime.genai.images_unsupported",
+                    FailureCategory.CONFIGURATION_ERROR,
+                    "This model takes text only",
+                    "Images need a vision-language (VLM) artifact.",
+                )
+            )
+        last = messages[-1]
+        if last.role != "user" or any(message.images for message in messages[:-1]):
+            raise GenerationError(
+                diagnostic(
+                    "runtime.genai.images_not_last_turn",
+                    FailureCategory.CONFIGURATION_ERROR,
+                    "Images can only go with the newest user message",
+                    "OpenVINO GenAI binds images to the last user turn of a conversation only.",
+                )
+            )
+        return list(last.images)
 
     def _generate_llm(self, history: ChatHistory, generation_config: Any, streamer: Any) -> Any:
         """Generate with an ``LLMPipeline`` using a GenAI ``ChatHistory``.
@@ -1128,8 +1224,12 @@ class GenAIChatRuntime:
     def _genai_history(self, history: ChatHistory) -> Any:
         """Our history as an ``openvino_genai.ChatHistory``, with the template variables."""
         genai_history = self._genai.ChatHistory()
+        vlm = self._pipeline_kind is PipelineKind.VLM
         for message in history.messages:
-            genai_history.append(message.as_payload())
+            payload = message.as_payload()
+            if vlm:
+                payload["content"] = _without_media_tags(payload["content"])
+            genai_history.append(payload)
         extra = thinking_extra_context(
             self._chat_profile, thinking=self._thinking, template=self._chat_template
         )
@@ -1142,7 +1242,13 @@ class GenAIChatRuntime:
                 self._extra_context_error = redact_text(f"{type(exc).__name__}: {exc}")
         return genai_history
 
-    def _generate_vlm(self, history: ChatHistory, generation_config: Any, streamer: Any) -> Any:
+    def _generate_vlm(
+        self,
+        history: ChatHistory,
+        generation_config: Any,
+        streamer: Any,
+        images: Sequence[ChatImage] = (),
+    ) -> Any:
         """Generate with a ``VLMPipeline``, statelessly where the build allows it.
 
         OpenVINO GenAI 2026.4 accepts a ``ChatHistory`` here, exactly as the LLM
@@ -1151,8 +1257,15 @@ class GenAIChatRuntime:
         generating anything; from then on the deprecated chat lifecycle is driven
         instead, entirely inside the adapter, handing the pipeline only the turns
         it has not seen.
+
+        ``images`` belong to the newest user turn and go to the pipeline as
+        ``images=``, without tags in the text: GenAI then places them ahead of
+        that turn's words, in order. A call without images passes no
+        ``images`` argument at all, so it is exactly what it was before images.
         """
         extra = _streamer_kwargs(streamer)
+        if images:
+            extra["images"] = [_image_tensor(image) for image in images]
         if self._vlm_accepts_history is not False:
             try:
                 result = self._pipeline.generate(
@@ -1192,12 +1305,10 @@ class GenAIChatRuntime:
         if not self._continues_conversation(messages):
             self._restart_vlm_chat(messages)
         pending = messages[len(self._sent) :]
-        prompt = _user_turn_text(pending)
-        if not prompt and _user_turn_text(messages):
+        if not _has_user_input(pending) and _has_user_input(messages):
             self._restart_vlm_chat(messages)
             pending = messages[len(self._sent) :]
-            prompt = _user_turn_text(pending)
-        if not prompt:
+        if not _has_user_input(pending):
             raise GenerationError(
                 diagnostic(
                     "runtime.generation.empty_prompt",
@@ -1207,7 +1318,7 @@ class GenAIChatRuntime:
                 )
             )
         self._sent = messages
-        return prompt
+        return _without_media_tags(_user_turn_text(pending))
 
     def _continues_conversation(self, messages: Sequence[ChatMessage]) -> bool:
         """Whether ``messages`` continues the conversation the pipeline is holding.

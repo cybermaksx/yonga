@@ -1194,6 +1194,12 @@ def _session_info(session: ChatSession) -> ChatSessionInfo:
 #: line is visible to every user of the machine through the process list.
 API_KEY_ENV = "YONGA_API_KEY"
 
+#: ``serve --max-body-mb``: the default, and the most it may be set to. The
+#: default matches the API's own; the ceiling keeps one request from holding
+#: more memory than a desktop can spare while it is read and decoded.
+DEFAULT_MAX_BODY_MB = 8
+MAX_BODY_MB_CEILING = 64
+
 
 @app.command()
 def serve(
@@ -1210,6 +1216,18 @@ def serve(
     show_reasoning: bool = typer.Option(
         False, "--show-reasoning", help="Return reasoning blocks instead of hiding them."
     ),
+    max_body_mb: int = typer.Option(
+        DEFAULT_MAX_BODY_MB,
+        "--max-body-mb",
+        min=1,
+        max=MAX_BODY_MB_CEILING,
+        help="Largest request body in MiB; embedded images count towards it.",
+    ),
+    carry_images_forward: bool = typer.Option(
+        False,
+        "--carry-images-forward",
+        help="Move images sent with earlier messages onto the last one instead of refusing them.",
+    ),
     json_output: bool = typer.Option(
         False, "--json", help="Not supported: a server is not one document."
     ),
@@ -1222,11 +1240,31 @@ def serve(
         show_reasoning=True if show_reasoning else None,
         display_name=artifact,
     )
-    _dispatch(state, lambda: _serve(state, artifact, options=options, host=host, port=port))
+    limits = _ServeLimits(
+        max_body_bytes=max_body_mb * 1024 * 1024, carry_images_forward=carry_images_forward
+    )
+    _dispatch(
+        state,
+        lambda: _serve(state, artifact, options=options, host=host, port=port, limits=limits),
+    )
+
+
+@dataclass(frozen=True)
+class _ServeLimits:
+    """What ``serve`` accepts in a request, beyond what the model decides."""
+
+    max_body_bytes: int = DEFAULT_MAX_BODY_MB * 1024 * 1024
+    carry_images_forward: bool = False
 
 
 def _serve(
-    state: CliState, artifact: str, *, options: ChatOptions, host: str, port: int
+    state: CliState,
+    artifact: str,
+    *,
+    options: ChatOptions,
+    host: str,
+    port: int,
+    limits: _ServeLimits | None = None,
 ) -> ExitCode:
     """Load the model once, then answer requests until interrupted."""
     if state.json_mode:
@@ -1252,7 +1290,12 @@ def _serve(
     service: ChatService = state.graph.chat_service(progress=state.sink())
     from yonga.application.serve import ModelServer
 
-    server = ModelServer(service.open_session(artifact, options=options), name=artifact)
+    limits = limits if limits is not None else _ServeLimits()
+    server = ModelServer(
+        service.open_session(artifact, options=options),
+        name=artifact,
+        carry_images_forward=limits.carry_images_forward,
+    )
     try:
         server.load()
         url = f"http://{_url_host(host)}:{port}/v1"
@@ -1260,8 +1303,13 @@ def _serve(
             f"Serving [bold]{server.model.id}[/] on {server.model.device} at [cyan]{url}[/]"
             + ("  (API key required)" if api_key else "")
         )
+        if server.image_policy.accepted and not _pillow_available():
+            console.print_error(
+                "[yellow]warning:[/] Pillow is not installed, so requests with images will "
+                "fail; text works. pip install 'yonga\\[serve]' to accept images."
+            )
         console.print("[dim]Press Ctrl+C to stop.[/]")
-        app_instance = create_app(server, api_key=api_key)
+        app_instance = create_app(server, api_key=api_key, max_body_bytes=limits.max_body_bytes)
         _run_http(app_instance, host=host, port=port, verbose=state.settings.verbose)
     finally:
         server.close()
@@ -1469,6 +1517,12 @@ def _serve_dependencies() -> Callable[..., object]:
             )
         ) from error
     return create_app
+
+
+def _pillow_available() -> bool:
+    from yonga.api.images import pillow_available
+
+    return pillow_available()
 
 
 def _run_http(app_instance: object, *, host: str, port: int, verbose: bool) -> None:

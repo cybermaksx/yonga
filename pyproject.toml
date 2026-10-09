@@ -69,6 +69,9 @@ serve = [
     # such a body without a CORS preflight.
     "fastapi>=0.132",
     "uvicorn>=0.30",
+    # Decodes the data-URL images a VLM artifact is sent. 10.3 is the first
+    # release without the known decoder overflows (libwebp, _imagingcms).
+    "pillow>=10.3",
 ]
 dev = [
     "pytest>=8.0",

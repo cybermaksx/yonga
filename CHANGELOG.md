@@ -19,6 +19,20 @@ manifest may change in any minor release.
   front of it. A request with stop sequences is
   streamed internally even when the client did not ask for a stream, so generation ends at the
   match. `docs/CLI_SPEC.md` section 14.
+- **`serve` takes images on a VLM artifact.** OpenAI `image_url` content parts holding a
+  `data:image/(png|jpeg|webp|gif);base64,` URL. Every other URL (`http`, `https`, `file`, ...) is
+  refused with a 400 naming the content part, permanently: yonga never fetches an image. At most 4
+  images per request, each at most 4096 x 4096 pixels, checked from the image header before
+  decoding and refused rather than scaled down. Images go with the last user message only, because
+  OpenVINO GenAI 2026.4 binds images to the newest turn of a stateless conversation; an image in an
+  earlier message is a 400 `serve.request.images_earlier_turn` saying so. An LLM artifact refuses
+  images with `serve.request.images_unsupported`. Decoding runs off the event loop.
+  `docs/CLI_SPEC.md` section 14.
+- **`serve --carry-images-forward`** moves images of earlier messages onto the last user message,
+  with a line telling the model they came earlier, for clients that resend every image of a
+  conversation. The model then no longer knows which words each image went with.
+- **`serve --max-body-mb N`** sets the request body limit, 1 to 64 MiB (8 by default), since
+  embedded images count towards it.
 - **`yonga probe --quick` and `--timeout SECONDS`.** Settling a deferred NPU compile means building
   the GenAI pipeline, which for a 9B model ran past 15 minutes. `--quick` never builds it;
   `--timeout` builds it in a child process (`python -P -m yonga.adapters.smoke_child`) and stops it
@@ -38,6 +52,13 @@ manifest may change in any minor release.
   fingerprint includes stop strings only when there are some, so every recorded fingerprint still
   matches. No built-in rule declares any, so nothing shipped behaves differently.
   `docs/REGISTRY_SPEC.md` section 8b.
+- **The `serve` extra installs Pillow**, which decodes images. It is imported only when an image
+  arrives: without it text is served as before, `serve` warns at startup for a VLM artifact, and an
+  image request is a 500 `serve.images.dependency_missing` naming `pip install 'yonga[serve]'`.
+  The AppImage, which bundles the extra, grows by Pillow's size.
+- **`<ov_genai_image_N>` and `<ov_genai_video_N>` are removed from text sent to a VLM artifact**,
+  in `chat` as in `serve`. GenAI reads them anywhere as "image N goes here", so typed text could
+  claim an image that was not attached and fail generation.
 
 ### Fixed
 

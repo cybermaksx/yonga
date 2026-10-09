@@ -34,3 +34,10 @@ user's decision to trust it.
 `yonga serve` binds `127.0.0.1` and needs no key there by default. Exposing it on another
 address without setting `YONGA_API_KEY` is a configuration choice that yonga warns about, not a
 vulnerability.
+
+`yonga serve` never fetches anything a request names. Images are accepted only embedded in the
+request as `data:image/(png|jpeg|webp|gif);base64,` URLs, and every other URL is refused, so a
+client cannot make the server connect to its own host or network. Images are decoded by Pillow,
+offered only those four decoders, with the pixel count checked from the header before any pixel is
+decoded. A way to make `serve` open a connection or a file, or to make a decoder other than those
+four read request bytes, is in scope; a vulnerability inside Pillow's own decoders is Pillow's.

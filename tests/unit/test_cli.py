@@ -1927,6 +1927,92 @@ def test_serve_without_the_extra_names_the_install_command(
     assert "yonga[serve]" in result.stderr
 
 
+@pytest.fixture
+def created(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
+    """Capture what ``serve`` hands ``create_app``, without building or running a server."""
+    captured: dict[str, object] = {}
+
+    def create_app(server: object, **kwargs: object) -> object:
+        captured.update(kwargs, server=server)
+        return object()
+
+    monkeypatch.setattr(cli_module, "_serve_dependencies", lambda: create_app)
+    monkeypatch.setattr(cli_module, "_run_http", lambda *args, **kwargs: None)
+    monkeypatch.setattr(cli_module, "_require_port", lambda host, port: None)
+    return captured
+
+
+def test_serve_defaults_to_an_8_mib_body_and_refusing_earlier_images(
+    runner: CliRunner, home: Path, tmp_path: Path, created: dict[str, object]
+) -> None:
+    result = invoke(runner, home, ["serve", str(_staged_artifact(tmp_path))])
+
+    assert result.exit_code == int(ExitCode.SUCCESS), result.stderr
+    assert created["max_body_bytes"] == 8 * 1024 * 1024
+    server = created["server"]
+    assert server.image_policy.carry_forward is False  # type: ignore[attr-defined]
+
+
+def test_serve_takes_a_body_limit_and_carries_images_forward_when_asked(
+    runner: CliRunner, home: Path, tmp_path: Path, created: dict[str, object]
+) -> None:
+    result = invoke(
+        runner,
+        home,
+        ["serve", str(_staged_artifact(tmp_path)), "--max-body-mb", "64", "--carry-images-forward"],
+    )
+
+    assert result.exit_code == int(ExitCode.SUCCESS), result.stderr
+    assert created["max_body_bytes"] == 64 * 1024 * 1024
+    server = created["server"]
+    assert server.image_policy.carry_forward is True  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("value", ["0", "65"])
+def test_serve_refuses_a_body_limit_out_of_range(
+    runner: CliRunner, home: Path, tmp_path: Path, created: dict[str, object], value: str
+) -> None:
+    result = invoke(
+        runner, home, ["serve", str(_staged_artifact(tmp_path)), "--max-body-mb", value]
+    )
+
+    assert result.exit_code != int(ExitCode.SUCCESS)
+    assert created == {}
+
+
+def test_serve_warns_when_a_vlm_cannot_decode_images(
+    runner: CliRunner,
+    home: Path,
+    tmp_path: Path,
+    created: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from yonga.application.serve import ImagePolicy, ModelServer
+
+    monkeypatch.setattr(
+        ModelServer, "image_policy", property(lambda self: ImagePolicy(accepted=True))
+    )
+    monkeypatch.setattr(cli_module, "_pillow_available", lambda: False)
+    result = invoke(runner, home, ["serve", str(_staged_artifact(tmp_path))])
+
+    assert result.exit_code == int(ExitCode.SUCCESS), result.stderr
+    assert "Pillow is not installed" in " ".join(result.stderr.split())
+    assert "yonga[serve]" in result.stderr
+
+
+def test_serve_says_nothing_about_pillow_for_a_text_only_model(
+    runner: CliRunner,
+    home: Path,
+    tmp_path: Path,
+    created: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli_module, "_pillow_available", lambda: False)
+    result = invoke(runner, home, ["serve", str(_staged_artifact(tmp_path))])
+
+    assert "Pillow" not in result.stderr
+
+
 def test_serve_refuses_a_port_in_use_before_loading_anything(
     runner: CliRunner, home: Path, tmp_path: Path
 ) -> None:
