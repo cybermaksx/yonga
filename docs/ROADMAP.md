@@ -200,8 +200,11 @@ infrastructure, not code.
   - a repository's own modelling code was treated as required even for architectures Transformers
     implements natively (Phi-4-mini);
   - an HTTP 429 from the Hub was reported as a transient 5xx.
-  phi3 still cannot be exported: optimum 2.3.0 and optimum-intel 2.2.0 fail inside optimum
-  (`export.optimum.normalized_config`). mistral remains covered only by the generic rule.
+  phi3 and mistral cannot be exported on Python 3.14: optimum 2.3.0, the release optimum-intel
+  2.2.0 requires, binds `NormalizedConfig.with_args` through a `functools.partial`, which Python
+  3.14 turned into a method descriptor (`export.optimum.normalized_config`). optimum fixed it in
+  pull request 2496, which no release carries yet; Python 3.11-3.13 are not affected. mistral
+  remains covered only by the generic rule.
 - **A GUI or web frontend. [L]** Application services already emit structured `ProgressEvent`s and
   never import Rich, so a second frontend does not require touching the core.
 

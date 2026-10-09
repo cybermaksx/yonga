@@ -526,7 +526,11 @@ issues:
     schema_version: 1
     status: active
     priority: 60
-    summary: optimum's export configuration code fails for this architecture
+    summary: optimum cannot build this architecture's export config on Python 3.14
+    # The error only exists on Python 3.14, where functools.partial became a
+    # method descriptor; on 3.11-3.13 the same optimum works.
+    constraints:
+      python: ">=3.14"
     match:
       case_sensitive: true
       exception_contains:
@@ -537,21 +541,28 @@ issues:
       environment_broken: false
       retry_same_device: false
     recommendation:
-      title: The installed optimum cannot build this architecture's export config
+      title: optimum cannot build this architecture's export config on Python 3.14
       message: >-
         optimum failed while constructing the export configuration, before any
-        conversion started. This is a defect in the installed optimum /
-        optimum-intel pair for this architecture, not in yonga, the model or
-        the device. Observed for phi3 (Phi-4-mini) with optimum 2.3.0 and
-        optimum-intel 2.2.0.
+        conversion started. On Python 3.14 functools.partial became a method
+        descriptor, and optimum 2.3.0 and earlier bind NormalizedConfig.with_args
+        through one, so every architecture whose export config uses it fails
+        (among them mistral, mixtral, phi3, phimoe, gpt2 and bloom). The defect
+        is in optimum, not in yonga, the model or the device; optimum fixed it
+        in pull request 2496, which no release carries yet.
       remediation:
-        - Check for a newer optimum-intel release, then run the same prepare again.
+        - Run yonga from Python 3.11, 3.12 or 3.13, where the same optimum exports this architecture.
+        - Or upgrade optimum once a release includes huggingface/optimum#2496 (optimum-intel must accept that release too).
         - Or pick a model of another architecture; 'yonga search QUERY' shows which ones the registry has verified.
     sources:
       - kind: tested
         note: >-
           microsoft/Phi-4-mini-instruct, optimum 2.3.0, optimum-intel 2.2.0,
-          Transformers 5.5.4, on the reference host.
+          Transformers 5.5.4, Python 3.14.4, on the reference host. Building
+          the export config for mistral and phi3 fails the same way there, and
+          for llama it succeeds (2026-10-09).
+      - kind: community
+        url: https://github.com/huggingface/optimum/pull/2496
 
   - id: exporter-transformers-symbol-mismatch
     schema_version: 1

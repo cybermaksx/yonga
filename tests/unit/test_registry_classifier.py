@@ -732,3 +732,23 @@ def test_npu_profiles_carry_the_static_shape_budget() -> None:
         assert runtime["MAX_PROMPT_LEN"] == "1024"
         assert runtime["MIN_RESPONSE_LEN"] == "128"
     assert "MAX_PROMPT_LEN" not in profiles["gpu-int4-asym-g128"].runtime_properties
+
+
+# --- an exporter defect that only exists on one Python ----------------------------------
+
+OPTIMUM_ALLOW_NEW_ERROR = (
+    "TypeError: NormalizedConfig.__init__() got multiple values for argument 'allow_new'"
+)
+
+
+def test_the_optimum_allow_new_failure_is_blamed_on_python_3_14_only() -> None:
+    """Verified on the reference host: mistral and phi3 configs fail on 3.14, not before."""
+    registry = load_builtin_registry()
+    on_314 = RegistryResolver(registry, versions={**HOST_VERSIONS, "python": "3.14.4"})
+    on_313 = RegistryResolver(registry, versions={**HOST_VERSIONS, "python": "3.13.5"})
+
+    diagnostic = on_314.classify(raw_error=OPTIMUM_ALLOW_NEW_ERROR)
+    assert diagnostic.code == "export.optimum.normalized_config"
+    assert "Python 3.14" in diagnostic.message
+    assert any("3.13" in step for step in diagnostic.remediation)
+    assert on_313.classify(raw_error=OPTIMUM_ALLOW_NEW_ERROR).code != diagnostic.code
