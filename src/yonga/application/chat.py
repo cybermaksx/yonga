@@ -779,6 +779,47 @@ class StopMatcher:
         return 0
 
 
+class _SplitStopMatcher:
+    """Match stop sequences in shown leading reasoning and in the answer apart.
+
+    :class:`LeadingReasoning` joins the two with a separator of yonga's own,
+    which the model never wrote, so a stop such as ``"\\n\\n"`` must not match
+    it. Each half gets its own :class:`StopMatcher`, and the separator is put in
+    front of the answer only after matching: a stop the model writes in the
+    shown reasoning still ends the answer there, and one it writes in the
+    answer ends it there. The concatenated output equals
+    :func:`join_after_reasoning` of the two halves, each cut by
+    :func:`truncate_at_stop` -- an answer is dropped when the reasoning was cut.
+    """
+
+    def __init__(self, leading: LeadingReasoning, stops: Sequence[str]) -> None:
+        """Match ``stops`` on what ``leading`` splits; empty strings are ignored."""
+        self._leading = leading
+        self._reasoning = StopMatcher(stops)
+        self._answer = StopMatcher(stops)
+
+    @property
+    def hit(self) -> bool:
+        """True once a stop sequence matched in either half."""
+        return self._reasoning.hit or self._answer.hit
+
+    def feed(self, reasoning: str, answer: str) -> str:
+        """Take released reasoning and the visible answer after it; return what to release."""
+        released = self._reasoning.feed(reasoning) if reasoning else ""
+        if answer and not self._reasoning.hit:
+            # No more reasoning follows once the answer has begun.
+            released += self._reasoning.finish()
+            released += self._leading.join(self._answer.feed(answer))
+        return released
+
+    def finish(self) -> str:
+        """Return whatever is still held once the answer has ended without a match."""
+        released = self._reasoning.finish()
+        if self._reasoning.hit:
+            return released
+        return released + self._leading.join(self._answer.finish())
+
+
 #: Receives each piece of a streamed answer; returning ``True`` asks to stop.
 TextSink = Callable[[str], bool | None]
 
@@ -1622,7 +1663,9 @@ class ChatSession:
         are read outside reasoning whether it is shown or not: with
         ``--show-reasoning`` the reasoning that opens the answer is shown in
         front of the content (:func:`split_leading_reasoning`) and the rest is
-        read as a hidden-reasoning answer would be.
+        read as a hidden-reasoning answer would be. Stop sequences are then
+        matched on the shown reasoning and on the answer apart, so the blank
+        line yonga puts between them never matches one.
 
         ``should_stop`` is asked on every chunk the runtime streams, whatever
         is released: a client that went away ends generation even while the
@@ -1650,6 +1693,12 @@ class ChatSession:
         )
         stops = [text for text in stop if text]
         matcher = StopMatcher(stops)
+        # With shown reasoning each half is matched apart, so a stop never
+        # matches the separator yonga puts between them.
+        split = _SplitStopMatcher(leading, stops) if leading is not None else None
+
+        def stopped() -> bool:
+            return split.hit if split is not None else matcher.hit
 
         def visible(chunk: str) -> str:
             shown = ""
@@ -1658,8 +1707,8 @@ class ChatSession:
             released = streaming.feed(chunk) if chunk else ""
             if gate is not None and released:
                 released = gate.feed(released)
-            if leading is not None:
-                released = shown + leading.join(released)
+            if split is not None:
+                return split.feed(shown, released)
             return matcher.feed(released) if stops and released else released
 
         try:
@@ -1671,7 +1720,7 @@ class ChatSession:
                         return True
                     released = visible(chunk)
                     wants_stop = on_text(released) if on_text is not None and released else None
-                    return True if matcher.hit else wants_stop
+                    return True if stopped() else wants_stop
 
                 raw = runtime.generate_stream(history, generation, forward)
             else:
@@ -1692,9 +1741,9 @@ class ChatSession:
             rest = (streaming.feed(tail) if tail else "") + streaming.finish()
             if gate is not None:
                 rest = (gate.feed(rest) if rest else "") + gate.finish()
-            if leading is not None:
-                rest = shown + leading.join(rest)
-            if stops:
+            if split is not None:
+                rest = split.feed(shown, rest) + split.finish()
+            elif stops:
                 rest = (matcher.feed(rest) if rest else "") + matcher.finish()
             if rest:
                 on_text(rest)
@@ -1706,6 +1755,7 @@ class ChatSession:
         }
         if rule is None and not stops:
             return ChatTurn(result=raw.model_copy(update=update))
+        shown = ""
         if rule is None:
             parsed = ParsedAnswer(answer.display_text.strip(), [], answer.display_text.strip())
         elif leading is None:
@@ -1717,21 +1767,24 @@ class ChatSession:
             hidden = sanitize_answer(after, wrappers, show=False).display_text
             parsed = parse_tool_calls(hidden, rule, names)
             shown = lead.strip()
-            parsed = parsed._replace(
-                content=join_after_reasoning(shown, parsed.content),
-                prefix=join_after_reasoning(shown, parsed.prefix),
-            )
         content, calls = parsed.content, parsed.calls
         if stops:
-            # The same cut StopMatcher makes after the gate: a stop that completes
-            # before the first call ends the answer there, and there is no call.
-            cut, matched = truncate_at_stop(parsed.prefix, stops)
+            # The same cuts the stream makes: shown reasoning and the answer are
+            # matched apart, so the separator between them never matches, and a
+            # stop that completes before the first call ends the answer there
+            # with no call.
+            reasoning_cut, matched = truncate_at_stop(shown, stops)
             if matched:
-                content, calls = cut, []
+                shown, content, calls = reasoning_cut, "", []
             else:
-                content, matched = truncate_at_stop(content, stops)
+                cut, matched = truncate_at_stop(parsed.prefix, stops)
+                if matched:
+                    content, calls = cut, []
+                else:
+                    content, matched = truncate_at_stop(content, stops)
             if matched:
                 update["stop_reason"] = STOP_SEQUENCE_REASON
+        content = join_after_reasoning(shown, content)
         update["display_text"] = content
         if calls:
             update["tool_calls"] = calls if parallel_tool_calls else calls[:1]

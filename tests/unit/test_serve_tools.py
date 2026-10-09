@@ -334,6 +334,71 @@ def test_with_shown_reasoning_a_stop_can_still_end_the_reasoning(
         assert choice["finish_reason"] == "stop"
 
 
+@pytest.mark.parametrize("stop", ["\n\n", "\n"])
+@pytest.mark.parametrize("chunk", [1, 2, 3, 7, 1000])
+def test_with_shown_reasoning_a_stop_never_matches_the_separator(
+    tmp_path: Path, stop: str, chunk: int
+) -> None:
+    """The blank line between shown reasoning and the answer is yonga's, not the model's."""
+    server, runtime = make_server(
+        tmp_path, ["<think>Plan.</think>The answer is 4."] * 2, chunk=chunk, show_reasoning=True
+    )
+    plain = post(server, ask(stop=stop)).json()["choices"][0]
+    streamed = post(server, ask(stop=stop, stream=True))
+
+    shown = "<think>Plan.</think>\n\nThe answer is 4."
+    assert plain["message"] == {"role": "assistant", "content": shown}
+    assert content_of(streamed.text) == shown
+    assert plain["finish_reason"] == final_reason(streamed.text) == "stop"
+    assert not runtime.stopped_early
+
+
+@pytest.mark.parametrize("stop", ["\n\n", "\n"])
+@pytest.mark.parametrize("chunk", [1, 2, 3, 7, 1000])
+def test_with_shown_reasoning_a_call_is_still_made_whatever_the_stop(
+    tmp_path: Path, stop: str, chunk: int
+) -> None:
+    server, _ = make_server(
+        tmp_path, ["<think>Plan.</think>Checking." + CALL] * 2, chunk=chunk, show_reasoning=True
+    )
+    plain = post(server, ask(stop=stop)).json()["choices"][0]
+    streamed = post(server, ask(stop=stop, stream=True))
+
+    shown = "<think>Plan.</think>\n\nChecking."
+    assert plain["message"]["content"] == content_of(streamed.text) == shown
+    (call,) = plain["message"]["tool_calls"]
+    (delta,) = tool_deltas(streamed.text)
+    assert call["function"]["name"] == delta["function"]["name"] == "get_weather"
+    assert plain["finish_reason"] == final_reason(streamed.text) == "tool_calls"
+
+
+@pytest.mark.parametrize(
+    ("answer", "shown"),
+    [
+        # Written in the shown reasoning: the answer ends inside it.
+        ("<think>Plan.\n\nMore.</think>The answer is 4.", "<think>Plan."),
+        # Written in the answer: the answer ends there, after the separator.
+        ("<think>Plan.</think>First.\n\nSecond.", "<think>Plan.</think>\n\nFirst."),
+        # Written in the answer before a call: there is no call.
+        ("<think>Plan.</think>First.\n\nSecond." + CALL, "<think>Plan.</think>\n\nFirst."),
+    ],
+)
+@pytest.mark.parametrize("stop", ["\n\n", "\n"])
+@pytest.mark.parametrize("chunk", [1, 2, 3, 7, 1000])
+def test_with_shown_reasoning_a_stop_the_model_writes_still_ends_the_answer(
+    tmp_path: Path, answer: str, shown: str, stop: str, chunk: int
+) -> None:
+    server, runtime = make_server(tmp_path, [answer] * 2, chunk=chunk, show_reasoning=True)
+    plain = post(server, ask(stop=stop)).json()["choices"][0]
+    streamed = post(server, ask(stop=stop, stream=True))
+
+    assert plain["message"] == {"role": "assistant", "content": shown}
+    assert content_of(streamed.text) == shown
+    assert tool_deltas(streamed.text) == []
+    assert plain["finish_reason"] == final_reason(streamed.text) == "stop"
+    assert runtime.stopped_early or chunk == 1000
+
+
 # --- a client that goes away ------------------------------------------------------------
 
 
