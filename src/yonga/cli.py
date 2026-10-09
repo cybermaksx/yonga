@@ -1917,9 +1917,11 @@ def _cache_prune(
             ],
             "planned_bytes": report.planned_bytes,
             "removed": list(report.removed),
+            "used_since_plan": list(report.used_since_plan),
             "failed": [failure.model_dump(mode="json") for failure in report.failed],
             "freed_bytes": report.freed_bytes,
             "kept": len(inventory.entries) - len(plan.entries),
+            "ignored": list(inventory.ignored),
         }
 
     if not plan.entries:
@@ -1933,7 +1935,10 @@ def _cache_prune(
             )
         else:
             console.print("Nothing to prune: the compile cache is empty.")
-        _cache_runtime_note(state, plan.installed_openvino)
+        if inventory.entries:
+            _cache_runtime_note(state, plan.installed_openvino)
+        for name in inventory.ignored:
+            console.detail(f"Not a cache entry, left alone: {inventory.root / name}")
         return ExitCode.SUCCESS
 
     console.print(tables.compile_cache_entries(plan.entries, reasons=plan.reasons))
@@ -1943,6 +1948,15 @@ def _cache_prune(
         f"{human_bytes(plan.total_bytes)}; {kept} kept. Only {plan.root} is touched."
     )
     _cache_runtime_note(state, plan.installed_openvino)
+    if CacheEntryStatus.STALE_RUNTIME.value in plan.reasons.values():
+        console.print(
+            f"Stale-runtime means built by an OpenVINO other than {plan.installed_openvino}, "
+            "the one running this command; an entry another install used after this "
+            "release was first used here is kept as in-use.",
+            style="dim",
+        )
+    for name in inventory.ignored:
+        console.detail(f"Not a cache entry, left alone: {inventory.root / name}")
     if dry_run:
         state.emit(document(service.prune(plan, dry_run=True)))
         console.print("Dry run: nothing was removed.", style="dim")
@@ -1966,6 +1980,8 @@ def _cache_prune(
         console.print(
             f"Removed {len(report.removed)} entries, {human_bytes(report.freed_bytes)} freed."
         )
+        for key in report.used_since_plan:
+            console.print(f"Kept {plan.root / key}: it was used after the plan was made.")
         for failure in report.failed:
             console.print_error(f"Could not remove {failure.path}: {failure.error}")
     return ExitCode.WARNINGS if report.failed else ExitCode.SUCCESS

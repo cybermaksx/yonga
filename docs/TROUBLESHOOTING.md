@@ -282,7 +282,11 @@ artifact, device and OpenVINO version, several GiB each for NPU and GPU blobs, k
 removes them. `yonga cache list` shows what it holds and which entries are dead (`orphaned`: the
 artifact is gone; `stale-runtime`: built by another OpenVINO release, never reused). `yonga cache
 prune --dry-run` shows what a prune would free, `yonga cache prune` frees it, and `--older-than
-DAYS`, `--unattributed` or `--all` go further. `yonga doctor` flags the reclaimable part under
+DAYS`, `--unattributed` or `--all` go further. Stale-runtime is judged against the OpenVINO of the
+yonga you run: when two installs with different OpenVINO releases share `~/.cache/yonga`, entries
+the other install used after this release first built something are kept as `in-use`, but entries
+it has not touched since then are pruned and it recompiles them on its next load. Run the prune
+from the install whose runtime you keep, or give the installs separate `--cache-dir`s. `yonga doctor` flags the reclaimable part under
 Storage once it reaches 10 GiB, or 25 % of the free space.
 
 ### 5.4 NNCF refuses the profile's group size

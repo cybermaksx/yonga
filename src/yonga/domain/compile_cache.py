@@ -252,6 +252,8 @@ class CompileCachePruneReport(BaseModel):
 
     dry_run: bool = False
     removed: list[str] = Field(default_factory=list)
+    used_since_plan: list[str] = Field(default_factory=list)
+    """Planned keys left alone because something used them after the inventory."""
     failed: list[PruneFailure] = Field(default_factory=list)
     planned_bytes: int = 0
     freed_bytes: int = 0

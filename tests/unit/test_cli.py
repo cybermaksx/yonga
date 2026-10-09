@@ -19,6 +19,7 @@ import json
 import os
 import shutil
 from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -32,7 +33,13 @@ from typer.testing import CliRunner, Result
 
 from tests.support import RefusingRunner, SmokeChildRunner, plain_text
 from tests.unit.test_artifact_store import make_manifest, publish
-from tests.unit.test_compile_cache import INSTALLED, OLDER, legacy_entry, recorded_entry
+from tests.unit.test_compile_cache import (
+    BEFORE_UPGRADE,
+    INSTALLED,
+    OLDER,
+    legacy_entry,
+    recorded_entry,
+)
 from tests.unit.test_prepare_planning import (
     GGUF_REPO,
     SAFETENSORS_REPO,
@@ -73,6 +80,7 @@ from yonga.cli import app
 from yonga.config.settings import Settings
 from yonga.domain.artifacts import IRDescription, ProbeResult, ProbeStatus, assert_no_secrets
 from yonga.domain.benchmarks import GenerationSettings
+from yonga.domain.compile_cache import COMPILE_CACHE_ENTRY_FILENAME
 from yonga.domain.diagnostics import ConfigurationError, ExitCode, FailureCategory, diagnostic
 from yonga.domain.hardware import (
     DeviceKind,
@@ -1296,7 +1304,9 @@ def populated_cache(home: Path, tmp_path: Path) -> dict[str, Path]:
     )
     entries = {
         "in-use": recorded_entry(settings, kept, size=1000),
-        "stale-runtime": recorded_entry(settings, kept, device="NPU", version=OLDER, size=3000),
+        "stale-runtime": recorded_entry(
+            settings, kept, device="NPU", version=OLDER, size=3000, used=BEFORE_UPGRADE
+        ),
         "orphaned": recorded_entry(settings, gone, device="CPU", size=5000),
         "unattributed": legacy_entry(settings, "0123456789abcdef", size=7000),
     }
@@ -1423,6 +1433,79 @@ def test_cache_prune_all_and_unattributed_go_further(
     nothing = invoke(runner, home, ["cache", "prune", "--yes"])
     assert nothing.exit_code == int(ExitCode.SUCCESS)
     assert "Nothing to prune" in nothing.stdout
+
+
+def test_cache_prune_dry_run_in_human_mode_lists_the_plan(
+    runner: CliRunner, home: Path, tmp_path: Path
+) -> None:
+    entries = populated_cache(home, tmp_path)
+    (home / "cache" / "compile" / "notes").mkdir()
+
+    result = invoke(runner, home, ["cache", "prune", "--dry-run"])
+
+    assert result.exit_code == int(ExitCode.SUCCESS)
+    output = plain_text(result.stdout)
+    assert entries["orphaned"].name in output and entries["stale-runtime"].name in output
+    assert entries["in-use"].name not in output
+    assert "Dry run: nothing was removed." in output
+    assert "another install" in output, "stale-runtime is explained relative to this runtime"
+    assert all(path.is_dir() for path in entries.values())
+
+
+def test_cache_prune_older_than_also_takes_unused_entries(
+    runner: CliRunner, home: Path, tmp_path: Path
+) -> None:
+    entries = populated_cache(home, tmp_path)
+    stamp = (datetime.now(tz=UTC) - timedelta(days=90)).timestamp()
+    for path in [*entries["in-use"].rglob("*"), entries["in-use"]]:
+        os.utime(path, (stamp, stamp))
+    record = entries["in-use"] / COMPILE_CACHE_ENTRY_FILENAME
+    document = json.loads(record.read_text(encoding="utf-8"))
+    document["last_used_at"] = datetime.fromtimestamp(stamp, tz=UTC).isoformat()
+    record.write_text(json.dumps(document), encoding="utf-8")
+    os.utime(record, (stamp, stamp))
+    os.utime(entries["in-use"], (stamp, stamp))
+
+    result = invoke(runner, home, ["cache", "prune", "--older-than", "30", "--yes", "--json"])
+
+    payload = one_document(result)
+    assert result.exit_code == int(ExitCode.SUCCESS)
+    planned = {entry["key"]: entry["selected_because"] for entry in records(payload["planned"])}
+    assert planned[entries["in-use"].name] == "older-than"
+    criteria = payload["criteria"]
+    assert isinstance(criteria, dict) and criteria["older_than_days"] == 30.0
+    assert not entries["in-use"].exists()
+    assert entries["unattributed"].is_dir(), "unattributed but recent, and not asked for"
+
+
+def test_cache_prune_reports_an_entry_it_could_not_remove(
+    runner: CliRunner, home: Path, tmp_path: Path
+) -> None:
+    entries = populated_cache(home, tmp_path)
+    locked = entries["orphaned"] / "locked"
+    locked.mkdir()
+    (locked / "stuck.blob").write_bytes(b"\x07" * 4096)
+    locked.chmod(0o500)
+    try:
+        result = invoke(runner, home, ["cache", "prune", "--yes", "--json"])
+        human = invoke(runner, home, ["cache", "prune", "--yes"])
+    finally:
+        locked.chmod(0o700)
+
+    payload = one_document(result)
+    assert result.exit_code == int(ExitCode.WARNINGS)
+    assert payload["ok"] is False
+    failed = records(payload["failed"])
+    assert [item["key"] for item in failed] == [entries["orphaned"].name]
+    assert payload["removed"] == [entries["stale-runtime"].name]
+    planned_bytes = payload["planned_bytes"]
+    freed_bytes = payload["freed_bytes"]
+    assert isinstance(planned_bytes, int) and isinstance(freed_bytes, int)
+    assert freed_bytes < planned_bytes
+    assert (locked / "stuck.blob").is_file()
+
+    assert human.exit_code == int(ExitCode.WARNINGS)
+    assert "Could not remove" in plain_text(human.stderr)
 
 
 def test_cache_prune_rejects_a_negative_age(runner: CliRunner, home: Path) -> None:

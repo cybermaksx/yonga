@@ -82,8 +82,8 @@ The `compile cache` line reports the size of the OpenVINO compile cache and how 
 reclaimable: orphaned plus stale-runtime entries, as `yonga cache list` classifies them (section
 12b). It is a warning, with `yonga cache prune` as the remediation, when the reclaimable bytes are
 at least 10 GiB, or at least 25 % of the free space on the cache filesystem, but never below 1 GiB.
-The `--json` document carries the same numbers under `compile_cache` (`entries`, `total_bytes`,
-`reclaimable_bytes`, `warn_threshold_bytes`, `installed_openvino`).
+The `--json` document carries the same numbers under `compile_cache` (`path`, `entries`,
+`total_bytes`, `reclaimable_bytes`, `warn_threshold_bytes`, `installed_openvino`).
 
 Exit codes:
 
@@ -435,15 +435,25 @@ and status, then the total size and count. Statuses:
 |---|---|
 | `in-use` | The owning artifact exists and the installed OpenVINO would reuse the blobs. |
 | `orphaned` | The owning artifact is gone from the store and from its recorded path. |
-| `stale-runtime` | Built by an OpenVINO version other than the installed one (compared on the full version string the runtime reports); it can never be reused. Not assigned when the installed version cannot be read. |
+| `stale-runtime` | Built by an OpenVINO release other than the one running this command (compared on the full version string `openvino.get_version()` reports; a bare release such as `2026.4.0` and its full build string count as the same release); this runtime can never reuse it. Not assigned when `openvino.get_version()` cannot be called. |
 | `unattributed` | No ownership record, and no known artifact produces the key. |
+
+Stale-runtime is relative to the OpenVINO running the command, and two yonga installs with
+different OpenVINO releases (a pipx install and a development virtualenv, say) can share one cache
+directory. So an entry built by another release that was last used *after* the running release
+first built an entry here, according to the ownership records, is reported as `in-use`, with a
+reason naming the other release: both runtimes are active against this cache. An entry of another
+release last used before that moment is stale-runtime, as after an upgrade. An install that stops
+using its entries loses them to the next default prune once the other install has built anything.
 
 An entry without a record (one made before records existed) is attributed by recomputing the
 keys every artifact in the store, and every artifact a saved benchmark names, could have produced:
 devices CPU, GPU and NPU plus those the manifest probed or recommends; OpenVINO versions from the
-installed runtime, manifests, benchmarks and other records; no properties, the manifest's
-recommended runtime properties, a recorded smoke test's properties and a benchmark's. `yonga
-remove` uses the records and the same derivation to find an artifact's entries.
+installed runtime (its full build string), manifests, benchmarks and other records; no
+properties, the manifest's recommended runtime properties, a recorded smoke test's properties and a
+benchmark's. `yonga remove` uses the records and the same derivation for its own artifact to find
+its entries; it only asks OpenVINO for the installed version when an entry without a record
+exists.
 
 `prune` removes orphaned and stale-runtime entries. `--older-than DAYS` also removes any entry not
 used for that many days, `--unattributed` also removes unattributed entries, and `--all` empties the
@@ -452,14 +462,19 @@ confirmation unless `--yes`; `--dry-run` prints the plan and deletes nothing. On
 of the compile cache root whose names are 16 lowercase hexadecimal characters, and that are real
 directories rather than symbolic links, are ever deleted; the check is repeated immediately before
 each deletion, and anything else under the root is listed (with `--verbose`) and left alone. The
-result reports the bytes actually freed. An entry removed while a running `chat` or `serve` uses
-it costs that model a recompile on its next load, nothing more.
+ownership record is deleted last, so the remains of an entry that could not be removed completely
+keep their owner and status. Unless `--all` is given, an entry whose record or modification time
+changed after the inventory was taken (a `chat`, `serve` or `bench` started on it while the prompt
+waited, or a compile writing into it) is skipped and reported as used since the plan. The result
+reports the bytes actually freed. An entry removed while a running `chat` or `serve` uses it costs
+that model a recompile on its next load, nothing more.
 
 `--json` documents: `list` carries `compile_cache_dir`, `artifacts_dir`, `installed_openvino`,
 `count`, `total_bytes`, `reclaimable_bytes`, `by_status`, `bytes_by_status`, `entries` and
 `ignored`. `prune` carries `criteria`, `dry_run`, `planned` (each entry with `selected_because`:
 `orphaned`, `stale-runtime`, `unattributed`, `older-than` or `all`), `planned_bytes`, `removed`,
-`failed`, `freed_bytes` and `kept`.
+`used_since_plan` (planned keys skipped because something used them after the inventory),
+`failed`, `freed_bytes`, `kept` (the number of entries not planned) and `ignored`.
 
 Exit codes: 0 on success, including nothing to prune and a dry run; 2 when some entries could not
 be removed (`failed` lists them); 60 when the confirmation is declined, or when it cannot be asked

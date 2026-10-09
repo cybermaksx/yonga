@@ -81,7 +81,10 @@ manifest may change in any minor release.
   `in-use`, `orphaned` (the artifact is gone), `stale-runtime` (built by an OpenVINO release other
   than the installed one, so never reused) or `unattributed`. Entries made before the records are
   attributed by recomputing the keys of every artifact in the store and every artifact a saved
-  benchmark names. `cache prune` removes orphaned and stale-runtime entries; `--older-than DAYS`,
+  benchmark names. Stale-runtime is relative to the OpenVINO running the command; an entry of
+  another release used after this one first built an entry here belongs to another install
+  sharing the cache and stays `in-use`. `cache prune` removes orphaned and stale-runtime entries,
+  skipping any entry used after the plan was made (unless `--all`); `--older-than DAYS`,
   `--unattributed` and `--all` go further, `--dry-run` only shows the plan, and it asks first
   unless `--yes`. It deletes only key-named, real directories directly under the compile cache
   root, never follows a symbolic link, and reports the bytes freed. `--json` on both.

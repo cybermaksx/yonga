@@ -12,7 +12,11 @@ Each entry is classified (:class:`~yonga.domain.compile_cache.CacheEntryStatus`)
 * **in-use** -- its artifact exists and the installed OpenVINO would reuse it;
 * **orphaned** -- the artifact it was built for is gone;
 * **stale-runtime** -- an OpenVINO release other than the installed one built it,
-  and since the runtime version is part of the key, it will never be reused;
+  and since the runtime version is part of the key, it will never be reused *by
+  the OpenVINO running this command*. Two installs of yonga with different
+  OpenVINO releases can share one cache directory, so an entry built by another
+  release that was used after the installed release's first recorded use is
+  taken to belong to that other install and kept as in-use;
 * **unattributed** -- it carries no ownership record and no known artifact
   produces its key.
 
@@ -28,7 +32,9 @@ Deletion is narrow on purpose. Only *direct children* of the compile cache root
 whose names have the exact shape of a key, and that are real directories rather
 than symbolic links, are ever candidates; the check is repeated immediately
 before each removal, and nothing else under the cache directory (the managed
-temp directory, export environments, metadata) is in scope.
+temp directory, export environments, metadata) is in scope. An entry whose
+ownership record or modification time moved after the inventory was taken (a
+``chat`` or ``serve`` started on it while the prompt waited) is skipped too.
 """
 
 from __future__ import annotations
@@ -39,6 +45,7 @@ import os
 import shutil
 import stat
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -52,6 +59,7 @@ from yonga.application.artifacts import ArtifactStore
 from yonga.config.paths import Paths
 from yonga.domain.artifacts import ArtifactManifest
 from yonga.domain.compile_cache import (
+    COMPILE_CACHE_ENTRY_FILENAME,
     CacheAttribution,
     CacheEntryStatus,
     CompileCacheEntry,
@@ -71,7 +79,9 @@ __all__ = [
     "CompileCacheService",
     "cache_entry_dirs",
     "check_older_than",
+    "known_key_versions",
     "manifest_key_inputs",
+    "same_openvino_release",
 ]
 
 #: Devices every artifact's keys are recomputed for, whatever its manifest says:
@@ -151,6 +161,44 @@ def manifest_key_inputs(
         list(dict.fromkeys(versions)),
         property_sets,
     )
+
+
+def same_openvino_release(first: str, second: str) -> bool:
+    """Whether two OpenVINO version strings name the same build in different forms.
+
+    ``openvino.get_version()`` gives ``2026.4.0-22959-<sha>-releases/2026/4`` and
+    the distribution metadata gives ``2026.4.0``. When exactly one of the two
+    carries a ``-<build>`` suffix and the release before it is equal, they are
+    treated as the same release: calling an entry stale on that difference
+    alone would be a format mismatch, not evidence.
+    """
+    if first == second:
+        return True
+    first_release, first_dash, _ = first.partition("-")
+    second_release, second_dash, _ = second.partition("-")
+    if bool(first_dash) == bool(second_dash):
+        return False
+    return first_release == second_release
+
+
+def known_key_versions(
+    paths: Paths,
+    records: Iterable[CompileCacheRecord | None],
+    *,
+    installed: str | None,
+) -> list[str | None]:
+    """The OpenVINO versions worth trying when recomputing legacy keys.
+
+    "Unknown" (``None``), the installed runtime's full version, its distribution
+    version, every version an ownership record mentions and every version a
+    saved benchmark recorded. ``yonga cache list`` and ``yonga remove`` both use
+    this, together with :func:`manifest_key_inputs`, so they agree on which
+    legacy entry belongs to which artifact.
+    """
+    versions: list[str | None] = [None, installed, installed_version("openvino")]
+    versions.extend(record.openvino_version for record in records if record is not None)
+    versions.extend(claim.openvino for claim in _benchmark_claims(paths))
+    return list(dict.fromkeys(versions))
 
 
 def check_older_than(days: float | None) -> float | None:
@@ -257,6 +305,7 @@ class CompileCacheService:
         attribution: dict[str, _Attribution] | None = None
         if any(record is None for record in records.values()):
             attribution = self._attribution_table(store, records.values(), installed)
+        installed_since = _first_use_of(installed, records.values())
 
         entries: list[CompileCacheEntry] = []
         for directory in directories:
@@ -270,7 +319,12 @@ class CompileCacheService:
             entry.size_bytes = size
             entry.file_count = count
             entry.last_used_at = _latest(entry.last_used_at, newest)
-            _classify(entry, installed=installed, store_root=self._store.root)
+            _classify(
+                entry,
+                installed=installed,
+                installed_since=installed_since,
+                store_root=self._store.root,
+            )
             entries.append(entry)
         entries.sort(key=lambda item: (-item.size_bytes, item.key))
         inventory.entries = entries
@@ -372,14 +426,8 @@ class CompileCacheService:
         record and the installed runtime mention, so an entry built by an older
         release is attributed as long as anything remembers that release.
         """
-        claims = self._benchmark_claims()
-        versions: list[str | None] = [
-            None,
-            installed,
-            installed_version("openvino"),
-        ]
-        versions.extend(record.openvino_version for record in records if record is not None)
-        versions.extend(claim.openvino for claim in claims)
+        claims = _benchmark_claims(self._paths)
+        versions = known_key_versions(self._paths, records, installed=installed)
         for _, manifest in store.values():
             if manifest is None:
                 continue
@@ -451,44 +499,6 @@ class CompileCacheService:
         for key, (device, version, _) in keys.items():
             table.setdefault(key, _Attribution(owner=owner, device=device, version=version))
 
-    def _benchmark_claims(self) -> list[_BenchmarkClaim]:
-        """Read what every saved benchmark recorded about its artifact. Never raises."""
-        claims: list[_BenchmarkClaim] = []
-        try:
-            documents = sorted(self._paths.benchmarks_dir.glob("*.json"))
-        except OSError:
-            return claims
-        for path in documents:
-            try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                continue
-            if not isinstance(payload, dict):
-                continue
-            artifact_id = payload.get("artifact_id")
-            if not isinstance(artifact_id, str) or not artifact_id.strip():
-                continue
-            raw_path = payload.get("artifact_path")
-            artifact_path = Path(raw_path) if isinstance(raw_path, str) and raw_path else None
-            device = payload.get("device")
-            properties = payload.get("runtime_properties")
-            packages = payload.get("package_versions")
-            openvino = packages.get("openvino") if isinstance(packages, dict) else None
-            claims.append(
-                _BenchmarkClaim(
-                    artifact_id=artifact_id.strip(),
-                    artifact_path=artifact_path,
-                    device=normalise_device(device) if isinstance(device, str) else None,
-                    properties=(
-                        {str(key): str(value) for key, value in properties.items()}
-                        if isinstance(properties, dict)
-                        else {}
-                    ),
-                    openvino=openvino if isinstance(openvino, str) else None,
-                )
-            )
-        return claims
-
     # --- prune --------------------------------------------------------------
 
     def plan_prune(
@@ -532,6 +542,11 @@ class CompileCacheService:
         if dry_run:
             return report
         for entry in plan.entries:
+            contained = entry.path.parent == self.root and is_cache_key(entry.path.name)
+            if contained and not plan.everything and _used_since(entry):
+                # A chat, serve or bench picked it up after the inventory: keep it.
+                report.used_since_plan.append(entry.key)
+                continue
             present = _is_real_dir(entry.path)
             error = _remove_entry(self.root, entry.path)
             if error is None:
@@ -552,6 +567,45 @@ class CompileCacheService:
 # --- helpers ----------------------------------------------------------------------------
 
 
+def _benchmark_claims(paths: Paths) -> list[_BenchmarkClaim]:
+    """Read what every saved benchmark recorded about its artifact. Never raises."""
+    claims: list[_BenchmarkClaim] = []
+    try:
+        documents = sorted(paths.benchmarks_dir.glob("*.json"))
+    except OSError:
+        return claims
+    for path in documents:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        artifact_id = payload.get("artifact_id")
+        if not isinstance(artifact_id, str) or not artifact_id.strip():
+            continue
+        raw_path = payload.get("artifact_path")
+        artifact_path = Path(raw_path) if isinstance(raw_path, str) and raw_path else None
+        device = payload.get("device")
+        properties = payload.get("runtime_properties")
+        packages = payload.get("package_versions")
+        openvino = packages.get("openvino") if isinstance(packages, dict) else None
+        claims.append(
+            _BenchmarkClaim(
+                artifact_id=artifact_id.strip(),
+                artifact_path=artifact_path,
+                device=normalise_device(device) if isinstance(device, str) else None,
+                properties=(
+                    {str(key): str(value) for key, value in properties.items()}
+                    if isinstance(properties, dict)
+                    else {}
+                ),
+                openvino=openvino if isinstance(openvino, str) else None,
+            )
+        )
+    return claims
+
+
 def _selection_reason(
     entry: CompileCacheEntry,
     *,
@@ -569,8 +623,38 @@ def _selection_reason(
     return None
 
 
-def _classify(entry: CompileCacheEntry, *, installed: str | None, store_root: Path) -> None:
-    """Set the entry's status and the one-line reason for it."""
+def _first_use_of(
+    installed: str | None, records: Iterable[CompileCacheRecord | None]
+) -> datetime | None:
+    """When the installed OpenVINO first built an entry here, as far as records tell."""
+    if installed is None:
+        return None
+    moments = [
+        record.created_at
+        for record in records
+        if record is not None
+        and record.openvino_version is not None
+        and same_openvino_release(record.openvino_version, installed)
+    ]
+    return min(moments) if moments else None
+
+
+def _classify(
+    entry: CompileCacheEntry,
+    *,
+    installed: str | None,
+    installed_since: datetime | None,
+    store_root: Path,
+) -> None:
+    """Set the entry's status and the one-line reason for it.
+
+    Stale-runtime is relative to the OpenVINO running this command. An entry
+    another release built is still in-use when it was used after the installed
+    release first built anything here (``installed_since``): both runtimes are
+    active against this cache, so the other one is taken to be another install
+    of yonga sharing the directory. A version that differs only in form (the
+    full build string against the bare release) is never a reason either.
+    """
     if entry.attribution is CacheAttribution.NONE:
         entry.status = CacheEntryStatus.UNATTRIBUTED
         entry.reason = (
@@ -583,14 +667,47 @@ def _classify(entry: CompileCacheEntry, *, installed: str | None, store_root: Pa
         entry.status = CacheEntryStatus.ORPHANED
         entry.reason = f"artifact {owner} is no longer in {store_root} or at its recorded path"
         return
+    where = "in the store" if entry.owner_in_store else f"at {entry.artifact_path}"
     built = entry.openvino_version or "unknown"
-    if installed is not None and built != installed:
+    if installed is not None and not same_openvino_release(built, installed):
+        used = entry.last_used_at
+        if installed_since is not None and used is not None and used > installed_since:
+            entry.status = CacheEntryStatus.IN_USE
+            entry.reason = (
+                f"artifact {owner} is {where}; built by OpenVINO {built}, which another "
+                f"install still used on {used:%Y-%m-%d}, after {installed} was first used here"
+            )
+            return
         entry.status = CacheEntryStatus.STALE_RUNTIME
         entry.reason = f"built by OpenVINO {built}; the installed runtime is {installed}"
         return
     entry.status = CacheEntryStatus.IN_USE
-    where = "in the store" if entry.owner_in_store else f"at {entry.artifact_path}"
     entry.reason = f"artifact {owner} is {where}"
+
+
+def _used_since(entry: CompileCacheEntry) -> bool:
+    """Whether ``entry`` was used after the inventory measured it. Never raises.
+
+    The inventory's ``last_used_at`` is the latest of the ownership record's
+    ``last_used_at`` and every file's mtime, so anything later now -- a refreshed
+    record, a new blob, the directory itself changing -- means something used
+    the entry since. Only the directory, the record file and the record are
+    looked at again; a containment problem is left to :func:`_remove_entry`.
+    """
+    seen = entry.last_used_at
+    if seen is None or not _is_real_dir(entry.path):
+        return False
+    stamps: list[float] = []
+    for candidate in (entry.path, entry.path / COMPILE_CACHE_ENTRY_FILENAME):
+        try:
+            stamps.append(os.lstat(candidate).st_mtime)
+        except OSError:
+            continue
+    latest = datetime.fromtimestamp(max(stamps), tz=UTC) if stamps else None
+    record = read_compile_cache_record(entry.path)
+    if record is not None:
+        latest = _latest(latest, record.last_used_at)
+    return latest is not None and latest > seen
 
 
 def _is_real_dir(path: Path) -> bool:
@@ -666,7 +783,33 @@ def _remove_entry(root: Path, path: Path) -> str | None:
         return f"{type(exc).__name__}: {exc}"
     if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
         return f"{path} is not a directory; it was left alone"
-    shutil.rmtree(path, ignore_errors=True)
+    # The ownership record goes last: when anything else cannot be removed, the
+    # leftovers keep their owner and status, and the next prune tries again.
+    record = path / COMPILE_CACHE_ENTRY_FILENAME
+    try:
+        children = list(os.scandir(path))
+    except OSError:
+        children = []
+    for child in children:
+        if child.name == COMPILE_CACHE_ENTRY_FILENAME:
+            continue
+        child_path = path / child.name
+        try:
+            if child.is_dir(follow_symlinks=False):
+                shutil.rmtree(child_path, ignore_errors=True)
+            else:
+                child_path.unlink()
+        except OSError:
+            continue
+    try:
+        leftovers = [child.name for child in os.scandir(path)]
+    except OSError:
+        leftovers = [COMPILE_CACHE_ENTRY_FILENAME, "?"]
+    if leftovers in ([], [COMPILE_CACHE_ENTRY_FILENAME]):
+        with suppress(OSError):
+            record.unlink(missing_ok=True)
+        with suppress(OSError):
+            path.rmdir()
     if path.is_symlink() or path.exists():
         return f"{path} could not be removed completely; check its permissions"
     return None

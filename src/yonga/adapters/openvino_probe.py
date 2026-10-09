@@ -138,20 +138,28 @@ def openvino_available() -> tuple[bool, str | None]:
     return (True, None)
 
 
-def openvino_runtime_version() -> str | None:
+def openvino_runtime_version(*, strict: bool = False) -> str | None:
     """Return the full OpenVINO runtime version string, or ``None`` when unavailable.
 
     Prefers ``openvino.get_version()`` (which carries the build id, e.g.
-    ``2026.4.0-22959-...``) and falls back to the installed distribution version.
+    ``2026.4.0-22959-...``) and falls back to ``openvino.__version__`` and then
+    to the installed distribution version (``2026.4.0``).
+
+    With ``strict`` there is no fallback: the answer is ``get_version()``'s or
+    ``None``. That is the form for comparing against the version folded into a
+    compile cache key, where the short distribution string would make every
+    entry look as if another release had built it.
     """
     try:
         module = _import_openvino()
     except Exception:
-        return installed_version("openvino")
+        return None if strict else installed_version("openvino")
     with suppress(Exception):
         version = module.get_version()
         if version:
             return str(version)
+    if strict:
+        return None
     with suppress(Exception):
         version = module.__version__
         if version:

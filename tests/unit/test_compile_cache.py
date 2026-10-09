@@ -21,6 +21,7 @@ from pathlib import Path
 import pytest
 
 from tests.unit.test_artifact_store import make_manifest, publish, settings_for
+from yonga.adapters import openvino_probe
 from yonga.adapters.openvino_probe import (
     artifact_fingerprint,
     compile_cache_dir,
@@ -29,7 +30,12 @@ from yonga.adapters.openvino_probe import (
     record_compile_cache_use,
 )
 from yonga.application.artifacts import ArtifactStore
-from yonga.application.compile_cache import CompileCacheService, cache_entry_dirs
+from yonga.application.compile_cache import (
+    CompileCacheService,
+    cache_entry_dirs,
+    same_openvino_release,
+)
+from yonga.application.wiring import Wiring
 from yonga.config.settings import Settings
 from yonga.domain.compile_cache import (
     COMPILE_CACHE_ENTRY_FILENAME,
@@ -50,6 +56,12 @@ OLDER = "2026.3.0"
 
 #: A fixed "now" for every age-based decision.
 NOW = datetime(2026, 10, 9, 12, 0, tzinfo=UTC)
+
+#: When the entries built by :data:`OLDER` were last used: well before anything
+#: the installed runtime built, as after a real upgrade. An entry of another
+#: release used *after* the installed one first built something here belongs to
+#: another install sharing the cache and is not stale.
+BEFORE_UPGRADE = NOW - timedelta(days=120)
 
 
 @pytest.fixture
@@ -83,7 +95,10 @@ def recorded_entry(
     size: int = 1024,
     used: datetime | None = None,
 ) -> Path:
-    """Make an entry exactly as the runtime does, ownership record included."""
+    """Make an entry exactly as the runtime does, ownership record included.
+
+    With ``used``, the entry's files are dated then as well, as they would be.
+    """
     fingerprint = artifact_fingerprint(artifact_dir)
     key = compile_cache_key(
         artifact_hash=fingerprint, device=device, openvino_version=version, properties=properties
@@ -99,6 +114,8 @@ def recorded_entry(
         properties=properties,
         now=used,
     )
+    if used is not None:
+        age(directory, used)
     return directory
 
 
@@ -230,7 +247,7 @@ def test_every_entry_gets_an_owner_and_a_status(
     gone = publish(store, tmp_path, manifest=gone_manifest, name="staging-gone")
 
     in_use = recorded_entry(settings, published, size=100)
-    stale = recorded_entry(settings, published, version=OLDER, size=200)
+    stale = recorded_entry(settings, published, version=OLDER, size=200, used=BEFORE_UPGRADE)
     orphaned = recorded_entry(settings, gone, device="NPU", size=400)
     shutil.rmtree(gone)  # deleted by hand, behind yonga's back
 
@@ -401,6 +418,84 @@ def test_an_empty_or_missing_cache_never_asks_for_the_runtime_version(
     assert inventory.total_bytes == 0
 
 
+#: The full ``openvino.get_version()`` form of :data:`INSTALLED`.
+INSTALLED_BUILD = "2026.4.0-22959-99c81491cc3-releases/2026/4"
+
+
+@pytest.mark.parametrize(
+    ("first", "second", "same"),
+    [
+        (INSTALLED_BUILD, INSTALLED_BUILD, True),
+        (INSTALLED_BUILD, "2026.4.0", True),
+        ("2026.4.0", INSTALLED_BUILD, True),
+        (INSTALLED_BUILD, "2026.3.0", False),
+        (INSTALLED_BUILD, "2026.4.0-1-other-build", False),
+        ("2026.4.0", "2026.4.1", False),
+    ],
+)
+def test_only_a_different_release_is_a_different_runtime(
+    first: str, second: str, same: bool
+) -> None:
+    assert same_openvino_release(first, second) is same
+
+
+def test_a_short_installed_version_never_makes_a_full_build_stale(
+    settings: Settings, store: ArtifactStore, tmp_path: Path
+) -> None:
+    """The distribution version names the same release as the build string in the key."""
+    published = publish(store, tmp_path)
+    entry = recorded_entry(settings, published, version=INSTALLED_BUILD)
+
+    service = service_for(settings, store, installed=INSTALLED)
+    inventory = service.inventory()
+
+    assert by_key(inventory)[entry.name].status is CacheEntryStatus.IN_USE
+    assert inventory.reclaimable_bytes == 0
+    assert service.plan_prune(inventory).entries == []
+
+
+def test_the_strict_runtime_version_never_falls_back_to_the_distribution(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When OpenVINO cannot be imported, the cache service is told "unknown"."""
+
+    def broken() -> object:
+        raise ImportError("libopenvino.so: cannot open shared object file")
+
+    monkeypatch.setattr(openvino_probe, "_import_openvino", broken)
+    monkeypatch.setattr(openvino_probe, "installed_version", lambda name: "2026.4.0")
+
+    assert openvino_probe.openvino_runtime_version() == "2026.4.0"
+    assert openvino_probe.openvino_runtime_version(strict=True) is None
+    assert Wiring(settings).openvino_version() is None
+
+
+def test_another_install_still_using_its_release_keeps_its_entries(
+    settings: Settings, store: ArtifactStore, tmp_path: Path
+) -> None:
+    """Two installs with different OpenVINO releases share one cache directory."""
+    published = publish(store, tmp_path)
+    upgraded_at = NOW - timedelta(days=10)
+    recorded_entry(settings, published, device="GPU", used=upgraded_at)
+    # Last used before the installed release built anything: truly superseded.
+    superseded = recorded_entry(
+        settings, published, device="CPU", version=OLDER, used=NOW - timedelta(days=20)
+    )
+    # Used after it: the other install is still alive.
+    shared = recorded_entry(
+        settings, published, device="NPU", version=OLDER, used=NOW - timedelta(days=2)
+    )
+
+    service = service_for(settings, store)
+    inventory = service.inventory()
+    entries = by_key(inventory)
+
+    assert entries[superseded.name].status is CacheEntryStatus.STALE_RUNTIME
+    assert entries[shared.name].status is CacheEntryStatus.IN_USE
+    assert "another install" in entries[shared.name].reason
+    assert {entry.key for entry in service.plan_prune(inventory).entries} == {superseded.name}
+
+
 # --- planning ----------------------------------------------------------------------------
 
 
@@ -413,7 +508,7 @@ def test_the_plan_takes_only_what_the_options_allow(
     age(fresh, NOW - timedelta(days=1))
     old = recorded_entry(settings, published, device="CPU", used=NOW - timedelta(days=40))
     age(old, NOW - timedelta(days=40))
-    stale = recorded_entry(settings, published, device="NPU", version=OLDER)
+    stale = recorded_entry(settings, published, device="NPU", version=OLDER, used=BEFORE_UPGRADE)
     unknown = legacy_entry(settings, "0123456789abcdef")
 
     service = service_for(settings, store)
@@ -459,7 +554,9 @@ def test_prune_removes_the_plan_and_nothing_else(
 ) -> None:
     published = publish(store, tmp_path)
     keep = recorded_entry(settings, published)
-    stale = recorded_entry(settings, published, device="NPU", version=OLDER, size=4096)
+    stale = recorded_entry(
+        settings, published, device="NPU", version=OLDER, size=4096, used=BEFORE_UPGRADE
+    )
     # NPU blobs are written read-only; the directory is what decides removal.
     for blob in stale.glob("*.blob"):
         blob.chmod(0o440)
@@ -551,6 +648,56 @@ def test_prune_never_follows_a_link_that_replaced_an_entry(
     assert (target / "data.bin").is_file()
 
 
+def test_prune_keeps_an_entry_used_after_the_plan(
+    settings: Settings, store: ArtifactStore, tmp_path: Path
+) -> None:
+    """A chat that refreshes an entry while the prompt waits keeps it."""
+    published = publish(store, tmp_path)
+    old = recorded_entry(settings, published, device="CPU", used=NOW - timedelta(days=60))
+    service = service_for(settings, store)
+    plan = service.plan_prune(service.inventory(), older_than_days=30)
+    assert [entry.key for entry in plan.entries] == [old.name]
+
+    record_compile_cache_use(
+        old,
+        artifact_dir=published,
+        artifact_hash=artifact_fingerprint(published),
+        device="CPU",
+        openvino_version=INSTALLED,
+        now=NOW,
+    )
+    report = service.prune(plan)
+
+    assert report.removed == []
+    assert report.used_since_plan == [old.name]
+    assert report.failed == []
+    assert report.freed_bytes == 0
+    assert old.is_dir()
+
+
+def test_prune_keeps_an_entry_compiled_into_after_the_plan(
+    settings: Settings, store: ArtifactStore, tmp_path: Path
+) -> None:
+    """A legacy entry gains a blob after the inventory: something is compiling into it."""
+    unknown = legacy_entry(settings, "0123456789abcdef")
+    age(unknown, NOW - timedelta(days=60))
+    service = service_for(settings, store)
+    plan = service.plan_prune(service.inventory(), unattributed=True)
+    assert [entry.key for entry in plan.entries] == [unknown.name]
+
+    (unknown / "1234.blob").write_bytes(b"\x05" * 8)
+    report = service.prune(plan)
+
+    assert report.used_since_plan == [unknown.name]
+    assert unknown.is_dir()
+
+    # --all is an explicit request to empty the cache; it does not wait.
+    everything = service.plan_prune(service.inventory(), everything=True)
+    (unknown / "5678.blob").write_bytes(b"\x06" * 8)
+    assert service.prune(everything).removed == [unknown.name]
+    assert not unknown.exists()
+
+
 # --- yonga remove reuses the records -----------------------------------------------------
 
 
@@ -586,3 +733,49 @@ def test_remove_finds_a_legacy_entry_for_a_device_the_manifest_never_probed(
     report = store.remove(manifest.artifact_id, dry_run=True)
 
     assert cpu in report.compile_cache_paths
+
+
+def test_remove_finds_a_legacy_entry_keyed_with_the_full_runtime_build(
+    settings: Settings, store: ArtifactStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Keys carry ``get_version()``'s build string, which no manifest records."""
+    manifest = make_manifest(device="GPU")
+    publish(store, tmp_path, manifest=manifest)
+    upgraded = "2027.1.0-23001-0123abcd-releases/2027/1"
+    by_runtime = legacy_entry(
+        settings,
+        compile_cache_key(
+            artifact_hash=manifest.artifact_id, device="GPU", openvino_version=upgraded
+        ),
+    )
+    monkeypatch.setattr(openvino_probe, "openvino_runtime_version", lambda strict=False: upgraded)
+
+    report = store.remove(manifest.artifact_id, dry_run=True)
+
+    assert by_runtime in report.compile_cache_paths
+    service = service_for(settings, store, installed=upgraded)
+    found = by_key(service.inventory())[by_runtime.name]
+    assert found.artifact_id == manifest.artifact_id, "cache list agrees with remove"
+
+
+def test_remove_tries_the_versions_other_records_name(
+    settings: Settings, store: ArtifactStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A release only another entry's record remembers is still tried."""
+    manifest = make_manifest(device="GPU")
+    published = publish(store, tmp_path, manifest=manifest)
+    remembered = "2026.2.0-21000-feedbeef-releases/2026/2"
+    recorded_entry(settings, tmp_path / "unrelated-artifact-dir", version=remembered)
+    legacy = legacy_entry(
+        settings,
+        compile_cache_key(
+            artifact_hash=manifest.artifact_id, device="CPU", openvino_version=remembered
+        ),
+    )
+    monkeypatch.setattr(openvino_probe, "openvino_runtime_version", lambda strict=False: None)
+
+    report = store.remove(manifest.artifact_id)
+
+    assert legacy in report.compile_cache_paths
+    assert not legacy.exists()
+    assert not published.exists()

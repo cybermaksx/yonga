@@ -1029,6 +1029,37 @@ def test_reclaimable_cache_is_a_warning_when_it_is_a_quarter_of_the_free_space(t
     assert require(floor, "storage.compile_cache").status is Severity.OK
 
 
+def test_the_free_space_threshold_never_drops_below_the_floor(tmp_path):
+    """On a nearly full disk a quarter of the free space is tiny; 1 GiB still applies."""
+    settings = make_settings(tmp_path)
+    full = FilesystemInfo(
+        path=Path("/"),
+        mount_point=Path("/"),
+        fstype="ext4",
+        total_bytes=500 * GIB,
+        free_bytes=2 * GIB,
+        available_bytes=2 * GIB,
+    )
+    inventory = healthy_inventory(settings, filesystems=[full], managed_temp=full)
+    assert (
+        COMPILE_CACHE_WARN_FREE_FRACTION * 2 * GIB < 3 * GIB // 4 < COMPILE_CACHE_WARN_FLOOR_BYTES
+    )
+
+    under = doctor_with_cache(
+        settings, cache_inventory(settings, orphaned=3 * GIB // 4), inventory=inventory
+    ).run()
+    at = doctor_with_cache(
+        settings,
+        cache_inventory(settings, orphaned=COMPILE_CACHE_WARN_FLOOR_BYTES),
+        inventory=inventory,
+    ).run()
+
+    assert require(under, "storage.compile_cache").status is Severity.OK
+    assert under.compile_cache is not None
+    assert under.compile_cache["warn_threshold_bytes"] == COMPILE_CACHE_WARN_FLOOR_BYTES
+    assert require(at, "storage.compile_cache").status is Severity.WARNING
+
+
 def test_an_empty_compile_cache_is_reported_as_such(tmp_path):
     settings = make_settings(tmp_path)
 

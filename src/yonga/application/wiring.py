@@ -406,11 +406,13 @@ class Wiring:
         The same string the runtime folds into every compile cache key, so an
         entry built by any other release can be recognised as unusable.
         Importing OpenVINO happens here, on first call, and only for commands
-        that need the answer.
+        that need the answer. Strict: when ``openvino.get_version()`` cannot be
+        called this is ``None``, never the short distribution version, which no
+        key was ever built from.
         """
         from yonga.adapters.openvino_probe import openvino_runtime_version
 
-        return openvino_runtime_version()
+        return openvino_runtime_version(strict=True)
 
     def runtime_probe(self) -> RuntimeProbePort:
         """Return the OpenVINO runtime probe.

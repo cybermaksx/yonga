@@ -70,7 +70,6 @@ from yonga.domain.diagnostics import (
 from yonga.domain.models import ModelIdentity, PipelineKind
 from yonga.repairs import huggingface_cache_roots
 from yonga.util.hashing import sha256_file, short_hash
-from yonga.util.versions import installed_version
 
 __all__ = [
     "HASH_SKIP_THRESHOLD_BYTES",
@@ -111,9 +110,6 @@ _INVENTORY_EXCLUDED_NAMES: frozenset[str] = frozenset({INCOMPLETE_MARKER_NAME})
 
 _HEX_RE = re.compile(r"[0-9a-fA-F]+")
 _UNSAFE_COMPONENT = re.compile(r"[^A-Za-z0-9._-]+")
-
-#: Distribution whose version participates in an OpenVINO compile-cache key.
-_OPENVINO_DISTRIBUTION: str = "openvino"
 
 
 def revision_component(revision: str | None) -> str:
@@ -870,8 +866,13 @@ class ArtifactStore:
         a digest of (artifact identity, device, OpenVINO version, runtime
         properties), so it cannot be inverted, and every key this artifact could
         plausibly have produced is recomputed from its own manifest and kept when
-        the directory exists (:func:`yonga.application.compile_cache.manifest_key_inputs`
-        decides which devices, versions and properties are tried).
+        the directory exists. :func:`yonga.application.compile_cache.manifest_key_inputs`
+        decides which devices, versions and properties are tried, and
+        :func:`yonga.application.compile_cache.known_key_versions` adds the
+        installed runtime's full version, the versions other entries' records
+        name and the ones saved benchmarks recorded -- the same derivation
+        ``yonga cache list`` uses. The installed runtime is only asked (which
+        imports OpenVINO) when an entry without a record exists.
 
         The identity half of the key is the manifest's ``artifact_id`` and nothing
         else. Digesting the directory's *contents* instead would make two
@@ -889,19 +890,31 @@ class ArtifactStore:
             return []
         from yonga.adapters.openvino_probe import (
             candidate_compile_cache_keys,
+            openvino_runtime_version,
             read_compile_cache_record,
         )
-        from yonga.application.compile_cache import cache_entry_dirs, manifest_key_inputs
+        from yonga.application.compile_cache import (
+            cache_entry_dirs,
+            known_key_versions,
+            manifest_key_inputs,
+        )
 
         cache_root = self._paths.compile_cache_dir
         found: list[Path] = []
         entries = cache_entry_dirs(cache_root)
-        for entry in entries:
-            record = read_compile_cache_record(entry)
+        records = [read_compile_cache_record(entry) for entry in entries]
+        for entry, record in zip(entries, records, strict=True):
             if record is not None and record.fingerprint == manifest.artifact_id:
                 found.append(entry)
+        if all(record is not None for record in records):
+            # Every entry names its owner; nothing is left to recompute.
+            return found
+        installed: str | None = None
+        with suppress(Exception):
+            installed = openvino_runtime_version(strict=True)
         devices, versions, property_sets = manifest_key_inputs(
-            manifest, extra_versions=(installed_version(_OPENVINO_DISTRIBUTION),)
+            manifest,
+            extra_versions=known_key_versions(self._paths, records, installed=installed),
         )
         keys = candidate_compile_cache_keys(
             manifest.artifact_id,
