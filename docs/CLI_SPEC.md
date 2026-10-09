@@ -452,10 +452,14 @@ code.
 Anything else is a 400 `invalid_request` with `param` `stop`; an empty list means no stop. yonga
 matches the sequences itself, on the visible answer after the reasoning sanitiser, never inside a
 hidden reasoning block: a common stop such as `"\n\n"` would otherwise end a reasoning model's
-answer before it began. The answer ends before the earliest match, without the match and without
-the whitespace in front of it, and `finish_reason` is `stop`, also when generation had reached its
-token limit. Matches across chunk boundaries are found: a stream holds back only the tail that
-could still become a match, so no part of a stop sequence is ever sent. With a stop sequence the
+answer before it began. With `--show-reasoning` the reasoning block is part of the visible answer,
+so a stop sequence can end it there. The answer ends before the first stop sequence to complete
+(the match with the smallest end; of two ending together, the longer one), without the match and
+without the whitespace in front of it, and `finish_reason` is `stop`, also when generation had
+reached its token limit. That is where generation stops, and it does not depend on how the text was
+chunked: with `["Observation:", "ion"]` the answer ends before `ion`. Matches across chunk
+boundaries are found: a stream holds back only the tail that could still become a match and the
+whitespace in front of it, so no part of a stop sequence is ever sent. With a stop sequence the
 model is streamed internally even for a non-streaming request, so generation ends at the match
 instead of at the token limit. A streamed and an unstreamed answer to the same request end at the
 same place.

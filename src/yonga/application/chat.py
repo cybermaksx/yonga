@@ -552,20 +552,31 @@ class StreamingSanitizer:
 STOP_SEQUENCE_REASON = "stop_sequence"
 
 
-def _earliest_stop(text: str, stops: Sequence[str]) -> int | None:
-    """Index of the earliest occurrence of any of ``stops`` in ``text``, if one occurs."""
-    found = [index for index in (text.find(stop) for stop in stops if stop) if index >= 0]
-    return min(found) if found else None
+def _first_stop(text: str, stops: Sequence[str]) -> int | None:
+    """Start of the first stop sequence to complete in ``text``, if one does.
+
+    "First to complete" is the match with the smallest end, ties going to the
+    one that starts earlier: that is where generation would have stopped, and
+    unlike the earliest *start* it does not depend on how the text was chunked.
+    With ``["Observation:", "ion"]`` the answer ends before ``"ion"``, which
+    completes while ``"Observation:"`` is still only a partial match.
+    """
+    found = [
+        (index + len(stop), index)
+        for index, stop in ((text.find(stop), stop) for stop in stops if stop)
+        if index >= 0
+    ]
+    return min(found)[1] if found else None
 
 
 def truncate_at_stop(text: str, stops: Sequence[str]) -> tuple[str, bool]:
-    """Cut ``text`` before the earliest stop sequence; return it and whether one matched.
+    """Cut ``text`` before the first stop sequence to complete; return it and whether one did.
 
     ``text`` is the sanitised visible answer. The cut also drops the whitespace
     in front of the match, exactly as :class:`StopMatcher` releases it, so a
     streamed and an unstreamed answer to the same request read the same.
     """
-    index = _earliest_stop(text, stops)
+    index = _first_stop(text, stops)
     if index is None:
         return text, False
     return text[:index].rstrip(), True
@@ -586,8 +597,10 @@ class StopMatcher:
       (:func:`truncate_at_stop`) and released text cannot be taken back.
 
     On a match the text before it is released, :attr:`hit` turns true, and every
-    later piece is swallowed. The concatenated output equals
-    ``truncate_at_stop(answer, stops)[0]`` for the concatenated input.
+    later piece is swallowed. A match is found as soon as it completes, which is
+    why the first stop sequence to *complete* is the one that counts. The
+    concatenated output equals ``truncate_at_stop(answer, stops)[0]`` for the
+    concatenated input, however it was chunked.
     """
 
     def __init__(self, stops: Sequence[str]) -> None:
@@ -606,7 +619,7 @@ class StopMatcher:
         if self._hit:
             return ""
         text = self._held + piece
-        index = _earliest_stop(text, self._stops)
+        index = _first_stop(text, self._stops)
         if index is not None:
             self._hit = True
             self._held = ""
@@ -1391,7 +1404,7 @@ class ChatSession:
 
         ``stop`` holds a client's stop sequences. A :class:`StopMatcher` after
         the sanitiser looks for them in the visible answer only, and the first
-        match ends the answer before it: the runtime is asked to stop, the
+        one to complete ends the answer before it: the runtime is asked to stop, the
         result's ``display_text`` is cut there (see :func:`truncate_at_stop`)
         and its ``stop_reason`` is :data:`STOP_SEQUENCE_REASON`. A runtime that
         can stream is streamed even without ``on_text`` then, so generation

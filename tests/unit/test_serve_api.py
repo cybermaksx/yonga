@@ -55,13 +55,19 @@ class StreamingRuntime(FakeRuntime):
 
 
 def make_server(
-    tmp_path: Path, answers: list[str | BaseException], *, streaming: bool = True
+    tmp_path: Path,
+    answers: list[str | BaseException],
+    *,
+    streaming: bool = True,
+    chunk: int = 3,
+    show_reasoning: bool = False,
 ) -> tuple[ModelServer, FakeRuntime]:
     service, factory, _ = build_service(tmp_path)
-    runtime = StreamingRuntime(answers) if streaming else FakeRuntime(answers)
+    runtime = StreamingRuntime(answers, chunk) if streaming else FakeRuntime(answers)
     factory.runtime = runtime
     artifact = write_artifact(tmp_path, make_manifest())
     session = service.open_artifact(artifact)
+    session.set_reasoning(show_reasoning)
     server = ModelServer(session, name="qwen")
     server.load()
     return server, runtime
@@ -253,6 +259,42 @@ def test_a_streamed_answer_stops_at_the_same_place(tmp_path: Path) -> None:
     assert "Two" not in response.text
     assert final_reason(response.text) == "stop"
     assert isinstance(runtime, StreamingRuntime) and runtime.stopped_early
+
+
+@pytest.mark.parametrize("chunk", [1, 3, 1000])
+def test_overlapping_stops_end_both_answers_where_the_first_one_completes(
+    tmp_path: Path, chunk: int
+) -> None:
+    """``"ion"`` completes before ``"Observation:"`` does, so the answer ends there.
+
+    The fake streams up to the stop and then returns its whole text, as GenAI
+    may when its streamer still held tokens back: the text past the streamed
+    point must not move the cut of the unstreamed answer.
+    """
+    text = "Thought: x. Observation: y"
+    server, runtime = make_server(tmp_path, [text] * 2, chunk=chunk)
+    client = client_for(server)
+    stop = ["Observation:", "ion"]
+
+    plain = client.post("/v1/chat/completions", json=ask(stop=stop)).json()
+    streamed = client.post("/v1/chat/completions", json=ask(stream=True, stop=stop))
+
+    assert plain["choices"][0]["message"]["content"] == "Thought: x. Observat"
+    assert content_of(streamed.text) == "Thought: x. Observat"
+    assert plain["choices"][0]["finish_reason"] == final_reason(streamed.text) == "stop"
+    assert isinstance(runtime, StreamingRuntime) and runtime.stopped_early
+
+
+def test_with_show_reasoning_a_stop_can_end_the_shown_reasoning(tmp_path: Path) -> None:
+    """The block is part of the visible answer then, so a stop matches inside it."""
+    server, _ = make_server(
+        tmp_path, ["<think>Plan.\n\nMore plan.</think>\n\nAnswer."], show_reasoning=True
+    )
+    body = client_for(server).post("/v1/chat/completions", json=ask(stop="\n\n")).json()
+
+    (choice,) = body["choices"]
+    assert choice["message"]["content"] == "<think>Plan."
+    assert choice["finish_reason"] == "stop"
 
 
 def test_a_stop_sequence_inside_hidden_reasoning_is_ignored(tmp_path: Path) -> None:

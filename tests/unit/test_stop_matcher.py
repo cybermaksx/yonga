@@ -8,6 +8,8 @@ the whole text, which is what an unstreamed answer gets.
 
 from __future__ import annotations
 
+import random
+
 import pytest
 
 from yonga.application.chat import StopMatcher, StreamingSanitizer, truncate_at_stop
@@ -37,6 +39,9 @@ def run(text: str, stops: list[str], size: int) -> tuple[list[str], str, bool]:
         ("Bu çok güzel bir gün", ["güzel"], "Bu çok", True),
         ("emoji 🙂 then 🛑 stop", ["🛑"], "emoji 🙂 then", True),
         ("Answer.\n\nUser: next", ["\n\nUser:", "User:"], "Answer.", True),
+        ("Thought: x. Observation: y", ["Observation:", "ion"], "Thought: x. Observat", True),
+        ("Thought: x. Observation: y", ["ion", "Observation:"], "Thought: x. Observat", True),
+        ("x abc", ["abc", "bc"], "x", True),
     ],
 )
 def test_the_pieces_add_up_to_the_truncated_answer(
@@ -95,3 +100,22 @@ def test_a_stop_inside_hidden_reasoning_does_not_end_the_answer(size: int) -> No
 
     assert released == "The answer is 42."
     assert matcher.hit
+
+
+def test_the_cut_never_depends_on_how_the_answer_was_chunked() -> None:
+    """The first stop to complete wins, so every chunking agrees with the whole text.
+
+    Short texts over a tiny alphabet make overlapping stops, where a short one
+    completes inside a longer one that started earlier, common enough to hit.
+    """
+    rng = random.Random(20261009)
+    for _ in range(3000):
+        text = "".join(rng.choice("ab ") for _ in range(rng.randint(0, 10)))
+        stops = [
+            "".join(rng.choice("ab ") for _ in range(rng.randint(1, 4)))
+            for _ in range(rng.randint(1, 4))
+        ]
+        expected = truncate_at_stop(text, stops)
+        for size in range(1, len(text) + 1):
+            _, joined, hit = run(text, stops, size)
+            assert (joined, hit) == expected, (text, stops, size)

@@ -14,8 +14,9 @@ manifest may change in any minor release.
 - **`serve` honours OpenAI `stop`.** A string or up to 4 non-empty strings of at most 256
   characters; anything else is a 400 `invalid_request` naming `stop`. yonga matches them on the
   visible answer after the reasoning sanitiser, never inside a hidden reasoning block, across chunk
-  boundaries, and ends the answer before the earliest match with `finish_reason` `stop`. A stream
-  holds back only the tail that could still become a match. A request with stop sequences is
+  boundaries, and ends the answer before the first stop sequence to complete with `finish_reason`
+  `stop`. A stream holds back only the tail that could still become a match and the whitespace in
+  front of it. A request with stop sequences is
   streamed internally even when the client did not ask for a stream, so generation ends at the
   match. `docs/CLI_SPEC.md` section 14.
 - **`yonga probe --quick` and `--timeout SECONDS`.** Settling a deferred NPU compile means building

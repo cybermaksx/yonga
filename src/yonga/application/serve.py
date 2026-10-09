@@ -52,8 +52,9 @@ __all__ = [
 
 #: Most stop sequences one request may carry, as OpenAI allows.
 MAX_STOP_SEQUENCES = 4
-#: Longest stop sequence accepted, in characters. Every piece of a streamed
-#: answer is held back by up to this much while a match may still complete.
+#: Longest stop sequence accepted, in characters. A streamed answer holds back
+#: the tail that may still complete a match, at most one character less than
+#: this, plus the whitespace in front of that tail.
 MAX_STOP_LENGTH = 256
 
 
