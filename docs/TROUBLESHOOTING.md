@@ -38,7 +38,7 @@ From `docs/CLI_SPEC.md` section 15; the mapping from category to code lives in
 | Code | Meaning |
 |---|---|
 | 0 | success |
-| 2 | success with warnings (this is what `doctor` returns on a tmpfs `/tmp`); also `probe` when no device passed or failed and one is inconclusive (section 5.1) |
+| 2 | success with warnings (this is what `doctor` returns on a tmpfs `/tmp`); also `probe` when no device passed or failed and one is inconclusive (section 5.1), and `self install` when the copy is in place but `yonga` on `PATH` does not run it yet (section 5.9) |
 | 10 | environment unusable (missing packages, driver, permission) |
 | 20 | model/source resolution failure |
 | 21 | authentication/gated access required |
@@ -51,10 +51,16 @@ From `docs/CLI_SPEC.md` section 15; the mapping from category to code lives in
 | 51 | runtime compilation failure |
 | 52 | runtime generation failure |
 | 60 | user cancelled |
-| 70 | registry/configuration error |
+| 70 | registry/configuration error; also a command line yonga cannot parse (section 2) |
 | 99 | unexpected internal error |
 
 A closed stdout is **0**, not 99: see section 8.
+
+A command line that cannot be parsed exits **70**, the code of an invalid option value: an unknown
+command or option, a missing argument, a value of the wrong type (`--timeout abc`,
+`--older-than abc`), or `yonga` with no command at all, which prints the command list. The parser
+would exit 2, and 2 is reserved for warnings and an inconclusive probe, so a script that retries an
+inconclusive `probe` with a longer `--timeout` never mistakes a typo for one. `--help` exits 0.
 
 Codes 40, 42 and 52 say *where* a job died rather than *why* (conversion, repair, generation), so
 they appear only when the category is `unknown_runtime_error`, and from `bench` when none of its
@@ -433,9 +439,20 @@ ModuleNotFoundError: Could not import module 'PreTrainedModel'.
 
 `optimum-intel` requires `torchvision`, and pip had fetched it from PyPI — the CUDA build — while
 torch had come from the CPU index. The two cannot load together. yonga now installs every
-torch-built package (`torch`, `torchvision`) from the same CPU index. If you see this error in an
-environment of your own, install both from one index:
-`pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu`.
+torch-built package (`torch`, `torchvision`) from the same CPU index.
+
+The same error in an environment of your own (a pip install that took torch alone from the CPU
+index, as `INSTALL.md` once advised) breaks `prepare` at conversion, exit 40, while `pip check`
+still reports nothing. Installing torchvision again from the CPU index is not enough: pip sees the
+PyPI build already satisfies the requirement and keeps it. Replace it explicitly:
+
+```bash
+pip uninstall -y torchvision
+pip install torchvision --index-url https://download.pytorch.org/whl/cpu
+```
+
+`pip list` then shows the same `+cpu` suffix on `torch` and `torchvision`, and
+`python -c "import optimum.exporters.openvino"` imports cleanly.
 
 ### 5.8 A GGUF repository cannot be imported
 
@@ -452,6 +469,30 @@ Name a different file with `--gguf-file`: `Q8_0` files hold only `Q8_0` and `F32
 `Q4_0` files usually add a single `Q8_0`. `source.gguf_unsupported` means the architecture itself
 cannot be imported, for example gemma3 or qwen35. There, a safetensors repository of the same
 model is the route, declared as a derivative or named with `--source`.
+
+### 5.9 `self install` and `self uninstall` refuse
+
+`yonga self install` copies the running AppImage to `~/.local/bin/yonga` (another directory with
+`--bin-dir DIR`); `docs/CLI_SPEC.md` section 12c has the whole contract. Its refusals leave
+everything at the target exactly as it was.
+
+| Code | Category | Exit | Means | Do this |
+|---|---|---|---|---|
+| `self.not_appimage` | `configuration_error` | 70 | This yonga does not run from an AppImage: a pip or pipx install, or one that merely inherited another application's `APPIMAGE`. | Use the environment's own `yonga` (activate it), or `pipx install 'yonga[openvino,export]'`; run `self install` from the downloaded AppImage. |
+| `self.target.not_appimage` | `configuration_error` | 70 | Something other than a yonga AppImage is at `DIR/yonga`: a pip or pipx command, a symbolic link, a directory or another file. Never replaced or removed. | Remove it yourself if you want the AppImage there (`pipx uninstall yonga`), or install elsewhere with `--bin-dir DIR`. |
+| `self.target.changed` | `configuration_error` | 70 | What is at `DIR/yonga` changed between the question and the rename; nothing was replaced. | Run the command again. |
+| `self.source.changed` | `configuration_error` | 70 | The AppImage changed size while it was copied (a download still in progress). | Run it again once the file is complete. |
+| `self.bin_dir.not_a_directory` | `configuration_error` | 70 | `--bin-dir` names something that exists and is not a directory. | Pass a directory; `~/.local/bin` is the default. |
+| `self.bin_dir.not_writable` | `permission_denied` | 10 | The directory, or the nearest existing parent of a missing one, is not writable by you. yonga never uses sudo. | Choose a directory you own with `--bin-dir DIR`. |
+| `self.insufficient_disk` | `insufficient_disk` | 30 | The copy does not fit on that filesystem. | Free space, or choose another directory. |
+| `self.io.read`, `self.io.create`, `self.io.write`, `self.io.remove` | `permission_denied`, `insufficient_disk` or `unknown_runtime_error` | 10, 30 or 99 | Reading the AppImage or the target, creating the directory, writing the copy or removing it failed; the message names the file. | The remediation follows the error: a directory you own, more space, or `--debug` for the raw error. |
+| `self.install.declined`, `self.uninstall.declined` | `user_cancelled` | 60 | The confirmation to replace or remove an AppImage was declined, or could not be asked (no terminal, or `--json` without `--yes`). | Re-run with `--yes`. |
+
+`self install` exiting **2** is not a failure: the copy is in place, but `yonga` on `PATH` does not
+run it yet, because `DIR` is not on `PATH` or an earlier `PATH` entry has another `yonga`. The
+message says which, and the line to run. On Ubuntu and Debian, `~/.profile` adds `~/.local/bin` to
+`PATH` at login only when the directory already exists then, so after the first install log out and
+back in once, or run `export PATH="$HOME/.local/bin:$PATH"` in the current shell.
 
 ## 6. Reading a job log
 

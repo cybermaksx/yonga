@@ -103,14 +103,21 @@ source .venv/bin/activate
 pip install "yonga[openvino,export]"
 ```
 
-On a machine without an NVIDIA GPU, install the CPU build of torch first. The `export` extra pulls
-torch in, and the default PyPI build on Linux carries CUDA — on the reference host 1.2 GB of torch
-plus 3.2 GB of NVIDIA libraries that an Intel AI PC never uses. The CPU wheel is 196 MB:
+On a machine without an NVIDIA GPU, install the CPU builds of torch and torchvision first. The
+`export` extra pulls both in (`optimum-intel` requires `torchvision`), and the default PyPI build on
+Linux carries CUDA — on the reference host 1.2 GB of torch plus 3.2 GB of NVIDIA libraries that an
+Intel AI PC never uses. The CPU torch wheel is 196 MB:
 
 ```bash
-pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 pip install "yonga[openvino,export]"
 ```
+
+Install the two together, from the same index. With only torch from the CPU index, pip fetches
+torchvision from PyPI, and that build cannot register its operators against a CPU torch:
+`import torchvision` fails with `operator torchvision::nms does not exist`, and with it the
+exporter, so `prepare` fails at conversion (exit 40) while `pip check` reports nothing wrong.
+`TROUBLESHOOTING.md` section 5.7 has the repair for an environment already in that state.
 
 Add `serve` to the extras for the HTTP API: `pip install "yonga[openvino,export,serve]"`.
 
@@ -143,9 +150,13 @@ Without any extras the package still installs and runs. `inspect`, `list`, `logs
 OpenVINO
 ✗  Runtime          not installed  openvino was not found in this environment.
                     → Install the runtime extras: pip install 'yonga[openvino]'
-                    → yonga never installs, upgrades or removes a package: run the command yourself
-                    in the environment yonga runs from.
+                    → yonga never installs, upgrades or removes a package in the environment it
+                    runs from: run the command yourself.
 ```
+
+That is one row of several: `GenAI` and `Tokenizers` read the same way, and `optimum-intel`, `nncf`
+and `transformers` are warnings rather than errors, because without them `prepare` converts in a
+managed export environment instead (section 6).
 
 That last line is a rule, not a disclaimer. `yonga` never runs `apt`, `modprobe`, `sudo` or
 `usermod`, and never runs `pip` in the environment you installed it into. It tells you the command;
@@ -282,8 +293,8 @@ yourself:
      not: openvino 2026.4.0, openvino-genai 2026.2.0.0, openvino-tokenizers 2026.4.0.0.
    → Install one family yourself, for example: pip install 'openvino==2026.4.*'
      'openvino-genai==2026.4.*' 'openvino-tokenizers==2026.4.*'
-   → yonga never installs, upgrades or removes a package: run the command yourself in the
-     environment yonga runs from.
+   → yonga never installs, upgrades or removes a package in the environment it runs from: run
+     the command yourself.
 ```
 
 (That block is the shipped check rendered with a deliberately mismatched set; the reference host is
@@ -436,5 +447,5 @@ yonga chat ARTIFACT_ID --device cpu
 ```
 
 `Qwen/Qwen3-0.6B` is a good first model: the whole path (download, INT4 conversion, tokenizer repair,
-CPU compile, generation) finishes in minutes and the artifact is around 389 MiB. If something fails,
+CPU compile, generation) finishes in minutes and the artifact is around 430 MiB. If something fails,
 `docs/TROUBLESHOOTING.md` maps the diagnostic code to what it means.

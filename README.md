@@ -67,7 +67,7 @@ on Python 3.14, and Python 3.11-3.13 are not affected. GGUF import is verified s
 
 ## What works today
 
-Sixteen commands; `registry` has six subcommands, `env` and `cache` two each:
+Seventeen commands; `registry` has six subcommands, `env`, `cache` and `self` two each:
 
 | Command | What it does |
 |---|---|
@@ -85,6 +85,7 @@ Sixteen commands; `registry` has six subcommands, `env` and `cache` two each:
 | `yonga serve ARTIFACT` | An OpenAI-compatible HTTP API (`/v1/models`, `/v1/chat/completions` with SSE streaming, `/health`) over the same session `chat` uses, bound to `127.0.0.1` by default. |
 | `yonga env list` / `env remove KEY` | The isolated environments `prepare` builds when a model's exporter needs package versions other than the installed ones, and the disk they use. |
 | `yonga cache list` / `cache prune` | The OpenVINO compile cache: each entry's size, last use, owning artifact and whether it is still used, orphaned, or built by another OpenVINO release; `prune` removes the dead ones (`--older-than DAYS`, `--unattributed`, `--all`, `--dry-run`). |
+| `yonga self install` / `self uninstall` | Copies the running AppImage to `~/.local/bin/yonga` (or `--bin-dir DIR`) so `yonga` works in any shell, and says what to do when that directory is not on `PATH`; `uninstall` removes the copy and keeps models and caches. AppImage only, never with sudo. |
 | `yonga logs [JOB_ID]` | Lists job logs, prints one as a table, or `--raw` for the JSON Lines file. |
 | `yonga registry validate` | Loads every registry layer and checks it is internally consistent. |
 | `yonga registry explain MODEL` | Shows which rules matched, which lost, and why. |
@@ -120,7 +121,7 @@ source .venv/bin/activate
 pip install "yonga[openvino,export]"
 ```
 
-`pip install yonga` alone installs the core without any extra. On a machine without an NVIDIA GPU, installing the CPU build of torch first saves about 4 GB of CUDA libraries that an Intel AI PC never uses; [`docs/INSTALL.md`](https://github.com/ooguz/yonga/blob/main/docs/INSTALL.md#pip) has the command.
+`pip install yonga` alone installs the core without any extra. On a machine without an NVIDIA GPU, installing the CPU builds of torch and torchvision first saves about 4 GB of CUDA libraries that an Intel AI PC never uses. Install both from PyTorch's CPU index: with torch alone from there, pip takes torchvision from PyPI, which cannot load against a CPU torch and breaks conversion. [`docs/INSTALL.md`](https://github.com/ooguz/yonga/blob/main/docs/INSTALL.md#pip) has the commands.
 
 To work on `yonga` itself, install from a clone of this repository instead: `pip install -e ".[openvino,export,serve,dev]"`.
 
@@ -283,7 +284,7 @@ User-facing documentation:
 
 - [`docs/USAGE.md`](https://github.com/ooguz/yonga/blob/main/docs/USAGE.md) — a hands-on tour of every command and how to check what it does.
 - [`docs/INSTALL.md`](https://github.com/ooguz/yonga/blob/main/docs/INSTALL.md) — Ubuntu prerequisites, extras, NPU driver and permissions, version rules.
-- [`docs/TROUBLESHOOTING.md`](https://github.com/ooguz/yonga/blob/main/docs/TROUBLESHOOTING.md) — every diagnostic code, exit codes, and how to read a job log.
+- [`docs/TROUBLESHOOTING.md`](https://github.com/ooguz/yonga/blob/main/docs/TROUBLESHOOTING.md) — every code the shipped registry can produce, the failures actually seen on the reference host, exit codes, and how to read a job log.
 - [`docs/PROFILE_COMPARISON.md`](https://github.com/ooguz/yonga/blob/main/docs/PROFILE_COMPARISON.md) — profile measurements on this host: size, speed and output quality (`yonga eval`) for two INT4 quantizations of Qwen3.5-9B, GGUF imports against the original weights, and the twelve-model, three-device measurements behind the small-model defaults, with the caveats spelled out.
 - [`CHANGELOG.md`](https://github.com/ooguz/yonga/blob/main/CHANGELOG.md) — what changed in each release.
 

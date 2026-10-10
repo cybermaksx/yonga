@@ -587,6 +587,46 @@ def test_version_prints_the_product_name_and_version(runner: CliRunner) -> None:
     assert result.stdout.strip() == f"yonga {__version__}"
 
 
+@pytest.mark.parametrize(
+    "args",
+    [
+        pytest.param(["probe", "x", "--timeout", "abc"], id="option-type"),
+        pytest.param(["cache", "prune", "--dry-run", "--older-than", "abc"], id="group-option"),
+        pytest.param(["--json", "probe", "x", "--timeout", "abc"], id="json"),
+        pytest.param(["--bogus", "doctor"], id="root-option"),
+        pytest.param(["doctor", "--bogus"], id="command-option"),
+        pytest.param(["nosuch"], id="command"),
+        pytest.param(["registry", "nosuch"], id="subcommand"),
+        pytest.param(["probe"], id="missing-argument"),
+        pytest.param([], id="no-command"),
+    ],
+)
+def test_a_command_line_that_cannot_be_parsed_exits_seventy(
+    runner: CliRunner, home: Path, args: list[str]
+) -> None:
+    """Click's usage errors exit 70, never the 2 of warnings or an inconclusive probe."""
+    result = invoke(runner, home, args)
+    assert result.exit_code == int(ExitCode.REGISTRY), result.output
+    assert "Traceback" not in result.output
+
+
+def test_bare_yonga_shows_the_help_and_exits_seventy(runner: CliRunner) -> None:
+    """``yonga`` alone prints the command list; it ran nothing, so it is not a success."""
+    result = runner.invoke(app, [])
+    assert result.exit_code == int(ExitCode.REGISTRY)
+    assert "doctor" in result.output
+
+
+def test_help_and_a_parsable_command_line_keep_their_codes(runner: CliRunner, home: Path) -> None:
+    """Only parse failures change: ``--help`` is 0, and a command keeps its own code.
+
+    The exit 2 of a command that ran is covered by the doctor and probe tests below.
+    """
+    assert runner.invoke(app, ["probe", "--help"]).exit_code == 0
+    assert runner.invoke(app, ["cache", "prune", "--help"]).exit_code == 0
+    assert invoke(runner, home, ["doctor"]).exit_code == int(ExitCode.SUCCESS)
+
+
 def test_importing_the_cli_loads_no_accelerator_stack() -> None:
     """Importing the CLI must not drag in OpenVINO, Torch or the Hub client."""
     import subprocess
