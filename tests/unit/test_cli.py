@@ -2553,3 +2553,131 @@ def test_eval_json_is_one_document(runner: CliRunner, home: Path, tmp_path: Path
     payload = one_document(result)
     assert payload["summary"]["kl_mean"] > 0  # type: ignore[index]
     assert payload["device"] == "CPU"
+
+
+def test_eval_says_where_it_saved_the_result(runner: CliRunner, home: Path, tmp_path: Path) -> None:
+    pytest.importorskip("numpy")
+    result = invoke(
+        runner,
+        home,
+        ["eval", "cand", "--reference", "ref"],
+        factory=lambda settings: EvaluatingWiring(settings, tmp_path),
+    )
+
+    assert result.exit_code == int(ExitCode.SUCCESS), result.stderr
+    (saved,) = (home / "data" / "evaluations").glob("*.json")
+    assert f"Saved: {saved}" in result.stdout
+
+
+def test_eval_json_carries_the_result_path(runner: CliRunner, home: Path, tmp_path: Path) -> None:
+    pytest.importorskip("numpy")
+    result = invoke(
+        runner,
+        home,
+        ["eval", "cand", "--reference", "ref", "--json"],
+        factory=lambda settings: EvaluatingWiring(settings, tmp_path),
+    )
+
+    payload = one_document(result)
+    path = Path(str(payload["result_path"]))
+    assert path.parent == home / "data" / "evaluations"
+    assert json.loads(path.read_text(encoding="utf-8"))["evaluation_id"] == payload["evaluation_id"]
+
+
+@pytest.mark.parametrize("device", ["npu", "NPU"])
+def test_eval_refuses_the_npu_before_loading_anything(
+    runner: CliRunner, home: Path, tmp_path: Path, device: str
+) -> None:
+    """``--device cpu|gpu`` is the documented set: the NPU is refused with exit 70."""
+
+    class NoEvaluation(FakeWiring):
+        def evaluation_service(self, *, progress: ProgressSink | None = None) -> EvaluationService:
+            raise AssertionError("the NPU must be refused before any service is built")
+
+    result = invoke(
+        runner,
+        home,
+        ["eval", "cand", "--reference", "ref", "--device", device],
+        factory=NoEvaluation,
+    )
+
+    assert result.exit_code == int(ExitCode.REGISTRY)
+    stderr = plain_text(result.stderr)
+    assert "eval runs on the CPU or the GPU" in stderr
+    assert "--device cpu" in stderr
+    assert not (home / "data" / "evaluations").exists()
+
+
+def test_eval_still_refuses_an_unknown_device(runner: CliRunner, home: Path) -> None:
+    result = invoke(runner, home, ["eval", "cand", "--reference", "ref", "--device", "tpu"])
+    assert result.exit_code == int(ExitCode.REGISTRY)
+    assert "Unknown device" in plain_text(result.stderr)
+
+
+# --- probe: what is shown, and when ----------------------------------------------------
+
+
+class CoreOnlyRuntimeProbe(FakeRuntimeProbe):
+    """The runtime probe of a core-only install: ``openvino`` does not import."""
+
+    def available(self) -> tuple[bool, str | None]:
+        return (False, "ModuleNotFoundError: No module named 'openvino'")
+
+
+def test_probe_without_openvino_names_the_extra_and_exits_ten(
+    runner: CliRunner, home: Path, tmp_path: Path
+) -> None:
+    """Like bench: an environment failure, never an "unrecognised failure" exit 51."""
+    artifact = _staged_artifact(tmp_path)
+    runtime = CoreOnlyRuntimeProbe()
+    wiring_for = lambda settings: FakeWiring(settings, runtime=runtime)  # noqa: E731
+
+    result = invoke(runner, home, ["probe", str(artifact), "--device", "cpu"], factory=wiring_for)
+
+    assert result.exit_code == int(ExitCode.ENVIRONMENT_UNUSABLE)
+    stderr = plain_text(result.stderr)
+    assert "pip install 'yonga[openvino]'" in stderr
+    assert "Unrecognised failure" not in stderr
+    assert runtime.compiled == []
+
+    as_json = invoke(
+        runner, home, ["probe", str(artifact), "--device", "cpu", "--json"], factory=wiring_for
+    )
+    assert as_json.exit_code == int(ExitCode.ENVIRONMENT_UNUSABLE)
+    assert "runtime.openvino.missing" in as_json.stdout
+
+
+def test_probe_auto_reports_another_devices_failure_as_information(
+    runner: CliRunner, home: Path, tmp_path: Path
+) -> None:
+    """A device that passed is the answer; a refusal elsewhere is no red verdict."""
+    artifact = _staged_artifact(tmp_path)
+    runtime = FakeRuntimeProbe(compile_failures={"NPU": NPU_UNSUPPORTED_GRAPH})
+    wiring_for = lambda settings: FakeWiring(settings, runtime=runtime)  # noqa: E731
+
+    result = invoke(runner, home, ["probe", str(artifact), "--device", "auto"], factory=wiring_for)
+
+    assert result.exit_code == int(ExitCode.SUCCESS)
+    assert {device for _name, device in runtime.compiled} == {"NPU", "GPU", "CPU"}
+    stderr = plain_text(result.stderr)
+    # The NPU failure keeps its progress line and its row, without a diagnostic
+    # block, advice to prepare again, or a pointer at the raw error.
+    assert "NPU" in result.stdout and "failed" in result.stdout
+    assert "Re-run with --debug" not in stderr
+    assert "Run: yonga prepare" not in stderr
+    assert "Recommended fallback" not in stderr
+    assert "This artifact runs on GPU, CPU" in stderr
+    assert "for information only" in stderr
+
+
+def test_probe_of_one_failing_device_still_explains_the_failure_once(
+    runner: CliRunner, home: Path, tmp_path: Path
+) -> None:
+    artifact = _staged_artifact(tmp_path)
+    runtime = FakeRuntimeProbe(compile_failures={"NPU": NPU_UNSUPPORTED_GRAPH})
+    wiring_for = lambda settings: FakeWiring(settings, runtime=runtime)  # noqa: E731
+
+    result = invoke(runner, home, ["probe", str(artifact), "--device", "npu"], factory=wiring_for)
+
+    assert result.exit_code != int(ExitCode.SUCCESS)
+    assert plain_text(result.stderr).count("Re-run with --debug") == 1

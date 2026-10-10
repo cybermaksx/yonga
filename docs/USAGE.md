@@ -248,7 +248,9 @@ yonga eval ARTIFACT --reference REF_ARTIFACT --device gpu            # what the 
 ```
 
 It reports mean KL divergence (lower is closer; 0 is identical), top-1 agreement and perplexity,
-in total and per passage (prose, code, arithmetic, Turkish, and more). Use `cpu-fp16-ref` as the
+in total and per passage (prose, code, arithmetic, Turkish, and more), and prints where it saved
+the result (`result_path` in `--json`). There is no `--device npu`: an artifact prepared for the
+NPU is evaluated on the CPU like any other. Use `cpu-fp16-ref` as the
 reference when the model fits in memory at 16 bits. On `Qwen/Qwen3-0.6B`, INT8 against FP16 measured
 KL 0.0074, so INT8 is a fair stand-in when FP16 does not fit.
 

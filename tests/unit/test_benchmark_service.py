@@ -26,7 +26,7 @@ from yonga.application.benchmark import (
 )
 from yonga.application.jobs import JobContext
 from yonga.application.probe import LocalArtifactStore
-from yonga.application.progress import CollectingSink
+from yonga.application.progress import CollectingSink, ProgressKind
 from yonga.config.settings import Settings
 from yonga.domain.benchmarks import BenchmarkResult, GenerationSettings
 from yonga.domain.diagnostics import (
@@ -967,3 +967,55 @@ def test_a_directory_outside_the_catalogue_is_accepted(
     result = service.run(loose, device="CPU", suite="quick", runs=1, ctx=ctx)
     assert result.artifact_path == loose
     assert result.repo_id == "export"
+
+
+def test_progress_numbers_measured_runs_apart_from_the_warmups(
+    tmp_path: Path,
+    job_ctx: tuple[JobContext, CollectingSink],
+) -> None:
+    """ "3 runs, 1 warmup" reads as warmup 1/1 then run 1/3 to run 3/3, not run 2 to 4."""
+    ctx, sink = job_ctx
+    runtime = ScriptedRuntime(
+        {"short-instruction": [make_generation(ttft_ms=100.0) for _ in range(4)]}
+    )
+    service, _ = make_service(tmp_path, runtime)
+
+    service.run(make_artifact(tmp_path), device="CPU", suite="quick", runs=3, warmups=1, ctx=ctx)
+
+    labels = [
+        event.message
+        for event in sink.of_kind(ProgressKind.STAGE)
+        if event.message.startswith("short-instruction:")
+    ]
+    assert labels == [
+        "short-instruction: warmup 1/1",
+        "short-instruction: run 1/3",
+        "short-instruction: run 2/3",
+        "short-instruction: run 3/3",
+    ]
+
+
+def test_a_failed_run_is_named_by_its_measured_run_number(
+    tmp_path: Path,
+    job_ctx: tuple[JobContext, CollectingSink],
+) -> None:
+    """The error names the same run the progress line did."""
+    ctx, _ = job_ctx
+    runtime = ScriptedRuntime(
+        {
+            "short-instruction": [
+                make_generation(ttft_ms=100.0),
+                RuntimeError("out of device memory"),
+                make_generation(ttft_ms=200.0),
+                make_generation(ttft_ms=300.0),
+            ]
+        }
+    )
+    service, _ = make_service(tmp_path, runtime)
+
+    result = service.run(
+        make_artifact(tmp_path), device="CPU", suite="quick", runs=3, warmups=1, ctx=ctx
+    )
+
+    assert len(result.errors) == 1
+    assert result.errors[0].startswith("short-instruction run 1/3: ")

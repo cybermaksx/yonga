@@ -8,6 +8,7 @@ therefore about real behaviour, not about a mock.
 
 from __future__ import annotations
 
+import json
 import shlex
 import textwrap
 from collections.abc import Iterator, Mapping, Sequence
@@ -50,11 +51,12 @@ from yonga.domain.diagnostics import (
     ExitCode,
     FailureCategory,
     Severity,
+    YongaError,
 )
 from yonga.domain.models import PipelineKind
 from yonga.registry.loader import load_builtin_registry
 from yonga.registry.resolver import RegistryResolver
-from yonga.util.jsonlog import null_logger
+from yonga.util.jsonlog import JobLogger, null_logger
 
 # --- real host facts ------------------------------------------------------------------
 
@@ -1156,3 +1158,96 @@ def test_a_deferred_raw_compile_is_reported_as_deferred_not_as_an_error(
     assert language[0].status == "deferred"
     assert language[0].severity is Severity.INFO
     assert not any(event.message == "language on NPU: failed" for event in sink.events)
+
+
+# --- a runtime that is not installed --------------------------------------------------
+
+
+class MissingRuntimeProbe(FakeRuntimeProbe):
+    """A runtime probe on a core-only install: ``openvino`` does not import.
+
+    Mirrors :class:`~yonga.adapters.openvino_probe.OpenVINOProbe` there: every
+    IR is unreadable with the import error as its text.
+    """
+
+    def available(self) -> tuple[bool, str | None]:
+        return (False, "ModuleNotFoundError: No module named 'openvino'")
+
+    def read_ir(self, path: Path) -> IRDescription:
+        return IRDescription(
+            path=path,
+            role=role_for_filename(path.name),
+            readable=False,
+            read_error="ModuleNotFoundError: No module named 'openvino'",
+        )
+
+
+def test_a_missing_openvino_is_an_environment_failure_not_an_unrecognised_one(
+    tmp_path: Path,
+) -> None:
+    """A core-only install is told to install the extra, with exit 10, as bench does."""
+    artifact = make_artifact(tmp_path)
+    write_manifest(artifact, repo_id="acme/model")
+    runtime = MissingRuntimeProbe()
+
+    with pytest.raises(YongaError) as excinfo:
+        service(runtime, tmp_path).probe_detailed(artifact, device="cpu")
+
+    found = excinfo.value.diagnostic
+    assert found.code == "runtime.openvino.missing"
+    assert found.category is FailureCategory.PACKAGE_ABI_MISMATCH
+    assert excinfo.value.exit_code() is ExitCode.ENVIRONMENT_UNUSABLE
+    assert any("pip install 'yonga[openvino]'" in step for step in found.remediation)
+    assert "No module named 'openvino'" in found.message
+    assert runtime.compiled == []
+    assert runtime.tokenizer_calls == 0
+
+
+def test_a_runtime_that_cannot_say_whether_it_imports_is_taken_at_its_word(
+    tmp_path: Path,
+) -> None:
+    """The ``RuntimeProbe`` port does not require ``available()``: no check, no refusal."""
+    artifact = make_artifact(tmp_path)
+
+    reports = service(FakeRuntimeProbe(), tmp_path).probe(artifact, device="cpu")
+
+    assert reports[0].status is ProbeStatus.OK
+
+
+def test_every_probe_result_and_its_raw_text_goes_to_the_job_log(tmp_path: Path) -> None:
+    """The terminal summarises a compiler dump; the job log keeps all of it."""
+    artifact = make_artifact(tmp_path)
+    write_manifest(artifact, repo_id="acme/model")
+    runtime = FakeRuntimeProbe(compile_errors={"NPU": NPU_DYNAMIC_SHAPE_ERROR})
+    settings = make_settings(tmp_path)
+    log_path = tmp_path / "job.jsonl"
+    logger = JobLogger("job-log", log_path)
+    ctx = JobContext(job_id="job-log", logger=logger, paths=settings.paths, settings=settings)
+    try:
+        service(runtime, tmp_path).probe(artifact, device="npu", quick=True, ctx=ctx)
+    finally:
+        logger.close()
+
+    records = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    results = [record for record in records if record["event"] == "probe.result"]
+    language = next(record for record in results if record["role"] == "language")
+    assert language["device"] == "NPU"
+    assert language["status"] == "deferred"
+    assert language["code"] == "npu.compiler.dynamic_shape"
+    assert "to_shape was called on a dynamic shape" in language["raw"]
+    assert any(record["role"] == "tokenizer" for record in results)
+
+
+def test_the_manual_entry_point_reports_a_refusal_instead_of_a_traceback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """No such artifact (or no OpenVINO) is a typed refusal with its own exit code."""
+    import yonga.config.settings as settings_module
+    from yonga.application.probe import main
+
+    monkeypatch.setattr(settings_module, "load_settings", lambda: make_settings(tmp_path))
+
+    assert main([str(tmp_path / "missing")]) == int(ExitCode.REGISTRY)
+    captured = capsys.readouterr()
+    assert "artifact.not_found" in captured.err
+    assert captured.out == ""

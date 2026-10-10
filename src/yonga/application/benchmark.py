@@ -351,6 +351,18 @@ def _safe_id(value: str) -> str:
     return cleaned or "benchmark"
 
 
+def _run_label(index: int, *, runs: int, warmups: int) -> str:
+    """Name position ``index`` of a prompt's sequence the way a reader counts it.
+
+    Warmups and measured runs are numbered separately, each from one:
+    ``warmup 1/1``, then ``run 1/3`` to ``run 3/3``. The run's ``run_index`` in
+    the saved result still counts the whole sequence, warmups first.
+    """
+    if index < warmups:
+        return f"warmup {index + 1}/{warmups}"
+    return f"run {index - warmups + 1}/{runs}"
+
+
 def benchmark_result_path(paths: Paths, result: BenchmarkResult) -> Path:
     """Return the file a benchmark result is saved to."""
     return paths.benchmarks_dir / f"{_safe_id(result.benchmark_id)}.json"
@@ -604,10 +616,10 @@ class BenchmarkService:
                     return collected
                 warmup = index < warmups
                 done += 1
-                label = "warmup" if warmup else "run"
+                label = _run_label(index, runs=runs, warmups=warmups)
                 ctx.emit(
                     ProgressKind.STAGE,
-                    f"{fixture.id}: {label} {index + 1}",
+                    f"{fixture.id}: {label}",
                     current=done,
                     total=total,
                 )
@@ -621,10 +633,10 @@ class BenchmarkService:
                 )
                 collected.append(metrics)
                 if metrics.error is not None:
-                    errors.append(f"{fixture.id} {label} {index + 1}: {metrics.error}")
+                    errors.append(f"{fixture.id} {label}: {metrics.error}")
                     ctx.emit(
                         ProgressKind.LOG,
-                        f"{fixture.id} {label} {index + 1} failed: {metrics.error}",
+                        f"{fixture.id} {label} failed: {metrics.error}",
                         severity=Severity.ERROR,
                     )
                     if not warmup:

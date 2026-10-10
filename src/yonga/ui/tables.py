@@ -22,7 +22,7 @@ from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 
-from yonga.domain.artifacts import ArtifactSummary, DeviceProbeReport, ProbeStatus
+from yonga.domain.artifacts import ArtifactSummary, DeviceProbeReport, ProbeResult, ProbeStatus
 from yonga.domain.benchmarks import BenchmarkResult
 from yonga.domain.compatibility import (
     CompatibilityDecision,
@@ -31,7 +31,7 @@ from yonga.domain.compatibility import (
     ResolutionExplanation,
 )
 from yonga.domain.compile_cache import CacheEntryStatus, CompileCacheEntry
-from yonga.domain.diagnostics import HealthSection, Severity
+from yonga.domain.diagnostics import FailureCategory, HealthSection, Severity
 from yonga.domain.evaluation import EvaluationResult
 from yonga.domain.models import ModelMetadata
 from yonga.domain.plans import PreparationPlan
@@ -951,11 +951,15 @@ def _compact_count(value: int | None) -> str:
 # ----------------------------------------------------------------------
 # probe
 # ----------------------------------------------------------------------
-def probe_report(reports: Sequence[DeviceProbeReport]) -> RenderableType:
+def probe_report(reports: Sequence[DeviceProbeReport], *, verbose: bool = False) -> RenderableType:
     """Render ``yonga probe`` (``docs/CLI_SPEC.md`` section 11).
 
     One block per device: the overall verdict, then a per-submodel read/compile
     row, then the smoke test, then the short explanation when it failed.
+
+    A row says in one line what happened; the raw runtime text behind it (a
+    native compiler dump runs to dozens of lines) is shown only with
+    ``verbose``, and is always in ``--json`` and the job log.
     """
     if not reports:
         return Text("No device probes were performed.", style="dim")
@@ -986,8 +990,9 @@ def probe_report(reports: Sequence[DeviceProbeReport]) -> RenderableType:
                 detail = Text.assemble(
                     detail, ("  ", ""), (human_duration(result.duration_seconds), "dim")
                 )
-            if result.message:
-                detail = Text.assemble(detail, ("  ", ""), (result.message, "dim"))
+            message = _probe_row_message(result, verbose=verbose)
+            if message:
+                detail = Text.assemble(detail, ("  ", ""), (message, "dim"))
             table.add_row(
                 Text(status_icon(result_severity), style=status_style(result_severity)),
                 Text(label),
@@ -1001,6 +1006,35 @@ def probe_report(reports: Sequence[DeviceProbeReport]) -> RenderableType:
             )
         blocks.append(Text(""))
     return Group(*blocks[:-1])
+
+
+def _probe_row_message(result: ProbeResult, *, verbose: bool) -> str:
+    """The detail text of one probe row: a summary, or the raw text when verbose.
+
+    A deferred raw compile is expected on the NPU for every dynamically shaped
+    LLM and needs nothing from the user, so it reads as one neutral line rather
+    than as the compiler dump it carries. A failure the registry recognised is
+    named by its diagnostic's title. Anything else keeps its own text, which is
+    all there is to go on. Blank lines are dropped either way.
+    """
+    raw = _without_blank_lines(result.message or "")
+    if verbose:
+        return raw
+    if result.status is ProbeStatus.DEFERRED:
+        return "the raw compile is not conclusive here; the GenAI pipeline decides"
+    found = result.diagnostic
+    if (
+        result.status is ProbeStatus.FAILED
+        and found is not None
+        and found.category is not FailureCategory.UNKNOWN_RUNTIME_ERROR
+    ):
+        return found.title.strip() or raw
+    return raw
+
+
+def _without_blank_lines(text: str) -> str:
+    """``text`` with its empty and whitespace-only lines removed."""
+    return "\n".join(line.rstrip() for line in text.splitlines() if line.strip())
 
 
 # ----------------------------------------------------------------------
@@ -1018,7 +1052,9 @@ def benchmark_summary(result: BenchmarkResult) -> RenderableType:
     header.add_row(Text("Artifact"), _text(result.artifact_id))
     header.add_row(Text("Device"), _text(result.device))
     header.add_row(Text("Profile"), _text(result.profile))
-    suite = f"{result.suite}  ({result.runs} runs, {result.warmups} warmups)"
+    runs = _count(result.runs, "run")
+    warmups = _count(result.warmups, "warmup")
+    suite = f"{result.suite}  ({runs}, {warmups})"
     header.add_row(Text("Suite"), _text(suite))
     header.add_row(Text("Max new tokens"), _text(result.settings.max_new_tokens))
     if result.compile_seconds is not None:
@@ -1060,6 +1096,11 @@ def _input_tokens_for(result: BenchmarkResult, prompt_id: str) -> str:
         if run.prompt_id == prompt_id and not run.warmup and run.input_tokens is not None:
             return str(run.input_tokens)
     return _DASH
+
+
+def _count(value: int, noun: str) -> str:
+    """``1 run``, ``3 runs``, ``0 warmups``."""
+    return f"{value} {noun}" if value == 1 else f"{value} {noun}s"
 
 
 def _round(value: float | None) -> str:

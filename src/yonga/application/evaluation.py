@@ -36,6 +36,7 @@ from pydantic import BaseModel, ConfigDict
 
 from yonga import __version__
 from yonga.application.progress import ProgressEvent, ProgressKind, ProgressSink, null_sink
+from yonga.config.paths import Paths
 from yonga.config.settings import Settings
 from yonga.domain.artifacts import ArtifactManifest
 from yonga.domain.diagnostics import ConfigurationError, FailureCategory, diagnostic
@@ -51,6 +52,7 @@ __all__ = [
     "Corpus",
     "EvaluationService",
     "LogitsScorer",
+    "evaluation_result_path",
     "load_corpus",
 ]
 
@@ -123,6 +125,11 @@ def load_corpus(path: Path | None = None) -> Corpus:
             )
     corpus.sha256 = hashlib.sha256(text.encode()).hexdigest()
     return corpus
+
+
+def evaluation_result_path(paths: Paths, result: EvaluationResult) -> Path:
+    """Return the file an evaluation result is saved to, under ``<data>/evaluations/``."""
+    return paths.data_dir / "evaluations" / f"{result.evaluation_id}.json"
 
 
 def _refusal(code: str, title: str, message: str, *remediation: str) -> ConfigurationError:
@@ -256,10 +263,9 @@ class EvaluationService:
         return result
 
     def save(self, result: EvaluationResult) -> Path:
-        """Write ``result`` under ``<data>/evaluations/``."""
-        directory = self._settings.paths.data_dir / "evaluations"
-        directory.mkdir(parents=True, exist_ok=True)
-        target = directory / f"{result.evaluation_id}.json"
+        """Write ``result`` under ``<data>/evaluations/`` and return the file."""
+        target = evaluation_result_path(self._settings.paths, result)
+        target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(result.model_dump_json(indent=2), encoding="utf-8")
         return target
 
