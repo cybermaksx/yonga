@@ -420,15 +420,21 @@ def test_hidden_reasoning_is_not_fed_back_into_the_conversation(tmp_path):
     assert all(SECRET not in content for _role, content in runtime.histories[-1])
 
 
-def test_show_reasoning_renders_everything(tmp_path):
-    service, _factory, _runtime = build_service(
-        tmp_path, answers=["<think>reasoning</think>visible"]
+def test_show_reasoning_reports_the_reasoning_apart_from_the_answer(tmp_path):
+    """Shown reasoning comes without its tags, so the CLI can draw it before the answer."""
+    service, _factory, runtime = build_service(
+        tmp_path, answers=["<think>reasoning</think>\n\nvisible", "second"]
     )
     artifact = write_artifact(tmp_path, make_manifest())
     session = service.open_artifact(artifact, options=ChatOptions(show_reasoning=True))
     turn = session.send("hello")
-    assert turn.display_text == "<think>reasoning</think>visible"
+    assert turn.display_text == "visible"
     assert turn.reasoning_text == "reasoning"
+    assert turn.reasoning_hidden is False
+
+    session.send("again")
+    stored = [content for role, content in runtime.histories[-1] if role == "assistant"]
+    assert stored == ["visible"]
 
 
 def test_show_reasoning_asks_the_template_for_thinking_mode(tmp_path):
@@ -524,6 +530,53 @@ def test_an_untyped_runtime_failure_is_still_reported_as_a_diagnostic(tmp_path):
     assert turn.diagnostic is not None
     assert turn.diagnostic.code == "chat.generation.unexpected_error"
     assert "boom" in turn.diagnostic.message
+
+
+class StreamingRuntime(FakeRuntime):
+    """Streams its answer a word at a time and stops when the callback asks."""
+
+    def __init__(self, answers: list[str | BaseException]) -> None:
+        super().__init__(answers)
+        self.chunks_sent: list[int] = []
+
+    def generate_stream(self, history, config, on_text):
+        result = self.generate(history, config)
+        sent = 0
+        for word in result.text.split():
+            sent += 1
+            if on_text(word + " ") is True:
+                break
+        self.chunks_sent.append(sent)
+        return result
+
+
+def test_a_stopped_reply_is_cancelled_and_leaves_no_trace(tmp_path):
+    """``should_stop`` ends generation at the next chunk; nothing of the turn is kept."""
+    runtime = StreamingRuntime(["one two three four five", "a fresh answer"])
+    service = ChatService(
+        FakeFactory(runtime),
+        FakeStore({}),
+        RegistryResolver(load_builtin_registry()),
+        make_settings(tmp_path),
+    )
+    session = service.open_artifact(write_artifact(tmp_path, make_manifest()))
+    asked: list[int] = []
+
+    def stop_on_second_chunk() -> bool:
+        asked.append(1)
+        return len(asked) >= 2
+
+    turn = session.send("count", should_stop=stop_on_second_chunk)
+    assert turn.cancelled is True
+    assert turn.ok is False
+    assert turn.diagnostic is None
+    assert runtime.chunks_sent == [2]
+    assert [m.role for m in session.history.messages] == []
+
+    answered = session.send("again", should_stop=lambda: False)
+    assert answered.ok
+    assert answered.display_text == "a fresh answer"
+    assert [role for role, _ in runtime.histories[-1]] == ["user"]
 
 
 def test_an_empty_prompt_is_refused_without_calling_the_runtime(tmp_path):
@@ -702,7 +755,9 @@ def test_reasoning_command_toggles_the_sanitiser(tmp_path):
     outcome = session.apply_command(parsed("/reasoning on"))
     assert outcome.ok
     assert session.show_reasoning is True
-    assert session.send("b").display_text == "<think>hidden</think>two"
+    shown = session.send("b")
+    assert shown.display_text == "two"
+    assert shown.reasoning_text == "hidden"
 
 
 def test_sampling_commands_change_the_settings(session_parts):

@@ -261,7 +261,9 @@ yonga chat MODEL_OR_ARTIFACT \
   [--system TEXT]
 ```
 
-If argument is a HF model without prepared artifact, prompt to prepare or explain the command to run. Avoid surprising long conversions on `chat` unless a future `--prepare` flag explicitly permits it.
+If argument is a HF model without prepared artifact, prompt to prepare or explain the command to run. Avoid surprising long conversions on `chat` unless a future `--prepare` flag explicitly permits it. Only an `owner/name` reference is told to run `yonga prepare` with it; an artifact id or any other name that matches nothing is pointed at `yonga list`, since preparing an artifact id would look it up on the Hub.
+
+The model is loaded (compiled) before the startup panel is drawn. A model that cannot load on the chosen device ends `chat` there with its category's exit code (section 15): 51 for an NPU compiler refusal, 10 when OpenVINO GenAI is missing. A message that fails later is reported and the prompt comes back; leaving (`/exit`, Ctrl-D, end of input) right after a failed message exits with that failure's code, 52 when no rule classified it.
 
 Startup panel:
 
@@ -296,8 +298,13 @@ Default response flow:
 1. show spinner `Yanıt hazırlanıyor...` / locale-neutral equivalent;
 2. generate without streaming hidden reasoning to terminal;
 3. sanitize recognized reasoning wrappers;
-4. render final answer as Markdown panel;
-5. render dim metrics footer.
+4. with `--show-reasoning` or `/reasoning on`, render the reasoning, without its wrapper tags, in a dim panel;
+5. render final answer as Markdown panel;
+6. render dim metrics footer.
+
+Ctrl-C while a reply is generated stops it at the next token, drops it together with the message
+that asked for it, and returns to the prompt; a second Ctrl-C before it has stopped ends `chat`
+(exit 60). Ctrl-C or Ctrl-D at the prompt leaves.
 
 Later enhancement: safe streaming after model-specific parser identifies final-answer boundary.
 
