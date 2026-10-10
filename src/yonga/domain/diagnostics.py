@@ -8,6 +8,7 @@ single source of truth for ``docs/CLI_SPEC.md`` section 15.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable, Mapping
 from enum import Enum, IntEnum
 from pathlib import Path
@@ -227,6 +228,52 @@ def diagnostic(
     }
     payload.update(fields)
     return Diagnostic.model_validate(payload)
+
+
+#: Upper-case words a remediation step uses for what it cannot know when it is
+#: written: ``MODEL`` is the repository the job is about, ``JOB_ID`` the job.
+#: A neighbouring letter, digit, underscore or hyphen makes it another word.
+_PLACEHOLDER_PATTERN = re.compile(r"(?<![\w-])(MODEL|JOB_ID)(?![\w-])")
+
+#: The command a remediation step ends with: ``Do this: yonga prepare X --device gpu``.
+_TRAILING_COMMAND = re.compile(r":\s+`?(yonga\s[^`]*?)`?\.?\s*$")
+
+
+def fill_placeholders(item: Diagnostic) -> Diagnostic:
+    """Put the known repository and job id into ``item``'s remediation, once each.
+
+    Registry remediation is data written before any job exists, so it says
+    ``yonga prepare MODEL`` and ``yonga logs JOB_ID --raw``. Wherever the
+    diagnostic knows the value -- ``job_id``, or the ``repo_id`` in its context
+    -- the placeholder is replaced, so the step can be copied as it stands; an
+    unknown value leaves the placeholder, which still reads as one.
+
+    Filling can make two steps say the same thing: a registry rule's "run this
+    model on the GPU instead: yonga prepare MODEL --device gpu" and ``prepare``'s
+    own "Prepare for GPU instead: yonga prepare <repo> --device gpu". A step that
+    repeats an earlier one, or ends in the same command as an earlier one, is
+    dropped. Safe to apply more than once.
+    """
+    model = item.context.get("repo_id") or item.context.get("model")
+    values = {name: value for name, value in (("MODEL", model), ("JOB_ID", item.job_id)) if value}
+
+    def substitute(match: re.Match[str]) -> str:
+        return values.get(match.group(1), match.group(1))
+
+    steps: list[str] = []
+    commands: set[str] = set()
+    for step in item.remediation:
+        filled = _PLACEHOLDER_PATTERN.sub(substitute, step) if values else step
+        command = _TRAILING_COMMAND.search(filled.strip())
+        key = " ".join(command.group(1).split()) if command is not None else None
+        if filled in steps or (key is not None and key in commands):
+            continue
+        steps.append(filled)
+        if key is not None:
+            commands.add(key)
+    if steps == item.remediation:
+        return item
+    return item.model_copy(update={"remediation": steps})
 
 
 class YongaError(Exception):

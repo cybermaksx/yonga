@@ -60,6 +60,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from yonga import __version__
 from yonga.adapters import (
+    ChecksToolchainImport,
     DeclaresRequirements,
     DeclaresRequirementsIn,
     ExportEnvironments,
@@ -115,6 +116,7 @@ from yonga.domain.diagnostics import (
     FailureCategory,
     HubAuthError,
     PreflightError,
+    RegistryError,
     RemoteCodeRequiredError,
     RepairError,
     Severity,
@@ -159,7 +161,7 @@ from yonga.domain.plans import (
     download_ignore_patterns,
     estimate_artifact_bytes,
 )
-from yonga.registry.resolver import RegistryResolver
+from yonga.registry.resolver import GROUP_SIZE_MISMATCH_CODE, RegistryResolver
 from yonga.registry.schema import (
     ArchitectureRule,
     ChatProfileRule,
@@ -643,14 +645,48 @@ class PrepareService:
         # is copied as published, so the model's size must not pick a profile
         # whose quantization would never be applied.
         size_applies = resolved_source.gguf_file is None and not resolved_source.already_openvino
-        profile, profile_explanation = self._registry.resolve_profile(
-            device=target_device,
-            arch_rule=arch_rule,
-            meta=source_meta,
-            model_rule=model_rule,
-            explicit_profile_id=profile_id,
-            size_applies=size_applies,
-        )
+        while True:
+            try:
+                profile, profile_explanation = self._registry.resolve_profile(
+                    device=target_device,
+                    arch_rule=arch_rule,
+                    meta=source_meta,
+                    model_rule=model_rule,
+                    explicit_profile_id=profile_id,
+                    size_applies=size_applies,
+                )
+                break
+            except RegistryError as error:
+                # Auto mode moves on when no profile for its first choice can
+                # quantize the model; an explicit device is an instruction.
+                remaining = compatibility.fallback_candidates
+                if (
+                    compatibility.explicit_request
+                    or error.diagnostic.code != GROUP_SIZE_MISMATCH_CODE
+                    or not remaining
+                ):
+                    raise
+                entry = next(
+                    (item for item in compatibility.per_device if item.device == remaining[0]),
+                    None,
+                )
+                compatibility = compatibility.model_copy(
+                    update={
+                        "selected_device": remaining[0],
+                        "status": entry.status if entry is not None else DeviceStatus.UNKNOWN,
+                        "evidence_level": (
+                            entry.evidence if entry is not None else EvidenceLevel.UNKNOWN
+                        ),
+                        "fallback_candidates": remaining[1:],
+                        "reasons": [
+                            *compatibility.reasons,
+                            f"No {target_device} profile can quantize this model: their group "
+                            "sizes do not divide its channel sizes, so auto-selection moved on "
+                            f"to {remaining[0]}.",
+                        ],
+                    }
+                )
+                target_device = remaining[0]
         profile_selection = profile_explanation.profile_selection
         if profile_selection is not None and not size_applies:
             profile_selection = profile_selection.model_copy(update={"applies": False})
@@ -2081,7 +2117,54 @@ class PrepareService:
         warnings.extend(
             self._require_exporter_requirements(plan, ctx, ignored=ignore_exporter_requirements)
         )
+        self._require_exporter_imports(plan, ctx)
         return warnings
+
+    def _require_exporter_imports(self, plan: PreparationPlan, ctx: JobContext) -> None:
+        """Refuse before the download when the exporter cannot even be imported here.
+
+        Only for an export that runs in the environment yonga runs in: a managed
+        environment was verified by the same import when it was built, and a
+        GGUF import or an OpenVINO copy never runs the exporter. Version checks
+        cannot see this: torch from the CPU index next to PyPI's torchvision has
+        the right versions and still fails on ``import torchvision``.
+        """
+        if (
+            plan.export_environment is not None
+            or plan.resolved_source.already_openvino
+            or plan.resolved_source.gguf_file is not None
+            or not isinstance(self._exporter, ChecksToolchainImport)
+        ):
+            return
+        ctx.emit(ProgressKind.LOG, "Checking that the exporter imports")
+        failure = self._exporter.toolchain_import_failure()
+        if failure is None:
+            return
+        fallback = diagnostic(
+            "export.toolchain_import_failed",
+            FailureCategory.PACKAGE_ABI_MISMATCH,
+            "The exporter cannot be imported in this environment",
+            (
+                "Importing optimum.exporters.openvino failed in the Python environment yonga "
+                "runs in, so no conversion can start here. Nothing has been downloaded."
+            ),
+            remediation=[
+                'Reproduce it: python -c "import optimum.exporters.openvino"',
+                "The full error is in the job log: yonga logs JOB_ID --raw",
+            ],
+            environment_broken=True,
+            raw_excerpt=failure,
+        )
+        raise PreflightError(
+            self._classify(
+                failure,
+                device=None,
+                stage="export",
+                ctx=ctx,
+                metadata=plan.resolved_source.metadata,
+                fallback=fallback,
+            )
+        )
 
     def _require_exporter_requirements(
         self,

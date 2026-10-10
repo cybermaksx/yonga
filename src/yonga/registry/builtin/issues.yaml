@@ -438,18 +438,25 @@ issues:
         installation, the devices and the source model are all fine; the
         conversion setting is what does not fit this model. Nothing had been
         compiled when this failed, so no device is implicated.
+      # MODEL and JOB_ID are filled in with the repository and the job when
+      # they are known; see "Placeholders in remediation" in docs/REGISTRY_SPEC.md.
       remediation:
         - >-
+          Re-run with a profile that has no group size. On the CPU that is the
+          8-bit reference: yonga prepare MODEL --device cpu --profile
+          cpu-int8-asym-ref. On the NPU it is the channel-wise profile (group
+          size -1, one scale per output channel): yonga prepare MODEL --device
+          npu --profile npu-int4-sym-cw. Each is for its own device:
+          npu-int4-sym-cw carries the NPU pipeline's MAX_PROMPT_LEN, which the
+          CPU and GPU plugins reject when the artifact is probed.
+        - >-
           When only a few small layers fail (Qwen3.5 0.8B-4B fail on one
-          one-channel rotary_emb weight), try the ratio-0.8 profile for the
-          device, which keeps a fifth of the weights at INT8: yonga prepare
+          one-channel rotary_emb weight), the ratio-0.8 profile for the device
+          may do, because it keeps a fifth of the weights at INT8: yonga prepare
           MODEL --profile cpu-int4-asym-g128-r08 (or gpu-int4-asym-g128-r08).
           It prepared those models; that it skips the failing layer is observed,
-          not guaranteed.
-        - >-
-          Or re-run with the channel-wise profile, which has no divisibility
-          requirement: yonga prepare MODEL --profile npu-int4-sym-cw
-          (group size -1, one scale per output channel; made for the NPU).
+          not guaranteed. When most layers fail, as they do when the hidden size
+          is not a multiple of 128, it cannot help.
         - >-
           Or pick a profile whose group size divides every channel size in the
           error; the shipped group-wise profiles all use 128.
@@ -470,6 +477,21 @@ issues:
             (channel size: 16)
           Re-running the same model with --profile npu-int4-sym-cw (group size
           -1) converts and publishes successfully.
+      - kind: tested
+        note: >-
+          HuggingFaceTB/SmolLM2-360M-Instruct (hidden size 960) with
+          cpu-int4-asym-g128-r08 on the reference host, optimum-intel 2.2.0 and
+          nncf 3.4.0: the ratio did not help, NNCF refused 118 nodes of channel
+          size 960. The list pushed the exception line out of the 40-line output
+          tail, so the failure surfaced as the generic export.failed until the
+          exporter kept exception lines in front of the tail.
+      - kind: tested
+        note: >-
+          Qwen/Qwen3-0.6B prepared with --profile npu-int4-sym-cw on the
+          reference host (2026-10-11) converts, then fails the probe on the CPU
+          ("Unsupported property MAX_PROMPT_LEN by CPU plugin") and on the GPU
+          ("Option not found: MAX_PROMPT_LEN"), so the remediation no longer
+          offers the NPU profile for those devices.
 
   # Category choice, deliberately: `package_abi_mismatch`. SPEC section 5.3 states
   # the ABI rule as being about a compatible package *set*, and that is exactly
@@ -610,6 +632,12 @@ issues:
         in pull request 2496, which no release carries yet.
       remediation:
         - Run yonga from Python 3.11, 3.12 or 3.13, where the same optimum exports this architecture.
+        - >-
+          The AppImage cannot do that: it bundles Python 3.14 and builds its
+          managed export environments on it. Install yonga with pip into a
+          virtual environment on an older Python instead (docs/INSTALL.md
+          section 2): python3.13 -m venv ~/.venvs/yonga, then
+          ~/.venvs/yonga/bin/pip install "yonga[openvino,export]"
         - Or upgrade optimum once a release includes huggingface/optimum#2496 (optimum-intel must accept that release too).
         - Or pick a model of another architecture; 'yonga search QUERY' shows which ones the registry has verified.
     sources:
@@ -676,3 +704,57 @@ issues:
           reference host against the Qwen3.5 traceback; the same shape is what
           optimum-intel raises for any architecture whose patcher outruns the
           installed transformers.
+
+  # Category choice, deliberately: `package_abi_mismatch` with
+  # `environment_broken: true`. torch and torchvision are each installed, but
+  # their native libraries come from two different builds (the CPU index and
+  # PyPI's CUDA build, or two torch releases), so torchvision cannot register
+  # its operators against this torch and anything that imports it dies. Every
+  # export in this environment fails the same way, whatever the model, so this
+  # environment *is* broken: exit 10, and no device is to blame or to fall back
+  # to. Reached only when yonga exports in the environment it runs in; the
+  # managed export environments install both from the same CPU index.
+  - id: torchvision-torch-build-mismatch
+    schema_version: 1
+    status: active
+    priority: 80
+    summary: torchvision and torch come from incompatible builds
+    match:
+      case_sensitive: true
+      exception_contains:
+        - "operator torchvision::nms does not exist"
+    classification:
+      code: export.torchvision.build_mismatch
+      category: package_abi_mismatch
+      environment_broken: true
+      retry_same_device: false
+    recommendation:
+      title: torchvision cannot load against the installed torch
+      message: >-
+        The exporter imports torchvision through Transformers, and torchvision
+        could not register its native operators with the installed torch: the
+        two were built for each other's different releases or indexes, most
+        often a CPU build of torch from download.pytorch.org next to the
+        default (CUDA) torchvision from PyPI. Every conversion in this Python
+        environment fails at this import, before any model is read, so the
+        model and the devices are not the problem. Transformers reports the
+        same failure as "Could not import module 'PreTrainedModel'".
+      fallback_devices: []
+      remediation:
+        - >-
+          Install torch and torchvision together from one index, in the
+          environment yonga runs in: pip install --force-reinstall torch
+          torchvision --index-url https://download.pytorch.org/whl/cpu
+        - "Then check that the exporter imports: python -c \"import optimum.exporters.openvino\""
+        - yonga does not change your environment for you; that choice stays yours.
+    sources:
+      - kind: tested
+        note: >-
+          Reproduced on the reference host in a pip install of yonga 0.4.0 with
+          torch 2.14.1+cpu from the CPU index and torchvision 0.29.1 from PyPI:
+          `yonga prepare Qwen/Qwen3-0.6B --device cpu` exited 40 with the
+          generic exporter message, and `python -c "import torchvision"` raised
+          "RuntimeError: operator torchvision::nms does not exist". The same
+          pair is what the managed export environment verification caught
+          before it installed both from the CPU index (docs/TROUBLESHOOTING.md
+          section 5.7).

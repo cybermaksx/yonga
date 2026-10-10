@@ -94,11 +94,12 @@ set. The Exit column is the category's code, which is what `probe`, `chat` and `
 | `runtime.out_of_memory` | `runtime-out-of-memory` | `out_of_memory` | 30 | The host or the accelerator ran out of memory. | Close other applications; choose stronger compression or a smaller group size. |
 | `storage.insufficient_disk` | `storage-no-space-left` | `insufficient_disk` | 30 | A write failed because the filesystem is full (including OpenVINO's `basic_ios::clear: iostream error`). | Free space, or point `YONGA_CACHE_DIR` at a bigger disk. |
 | `export.gguf.open_failed` | `gguf-reader-open-failed` | `permission_denied` | 10 | OpenVINO GenAI's GGUF reader could not open the file (`Failed to open ... with gguf_open`). It opens the file read-write, so a read-only file is refused, as is one that is not a GGUF file. | Check the data directory is writable (`yonga doctor`); if the download may be damaged, `hf cache verify REPO`. |
-| `export.quantization.group_size_mismatch` | `nncf-group-size-not-divisible` | `configuration_error` | 70 | The profile's group size does not divide the model's channel sizes. | `--profile npu-int4-sym-cw` (channel-wise, group size -1), or a profile with a smaller group size. |
+| `export.quantization.group_size_mismatch` | `nncf-group-size-not-divisible` | `configuration_error` | 70 | The profile's group size does not divide the model's channel sizes. Usually predicted from `config.json` and refused before the download (section 5.4). | A profile with no group size: `cpu-int8-asym-ref` on the CPU, `npu-int4-sym-cw` on the NPU. |
 | `export.transformers.symbol_missing.qwen35` | `qwen35-exporter-transformers-symbol-mismatch` | `package_abi_mismatch` | 10 | The exporter's Qwen3.5 patcher imports `Qwen3_5DynamicCache` and the installed Transformers does not define it. Nothing is broken; the two releases disagree about the Qwen3.5 modelling code. | Install the release the registry pins: `pip install "transformers==5.2.*"`. `yonga inspect MODEL` prints the requirement and what is installed. |
 | `export.transformers.out_of_range` | `exporter-transformers-version-range` | `package_abi_mismatch` | 10 | optimum-intel's export config for this architecture declares a Transformers range the installed release is outside. `prepare` normally reads that range first and builds a managed environment; you see this only when that was turned off. | Drop `--no-managed-env`, or install a release in the range the message names. |
-| `export.optimum.normalized_config` | `optimum-normalized-config-allow-new` | `package_abi_mismatch` | 10 | optimum failed building the export configuration (`got multiple values for argument 'allow_new'`), before conversion began. An exporter defect, seen for phi3. | Try a newer optimum-intel release. |
+| `export.optimum.normalized_config` | `optimum-normalized-config-allow-new` | `package_abi_mismatch` | 10 | optimum failed building the export configuration (`got multiple values for argument 'allow_new'`), before conversion began. An exporter defect on Python 3.14, seen for phi3 and mistral. | Run yonga on Python 3.11-3.13. The AppImage bundles 3.14, so that means a pip install into a virtual environment on an older Python (`docs/INSTALL.md` section 2). |
 | `export.transformers.symbol_missing` | `exporter-transformers-symbol-mismatch` | `package_abi_mismatch` | 10 | Generic form of the above: `optimum/exporters/openvino/model_patcher.py` looked for something the installed Transformers does not provide, for any architecture. | Install the Transformers release the architecture requires; the failing import is in `yonga logs JOB_ID --raw`. |
+| `export.torchvision.build_mismatch` | `torchvision-torch-build-mismatch` | `package_abi_mismatch` | 10 | `operator torchvision::nms does not exist`: torchvision and torch come from different builds (PyPI's torchvision next to a CPU torch), so nothing that imports torchvision loads and no model converts. `prepare` finds this before the download (section 5.7). | `pip install --force-reinstall torch torchvision --index-url https://download.pytorch.org/whl/cpu` |
 
 The last two are a backstop, not the usual path. When the registry declares the architecture's
 Transformers pin, `prepare` exports in a managed environment that satisfies it, or with
@@ -292,7 +293,7 @@ Storage once it reaches 10 GiB, or 25 % of the free space.
 
 ### 5.4 NNCF refuses the profile's group size
 
-Symptom: `yonga prepare` exits 40 with nothing useful, and the job log ends with:
+Symptom in older releases: `yonga prepare` exits 40 with nothing useful, and the job log ends with:
 
 ```text
 nncf.errors.InvalidGroupSizeError: Failed to apply group-wise quantization with group size value 128.
@@ -309,7 +310,9 @@ layer's channel size. The shipped group-wise profiles use 128; a model with smal
 them. Nothing is wrong with the installation, the device or the source model.
 
 Since `nncf-group-size-not-divisible` shipped, this is classified as
-`export.quantization.group_size_mismatch` (exit 70) and says what to do:
+`export.quantization.group_size_mismatch` (exit 70), also when NNCF lists more refused nodes than
+the 40 output lines yonga keeps (the exporter keeps the exception line in front of them), and says
+what to do, with the real repository and job id in place of `MODEL` and `JOB_ID`:
 
 ```text
 ✗ This model cannot be quantized with the profile's group size
@@ -320,33 +323,51 @@ size is smaller than, or not a multiple of, the group size this profile asks for
 the devices and the source model are all fine; the conversion setting is what does not fit this
 model. Nothing had been compiled when this failed, so no device is implicated.
 
+  - Re-run with a profile that has no group size. On the CPU that is the 8-bit reference: yonga
+    prepare MODEL --device cpu --profile cpu-int8-asym-ref. On the NPU it is the channel-wise
+    profile (group size -1, one scale per output channel): yonga prepare MODEL --device npu
+    --profile npu-int4-sym-cw. Each is for its own device: npu-int4-sym-cw carries the NPU
+    pipeline's MAX_PROMPT_LEN, which the CPU and GPU plugins reject when the artifact is probed.
   - When only a few small layers fail (Qwen3.5 0.8B-4B fail on one one-channel rotary_emb weight),
-    try the ratio-0.8 profile for the device, which keeps a fifth of the weights at INT8: yonga
-    prepare MODEL --profile cpu-int4-asym-g128-r08 (or gpu-int4-asym-g128-r08). It prepared those
-    models; that it skips the failing layer is observed, not guaranteed.
-  - Or re-run with the channel-wise profile, which has no divisibility requirement: yonga prepare
-    MODEL --profile npu-int4-sym-cw (group size -1, one scale per output channel; made for the NPU).
+    the ratio-0.8 profile for the device may do, because it keeps a fifth of the weights at INT8:
+    yonga prepare MODEL --profile cpu-int4-asym-g128-r08 (or gpu-int4-asym-g128-r08). It prepared
+    those models; that it skips the failing layer is observed, not guaranteed. When most layers
+    fail, as they do when the hidden size is not a multiple of 128, it cannot help.
   - Or pick a profile whose group size divides every channel size in the error; the shipped
     group-wise profiles all use 128.
   - The failing nodes and their channel sizes are in the job log: yonga logs JOB_ID --raw
 ```
 
-The channel-wise profile is verified to work on the same model:
-
-```console
-$ yonga prepare hf-internal-testing/tiny-random-LlamaForCausalLM --device cpu \
-      --profile npu-int4-sym-cw --yes
-7/7 Artifact ready at <data>/artifacts/hf-internal-testing--tiny-random-LlamaForCausalLM/…
-```
-
-`npu-int4-sym-cw` is named for the device it was written for, but a profile can be requested for any
-device: `prepare` uses an explicitly requested profile whatever device it declares, and names the
-mismatch in the plan before anything is downloaded.
+Most of the time it does not get that far. When `config.json`'s `hidden_size` is not a multiple of
+the group size, the refusal is certain, so the plan passes over the group-wise profiles before
+anything is downloaded and says why under "Chosen because" (`docs/REGISTRY_SPEC.md` section 5.2).
+`HuggingFaceTB/SmolLM2-360M-Instruct` (hidden size 960) gets `cpu-int8-asym-ref` on the CPU and
+`npu-int4-sym-cw` on the NPU. No GPU profile fits it, so `--device gpu` stops at the plan with exit
+70, and `--device auto` moves on to the next device:
 
 ```text
-Known limitations
-• Profile npu-int4-sym-cw targets NPU, not the requested GPU.
+✗ No GPU profile can quantize this model
+
+Every GPU conversion profile quantizes in groups that do not fit this model's channel sizes, so
+NNCF would refuse the export after the download: gpu-int4-asym-g128 cannot quantize this model: it
+quantizes in groups of 128, which does not divide this model's hidden_size of 960; … Nothing has
+been downloaded.
+
+  - Prepare it for the CPU instead, where cpu-int8-asym-ref fits: yonga prepare
+    HuggingFaceTB/SmolLM2-360M-Instruct --device cpu
+  - Prepare it for the NPU instead, where npu-int4-sym-cw fits: yonga prepare
+    HuggingFaceTB/SmolLM2-360M-Instruct --device npu
+  - Or add a profile whose group size divides the channel sizes above, in the registry override
+    directory, and name it with --profile.
 ```
+
+The devices offered are the ones whose own automatic choice fits the model, worked out the same
+way. A profile can be requested for another device than the one it declares (`prepare` uses it and
+names the mismatch in the plan, `Profile npu-int4-sym-cw targets NPU, not the requested GPU.`), but
+its runtime properties come with it, and the NPU profiles' `MAX_PROMPT_LEN` fails the probe on the
+CPU (`Unsupported property MAX_PROMPT_LEN by CPU plugin`) and on the GPU (`Option not found:
+MAX_PROMPT_LEN`). Verified with `Qwen/Qwen3-0.6B` on the reference host, 2026-10-11; that is why
+neither message offers the NPU profile for another device.
 
 ### 5.5 Gated or private repositories
 
@@ -444,6 +465,14 @@ torch had come from the CPU index. The two cannot load together. yonga now insta
 torch-built package (`torch`, `torchvision`) from the same CPU index. If you see this error in an
 environment of your own, install both from one index:
 `pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu`.
+
+The same pair in the environment yonga itself runs in (a pip install that took torch from the CPU
+index and torchvision from PyPI) used to pass every version check and fail each export with
+`export.failed`, after the download. `prepare` now imports `optimum.exporters.openvino` there during
+preflight, as the managed environments are verified, and stops before the download with
+`export.torchvision.build_mismatch` (exit 10), or `export.toolchain_import_failed` for an import
+failure no rule recognises. A successful import is remembered per interpreter and package
+versions, so it costs a few seconds once.
 
 ### 5.8 A GGUF repository cannot be imported
 

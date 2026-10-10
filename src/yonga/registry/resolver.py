@@ -46,10 +46,11 @@ from yonga.domain.diagnostics import (
     RegistryError,
     Severity,
     diagnostic,
+    fill_placeholders,
 )
 from yonga.domain.hardware import normalise_device
 from yonga.domain.models import ModelFormat
-from yonga.domain.plans import ConversionProfile
+from yonga.domain.plans import ConversionProfile, QuantizationSettings
 from yonga.registry.schema import (
     IDENTITY_HINT_SOURCE,
     AnyRule,
@@ -93,6 +94,75 @@ def _size_phrase(subject: MatchSubject) -> str:
         basis = subject.parameter_count_basis or "no parameter count is known"
         return f"has an unknown size ({basis})"
     return f"has {format_parameter_count(subject.parameter_count)} parameters"
+
+
+#: ``config.json`` keys giving the input width of a family of linear layers, and
+#: the lowest 4-bit ``ratio`` at which a group size that does not divide that
+#: width is certain to be refused. NNCF quantizes each weight row in groups along
+#: its input channels and raises ``InvalidGroupSizeError`` for any 4-bit layer
+#: whose channel count the group size does not divide. ``hidden_size`` feeds the
+#: q/k/v and gate/up projections, well over half of a decoder's weights, so no
+#: ratio of one half or more can keep all of them at the 8-bit backup precision.
+#: ``intermediate_size`` feeds only the down projections, which a mixed ratio
+#: might happen to leave at 8 bits, so it is certain only at ratio 1.0.
+_CHANNEL_WIDTHS: tuple[tuple[str, float], ...] = (
+    ("hidden_size", 0.5),
+    ("intermediate_size", 1.0),
+)
+
+#: The code of a group size that cannot quantize the model, whether NNCF said so
+#: during the export or profile resolution predicted it before the download.
+GROUP_SIZE_MISMATCH_CODE = "export.quantization.group_size_mismatch"
+
+#: Weight formats quantized group-wise, where ``group_size`` takes effect.
+_GROUPED_FORMATS: frozenset[str] = frozenset({"int4", "nf4", "mxfp4", "cb4"})
+
+
+def channel_widths(meta: ModelMetadata | None) -> dict[str, int]:
+    """The linear-layer input widths ``config.json`` declares, for the group-size check.
+
+    A multimodal config keeps the language model's under ``text_config``; that
+    is the part a text-generation export quantizes to 4 bits. Only positive
+    integers count: anything else is not evidence of a width.
+    """
+    if meta is None:
+        return {}
+    sources: list[Mapping[str, object]] = [meta.config]
+    text_config = meta.config.get("text_config")
+    if isinstance(text_config, Mapping):
+        sources.append(text_config)
+    widths: dict[str, int] = {}
+    for key, _ratio in _CHANNEL_WIDTHS:
+        for source in sources:
+            value = source.get(key)
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                widths[key] = value
+                break
+    return widths
+
+
+def group_size_conflict(
+    quantization: QuantizationSettings, widths: Mapping[str, int]
+) -> str | None:
+    """Why ``quantization`` is certain to be refused for a model of ``widths``, or ``None``.
+
+    The answer is ``None`` whenever the refusal is not certain: channel-wise
+    or 8-bit quantization, an unknown width, or a mixed ratio low enough that
+    the affected layers could all stay at the backup precision.
+    """
+    group = quantization.group_size
+    if group is None or group <= 0 or quantization.weight_format not in _GROUPED_FORMATS:
+        return None
+    ratio = 1.0 if quantization.ratio is None else float(quantization.ratio)
+    for key, certain_from in _CHANNEL_WIDTHS:
+        width = widths.get(key)
+        if width is None or width % group == 0 or ratio < certain_from:
+            continue
+        return (
+            f"it quantizes in groups of {group}, which does not divide this model's "
+            f"{key} of {width}"
+        )
+    return None
 
 
 #: Constraint key -> distribution name used to look the installed version up.
@@ -587,6 +657,9 @@ class RegistryResolver:
         target = normalise_device(device)
         subject = self._subject(meta, device=target, size_applies=size_applies)
         explanation = ResolutionExplanation(subject=f"conversion profile for {target}")
+        # Like the size, the model's channel widths only matter where a profile's
+        # quantization is applied.
+        widths = channel_widths(meta) if size_applies else {}
         if explicit_profile_id is not None:
             profile = self._explicit_profile(explicit_profile_id, target, explanation)
             if not profile.status.is_usable:
@@ -604,11 +677,18 @@ class RegistryResolver:
                     f"Profile {profile.id} is meant for models {band.describe()}; this model "
                     f"{_size_phrase(subject)}. It is used because it was requested explicitly."
                 )
+            conflict = group_size_conflict(profile.quantization, widths)
+            if conflict is not None:
+                explanation.notes.append(
+                    f"Profile {profile.id} cannot quantize this model: {conflict}, and NNCF "
+                    f"refuses such a layer ({GROUP_SIZE_MISMATCH_CODE}). It is used "
+                    "because it was requested explicitly."
+                )
             automatic: str | None = None
             try:
                 scratch = ResolutionExplanation(subject=explanation.subject)
                 automatic_rule, _basis, _rule_id = self._automatic_profile(
-                    target, arch_rule, model_rule, subject, scratch
+                    target, arch_rule, model_rule, subject, scratch, widths=widths
                 )
                 automatic = automatic_rule.id
             except RegistryError:
@@ -621,8 +701,9 @@ class RegistryResolver:
             )
             return profile.to_conversion_profile(), explanation
 
+        unfit: list[str] = []
         winner, basis, rule_id = self._automatic_profile(
-            target, arch_rule, model_rule, subject, explanation
+            target, arch_rule, model_rule, subject, explanation, widths=widths, unfit=unfit
         )
         explanation.winner_id = winner.id
         # Only scoring can lose a profile to the model's size; a named
@@ -633,7 +714,8 @@ class RegistryResolver:
             winner,
             subject,
             rule_id=rule_id,
-            skipped=self._size_skipped(target, subject, winner) if scored else (),
+            skipped=[*(self._size_skipped(target, subject, winner) if scored else ()), *unfit],
+            unfit=bool(unfit),
         )
         return winner.to_conversion_profile(), explanation
 
@@ -644,8 +726,30 @@ class RegistryResolver:
         model_rule: ModelRule | None,
         subject: MatchSubject,
         explanation: ResolutionExplanation,
+        *,
+        widths: Mapping[str, int] | None = None,
+        unfit: list[str] | None = None,
+        suggest_devices: bool = True,
     ) -> tuple[ProfileRule, ProfileBasis, str | None]:
-        """The profile chosen without ``--profile``: a named preference, else scoring."""
+        """The profile chosen without ``--profile``: a named preference, else scoring.
+
+        A profile whose group size cannot quantize a model of ``widths`` is
+        passed over, named or scored: the export would only fail after the
+        download. Each one passed over is described in ``unfit``, and when none is
+        left the refusal names the devices whose own choice fits, unless
+        ``suggest_devices`` is off (as it is while working those out).
+        """
+        passed_over: list[str] = [] if unfit is None else unfit
+
+        def unusable(rule: ProfileRule, candidate: RuleCandidate) -> bool:
+            conflict = group_size_conflict(rule.quantization, widths or {})
+            if conflict is None:
+                return False
+            candidate.matched = False
+            candidate.reasons.append(f"cannot quantize this model: {conflict}")
+            passed_over.append(f"{rule.id} cannot quantize this model: {conflict}")
+            return True
+
         for source_rule in (model_rule, arch_rule):
             if source_rule is None:
                 continue
@@ -661,6 +765,8 @@ class RegistryResolver:
             candidate, matched = self._evaluate(preferred, subject)
             candidate.reasons.insert(0, f"named by {source_rule.kind} rule {source_rule.id}")
             explanation.candidates.append(candidate)
+            if matched and unusable(preferred, candidate):
+                continue
             if matched:
                 basis: ProfileBasis = (
                     "named_by_model_rule"
@@ -680,10 +786,24 @@ class RegistryResolver:
         for rule in self.registry.profiles:
             if rule.device != target:
                 continue
-            candidate, _matched = self._evaluate(rule, subject)
+            candidate, matched = self._evaluate(rule, subject)
+            if matched:
+                unusable(rule, candidate)
             explanation.candidates.append(candidate)
             scored.append((rule, candidate))
         winner = self._rank(scored, subject=f"conversion profile for {target}")
+        if winner is None and passed_over:
+            raise RegistryError(
+                self._no_fitting_profile(
+                    target,
+                    passed_over,
+                    arch_rule,
+                    model_rule,
+                    subject,
+                    widths or {},
+                    suggest_devices=suggest_devices,
+                )
+            )
         if winner is None:
             raise RegistryError(
                 Diagnostic(
@@ -704,6 +824,62 @@ class RegistryResolver:
             )
         basis = "size_band" if winner.applies_to.parameter_count is not None else "device_default"
         return winner, basis, None
+
+    def _no_fitting_profile(
+        self,
+        target: str,
+        unfit: Sequence[str],
+        arch_rule: ArchitectureRule | None,
+        model_rule: ModelRule | None,
+        subject: MatchSubject,
+        widths: Mapping[str, int],
+        *,
+        suggest_devices: bool,
+    ) -> Diagnostic:
+        """Refuse before the download when no profile for ``target`` can quantize the model.
+
+        The way out is another device whose own automatic choice fits, worked out
+        the same way. A profile made for one device is not offered for another:
+        it carries that device's runtime properties (the NPU's ``MAX_PROMPT_LEN``),
+        which the CPU and GPU plugins reject.
+        """
+        remediation: list[str] = []
+        others = sorted({rule.device for rule in self.registry.profiles} - {target})
+        for other in others if suggest_devices else ():
+            scratch = ResolutionExplanation(subject=f"conversion profile for {other}")
+            try:
+                fitting, _basis, _rule_id = self._automatic_profile(
+                    other,
+                    arch_rule,
+                    model_rule,
+                    subject.model_copy(update={"device": other}),
+                    scratch,
+                    widths=widths,
+                    suggest_devices=False,
+                )
+            except RegistryError:
+                continue
+            remediation.append(
+                f"Prepare it for the {other} instead, where {fitting.id} fits: "
+                f"yonga prepare MODEL --device {other.lower()}"
+            )
+        remediation.append(
+            "Or add a profile whose group size divides the channel sizes above, in the "
+            "registry override directory, and name it with --profile."
+        )
+        repo_id = subject.repo_id
+        return diagnostic(
+            GROUP_SIZE_MISMATCH_CODE,
+            FailureCategory.CONFIGURATION_ERROR,
+            f"No {target} profile can quantize this model",
+            (
+                f"Every {target} conversion profile quantizes in groups that do not fit this "
+                f"model's channel sizes, so NNCF would refuse the export after the download: "
+                f"{'; '.join(unfit)}. Nothing has been downloaded."
+            ),
+            remediation=remediation,
+            context={"device": target, **({"repo_id": repo_id} if repo_id else {})},
+        )
 
     def _size_skipped(self, target: str, subject: MatchSubject, winner: ProfileRule) -> list[str]:
         """One sentence per usable size-banded profile the model's size kept out.
@@ -740,6 +916,7 @@ class RegistryResolver:
         rule_id: str | None = None,
         automatic_profile_id: str | None = None,
         skipped: Sequence[str] = (),
+        unfit: bool = False,
     ) -> ProfileSelection:
         """Record why ``profile`` won, with the one sentence every surface prints."""
         band = profile.applies_to.parameter_count
@@ -756,7 +933,11 @@ class RegistryResolver:
                 f"{device} profile for that size (evidence: {profile.evidence.value})."
             )
         elif basis == "device_default":
-            sentence = f"Highest-priority {device} profile."
+            sentence = (
+                f"Highest-priority {device} profile that can quantize this model."
+                if unfit
+                else f"Highest-priority {device} profile."
+            )
         else:
             kind = "model" if basis == "named_by_model_rule" else "architecture"
             sentence = f"Named by {kind} rule {rule_id} for {device}."
@@ -1080,22 +1261,24 @@ class RegistryResolver:
                     f"Apply the '{repair_rule.id}' repair (implementation "
                     f"{repair_rule.implementation}) to the artifact."
                 )
-        return Diagnostic(
-            code=rule.classification.code,
-            category=category,
-            severity=Severity.ERROR,
-            title=title,
-            message=message,
-            remediation=remediation,
-            fallback_devices=list(recommendation.fallback_devices),
-            environment_broken=rule.classification.environment_broken,
-            retry_same_device=rule.classification.retry_same_device,
-            defer_to_pipeline=rule.classification.defer_to_pipeline,
-            matched_rule_id=rule.id,
-            raw_excerpt=_excerpt(text),
-            log_path=log_path,
-            job_id=job_id,
-            context=context,
+        return fill_placeholders(
+            Diagnostic(
+                code=rule.classification.code,
+                category=category,
+                severity=Severity.ERROR,
+                title=title,
+                message=message,
+                remediation=remediation,
+                fallback_devices=list(recommendation.fallback_devices),
+                environment_broken=rule.classification.environment_broken,
+                retry_same_device=rule.classification.retry_same_device,
+                defer_to_pipeline=rule.classification.defer_to_pipeline,
+                matched_rule_id=rule.id,
+                raw_excerpt=_excerpt(text),
+                log_path=log_path,
+                job_id=job_id,
+                context=context,
+            )
         )
 
     @staticmethod

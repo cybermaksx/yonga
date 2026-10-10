@@ -33,6 +33,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from yonga.domain.publication import PublisherIdentity
 
 __all__ = [
+    "ChecksToolchainImport",
     "CommandResult",
     "CommandRunner",
     "DeclaresRequirements",
@@ -137,6 +138,15 @@ class ReportsToolchain(Protocol):
 
     def toolchain_available(self) -> bool:
         """Whether an export could start here, without a managed environment."""
+        ...
+
+
+@runtime_checkable
+class ChecksToolchainImport(Protocol):
+    """An exporter that can try importing itself in the environment yonga runs in."""
+
+    def toolchain_import_failure(self) -> str | None:
+        """``None`` when the in-environment exporter imports, else the failure text."""
         ...
 
 

@@ -32,7 +32,7 @@ from pydantic import BaseModel
 from rich.console import Console, Group, RenderableType
 from rich.text import Text
 
-from yonga.domain.diagnostics import Diagnostic, Severity
+from yonga.domain.diagnostics import Diagnostic, Severity, fill_placeholders
 from yonga.util.redaction import redact_mapping, redact_text
 
 __all__ = [
@@ -207,8 +207,10 @@ def diagnostic_lines(item: Diagnostic, *, debug: bool = False) -> list[str]:
     This is the pure core shared by the coloured renderer and by the undecorated
     ``--json`` error output, which makes the wording testable without a terminal.
     The raw exception excerpt is included only when ``debug`` is true; in normal
-    mode a traceback is never shown.
+    mode a traceback is never shown. Remediation placeholders are filled in
+    here as well, so every surface prints the same copy-pasteable commands.
     """
+    item = fill_placeholders(item)
     lines: list[str] = [item.title.strip() or item.code]
     message = item.message.strip()
     if message:

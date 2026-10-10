@@ -33,7 +33,7 @@ import shutil
 import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from yonga.application.progress import ProgressKind
 from yonga.domain.diagnostics import (
@@ -109,6 +109,21 @@ DISK_EXHAUSTION_SIGNATURES: tuple[str, ...] = (
 
 #: How many trailing output lines are kept on an :class:`ExportResult`.
 TAIL_LINES: int = 40
+
+#: How many lines of each exception, its header and what follows it, a failed
+#: export keeps from above the tail, and for at most how many exceptions.
+EXCEPTION_CONTEXT_LINES: int = 3
+EXCEPTION_HEADERS_KEPT: int = 4
+
+_TRACEBACK_START = "Traceback (most recent call last):"
+
+#: Cache files under the exporter's cache directory: optimum-intel's declared
+#: Transformers ranges, and the interpreters whose export toolchain imported.
+_BOUNDS_CACHE_FILE = "exporter-bounds.json"
+_IMPORT_CACHE_FILE = "exporter-import.json"
+
+#: What the managed export environments are verified with, asked of yonga's own.
+_IMPORT_CHECK_SCRIPT = "import optimum.exporters.openvino\n"
 
 _INSTALL_EXPORT_EXTRA = 'pip install "yonga[export]"'
 _INSTALL_OPTIMUM = 'pip install "optimum-intel[openvino]" nncf'
@@ -356,6 +371,35 @@ class OptimumExporter:
         """Return installed versions of every package the export depends on."""
         return {name: installed_version(name) for name in EXPORT_PACKAGES}
 
+    def toolchain_import_failure(self) -> str | None:
+        """Import the export entry point in yonga's own interpreter; the failure text, or ``None``.
+
+        Installed version numbers say nothing about whether the packages load
+        together: torch from the CPU index next to PyPI's torchvision passes
+        every version check and fails on the first import. The managed export
+        environments are verified by importing ``optimum.exporters.openvino``;
+        this asks the same of the environment yonga runs in, before the
+        download rather than after it. The import takes seconds, so a success
+        is cached per interpreter and package versions; a failure never is.
+
+        ``None`` too when there is nothing in this interpreter to check: no
+        Optimum module, or a launcher configured from outside.
+        """
+        if self._launcher is not None or not _module_importable(OPTIMUM_CLI_MODULE):
+            return None
+        versions = {name: installed_version(name) for name in (*EXPORT_PACKAGES, "torchvision")}
+        key = json.dumps([sys.executable, versions], sort_keys=True)
+        cached = self._read_cache(_IMPORT_CACHE_FILE)
+        if cached.get(key) is True:
+            return None
+        result = self._runner.run([sys.executable, "-P", "-c", _IMPORT_CHECK_SCRIPT])
+        if result.returncode == 0:
+            cached[key] = True
+            self._write_cache(_IMPORT_CACHE_FILE, cached)
+            return None
+        lines = _failure_tail(result.stderr_lines) or _tail(result.stdout_lines)
+        return "\n".join(lines).strip() or f"the import exited with status {result.returncode}"
+
     def declared_requirements(
         self, model_type: str, task: str | None
     ) -> DeclaredRequirement | None:
@@ -439,23 +483,25 @@ class OptimumExporter:
                 return {key: parsed.get(key) for key in ("min", "max", "config")}
         return None
 
-    def _bounds_cache_path(self) -> Path | None:
-        return None if self._cache_dir is None else self._cache_dir / "exporter-bounds.json"
-
     def _read_bounds_cache(self) -> dict[str, dict[str, str | None]]:
-        path = self._bounds_cache_path()
-        if path is None:
+        return self._read_cache(_BOUNDS_CACHE_FILE)
+
+    def _write_bounds_cache(self, data: dict[str, dict[str, str | None]]) -> None:
+        self._write_cache(_BOUNDS_CACHE_FILE, data)
+
+    def _read_cache(self, name: str) -> dict[str, Any]:
+        if self._cache_dir is None:
             return {}
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
+            data = json.loads((self._cache_dir / name).read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return {}
         return data if isinstance(data, dict) else {}
 
-    def _write_bounds_cache(self, data: dict[str, dict[str, str | None]]) -> None:
-        path = self._bounds_cache_path()
-        if path is None:
+    def _write_cache(self, name: str, data: Mapping[str, object]) -> None:
+        if self._cache_dir is None:
             return
+        path = self._cache_dir / name
         with contextlib.suppress(OSError):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
@@ -514,10 +560,12 @@ class OptimumExporter:
         cwd = ctx.temp_dir if ctx.temp_dir.is_dir() else None
         result = self._runner.run(argv, env=env, cwd=cwd, timeout=self._timeout, ctx=ctx)
 
-        stdout_tail = _tail(result.stdout_lines)
-        stderr_tail = _tail(result.stderr_lines)
         cancelled = bool(result.cancelled)
         success = result.returncode == 0 and not cancelled
+        stdout_tail = _tail(result.stdout_lines)
+        # A failure keeps the exception lines too, wherever they are: they are what
+        # the registry classifier matches, and the lines after them can be many.
+        stderr_tail = _tail(result.stderr_lines) if success else _failure_tail(result.stderr_lines)
 
         failure: Diagnostic | None = None
         if not success:
@@ -693,6 +741,51 @@ def _tail(lines: Sequence[str], limit: int = TAIL_LINES) -> list[str]:
     """Return the last ``limit`` output lines, redacted and newline-stripped."""
     selected = list(lines)[-limit:] if limit > 0 else []
     return [redact_text(str(line).rstrip("\n")) for line in selected]
+
+
+def _failure_tail(lines: Sequence[str], limit: int = TAIL_LINES) -> list[str]:
+    """The last ``limit`` lines, preceded by any exception lines that fell out of them.
+
+    A Python exception's header line (``nncf.errors.InvalidGroupSizeError: ...``)
+    is the one line the registry's signatures are written against, but whatever
+    the exception prints after it can push it out of a plain tail: NNCF lists
+    every node it refused, one per line, 118 of them for SmolLM2-360M. The
+    header of each traceback above the tail (the first unindented line after
+    ``Traceback (most recent call last):``) and the lines right after it are kept
+    in front, so a chained cause such as ``operator torchvision::nms does not
+    exist`` survives as well, and an elision marker says what was left out.
+    """
+    every = [str(line).rstrip("\n") for line in lines]
+    start = max(len(every) - limit, 0) if limit > 0 else len(every)
+    if start == 0:
+        return _tail(every, limit)
+    headers: list[int] = []
+    in_traceback = False
+    for index, line in enumerate(every[:start]):
+        if line.strip() == _TRACEBACK_START:
+            in_traceback = True
+        elif in_traceback and line.strip() and not line[:1].isspace():
+            headers.append(index)
+            in_traceback = False
+    kept: list[int] = []
+    for index in headers[-EXCEPTION_HEADERS_KEPT:]:
+        kept.extend(
+            position
+            for position in range(index, min(index + EXCEPTION_CONTEXT_LINES, start))
+            if position not in kept
+        )
+    if not kept:
+        return _tail(every, limit)
+    selected: list[str] = []
+    previous = -1
+    for position in kept:
+        if position != previous + 1:
+            selected.append(f"[... {position - previous - 1} lines omitted ...]")
+        selected.append(every[position])
+        previous = position
+    if previous + 1 < start:
+        selected.append(f"[... {start - previous - 1} lines omitted ...]")
+    return [redact_text(line) for line in selected] + _tail(every, limit)
 
 
 def _environment_overrides(env: Mapping[str, str]) -> dict[str, str]:

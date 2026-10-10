@@ -136,7 +136,8 @@ class ProfileSelection(BaseModel):
     automatic_profile_id: str | None = None
     """For an explicit profile: what would have been chosen automatically, when different."""
     skipped: list[str] = Field(default_factory=list)
-    """One sentence per size-banded profile that lost because of the model's size."""
+    """One sentence per size-banded profile that lost because of the model's size, and per
+    profile passed over because its group size cannot quantize the model."""
     applies: bool = True
     """False when no profile decides the quantization (a GGUF import, an OpenVINO copy)."""
     sentence: str = ""
