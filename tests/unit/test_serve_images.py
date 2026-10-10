@@ -212,13 +212,13 @@ def no_decoding(monkeypatch: pytest.MonkeyPatch) -> None:
     [
         ({"stop": [""]}, "invalid_request", "stop"),
         ({"stop": ["a", "b", "c", "d", "e"]}, "invalid_request", "stop"),
-        ({"temperature": 9.0}, "serve.request.temperature", None),
-        ({"top_p": 0.0}, "serve.request.top_p", None),
-        ({"max_tokens": 0}, "serve.request.max_tokens", None),
+        ({"temperature": 9.0}, "serve.request.temperature", "temperature"),
+        ({"top_p": 0.0}, "serve.request.top_p", "top_p"),
+        ({"max_tokens": 0}, "serve.request.max_tokens", "max_tokens"),
     ],
 )
 def test_a_request_refused_for_its_settings_reads_no_image(
-    tmp_path: Path, extra: dict[str, object], code: str, param: str | None
+    tmp_path: Path, extra: dict[str, object], code: str, param: str
 ) -> None:
     server, runtime = make_server(tmp_path, ["Hi."])
     parts = [image_part(png()) for _ in range(MAX_IMAGES)]

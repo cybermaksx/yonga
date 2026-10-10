@@ -34,6 +34,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import json
+import re
 import threading
 import time
 from collections.abc import AsyncIterator
@@ -50,6 +51,8 @@ from yonga import __version__
 from yonga.api.openai import ChatCompletionRequest, ParameterError, wire_tool_call
 from yonga.application.chat import ChatTurn
 from yonga.application.serve import (
+    PARAM_CONTEXT,
+    PROMPT_TOO_LONG,
     CompletionRequest,
     ModelServer,
     completion_id,
@@ -67,6 +70,15 @@ DEFAULT_MAX_BODY_BYTES = 8 * 1024 * 1024
 
 #: Categories that describe the request rather than the server.
 _CLIENT_ERRORS = frozenset({FailureCategory.CONFIGURATION_ERROR})
+
+#: Diagnostics reported under OpenAI's own ``code`` and ``param``, so a client
+#: that handles that case (trimming a history that no longer fits) recognises it.
+_OPENAI_CODES = {PROMPT_TOO_LONG: ("context_length_exceeded", "messages")}
+
+#: Where OpenVINO says which of its source lines raised: "Check '...' failed at
+#: /path/file.cpp:359:" or "Exception from src/file.cpp:112:". It names the
+#: vendor's build machine and nothing a client can act on.
+_SOURCE_LOCATION = re.compile(r"(?:Check '[^\n]*?' failed at |Exception from )\S+?:\d+:\s*")
 
 #: The OpenAI-style ``code`` for an HTTP error raised by routing or by a limit.
 _HTTP_ERROR_CODES = {
@@ -106,16 +118,14 @@ def create_app(
             if scheme.lower() != "bearer" or not hmac.compare_digest(
                 token.encode(), api_key.encode()
             ):
-                return _error(401, "Invalid or missing API key.", "invalid_api_key", kind="auth")
+                return _error(401, "Invalid or missing API key.", "invalid_api_key")
         return await call_next(request)
 
     @app.exception_handler(RequestValidationError)
     async def invalid_body(_request: Request, error: RequestValidationError) -> JSONResponse:
         first = error.errors()[0] if error.errors() else {}
-        location = ".".join(str(part) for part in first.get("loc", ()) if part != "body")
-        return _error(
-            400, str(first.get("msg", "Invalid request body.")), "invalid_request", param=location
-        )
+        message, param = _validation_failure(first)
+        return _error(400, message, "invalid_request", param=param)
 
     @app.exception_handler(StarletteHTTPException)
     async def http_error(_request: Request, error: StarletteHTTPException) -> JSONResponse:
@@ -323,11 +333,12 @@ async def _stream(
                         "code": value.code,
                         "param": value.param,
                     }
+                elif report is not None:
+                    _status, body = _diagnostic_body(report)
+                    # The stream has begun: no status, and only what the event shape carries.
+                    error = {key: body[key] for key in ("message", "code", "param") if body[key]}
                 else:
-                    error = {
-                        "message": report.message if report is not None else "Generation failed.",
-                        "code": report.code if report is not None else "internal_error",
-                    }
+                    error = {"message": "Generation failed.", "code": "internal_error"}
                 yield f"data: {json.dumps({'error': error})}\n\n"
             yield "data: [DONE]\n\n"
             return
@@ -402,16 +413,10 @@ def _content_length(scope: Scope) -> int | None:
 # --- errors ---------------------------------------------------------------------------
 
 
-def _error(
-    status: int,
-    message: str,
-    code: str,
-    *,
-    param: str | None = None,
-    kind: str = "invalid_request_error",
-) -> JSONResponse:
-    body = {"error": {"message": message, "type": kind, "param": param, "code": code}}
-    return JSONResponse(body, status_code=status)
+def _error(status: int, message: str, code: str, *, param: str | None = None) -> JSONResponse:
+    """A client error in OpenAI's shape; OpenAI types a bad API key this way too."""
+    error = {"message": message, "type": "invalid_request_error", "param": param, "code": code}
+    return JSONResponse({"error": error}, status_code=status)
 
 
 def _model_not_found(name: str) -> JSONResponse:
@@ -419,6 +424,48 @@ def _model_not_found(name: str) -> JSONResponse:
 
 
 def _diagnostic_error(report: Diagnostic) -> JSONResponse:
-    status = 400 if report.category in _CLIENT_ERRORS else 500
-    kind = "invalid_request_error" if status == 400 else "server_error"
-    return _error(status, f"{report.title}: {report.message}", report.code, kind=kind)
+    status, body = _diagnostic_body(report)
+    return JSONResponse({"error": body}, status_code=status)
+
+
+def _diagnostic_body(report: Diagnostic) -> tuple[int, dict[str, object]]:
+    """The status and OpenAI-shaped error body for a diagnostic.
+
+    A refusal of the request is a 400 naming the parameter its diagnostic
+    carries; anything else is the server's 500. Either way OpenVINO's source
+    locations are left out of the message (see :data:`_SOURCE_LOCATION`).
+    """
+    client = report.category in _CLIENT_ERRORS
+    code, param = _OPENAI_CODES.get(report.code, (report.code, None))
+    if param is None and client:
+        param = report.context.get(PARAM_CONTEXT)
+    message = _SOURCE_LOCATION.sub("", f"{report.title}: {report.message}").strip()
+    body: dict[str, object] = {
+        "message": message,
+        "type": "invalid_request_error" if client else "server_error",
+        "param": param,
+        "code": code,
+    }
+    return (400 if client else 500), body
+
+
+def _validation_failure(error: dict[str, Any]) -> tuple[str, str | None]:
+    """The message and ``param`` for the first error of a body that did not validate.
+
+    ``param`` is the dotted path of the field, never a position in the body: a
+    body that is not JSON names no field, and the decode error's offset goes
+    into the message instead.
+    """
+    location = [part for part in error.get("loc", ()) if part != "body"]
+    if error.get("type") == "json_invalid":
+        offset = location[-1] if location and isinstance(location[-1], int) else None
+        reason = str((error.get("ctx") or {}).get("error", "")).strip() or "it does not parse"
+        where = f" at character {offset}" if offset is not None else ""
+        return f"The request body is not valid JSON: {reason}{where}.", None
+    if not location or not isinstance(location[0], str):
+        # The body as a whole: sent without a JSON content type, or not an object.
+        return (
+            "The request body must be a JSON object sent with Content-Type: application/json.",
+            None,
+        )
+    return str(error.get("msg", "Invalid request body.")), ".".join(map(str, location))

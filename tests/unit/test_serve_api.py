@@ -27,7 +27,7 @@ from tests.unit.test_chat_service import (
 from yonga.adapters.runtime_genai import ChatHistory, GenerationResult, TextCallback
 from yonga.api.app import create_app
 from yonga.api.openai import MAX_MESSAGES
-from yonga.application.serve import ModelServer
+from yonga.application.serve import PROMPT_TOO_LONG, ModelServer
 from yonga.domain.benchmarks import GenerationSettings
 from yonga.domain.diagnostics import FailureCategory, GenerationError, diagnostic
 
@@ -379,6 +379,36 @@ def test_out_of_range_values_are_refused_like_chat_refuses_them(tmp_path: Path) 
     assert response.json()["error"]["code"] == "serve.request.temperature"
 
 
+@pytest.mark.parametrize(
+    ("setting", "value", "param"),
+    [
+        ("temperature", 2.5, "temperature"),
+        ("temperature", -0.1, "temperature"),
+        ("top_p", 0, "top_p"),
+        ("top_p", 1.5, "top_p"),
+        ("top_k", -1, "top_k"),
+        ("repetition_penalty", 0, "repetition_penalty"),
+        ("max_tokens", 0, "max_tokens"),
+        ("max_completion_tokens", 0, "max_completion_tokens"),
+    ],
+)
+def test_a_generation_setting_out_of_range_names_the_parameter(
+    tmp_path: Path, setting: str, value: float, param: str
+) -> None:
+    server, runtime = make_server(tmp_path, ["Hi."])
+    for stream in (False, True):
+        body = {**ask(stream=stream), setting: value}
+        response = client_for(server).post("/v1/chat/completions", json=body)
+
+        assert response.status_code == 400
+        error = response.json()["error"]
+        assert error["param"] == param
+        assert error["type"] == "invalid_request_error"
+        assert error["code"].startswith("serve.request.")
+        assert f"{param} must be" in error["message"]
+    assert runtime.histories == []
+
+
 def test_a_conversation_ending_with_the_assistant_is_refused(tmp_path: Path) -> None:
     server, _ = make_server(tmp_path, ["Hi."])
     body = {
@@ -404,6 +434,78 @@ def test_a_generation_failure_is_a_500_with_its_diagnostic_code(tmp_path: Path) 
 
     assert response.status_code == 500
     assert response.json()["error"]["code"] == "runtime.genai.generation_failed"
+
+
+def test_a_server_error_does_not_echo_openvinos_source_locations(tmp_path: Path) -> None:
+    raw = (
+        "Check 'tensor.get_size() > 0' failed at /home/jenkins/agent/workspace/ie/src/"
+        "pipeline.cpp:120:\nThe device returned no logits.\n"
+    )
+    failure = GenerationError(
+        diagnostic(
+            "runtime.genai.generation_failed",
+            FailureCategory.UNKNOWN_RUNTIME_ERROR,
+            "Generation failed on NPU",
+            raw,
+            raw_excerpt=raw,
+        )
+    )
+    server, _ = make_server(tmp_path, [failure, failure])
+    client = client_for(server)
+
+    plain = client.post("/v1/chat/completions", json=ask()).json()["error"]
+    parsed = events(client.post("/v1/chat/completions", json=ask(stream=True)).text)
+    (streamed,) = [e["error"] for e in parsed if isinstance(e, dict) and "error" in e]
+
+    assert plain["message"] == "Generation failed on NPU: The device returned no logits."
+    assert streamed["message"] == plain["message"]
+    assert plain["type"] == "server_error"
+
+
+def prompt_too_long() -> GenerationError:
+    """What the runtime adapter reports for GenAI's refusal of an over-long NPU prompt."""
+    return GenerationError(
+        diagnostic(
+            PROMPT_TOO_LONG,
+            FailureCategory.CONFIGURATION_ERROR,
+            "The prompt is too long for this model",
+            "The prompt is 6423 tokens, and this model on NPU takes at most 1024.",
+            context={"device": "NPU", "prompt_tokens": "6423", "max_prompt_tokens": "1024"},
+        )
+    )
+
+
+def test_a_prompt_over_the_npu_length_is_openais_context_length_error(tmp_path: Path) -> None:
+    """A 400, so a client does not retry it, under the code clients trim a history on."""
+    server, _ = make_server(tmp_path, [prompt_too_long(), "Hi."])
+    client = client_for(server)
+
+    response = client.post("/v1/chat/completions", json=ask("word " * 6000))
+
+    assert response.status_code == 400
+    error = response.json()["error"]
+    assert error == {
+        "message": "The prompt is too long for this model: The prompt is 6423 tokens, and this "
+        "model on NPU takes at most 1024.",
+        "type": "invalid_request_error",
+        "param": "messages",
+        "code": "context_length_exceeded",
+    }
+    assert client.post("/v1/chat/completions", json=ask()).status_code == 200
+
+
+def test_a_streamed_prompt_over_the_npu_length_names_it_in_the_error_event(
+    tmp_path: Path,
+) -> None:
+    server, _ = make_server(tmp_path, [prompt_too_long()])
+    response = client_for(server).post("/v1/chat/completions", json=ask(stream=True))
+
+    parsed = events(response.text)
+    (error,) = [e["error"] for e in parsed if isinstance(e, dict) and "error" in e]
+    assert error["code"] == "context_length_exceeded"
+    assert error["param"] == "messages"
+    assert "6423" in error["message"]
+    assert parsed[-1] == "[DONE]"
 
 
 # --- streaming ------------------------------------------------------------------------
@@ -479,6 +581,11 @@ def test_an_api_key_is_required_when_configured(tmp_path: Path) -> None:
 
     assert missing.status_code == 401
     assert wrong.status_code == 401
+    for refused in (missing, wrong):
+        error = refused.json()["error"]
+        # OpenAI's shape for a bad key, which its client raises AuthenticationError on.
+        assert error["type"] == "invalid_request_error"
+        assert error["code"] == "invalid_api_key"
     assert "s3cret-key" not in missing.text + wrong.text
     assert right.status_code == 200
     assert len(runtime.histories) == 1
@@ -575,7 +682,44 @@ def test_a_json_body_without_a_json_content_type_is_refused(
     error = response.json()["error"]
     assert error["code"] == "invalid_request"
     assert error["type"] == "invalid_request_error"
+    assert error["param"] is None, "the body as a whole is refused, no field in it"
+    assert "application/json" in error["message"]
     assert runtime.histories == []
+
+
+def test_a_body_that_is_not_json_names_no_parameter(tmp_path: Path) -> None:
+    server, runtime = make_server(tmp_path, ["Hi."])
+
+    response = client_for(server).post(
+        "/v1/chat/completions",
+        content=b'{"model": "x", "messages": [',
+        headers={"Content-Type": "application/json"},
+    )
+
+    assert response.status_code == 400
+    error = response.json()["error"]
+    assert error["param"] is None, "never the decode error's offset"
+    assert error["code"] == "invalid_request"
+    assert error["message"].startswith("The request body is not valid JSON")
+    assert "character 28" in error["message"]
+    assert runtime.histories == []
+
+
+@pytest.mark.parametrize(
+    ("body", "param"),
+    [
+        ({"messages": [{"role": "user", "content": "Hi"}]}, "model"),
+        ({"model": "qwen", "messages": [{"content": "Hi"}]}, "messages.0.role"),
+    ],
+)
+def test_a_field_that_does_not_validate_is_named(
+    tmp_path: Path, body: dict[str, object], param: str
+) -> None:
+    server, _ = make_server(tmp_path, ["Hi."])
+    response = client_for(server).post("/v1/chat/completions", json=body)
+
+    assert response.status_code == 400
+    assert response.json()["error"]["param"] == param
 
 
 def test_authentication_comes_before_the_size_limit(tmp_path: Path) -> None:
