@@ -42,6 +42,7 @@ from tests.unit.test_compile_cache import (
 )
 from tests.unit.test_prepare_planning import (
     GGUF_REPO,
+    INSTALLED_EXPORT_VERSIONS,
     SAFETENSORS_REPO,
     FakeExporter,
     FakeFilesystemProbe,
@@ -812,8 +813,12 @@ def test_explicit_npu_never_falls_back_and_exits_fifty(
 ) -> None:
     """``--device npu`` is an instruction: the job stops and recommends the GPU."""
     runtime = FakeRuntimeProbe(compile_failures={"NPU": NPU_UNSUPPORTED_GRAPH})
+    # A registry that does not already rule the NPU out, so the probe decides.
     wiring_for = lambda settings: FakeWiring(  # noqa: E731 - one-line factory
-        settings, hub=hub_with(tmp_path=tmp_path), runtime=runtime
+        settings,
+        hub=hub_with(tmp_path=tmp_path),
+        runtime=runtime,
+        resolver=builtin_resolver([NPU_FIRST_REGISTRY]),
     )
     result = invoke(
         runner,
@@ -889,6 +894,103 @@ def test_declining_a_confirmation_exits_sixty(
         runner, home, ["prepare", SAFETENSORS_REPO, "--device", "cpu"], factory=wiring_for
     )
     assert result.exit_code == int(ExitCode.CANCELLED)
+    assert hub.downloaded == []
+
+
+def test_a_confirmation_nobody_could_answer_is_not_called_declined(
+    runner: CliRunner, home: Path, tmp_path: Path
+) -> None:
+    """No prompt was shown, so nothing was declined: say so, and name ``--yes``."""
+    hub = hub_with(tmp_path=tmp_path)
+    wiring_for = lambda settings: FakeWiring(settings, hub=hub)  # noqa: E731
+    result = invoke(
+        runner, home, ["prepare", SAFETENSORS_REPO, "--device", "cpu"], factory=wiring_for
+    )
+    assert result.exit_code == int(ExitCode.CANCELLED)
+    assert "declined" not in result.stderr
+    assert "could not be asked" in result.stderr
+    assert "--yes" in result.stderr
+    assert hub.downloaded == []
+
+
+def test_reusing_a_ready_artifact_needs_no_confirmation(
+    runner: CliRunner, home: Path, tmp_path: Path
+) -> None:
+    """A re-run returns the artifact, so it asks nothing and works without ``--yes``.
+
+    It used to ask about the repair the export would need, and in a script
+    without ``--yes`` failed with exit 60 on a question about an export that was
+    never going to run.
+    """
+    hub = hub_with(tmp_path=tmp_path)
+    wiring_for = lambda settings: FakeWiring(settings, hub=hub)  # noqa: E731
+    first = invoke(
+        runner, home, ["prepare", SAFETENSORS_REPO, "--device", "cpu", "--yes"], factory=wiring_for
+    )
+    assert first.exit_code in (int(ExitCode.SUCCESS), int(ExitCode.WARNINGS))
+
+    again = invoke(
+        runner, home, ["prepare", SAFETENSORS_REPO, "--device", "cpu"], factory=wiring_for
+    )
+
+    assert again.exit_code == int(ExitCode.SUCCESS), again.stderr
+    assert "Reused    an existing artifact" in again.stdout
+    assert "Confirmation required" not in again.stdout
+    assert "Expected download" not in again.stdout
+    assert "Expected repairs" not in again.stdout
+    assert hub.downloaded == [SAFETENSORS_REPO]
+
+
+def test_explicit_device_the_registry_rules_out_stops_before_the_download(
+    runner: CliRunner, home: Path, tmp_path: Path
+) -> None:
+    """The built-in registry knows Qwen3.5 cannot run on the NPU (tested evidence).
+
+    ``docs/CLI_SPEC.md`` section 6: the job says so and recommends the GPU with
+    exit 50, instead of downloading and converting first.
+    """
+    hub = hub_with(tmp_path=tmp_path)
+    runtime = FakeRuntimeProbe()
+    wiring_for = lambda settings: FakeWiring(  # noqa: E731 - one-line factory
+        settings, hub=hub, runtime=runtime
+    )
+    result = invoke(
+        runner,
+        home,
+        ["prepare", SAFETENSORS_REPO, "--device", "npu", "--yes"],
+        factory=wiring_for,
+    )
+    assert result.exit_code == int(ExitCode.DEVICE_UNSUPPORTED)
+    assert "NPU preparation cannot be completed" in result.stderr
+    assert "Recommended fallback: GPU" in result.stderr
+    assert "--device gpu" in result.stderr
+    assert "BLOCKED" in result.stdout
+    assert hub.downloaded == []
+    assert runtime.compiled == []
+
+
+def test_prepare_without_the_openvino_runtime_names_the_extra(
+    runner: CliRunner, home: Path, tmp_path: Path
+) -> None:
+    """A core-only install exits 10 naming ``yonga[openvino]``, not "no devices on this host".
+
+    The plan must not ask to build a managed export environment either: it
+    could never be used without the runtime that validates its output.
+    """
+    hub = hub_with(tmp_path=tmp_path)
+    wiring_for = lambda settings: FakeWiring(  # noqa: E731 - one-line factory
+        settings,
+        hub=hub,
+        hardware=FakeHardwareProbe(healthy_inventory(devices=(), openvino=False)),
+        exporter=FakeExporter(versions={**INSTALLED_EXPORT_VERSIONS, "optimum-intel": None}),
+    )
+    result = invoke(
+        runner, home, ["prepare", SAFETENSORS_REPO, "--device", "cpu", "--yes"], factory=wiring_for
+    )
+    assert result.exit_code == int(ExitCode.ENVIRONMENT_UNUSABLE)
+    assert "pip install 'yonga[openvino]'" in result.stderr
+    assert "no devices" not in result.stderr
+    assert "managed export environment" not in result.stdout
     assert hub.downloaded == []
 
 

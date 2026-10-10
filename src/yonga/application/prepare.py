@@ -113,6 +113,7 @@ from yonga.domain.diagnostics import (
     Diagnostic,
     ExportError,
     FailureCategory,
+    HubAuthError,
     PreflightError,
     RemoteCodeRequiredError,
     RepairError,
@@ -154,6 +155,9 @@ from yonga.domain.plans import (
     ExportResult,
     JobStage,
     PreparationPlan,
+    bytes_to_download,
+    download_ignore_patterns,
+    estimate_artifact_bytes,
 )
 from yonga.registry.resolver import RegistryResolver
 from yonga.registry.schema import (
@@ -357,6 +361,10 @@ class PreparationOutcome(BaseModel):
     reused: bool = False
     fallbacks: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
+    """What the user should know is not as asked: a fallback, an overridden pin."""
+    notes: list[str] = Field(default_factory=list)
+    """Facts about how the artifact was made that change nothing about it, such as
+    an export adopted from a failed job. Recorded in the manifest, never a warning."""
     repairs: list[RepairRecord] = Field(default_factory=list)
     validation: ValidationReport | None = None
     duration_seconds: float = 0.0
@@ -661,10 +669,26 @@ class PrepareService:
         )
         staging_dir = self._artifacts.staging_model_dir(job_id)
 
-        download_bytes = sum(entry.size or 0 for entry in source_meta.files)
+        pipeline = self._pipeline_kind(source_meta, arch_rule)
+        remote_code_required = self._remote_code_required(source_meta, arch_rule, model_rule)
+        remote_code = remote_code_required and bool(trust_remote_code)
+
+        ignore_patterns = download_ignore_patterns(
+            source_meta.files,
+            source_meta.formats,
+            source_format=resolved_source.format,
+            remote_code=remote_code,
+        )
+        download_bytes = bytes_to_download(source_meta.files, ignore_patterns)
         weight_bytes = source_meta.weight_bytes
+        artifact_bytes = None
+        if size_applies:
+            artifact_bytes = estimate_artifact_bytes(
+                source_meta.size_for_matching()[0], profile.quantization
+            )
         if resolved_source.gguf_file is not None:
             # One file of the repository's many quantizations is downloaded and imported.
+            ignore_patterns = []
             download_bytes = resolved_source.gguf_file_bytes or 0
             weight_bytes = resolved_source.gguf_file_bytes or weight_bytes
         disk = plan_disk_usage(
@@ -673,13 +697,13 @@ class PrepareService:
             source_weight_bytes=weight_bytes,
             settings=self._settings,
             expected_download_bytes=download_bytes,
+            estimated_artifact_bytes=artifact_bytes,
             download_dir=inventory.hf_auth.cache_dir if inventory.hf_auth is not None else None,
             probe=self._filesystem,
         )
 
-        pipeline = self._pipeline_kind(source_meta, arch_rule)
-        remote_code_required = self._remote_code_required(source_meta, arch_rule, model_rule)
-        expected_repairs = [rule.id for rule in self._expected_repairs()]
+        reuse = None if force else self._reusable_artifact(artifact_dir, source_sha, artifact_key)
+        expected_repairs = [] if reuse is not None else [r.id for r in self._expected_repairs()]
         known_limitations = list(arch_rule.known_limitations) if arch_rule is not None else []
         if arch_rule is not None:
             # On a successful match the only note resolution adds is how the
@@ -715,30 +739,45 @@ class PrepareService:
                 f"its own quantization ({types}); the {profile.id} profile's quantization "
                 "settings do not apply, only its runtime properties."
             )
+        runtime_missing = not inventory.openvino_available and not inventory.devices
+        auth_missing = self._auth_missing(source_meta)
+        if auth_missing:
+            known_limitations.append(
+                f"{resolved_source.source.repo_id} is gated or private and no Hugging Face "
+                "token was found, so the download would be refused: accept the conditions on "
+                "the model page and run 'hf auth login' first."
+            )
         export_environment = self._plan_export_environment(
-            exporter_requirements, resolved_source=resolved_source, allowed=managed_env
+            exporter_requirements,
+            resolved_source=resolved_source,
+            # Nothing is exported for a reused artifact, and without the OpenVINO
+            # runtime nothing could validate an export: no environment is built.
+            allowed=managed_env and reuse is None and not runtime_missing,
         )
         environment_ready = (
             export_environment is not None
             and self._environments is not None
             and self._environments.find(export_environment) is not None
         )
-        if export_environment is not None:
+        # A reused artifact is not exported again, so the exporter's requirements
+        # decide nothing about it and are not reported.
+        if reuse is None and export_environment is not None:
             known_limitations.extend(
                 f"The installed packages do not meet an exporter requirement ({problem}); the "
                 f"export runs in managed environment {export_environment.name} instead."
                 for problem in exporter_requirements.problems
             )
-        else:
+        elif reuse is None:
             known_limitations.extend(
                 f"Exporter requirement not satisfied: {problem}"
                 for problem in exporter_requirements.problems
             )
-        known_limitations.extend(
-            f"Exporter requirement could not be checked: {note}" for note in exporter_unverifiable
-        )
+        if reuse is None:
+            known_limitations.extend(
+                f"Exporter requirement could not be checked: {note}"
+                for note in exporter_unverifiable
+            )
 
-        reuse = None if force else self._reusable_artifact(artifact_dir, source_sha, artifact_key)
         if reuse is None and profile_selection is not None and profile_selection.applies:
             known_limitations.extend(
                 self._existing_under_other_profiles(artifact_dir, profile, profile_selection)
@@ -782,7 +821,15 @@ class PrepareService:
             export_environment=export_environment,
             export_environment_ready=environment_ready,
             profile_selection=profile_selection,
+            download_ignore_patterns=ignore_patterns,
+            auth_missing=auth_missing,
         )
+        if plan.reuses_artifact or plan.refused_before_work:
+            # Nothing the confirmations describe will happen: a reused artifact is
+            # returned as it is, and a refused plan stops before any of it. Asking
+            # anyway made a re-run without --yes fail on a question about an
+            # export that was never going to run.
+            plan = plan.model_copy(update={"confirmations": []})
         if not reuse_export or reuse is not None or resolved_source.already_openvino:
             return plan
         reusable = export_reuse.find_reusable(
@@ -828,6 +875,21 @@ class PrepareService:
         except (YongaError, LookupError, OSError):
             return identity
         return identity.with_revision(resolved) if resolved else identity
+
+    def _auth_missing(self, metadata: ModelMetadata) -> bool:
+        """Whether a gated or private source will refuse its download for want of a token.
+
+        Asked only for a repository the Hub marks gated or private, and never
+        offline: a snapshot already in the cache needs no token. A token that
+        has not been granted access is not detectable here; the download says so.
+        """
+        if not (metadata.gated or metadata.private):
+            return False
+        try:
+            auth = self._hub.auth_info()
+        except (YongaError, OSError):
+            return False
+        return not auth.offline and not auth.logged_in
 
     def _requested_device(self, device: str | DevicePolicy | None) -> str:
         """Normalise the requested device, falling back to the configured default."""
@@ -1140,12 +1202,9 @@ class PrepareService:
             )
         selected = order[0]
         entry = by_name.get(selected)
-        reasons = [f"Auto-selection chose {selected} as the most compatible available device."]
+        reasons = [self._auto_reason(selected, order, by_name, arch_rule)]
         if entry is not None and entry.reason:
             reasons.append(entry.reason)
-        recommended = arch_rule.recommended_device if arch_rule is not None else None
-        if recommended and recommended == selected:
-            reasons.append(f"The registry recommends {selected} for this architecture.")
         return CompatibilityDecision(
             requested_device="AUTO",
             selected_device=selected,
@@ -1156,6 +1215,44 @@ class PrepareService:
             fallback_candidates=order[1:],
             per_device=per_device,
             explicit_request=False,
+        )
+
+    @staticmethod
+    def _auto_reason(
+        selected: str,
+        order: Sequence[str],
+        by_name: Mapping[str, DeviceCompatibility],
+        arch_rule: ArchitectureRule | None,
+    ) -> str:
+        """Say why auto-selection chose ``selected``, naming the rule that actually decided.
+
+        The plan prints this sentence first, so it must be the real reason: the
+        registry's recommendation when that promoted the device, a better
+        compatibility status when one device has it, and otherwise yonga's
+        default order among equally supported devices.
+        """
+        recommended = arch_rule.recommended_device if arch_rule is not None else None
+        if recommended and recommended == selected:
+            return (
+                f"Auto-selection chose {selected}: the registry recommends it for this "
+                "architecture."
+            )
+
+        def status(name: str) -> DeviceStatus:
+            entry = by_name.get(name)
+            return entry.status if entry is not None else DeviceStatus.UNKNOWN
+
+        ties = [name for name in order if status(name) is status(selected)]
+        if len(ties) == 1:
+            return (
+                f"Auto-selection chose {selected}: it is the only available device whose "
+                f"compatibility is {status(selected).value}."
+            )
+        preference = ", ".join(AUTO_DEVICE_PREFERENCE)
+        return (
+            f"Auto-selection chose {selected}: {', '.join(ties)} are equally "
+            f"{status(selected).value}, and {selected} comes first in the default order "
+            f"({preference})."
         )
 
     @staticmethod
@@ -1452,6 +1549,7 @@ class PrepareService:
         ctx: JobContext,
         allow_repairs: bool = True,
         ignore_exporter_requirements: bool = False,
+        unattended: bool = False,
     ) -> PreparationOutcome:
         """Execute a plan through the full preparation state machine.
 
@@ -1468,6 +1566,10 @@ class PrepareService:
             ignore_exporter_requirements: Proceed even when the registry's
                 exporter version pins are unmet. Defaults to ``False``; the CLI
                 only sets it from its own explicit flag, never from ``--yes``.
+            unattended: Nobody can answer a prompt (stdin is not a terminal).
+                A confirmation ``confirm`` turns down is then reported as one
+                that could not be asked, with the flag that answers it, rather
+                than as one the user declined.
         """
         tracker = _StageTracker()
         try:
@@ -1478,6 +1580,7 @@ class PrepareService:
                 allow_repairs=allow_repairs,
                 tracker=tracker,
                 ignore_exporter_requirements=ignore_exporter_requirements,
+                unattended=unattended,
             )
         except YongaError as error:
             self._clean_up_staging(ctx)
@@ -1513,6 +1616,7 @@ class PrepareService:
         allow_repairs: bool,
         tracker: _StageTracker,
         ignore_exporter_requirements: bool = False,
+        unattended: bool = False,
     ) -> PreparationOutcome:
         """Run the state machine. See :meth:`prepare` for the caller contract."""
         started = time.perf_counter()
@@ -1529,11 +1633,13 @@ class PrepareService:
             ctx.emit(ProgressKind.LOG, reason)
 
         self._guard_remote_code(plan)
-        self._approve(plan, confirm)
-
+        # Reuse comes before every question: returning a ready artifact
+        # downloads, exports and repairs nothing, so there is nothing to agree to.
         reused = self._reuse(plan, ctx, started)
         if reused is not None:
             return reused
+        self._refuse_impossible(plan)
+        self._approve(plan, confirm, unattended=unattended)
 
         self._stage(ctx, 3)
         tracker.stage = JobStage.PREFLIGHT_OK
@@ -1569,7 +1675,9 @@ class PrepareService:
             )
         else:
             export = self._convert(plan, snapshot, staging, ctx, environment=environment)
-        warnings.extend(export.notes)
+        # How the IR was obtained (an adopted export, a copied OpenVINO repository)
+        # is recorded, not warned about: the artifact is exactly as good.
+        notes = list(export.notes)
         ctx.advance(JobStage.EXPORTED)
 
         self._stage(ctx, 6)
@@ -1602,7 +1710,7 @@ class PrepareService:
             probes=probes,
             device=device,
             source_meta=source_meta,
-            notes=warnings,
+            notes=[*warnings, *notes],
         )
         final = self._artifacts.finalize(
             staging,
@@ -1629,6 +1737,7 @@ class PrepareService:
             reused=False,
             fallbacks=fallbacks[1:],
             warnings=warnings,
+            notes=notes,
             repairs=list(repairs),
             validation=validation,
             duration_seconds=time.perf_counter() - started,
@@ -1703,11 +1812,20 @@ class PrepareService:
         )
 
     @staticmethod
-    def _approve(plan: PreparationPlan, confirm: ConfirmCallback) -> None:
-        """Ask for every confirmation the plan collected; a refusal cancels the job."""
+    def _approve(
+        plan: PreparationPlan, confirm: ConfirmCallback, *, unattended: bool = False
+    ) -> None:
+        """Ask for every confirmation the plan collected; a refusal cancels the job.
+
+        In an ``unattended`` session nobody was asked, so a refusal is reported
+        as a question that could not be put, with the way to answer it, and
+        never as the user's own "no".
+        """
         for reason in plan.confirmations:
             if confirm(reason):
                 continue
+            if unattended:
+                raise CancelledError(PrepareService._unanswerable(plan, reason))
             raise CancelledError(
                 diagnostic(
                     "job.declined",
@@ -1717,6 +1835,143 @@ class PrepareService:
                     context={"confirmation": reason.code},
                 )
             )
+
+    @staticmethod
+    def _unanswerable(plan: PreparationPlan, reason: ConfirmationReason) -> Diagnostic:
+        """The diagnostic for a confirmation that needed a prompt nobody could see."""
+        if reason.security_sensitive:
+            remediation = [
+                "Run the command in a terminal and answer the question yourself.",
+                f"--yes never approves {reason.code!r}.",
+            ]
+        else:
+            remediation = [
+                "Re-run the same command with --yes to approve it without a prompt: "
+                f"yonga prepare {plan.requested.repo_id} --yes",
+                "Or run it in a terminal to be asked.",
+            ]
+        return diagnostic(
+            "job.confirmation_unavailable",
+            FailureCategory.USER_CANCELLED,
+            "Preparation needs a confirmation",
+            (
+                f"Confirmation {reason.code!r} could not be asked, because this session has no "
+                f"terminal to ask in (stdin is not a terminal): {reason.message}"
+            ),
+            remediation=remediation,
+            context={"confirmation": reason.code},
+        )
+
+    def _refuse_impossible(self, plan: PreparationPlan) -> None:
+        """Stop, before any question is asked, a job that cannot finish as planned.
+
+        Each check costs nothing and each failure would otherwise surface only
+        after a download or a conversion: an OpenVINO runtime that is not
+        installed, a requested device OpenVINO does not report, a requested
+        device the registry knows cannot run this model, and a gated download
+        with no token. A reused artifact never gets here.
+        """
+        if plan.reuses_artifact:
+            # The plan was made to return an artifact that is no longer ready.
+            # Its confirmations were dropped for that reuse, so exporting now
+            # would run work nobody agreed to.
+            raise PreflightError(
+                diagnostic(
+                    "prepare.reuse_unavailable",
+                    FailureCategory.UNKNOWN_RUNTIME_ERROR,
+                    "The artifact to reuse changed",
+                    (
+                        f"The plan reused {plan.reuse_existing_artifact}, which is no longer a "
+                        "ready artifact. Nothing was downloaded or exported."
+                    ),
+                    remediation=["Re-run the command to plan the preparation again."],
+                    context={"artifact_dir": str(plan.reuse_existing_artifact)},
+                )
+            )
+        if plan.runtime_missing:
+            raise PreflightError(self._runtime_missing(plan))
+        self._require_device(plan)
+        if plan.device_known_unsupported:
+            raise DeviceUnsupportedError(self._known_unsupported(plan))
+        if plan.auth_missing:
+            source = plan.resolved_source.source.repo_id
+            raise HubAuthError(
+                diagnostic(
+                    "hub.auth.gated",
+                    FailureCategory.GATED_MODEL_AUTH_REQUIRED,
+                    "Model access is gated",
+                    (
+                        f"{source} is gated or private and no Hugging Face token was found, so "
+                        "its download would be refused. Nothing was downloaded."
+                    ),
+                    remediation=[
+                        "Open the model page in a browser and accept its licence/access "
+                        "conditions first.",
+                        "Authenticate with `hf auth login`, then re-run the command. A token "
+                        "exported as HF_TOKEN works too.",
+                    ],
+                    context={"repo_id": source},
+                )
+            )
+
+    @staticmethod
+    def _runtime_missing(plan: PreparationPlan) -> Diagnostic:
+        """The diagnostic for a preparation attempted without the OpenVINO runtime."""
+        error = plan.hardware.openvino_import_error
+        detail = f" ({redact_text(error)})" if error else ""
+        return diagnostic(
+            "runtime.openvino.missing",
+            FailureCategory.PACKAGE_ABI_MISMATCH,
+            "The OpenVINO runtime is not installed",
+            (
+                f"OpenVINO could not be imported in this environment{detail}. Every prepared "
+                "artifact is validated and probed with it, so yonga stops here, before the "
+                f"{format_bytes(plan.disk.expected_download_bytes)} download. The host and "
+                "its devices were not examined."
+            ),
+            remediation=[
+                "Install the runtime extras: pip install 'yonga[openvino]'",
+                "Confirm the active virtual environment is the one yonga runs from.",
+                "Then check the host with: yonga doctor",
+            ],
+            environment_broken=True,
+        )
+
+    @staticmethod
+    def _known_unsupported(plan: PreparationPlan) -> Diagnostic:
+        """The diagnostic for an explicit device the registry says cannot run this model."""
+        decision = plan.compatibility
+        device = plan.target_device
+        available = plan.hardware.available_device_names
+        alternatives = [name for name in decision.fallback_candidates if name in available]
+        entry = decision.compatibility_for(device)
+        rule = entry.rule_id if entry is not None and entry.rule_id else ""
+        notes = entry.notes if entry is not None else []
+        why = " ".join(note if note.endswith((".", "!", "?")) else f"{note}." for note in notes)
+        message = (
+            f"{device} preparation cannot be completed: the registry records {device} as "
+            f"unsupported for this model ({decision.evidence_level.value} evidence"
+            + (f", rule {rule}" if rule else "")
+            + ")."
+            + (f" {why}" if why else "")
+            + f" {device} was requested explicitly, so yonga will not silently prepare for "
+            "another device, and it stops before the download."
+        )
+        remediation = [
+            f"Prepare for {name} instead: yonga prepare {plan.requested.repo_id} "
+            f"--device {name.lower()}"
+            for name in alternatives
+        ]
+        remediation.append(f"See what the registry knows: yonga inspect {plan.requested.repo_id}")
+        return diagnostic(
+            "device.known_unsupported",
+            FailureCategory.DEVICE_UNAVAILABLE,
+            f"{device} cannot run this model",
+            message,
+            remediation=remediation,
+            fallback_devices=alternatives,
+            context={"requested_device": device, "rule": rule},
+        )
 
     def _reuse(
         self,
@@ -1767,9 +2022,9 @@ class PrepareService:
         Returns non-fatal warnings worth recording in the manifest. Raises
         :class:`~yonga.domain.diagnostics.PreflightError` when the managed temp
         or the artifact filesystem clearly cannot hold the job (exit code 30),
-        when the exporter's declared package pins are unmet (exit code 10), and
-        :class:`~yonga.domain.diagnostics.DeviceUnsupportedError` when an
-        explicitly requested device is not present at all.
+        and when the exporter's declared package pins are unmet (exit code 10).
+        A device that cannot be used was already refused by
+        :meth:`_refuse_impossible`, before any confirmation was asked.
         """
         warnings: list[str] = []
         temp_dir = ctx.temp_dir
@@ -1823,7 +2078,6 @@ class PrepareService:
             )
 
         self._require_space(plan.disk)
-        self._require_device(plan)
         warnings.extend(
             self._require_exporter_requirements(plan, ctx, ignored=ignore_exporter_requirements)
         )
@@ -2100,7 +2354,11 @@ class PrepareService:
             # A GGUF repository publishes one file per quantization; fetch only ours.
             snapshot = self._hub.download(source, ctx=ctx, allow_patterns=[gguf_file])
         else:
-            snapshot = self._hub.download(source, ctx=ctx)
+            # Only what the conversion reads: not the ONNX copies, native
+            # checkpoints and training runs many repositories also publish.
+            snapshot = self._hub.download(
+                source, ctx=ctx, ignore_patterns=plan.download_ignore_patterns or None
+            )
         ctx.logger.info("download.complete", "source snapshot ready", path=str(snapshot))
         return snapshot
 

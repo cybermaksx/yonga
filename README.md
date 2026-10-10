@@ -239,10 +239,12 @@ Quantization                int4, group size 128, ratio 0.8, asymmetric
 Chosen because              1.03M parameters (Hugging Face Hub count from safetensors headers)
                             is below 5B: cpu-int4-asym-g128-r08 is the CPU profile for that
                             size (evidence: tested).
-Expected download           14 MiB
+Expected download           6.2 MiB  only the files the conversion reads
 Estimated temp requirement  25 GiB  free 230 GiB in ~/.cache/yonga/tmp/<job-id>
-Estimated artifact          3.9 MiB
+Estimated artifact          about 726 KiB
 Remote code                 not required
+Export environment          this environment  ~/.venv/bin/python  the installed packages meet the
+                            exporter requirements
 
 Expected repairs
 • ov-tokenizer-precision-string-casing

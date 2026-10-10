@@ -9,6 +9,7 @@ functions decides anything — the layouts follow ``docs/CLI_SPEC.md`` sections 
 
 from __future__ import annotations
 
+import sys
 from collections.abc import Sequence
 from datetime import datetime
 from typing import TYPE_CHECKING, NamedTuple
@@ -454,28 +455,18 @@ def preparation_plan(plan: PreparationPlan) -> RenderableType:
         if selection is not None and selection.applies and selection.sentence:
             body.add_row(Text("Chosen because"), Text(selection.sentence, style="dim"))
 
-    disk = plan.disk
-    body.add_row(Text("Expected download"), _text(human_bytes(disk.expected_download_bytes)))
-    temp = disk.temp
-    temp_value = Text(human_bytes(temp.total_required_bytes), style="bold")
-    temp_value = Text.assemble(
-        temp_value,
-        ("  ", ""),
-        (f"free {human_bytes(temp.usable_free_bytes)} in {temp.job_temp_dir}", "dim"),
-    )
-    if not temp.sufficient:
-        temp_value = Text.assemble(temp_value, ("  ", ""), ("insufficient", "red"))
-    body.add_row(Text("Estimated temp requirement"), temp_value)
-    if temp.system_temp_would_fail:
+    if plan.reuses_artifact:
+        # Nothing is fetched, converted or written: download, temp space and
+        # export environment would all describe work that does not happen.
         body.add_row(
-            Text(""),
-            Text("System /tmp is too small; the managed temp directory is used.", style="yellow"),
+            Text("Reusing artifact"),
+            Text.assemble(
+                (str(plan.reuse_existing_artifact), "bold"),
+                ("  ready at this revision and profile; --force to prepare again", "dim"),
+            ),
         )
-    if disk.estimated_artifact_bytes is not None:
-        body.add_row(Text("Estimated artifact"), _text(human_bytes(disk.estimated_artifact_bytes)))
-    body.add_row(Text("Artifact directory"), _text(plan.artifact_dir))
-    if plan.reuse_existing_artifact is not None:
-        body.add_row(Text("Reusing artifact"), _text(plan.reuse_existing_artifact))
+    else:
+        _work_rows(body, plan)
 
     if plan.trust_remote_code_required:
         remote = Text(
@@ -485,28 +476,8 @@ def preparation_plan(plan: PreparationPlan) -> RenderableType:
         body.add_row(Text("Remote code"), Text.assemble(Text("required  ", style="bold"), remote))
     else:
         body.add_row(Text("Remote code"), Text("not required", style="dim"))
-    environment = plan.export_environment
-    if environment is not None:
-        pins = ", ".join(
-            f"{name}{specifier}"
-            for name, specifier in environment.packages.items()
-            if name == "transformers" and specifier
-        )
-        state = (
-            "exists, reused"
-            if plan.export_environment_ready
-            else "built only if the reused export fails its checks"
-            if plan.reusable_export is not None
-            else "will be built"
-        )
-        body.add_row(
-            Text("Export environment"),
-            Text.assemble(
-                Text(f"managed {environment.name}", style="cyan"),
-                (f"  {pins}  " if pins else "  ", ""),
-                (state, "dim"),
-            ),
-        )
+    if not plan.reuses_artifact:
+        body.add_row(Text("Export environment"), _export_environment_line(plan))
 
     reusable = plan.reusable_export
     if reusable is not None:
@@ -538,6 +509,7 @@ def preparation_plan(plan: PreparationPlan) -> RenderableType:
             )
         blocks.append(reasons)
 
+    blocks.extend(_refusal_block(plan))
     blocks.extend(_exporter_block(plan))
 
     return Panel(
@@ -548,6 +520,119 @@ def preparation_plan(plan: PreparationPlan) -> RenderableType:
         box=ROUNDED,
         padding=(1, 2),
     )
+
+
+def _work_rows(body: Table, plan: PreparationPlan) -> None:
+    """Add the download, temp-space and artifact rows of a plan that does the work."""
+    disk = plan.disk
+    download = Text(human_bytes(disk.expected_download_bytes), style="bold")
+    if plan.download_ignore_patterns:
+        download.append("  only the files the conversion reads", style="dim")
+    body.add_row(Text("Expected download"), download)
+    temp = disk.temp
+    temp_value = Text(human_bytes(temp.total_required_bytes), style="bold")
+    temp_value = Text.assemble(
+        temp_value,
+        ("  ", ""),
+        (f"free {human_bytes(temp.usable_free_bytes)} in {temp.job_temp_dir}", "dim"),
+    )
+    if not temp.sufficient:
+        temp_value = Text.assemble(temp_value, ("  ", ""), ("insufficient", "red"))
+    body.add_row(Text("Estimated temp requirement"), temp_value)
+    if temp.system_temp_would_fail:
+        body.add_row(
+            Text(""),
+            Text("System /tmp is too small; the managed temp directory is used.", style="yellow"),
+        )
+    if disk.estimated_artifact_bytes is not None:
+        body.add_row(
+            Text("Estimated artifact"), _text(f"about {human_bytes(disk.estimated_artifact_bytes)}")
+        )
+    body.add_row(Text("Artifact directory"), _text(plan.artifact_dir))
+
+
+def _export_environment_line(plan: PreparationPlan) -> Text:
+    """Say which Python the export runs in, and why that one.
+
+    Always shown, so a plan that exports in yonga's own environment says so
+    rather than leaving it to be inferred from a missing row.
+    """
+    source = plan.resolved_source
+    if source.already_openvino:
+        return Text("none needed  the published OpenVINO IR is copied, not exported", style="dim")
+    if source.gguf_file is not None:
+        return Text(
+            "none needed  OpenVINO GenAI imports the GGUF file in this process", style="dim"
+        )
+    environment = plan.export_environment
+    if environment is None:
+        if plan.runtime_missing:
+            why = "no managed environment is planned without the OpenVINO runtime"
+        elif plan.exporter.problems:
+            why = "managed environments are not in use, so the unmet requirements apply here"
+        else:
+            why = "the installed packages meet the exporter requirements"
+        return Text.assemble(
+            Text("this environment", style="cyan"),
+            (f"  {sys.executable}  ", ""),
+            (why, "dim"),
+        )
+    pins = ", ".join(
+        f"{name}{specifier}"
+        for name, specifier in environment.packages.items()
+        if name == "transformers" and specifier
+    )
+    state = (
+        "exists, reused"
+        if plan.export_environment_ready
+        else "built only if the reused export fails its checks"
+        if plan.reusable_export is not None
+        else "will be built"
+    )
+    return Text.assemble(
+        Text(f"managed {environment.name}", style="cyan"),
+        (f"  {pins}  " if pins else "  ", ""),
+        (state, "dim"),
+    )
+
+
+def _refusal_block(plan: PreparationPlan) -> list[RenderableType]:
+    """Render why a plan will stop before preflight, whatever is confirmed.
+
+    Keyed on the same properties the service refuses on, so the panel never
+    announces a stop that will not happen, nor hides one that will.
+    """
+    reasons: list[str] = []
+    if plan.runtime_missing:
+        reasons.append(
+            "The OpenVINO runtime is not installed in this environment: "
+            "pip install 'yonga[openvino]'"
+        )
+    if plan.device_known_unsupported:
+        fallback = next(iter(plan.compatibility.fallback_candidates), None)
+        reasons.append(
+            f"The registry records {plan.target_device} as unsupported for this model "
+            f"({plan.compatibility.evidence_level.value})."
+            + (f" Recommended fallback: --device {fallback.lower()}" if fallback else "")
+        )
+    if plan.auth_missing:
+        reasons.append(
+            "The repository is gated or private and no Hugging Face token was found: hf auth login"
+        )
+    if not reasons:
+        return []
+    table = Table.grid(padding=(0, 2))
+    table.add_column(no_wrap=True, width=1)
+    table.add_column(overflow="fold")
+    for reason in reasons:
+        table.add_row(Text("x", style="bold red"), Text(reason, style="red"))
+    return [
+        Text(""),
+        Rule(style="red"),
+        Text("BLOCKED — this preparation cannot run", style="bold red"),
+        table,
+        Text("Nothing is downloaded or converted.", style="dim"),
+    ]
 
 
 def _exporter_block(plan: PreparationPlan) -> list[RenderableType]:

@@ -811,6 +811,7 @@ def _prepare(
                 ctx=job,
                 allow_repairs=not no_repair,
                 ignore_exporter_requirements=ignore_exporter_requirements,
+                unattended=not console.interactive,
             )
 
     warnings = list(outcome.warnings)
@@ -830,6 +831,7 @@ def _prepare(
                 "reused": outcome.reused,
                 "fallbacks": list(outcome.fallbacks),
                 "warnings": warnings,
+                "notes": list(outcome.notes),
                 "repairs": [record.repair_id for record in outcome.repairs],
                 "duration_seconds": outcome.duration_seconds,
             }
@@ -842,6 +844,8 @@ def _prepare(
         console.print(f"  Profile   {outcome.manifest.export.profile}")
         if outcome.reused:
             console.print("  Reused    an existing artifact at this revision and profile")
+        for note in outcome.notes:
+            console.print(f"  note: {note}", style="dim")
         for warning in warnings:
             console.print_error(f"  warning: {warning}", style="yellow")
         console.print("")

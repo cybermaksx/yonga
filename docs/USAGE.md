@@ -128,9 +128,17 @@ yonga prepare Qwen/Qwen3-0.6B --device cpu
 
 Prints a plan and stops for confirmation **before** anything expensive. The plan carries the
 resolved source and pinned commit, the device decision and why, the profile and quantization, the
-expected download, the estimated temp requirement, the target directory, whether remote code is
-needed, and which repairs are expected. Then it runs seven stages: inspect → resolve → preflight →
-download → convert → validate/repair → probe.
+expected download (only the files the conversion reads, not the ONNX copies or training runs a
+repository may also carry), the estimated temp requirement and artifact size, the target directory,
+whether remote code is needed, which Python the export runs in, and which repairs are expected.
+Then it runs seven stages: inspect → resolve → preflight → download → convert → validate/repair →
+probe.
+
+Re-running `prepare` for an artifact that is already ready reuses it without a question, so it
+works in a script without `--yes`. When a question does need answering and there is no terminal,
+`prepare` stops with exit 60 and says to re-run with `--yes`. A job that cannot finish — no
+OpenVINO runtime, a `--device` the registry rules out for the model, a gated repository without a
+token — is refused before anything is downloaded, and the plan marks it **BLOCKED**.
 
 Useful flags: `--device auto|npu|gpu|cpu`, `--profile ID`, `--source REPO`, `--revision REV`,
 `--force`, `--no-repair`, `--yes`, `--trust-remote-code`, `--ignore-exporter-requirements`.

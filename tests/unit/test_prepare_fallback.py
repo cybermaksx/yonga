@@ -54,6 +54,7 @@ from yonga.domain.diagnostics import (
     diagnostic,
 )
 from yonga.domain.plans import CONFIRMATION_DEVICE_FALLBACK, ConfirmationReason
+from yonga.registry.resolver import RegistryResolver
 from yonga.util.hashing import sha256_file
 
 # --- real failure signatures captured on the reference host --------------------------
@@ -122,6 +123,17 @@ architectures:
 """
 
 
+def npu_first() -> RegistryResolver:
+    """A resolver that lets an explicit ``--device npu`` reach the runtime probe.
+
+    The built-in registry records the NPU as unsupported (tested) for Qwen3.5,
+    so an explicit NPU request on the fixture is refused before the download.
+    The tests that are about what the *probe* does on the NPU need a registry
+    that does not already know the answer.
+    """
+    return builtin_resolver([NPU_FIRST_REGISTRY])
+
+
 @pytest.fixture
 def settings(tmp_path: Path) -> Settings:
     """Settings confined to the test's temporary directory."""
@@ -143,7 +155,7 @@ def hub(tmp_path: Path) -> FakeHub:
 def test_explicit_npu_failure_never_falls_back(settings: Settings, hub: FakeHub) -> None:
     """``--device npu`` that fails stops with the diagnosis and a suggested command."""
     runtime = FakeRuntimeProbe(compile_failures={"NPU": NPU_UNSUPPORTED_GRAPH})
-    service = build_service(settings=settings, hub=hub, runtime=runtime)
+    service = build_service(settings=settings, hub=hub, runtime=runtime, resolver=npu_first())
     plan = service.plan(SAFETENSORS_REPO, device="npu")
     assert plan.compatibility.explicit_request is True
     assert plan.target_device == "NPU"
@@ -586,7 +598,9 @@ def test_a_deferred_npu_compile_is_settled_by_the_pipeline(
     """The dynamic-shape raw failure is overruled when the pipeline generates."""
     runtime = FakeRuntimeProbe(compile_failures={"NPU": NPU_DYNAMIC_SHAPE})
     smoke = FakeSmokeTester()
-    service = build_service(settings=settings, hub=hub, runtime=runtime, smoke=smoke)
+    service = build_service(
+        settings=settings, hub=hub, runtime=runtime, smoke=smoke, resolver=npu_first()
+    )
     plan = service.plan(SAFETENSORS_REPO, device="npu")
 
     outcome = run_prepare(service, plan, settings)
@@ -609,7 +623,11 @@ def test_a_deferred_npu_compile_without_pipeline_evidence_is_not_a_pass(
     """Deferral never passes a device on its own; no pipeline evidence means failed."""
     runtime = FakeRuntimeProbe(compile_failures={"NPU": NPU_DYNAMIC_SHAPE})
     service = build_service(
-        settings=settings, hub=hub, runtime=runtime, smoke=SkippingSmokeTester()
+        settings=settings,
+        hub=hub,
+        runtime=runtime,
+        smoke=SkippingSmokeTester(),
+        resolver=npu_first(),
     )
     plan = service.plan(SAFETENSORS_REPO, device="npu")
 
@@ -636,7 +654,9 @@ def test_a_pipeline_failure_is_classified_by_the_registry_not_the_adapter(
         "Compilation failed\n--- native output ---\n"
         "[ERROR] [vpux-compiler] OneShotBufferizeVPU2VPUIP failed : Only supports FP16."
     )
-    service = build_service(settings=settings, hub=hub, runtime=runtime, smoke=smoke)
+    service = build_service(
+        settings=settings, hub=hub, runtime=runtime, smoke=smoke, resolver=npu_first()
+    )
     plan = service.plan(SAFETENSORS_REPO, device="npu")
 
     with pytest.raises(DeviceUnsupportedError) as caught:
@@ -652,7 +672,9 @@ def test_a_conclusive_npu_compile_failure_still_stops_before_the_pipeline(
     """Only a failure the registry marks deferrable is handed to the pipeline."""
     runtime = FakeRuntimeProbe(compile_failures={"NPU": NPU_UNSUPPORTED_GRAPH})
     smoke = FakeSmokeTester()
-    service = build_service(settings=settings, hub=hub, runtime=runtime, smoke=smoke)
+    service = build_service(
+        settings=settings, hub=hub, runtime=runtime, smoke=smoke, resolver=npu_first()
+    )
     plan = service.plan(SAFETENSORS_REPO, device="npu")
 
     with pytest.raises(DeviceUnsupportedError):
@@ -695,7 +717,11 @@ def test_the_signature_is_found_even_after_a_long_traceback(
 
     runtime = FakeRuntimeProbe(compile_failures={"NPU": NPU_DYNAMIC_SHAPE})
     service = build_service(
-        settings=settings, hub=hub, runtime=runtime, smoke=LongFailureSmokeTester()
+        settings=settings,
+        hub=hub,
+        runtime=runtime,
+        smoke=LongFailureSmokeTester(),
+        resolver=npu_first(),
     )
     plan = service.plan(SAFETENSORS_REPO, device="npu")
 
