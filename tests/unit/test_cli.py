@@ -1626,7 +1626,10 @@ def test_logs_lists_jobs_and_renders_one(runner: CliRunner, home: Path) -> None:
     )
     index = invoke(runner, home, ["logs"])
     assert index.exit_code == int(ExitCode.SUCCESS)
-    assert job_id in index.stdout
+    # The table shows a prefix ``logs`` accepts; the full id is one ``--json`` away.
+    assert job_id[:8] in index.stdout
+    listed = one_document(invoke(runner, home, ["--json", "logs"]))
+    assert [job["job_id"] for job in records(listed["jobs"])] == [job_id]
 
     shown = invoke(runner, home, ["logs", job_id])
     assert shown.exit_code == int(ExitCode.SUCCESS)

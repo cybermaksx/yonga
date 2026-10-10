@@ -47,6 +47,8 @@ from yonga.application.jobs import (
     JobContext,
     WorkspaceSweep,
     open_job,
+    summarise_job,
+    summarise_jobs,
     sweep_managed_workspaces,
 )
 from yonga.application.probe import ProbeOutcome, check_probe_options
@@ -788,6 +790,7 @@ def _prepare(
         requested_model=model,
         progress=state.sink(),
         target_device=target,
+        command="prepare",
     ) as job:
         state.job = job
         plan = service.plan(
@@ -1069,6 +1072,7 @@ def _probe(
         progress=state.sink(),
         target_device=target,
         create_temp=False,
+        command="probe",
     ) as job:
         state.job = job
         with _quiet_native_stdout(state.json_mode):
@@ -1670,6 +1674,7 @@ def _bench(
         requested_model=artifact,
         progress=state.sink(),
         target_device=target,
+        command="bench",
     ) as job:
         state.job = job
         with _quiet_native_stdout(state.json_mode):
@@ -2378,15 +2383,24 @@ def _logs(
         return ExitCode.SUCCESS
 
     records = _log_records(path)
+    summary = summarise_job(path, paths=state.settings.paths)
     if state.json_mode:
-        state.emit({"job_id": path.stem, "path": str(path), "records": records})
+        state.emit(
+            {
+                "job_id": path.stem,
+                "path": str(path),
+                "summary": summary.to_json(),
+                "records": records,
+            }
+        )
         return ExitCode.SUCCESS
     state.console.print(f"Job {path.stem}  ({path})")
+    state.console.print(tables.job_heading(summary))
     for record in records:
         level = str(record.get("level", "info"))
         event = str(record.get("event", ""))
         message = str(record.get("message", ""))
-        stamp = str(record.get("timestamp", ""))[11:23]
+        stamp = tables.local_clock(record.get("timestamp"))
         style = "red" if level == "error" else ("yellow" if level == "warning" else "")
         state.console.print(f"  {stamp}  {level:<7} {event:<26} {message}", style=style or None)
     return ExitCode.SUCCESS
@@ -2422,37 +2436,39 @@ def _log_bundle(state: CliState, job_id: str, *, output: Path | None) -> ExitCod
 
 
 def _log_index(state: CliState, logs_dir: Path) -> ExitCode:
-    """Render the most recent job logs."""
-    entries = sorted(
-        (path for path in logs_dir.glob("*.jsonl") if path.is_file()),
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
-    )[:LOG_LIST_LIMIT]
+    """Render the most recent jobs: what each ran, on what, and how it ended."""
+    jobs = summarise_jobs(state.settings.paths, limit=LOG_LIST_LIMIT)
     if state.json_mode:
         state.emit(
             {
                 "logs_dir": str(logs_dir),
                 "jobs": [
                     {
-                        "job_id": path.stem,
-                        "path": str(path),
-                        "size_bytes": path.stat().st_size,
-                        "modified": path.stat().st_mtime,
+                        **job.to_json(),
+                        "path": str(job.log_path),
+                        "modified": _modified(job.log_path),
                     }
-                    for path in entries
+                    for job in jobs
                 ],
             }
         )
         return ExitCode.SUCCESS
-    if not entries:
+    if not jobs:
         state.console.print(f"No job logs in {logs_dir}.")
         return ExitCode.SUCCESS
     state.console.print(f"Job logs in {logs_dir}")
-    for path in entries:
-        state.console.print(f"  {path.stem}  {human_bytes(path.stat().st_size)}")
+    state.console.print(tables.job_list(jobs))
     state.console.print("")
-    state.console.print("Show one with: yonga logs JOB_ID")
+    state.console.print("Show one with: yonga logs JOB_ID (a unique prefix is enough)")
     return ExitCode.SUCCESS
+
+
+def _modified(path: Path) -> float | None:
+    """A log file's modification time, or ``None`` when it vanished meanwhile."""
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return None
 
 
 def _log_path(logs_dir: Path, job_id: str) -> Path:

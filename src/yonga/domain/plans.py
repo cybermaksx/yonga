@@ -429,7 +429,13 @@ class ExportResult(BaseModel):
 
 
 class JobStage(str, Enum):
-    """States of the preparation state machine (docs/ARCHITECTURE.md section 5)."""
+    """States of the job state machine (docs/ARCHITECTURE.md section 5).
+
+    ``ready`` is the end of a successful preparation; ``completed`` is the end
+    of any other job that ran to its end (a probe or a benchmark), which has
+    no artifact to make ready. ``cancelled`` is a job the user stopped, kept
+    apart from ``failed`` so that a Ctrl-C does not read as a defect.
+    """
 
     CREATED = "created"
     INSPECTED = "inspected"
@@ -441,16 +447,28 @@ class JobStage(str, Enum):
     REPAIRED = "repaired"
     PROBED = "probed"
     READY = "ready"
+    COMPLETED = "completed"
     FAILED = "failed"
+    CANCELLED = "cancelled"
 
     @property
     def is_terminal(self) -> bool:
         """True for stages from which the job does not continue."""
-        return self in {JobStage.READY, JobStage.FAILED}
+        return self in _TERMINAL_STAGES
+
+    @property
+    def succeeded(self) -> bool:
+        """True for the terminal stages a job reaches by finishing its work."""
+        return self in {JobStage.READY, JobStage.COMPLETED}
+
+
+_TERMINAL_STAGES: frozenset[JobStage] = frozenset(
+    {JobStage.READY, JobStage.COMPLETED, JobStage.FAILED, JobStage.CANCELLED}
+)
 
 
 class JobState(BaseModel):
-    """Small persisted record describing an in-flight or finished preparation job."""
+    """Small persisted record describing an in-flight or finished job."""
 
     model_config = _LENIENT
 
@@ -459,6 +477,8 @@ class JobState(BaseModel):
     created_at: datetime
     updated_at: datetime
     requested_model: str
+    command: str | None = None
+    """The command that opened the job (``prepare``, ``probe``, ``bench``), when known."""
     target_device: str | None = None
     profile_id: str | None = None
     artifact_dir: Path | None = None
@@ -475,3 +495,48 @@ class JobState(BaseModel):
     def to_json(self) -> dict[str, object]:
         """Return a fully JSON-serialisable representation of the job state."""
         return _json_safe_mapping(self.model_dump(mode="json"))
+
+
+class JobStatus(str, Enum):
+    """How a job ended, as ``yonga logs`` shows it."""
+
+    OK = "ok"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    RUNNING = "running"
+    UNFINISHED = "unfinished"
+    """Not terminal, and silent for longer than a live job ever is: the process died."""
+    UNKNOWN = "unknown"
+    """No readable state document: a log written before job states existed."""
+
+
+class JobSummary(BaseModel):
+    """One line of the job index: which job it was and how it ended."""
+
+    model_config = _LENIENT
+
+    job_id: str
+    log_path: Path
+    size_bytes: int = 0
+    started_at: datetime | None = None
+    ended_at: datetime | None = None
+    command: str | None = None
+    model: str | None = None
+    device: str | None = None
+    stage: JobStage | None = None
+    status: JobStatus = JobStatus.UNKNOWN
+    code: str | None = None
+    """The diagnostic code of a failed or cancelled job."""
+
+    @property
+    def duration_seconds(self) -> float | None:
+        """How long the job ran, once it has ended."""
+        if self.started_at is None or self.ended_at is None:
+            return None
+        return max(0.0, (self.ended_at - self.started_at).total_seconds())
+
+    def to_json(self) -> dict[str, object]:
+        """Return a JSON-serialisable representation, duration included."""
+        payload = _json_safe_mapping(self.model_dump(mode="json"))
+        payload["duration_seconds"] = self.duration_seconds
+        return payload

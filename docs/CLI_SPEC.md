@@ -488,7 +488,11 @@ yonga logs JOB_ID --raw
 yonga logs JOB_ID --bundle [--output PATH]
 ```
 
-Useful after failed conversion. `--bundle` writes a redacted, anonymised archive of the job log, job
+Useful after failed conversion. Without a job id it lists the 20 most recent jobs: an eight-character
+id prefix, the local start time (the zone is named under the table), the command, the model or
+artifact, the device, the outcome (`ok`, `failed`, `cancelled`, `running`, `unfinished`), the
+duration and the log size; `--json` adds the full id, the stage and the failure code. One job's
+view prints the same facts above its records, with every record time in local time. `--bundle` writes a redacted, anonymised archive of the job log, job
 state, artifact manifest and host report for attaching to a bug report.
 
 ## 14. `serve`

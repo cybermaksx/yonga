@@ -455,7 +455,7 @@ model is the route, declared as a derivative or named with `--source`.
 
 ## 6. Reading a job log
 
-Every `prepare` run gets a job id and a JSON Lines log under the data directory:
+Every `prepare`, `probe` and `bench` run gets a job id and a JSON Lines log under the data directory:
 
 ```
 ~/.local/share/yonga/logs/<job-id>.jsonl
@@ -470,24 +470,45 @@ yonga logs JOB_ID --raw       # the JSON Lines file verbatim
 yonga logs JOB_ID --json      # the records as one JSON document
 ```
 
-A table view looks like this (verified):
+The list says which job is which: the first eight characters of its id (any unique prefix is
+accepted), when it started in local time, the command, the model or artifact, the device, how it
+ended (`ok`, `failed`, `cancelled`, `running`, or `unfinished` for a job whose process died without
+recording an end) and how long it took. On a narrow terminal the log size, device, duration and
+start columns are dropped, in that order. `--json` has the full ids, the failure code and the
+duration in seconds.
 
 ```text
-Job 43984530-dfae-45d7-bf78-1c95727270bf
-  17:50:04.818  info    job.created            job created
-  17:50:05.120  info    job.stage              stage -> inspected
-  17:50:05.130  info    preflight.temp         conversion temp redirected to managed storage
-  17:50:05.130  info    hub.download.start     downloading hf-internal-testing/tiny-random-…
-  17:50:05.299  info    download.complete      source snapshot ready
-  17:50:05.303  info    export.command
-  17:50:07.574  debug   subprocess.output      `torch_dtype` is deprecated! Use `dtype` instead!
-  …
-  17:50:13.560  error   export.failed          conversion failed
+job       started           command  model                                 device  status         took      log
+61926a20  2026-10-11 02:32  bench    7ae557604adf--cpu-int4-asym-g128-r08  CPU     ! cancelled   6.6 s  1.0 KiB
+238a287d  2026-10-11 02:32  bench    7ae557604adf--cpu-int4-asym-g128-r08  CPU     ✓ ok          1.9 s    665 B
+aba94131  2026-10-11 02:32  probe    7ae557604adf--cpu-int4-asym-g128-r08  CPU     ✓ ok         710 ms    910 B
+Start times are local, UTC+03:00.
+```
+
+One job's table view starts with the same facts, and every record's time is local (verified, a
+`bench` interrupted with Ctrl-C):
+
+```text
+Job 61926a20-16b1-45e4-8392-5089d9f8c25e  (~/.local/share/yonga/logs/61926a20-….jsonl)
+  bench ~/…/7ae557604adf--cpu-int4-asym-g128-r08 CPU  ! cancelled (job.cancelled), took 6.6 s
+  Started 2026-10-11 02:32:54 UTC+03:00; the times below are local.
+  02:32:54.866  info    job.created                job created
+  02:33:01.510  warning job.cancelled              The job was interrupted before it finished.
+  02:33:01.511  info    job.temp_discarded         temporary directory of a cancelled job removed
 ```
 
 Useful events: `job.stage` (where the job got to), `export.command` (the exact argv, redacted),
 `subprocess.output` (every line the exporter printed), `export.failed` (the tail that was
 classified, in its `raw` field), `preflight.*` (disk and requirement decisions).
+
+Every job ends with one terminal event. `job.completed` is a job that ran to its end, `probe` and
+`bench` included. `job.failed` (an error) and `job.cancelled` (a warning: Ctrl-C is not a defect)
+carry the diagnostic's `code`, the last `stage` the job reached and, when it died working towards
+the next one, `failed_before`: a conversion interrupted after the download reads `"stage":
+"downloaded", "failed_before": "exported"`. Right before it, `job.error_detail` holds the raw text
+the failure was classified from in its `raw` field — the NPU compiler's failing pass and the shape
+it rejected, for example — so `yonga logs JOB_ID --raw` has the tool's own words whichever command
+failed.
 
 For a single failure, the fastest route is:
 
@@ -522,14 +543,17 @@ The same path is in the diagnostic's `staging_dir` context key, in the job state
 (`logs/<job-id>.state.json`) and in the job log as `job.staging_retained`. Inside it, `model/` holds
 whatever the exporter produced before it died: which IR files exist, their sizes, and whether the
 tokenizer pair was written at all. The managed `TMPDIR` is kept on failure for the same reason and
-logged as `job.temp_retained`.
+logged as `job.temp_retained`. A job you cancelled has nothing to diagnose, so its `TMPDIR` (the
+conversion's intermediates, often a gigabyte) is removed on the way out and logged as
+`job.temp_discarded`; its staging directory follows the same policy as a failure's, because a
+finished export kept there is what the next `prepare` reuses.
 
 When the export itself had finished, `model/.yonga/export-complete.json` is there too, and running
 the same `prepare` again adopts the directory instead of exporting (`export.reused` in the new job's
 log; `export.reuse_rejected` with the reason when a file no longer matches, after which it exports
 normally). Pass `--fresh-export` to keep it out of the way. A cancelled or crashed job records a
-terminal state (`job.cancelled`, `job.aborted`) on its way out, so it never looks like it is still
-running.
+terminal state on its way out (stage `cancelled` with a `job.cancelled` event, or stage `failed`
+with code `job.aborted`), so it never looks like it is still running.
 
 A staging directory holding nothing but the incomplete marker is removed straight away — it is the
 residue of an export that never wrote a file, and keeping those is how `.staging` used to grow to

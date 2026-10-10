@@ -361,7 +361,7 @@ def test_an_interrupted_job_records_that_it_ended(settings: Settings) -> None:
         raise KeyboardInterrupt
 
     store = JobStateStore.load(settings.paths.job_state_path("interrupted"))
-    assert store.stage is JobStage.FAILED
+    assert store.stage is JobStage.CANCELLED
     assert store.state.diagnostic is not None
     assert store.state.diagnostic.code == "job.cancelled"
     assert "interrupted" not in live_job_ids(settings.paths)

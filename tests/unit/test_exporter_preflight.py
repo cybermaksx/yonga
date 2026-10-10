@@ -171,7 +171,9 @@ def test_the_stop_is_recorded_against_the_preflight_stage(settings: Settings, hu
         for record in _log_records(settings.paths.job_log_path(plan.job_id))
         if record.get("event") == "job.failed"
     ]
-    assert [record["stage"] for record in failures] == ["preflight_ok"]
+    # ``failed_before`` is the step that was running; ``stage`` the last one reached.
+    assert [record["failed_before"] for record in failures] == ["preflight_ok"]
+    assert [record["stage"] for record in failures] == ["source_resolved"]
 
 
 def test_the_diagnostic_names_both_versions_and_the_pip_command(
