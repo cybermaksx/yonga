@@ -213,14 +213,34 @@ def _scan_from_inside(text: str, pairs: Sequence[tuple[str, str]]) -> _Scan:
         if cut < 0 or position < cut or longer:
             cut, token_length = position, len(closing)
     if cut < 0:
-        return _Scan(segments=[], blocks=[text], removed=True, unterminated=True)
+        return _Scan(
+            segments=[],
+            blocks=[_without_leading_opener(text, pairs)],
+            removed=True,
+            unterminated=True,
+        )
     rest = _scan(text[cut + token_length :], pairs)
     return _Scan(
         segments=rest.segments,
-        blocks=[text[:cut], *rest.blocks],
+        blocks=[_without_leading_opener(text[:cut], pairs), *rest.blocks],
         removed=True,
         unterminated=rest.unterminated,
     )
+
+
+def _without_leading_opener(block: str, pairs: Sequence[tuple[str, str]]) -> str:
+    """Drop an opening wrapper the model wrote at the start of a prompt-opened block.
+
+    When a template can open the block in the prompt, ``starts_in_reasoning`` is
+    set whenever thinking could not be proved off, and a model that opens the
+    block itself then puts its own opener at the start of the reasoning. It is a
+    tag, not reasoning, and ``--show-reasoning`` must not print it.
+    """
+    stripped = block.lstrip()
+    for opening, _ in sorted(pairs, key=lambda pair: len(pair[0]), reverse=True):
+        if stripped.startswith(opening):
+            return stripped[len(opening) :]
+    return block
 
 
 def _scan(
@@ -1085,17 +1105,19 @@ class ChatOptions(BaseModel):
 
 
 class ChatTurn(BaseModel):
-    """The outcome of one ``send``: either a result or a diagnostic, never both.
+    """The outcome of one ``send``: a result, a diagnostic, or a cancelled reply.
 
     A failed turn is a value, not an exception: the chat loop prints the
     diagnostic and returns to the prompt with the session and its loaded pipeline
-    intact.
+    intact. A turn the user stopped carries neither: ``cancelled`` is set and
+    nothing of it was kept.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     result: GenerationResult | None = None
     diagnostic: Diagnostic | None = None
+    cancelled: bool = False
 
     @property
     def ok(self) -> bool:
@@ -1306,7 +1328,9 @@ class ChatSession:
         """Bind a session to an artifact, a chat profile and a runtime factory.
 
         Nothing is loaded here: :meth:`load` (or the first :meth:`send`) builds
-        the pipeline, so the caller can draw the startup panel first.
+        the pipeline. ``yonga chat`` calls :meth:`load` before it draws the
+        startup panel, so a model that cannot load fails the command with its
+        own exit code instead of failing every message.
 
         ``classifier`` turns raw runtime text into a registry diagnostic. It is
         optional so a session can be built without a registry, and when it is
@@ -1574,14 +1598,22 @@ class ChatSession:
 
     # --- turns -----------------------------------------------------------
 
-    def send(self, user_text: str) -> ChatTurn:
+    def send(self, user_text: str, *, should_stop: Callable[[], bool] | None = None) -> ChatTurn:
         """Answer one user message.
 
         The raw model text is sanitised before it is returned *and* before it is
         stored in the conversation, so a hidden reasoning block can neither reach
-        the screen nor be fed back as context on the next turn. A failure comes
-        back as a :class:`ChatTurn` carrying a diagnostic; the session, its
-        history and its loaded pipeline all survive it.
+        the screen nor be fed back as context on the next turn. With reasoning
+        shown, ``display_text`` is still the answer alone and the reasoning comes
+        separately in ``reasoning_text``, so the CLI can draw it first and the
+        conversation keeps only the answer either way. A failure comes back as a
+        :class:`ChatTurn` carrying a diagnostic; the session, its history and its
+        loaded pipeline all survive it.
+
+        ``should_stop`` is asked on every chunk a streaming runtime produces;
+        once it answers true generation ends, the partial reply is dropped
+        together with the user message, and the turn comes back ``cancelled``.
+        That is how Ctrl-C stops a reply without ending the chat.
         """
         prompt = user_text.strip()
         if not prompt:
@@ -1590,11 +1622,21 @@ class ChatSession:
         try:
             runtime = self.load()
             self._emit(ProgressKind.STAGE, "Generating a reply...")
-            raw = runtime.generate(self.history, self._generation)
+            if should_stop is not None and isinstance(runtime, StreamingChatRuntime):
+
+                def stop_requested(_chunk: str) -> bool:
+                    return should_stop()
+
+                raw = runtime.generate_stream(self.history, self._generation, stop_requested)
+            else:
+                raw = runtime.generate(self.history, self._generation)
+            if should_stop is not None and should_stop():
+                self._rollback_user_turn()
+                return ChatTurn(cancelled=True)
             answer = sanitize_answer(
                 raw.text,
                 self._profile.reasoning_wrappers,
-                show=self._show_reasoning,
+                show=False,
                 starts_in_reasoning=self._starts_in_reasoning,
             )
             display = answer.display_text
@@ -1602,7 +1644,7 @@ class ChatSession:
                 update={
                     "display_text": display,
                     "reasoning_text": answer.reasoning_text,
-                    "reasoning_hidden": answer.reasoning_hidden,
+                    "reasoning_hidden": answer.reasoning_hidden and not self._show_reasoning,
                     "reasoning_unterminated": answer.reasoning_unterminated,
                 }
             )
@@ -1942,7 +1984,8 @@ class ChatSession:
             return CommandOutcome(
                 message=(
                     "Reasoning blocks are now shown. Thinking mode is off for this session, "
-                    "so the model may not produce any; restart with --thinking to enable it."
+                    "so the model may not produce any; restart the chat with --show-reasoning "
+                    "to turn it on."
                 )
             )
         return CommandOutcome(message="Reasoning blocks are now shown.")
@@ -2065,7 +2108,7 @@ def _resolve_thinking(
 ) -> bool:
     """Decide whether this session asks the chat template to enable thinking.
 
-    An explicit ``--thinking``/``--no-thinking`` wins. Otherwise asking to *see*
+    An explicit ``ChatOptions.thinking`` wins. Otherwise asking to *see*
     reasoning on a model whose template actually has a thinking variable is taken
     as asking for it, since the alternative is a flag that visibly does nothing.
     Everything else follows the profile, which defaults to off.

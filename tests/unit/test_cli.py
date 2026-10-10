@@ -15,9 +15,12 @@ traceback.
 
 from __future__ import annotations
 
+import _thread
 import json
 import os
+import re
 import shutil
+import time
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -82,7 +85,14 @@ from yonga.config.settings import Settings
 from yonga.domain.artifacts import IRDescription, ProbeResult, ProbeStatus, assert_no_secrets
 from yonga.domain.benchmarks import GenerationSettings
 from yonga.domain.compile_cache import COMPILE_CACHE_ENTRY_FILENAME
-from yonga.domain.diagnostics import ConfigurationError, ExitCode, FailureCategory, diagnostic
+from yonga.domain.diagnostics import (
+    CompileError,
+    ConfigurationError,
+    ExitCode,
+    FailureCategory,
+    GenerationError,
+    diagnostic,
+)
 from yonga.domain.hardware import (
     DeviceKind,
     FilesystemInfo,
@@ -1334,7 +1344,288 @@ def test_chat_commands_are_applied_to_the_session(
     assert result.exit_code == int(ExitCode.SUCCESS)
     assert "/reasoning on|off" in result.stdout
     assert "8" in result.stdout
-    assert factory.runtimes == []
+    # The model is loaded once, before the startup panel, and never asked anything.
+    assert len(factory.runtimes) == 1
+    assert factory.runtimes[0].turns == []
+
+
+#: Verbatim tail of a real NPU compiler refusal (see ``test_chat_service``).
+NPU_COMPILER_REFUSAL = (
+    "[ERROR] [vpux-compiler] Failed Pass MultiClusterStrategyAssignment on Operation\n"
+    "Compilation failed. Level0 pfnCreate2 result: ZE_RESULT_ERROR_INVALID_ARGUMENT\n"
+    "[NPU_VCL] Compiler returned msg:\nCompilation failed"
+)
+
+
+class RefusingRuntimeFactory(FakeRuntimeFactory):
+    """A runtime factory whose every load fails with one typed error."""
+
+    def __init__(self, error: Exception) -> None:
+        super().__init__()
+        self.error = error
+        self.attempts = 0
+
+    def __call__(self, artifact_dir: Path, **kwargs: Any) -> ChatRuntime:
+        """Fail the load the way the GenAI adapter does."""
+        self.attempts += 1
+        raise self.error
+
+
+class ScriptedRuntimeFactory(FakeRuntimeFactory):
+    """Hands out one prepared runtime."""
+
+    def __init__(self, runtime: FakeChatRuntime) -> None:
+        super().__init__()
+        self.runtime = runtime
+
+    def __call__(self, artifact_dir: Path, **kwargs: Any) -> ChatRuntime:
+        """Return the prepared runtime."""
+        self.opened.append((Path(artifact_dir), str(kwargs.get("device", "CPU"))))
+        self.runtimes.append(self.runtime)
+        return self.runtime
+
+
+def _chat_wiring(factory: FakeRuntimeFactory) -> Any:
+    """A wiring factory that hands ``chat`` this runtime factory."""
+    return lambda settings: FakeWiring(settings, runtime_factory=factory)
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (
+            CompileError(
+                diagnostic(
+                    "runtime.genai.load_failed",
+                    FailureCategory.UNKNOWN_RUNTIME_ERROR,
+                    "Could not load the model on NPU",
+                    NPU_COMPILER_REFUSAL,
+                    raw_excerpt=NPU_COMPILER_REFUSAL,
+                )
+            ),
+            ExitCode.COMPILE,
+        ),
+        (
+            CompileError(
+                diagnostic(
+                    "runtime.openvino_genai.missing",
+                    FailureCategory.PACKAGE_ABI_MISMATCH,
+                    "OpenVINO GenAI is not available",
+                    "openvino_genai could not be imported, so no model can be run.",
+                    environment_broken=True,
+                )
+            ),
+            ExitCode.ENVIRONMENT_UNUSABLE,
+        ),
+    ],
+    ids=["npu-compiler-refusal", "genai-missing"],
+)
+@pytest.mark.parametrize("stdin", ["Hello\nSecond message\n", ""], ids=["messages", "devnull"])
+def test_chat_fails_with_the_category_code_when_the_model_cannot_load(
+    runner: CliRunner,
+    home: Path,
+    tmp_path: Path,
+    error: CompileError,
+    expected: ExitCode,
+    stdin: str,
+) -> None:
+    """The model is loaded before the panel; a load failure ends the chat with its code.
+
+    Seen on the reference host: the panel claimed "Device NPU", every message
+    recompiled and printed the refusal again, and the chat exited 0.
+    """
+    artifact = _staged_artifact(tmp_path)
+    factory = RefusingRuntimeFactory(error)
+    result = invoke(
+        runner,
+        home,
+        ["chat", str(artifact), "--device", "npu"],
+        factory=_chat_wiring(factory),
+        stdin=stdin,
+    )
+    assert result.exit_code == int(expected), result.output
+    assert factory.attempts == 1
+    assert "Local Chat" not in result.stdout
+
+
+class FlakyChatRuntime(FakeChatRuntime):
+    """Fails the turns it is told to, and answers the others."""
+
+    def __init__(self, failures: Sequence[bool]) -> None:
+        super().__init__()
+        self.failures = list(failures)
+
+    def generate(self, history: ChatHistory, config: GenerationSettings) -> GenerationResult:
+        """Raise a generation failure no rule classifies, or answer."""
+        if self.failures and self.failures.pop(0):
+            raise GenerationError(
+                diagnostic(
+                    "runtime.genai.generation_failed",
+                    FailureCategory.UNKNOWN_RUNTIME_ERROR,
+                    "Generation failed on CPU",
+                    "the device stopped answering",
+                )
+            )
+        return super().generate(history, config)
+
+
+@pytest.mark.parametrize(
+    ("failures", "expected"),
+    [
+        ([True, True], ExitCode.GENERATION),
+        ([False, True], ExitCode.GENERATION),
+        ([True, False], ExitCode.SUCCESS),
+    ],
+    ids=["every-turn-failed", "last-turn-failed", "recovered"],
+)
+@pytest.mark.parametrize("ending", ["", "/exit\n"], ids=["eof", "exit-command"])
+def test_chat_exit_code_reports_a_last_message_that_got_no_answer(
+    runner: CliRunner,
+    home: Path,
+    tmp_path: Path,
+    failures: list[bool],
+    expected: ExitCode,
+    ending: str,
+) -> None:
+    """A failed turn keeps the chat going, but leaving right after it is not a success."""
+    artifact = _staged_artifact(tmp_path)
+    factory = ScriptedRuntimeFactory(FlakyChatRuntime(failures))
+    result = invoke(
+        runner,
+        home,
+        ["chat", str(artifact), "--device", "cpu"],
+        factory=_chat_wiring(factory),
+        stdin="first\nsecond\n" + ending,
+    )
+    assert result.exit_code == int(expected), result.output
+    assert "Generation failed on CPU" in result.output
+
+
+class InterruptedChatRuntime(FakeChatRuntime):
+    """Streams its first reply until told to stop, pressing Ctrl-C after it starts."""
+
+    def __init__(self) -> None:
+        super().__init__(reply="The second reply.")
+        self.stopped_after: int | None = None
+
+    def generate_stream(
+        self, history: ChatHistory, config: GenerationSettings, on_text: Any
+    ) -> GenerationResult:
+        """Stream until ``on_text`` asks to stop; the first turn interrupts the CLI."""
+        if self.turns:
+            return self.generate(history, config)
+        self.turns.append(len(history))
+        _thread.interrupt_main()
+        deadline = time.monotonic() + 10
+        chunks = 0
+        while time.monotonic() < deadline:
+            chunks += 1
+            if on_text("count ") is True:
+                self.stopped_after = chunks
+                break
+            time.sleep(0.01)
+        return GenerationResult(text="count " * chunks, display_text="count " * chunks)
+
+
+def test_ctrl_c_stops_the_reply_and_returns_to_the_prompt(
+    runner: CliRunner, home: Path, tmp_path: Path
+) -> None:
+    """Ctrl-C during generation stops it at the next token; the chat goes on.
+
+    Seen on the reference host: the spinner ran for 53 s after Ctrl-C, then the
+    whole chat ended with exit 60 and the conversation was lost.
+    """
+    artifact = _staged_artifact(tmp_path)
+    runtime = InterruptedChatRuntime()
+    result = invoke(
+        runner,
+        home,
+        ["chat", str(artifact), "--device", "cpu"],
+        factory=_chat_wiring(ScriptedRuntimeFactory(runtime)),
+        stdin="Count from 1 to 3000\nAnd now?\n",
+    )
+    assert result.exit_code == int(ExitCode.SUCCESS), result.output
+    assert runtime.stopped_after is not None
+    assert "Reply cancelled." in result.stdout
+    assert "count count" not in result.stdout
+    assert "The second reply." in result.stdout
+    # The cancelled exchange is not part of the conversation the next turn sees.
+    assert runtime.turns == [1, 1]
+
+
+def test_show_reasoning_draws_the_reasoning_before_the_answer_without_tags(
+    runner: CliRunner, home: Path, tmp_path: Path
+) -> None:
+    """``--show-reasoning`` shows the chain of thought first, delimited, tags removed."""
+    artifact = _staged_artifact(tmp_path)
+    runtime = FakeChatRuntime(reply="<think>\nAdding two and two.\n</think>\n\n2+2 equals 4.")
+    result = invoke(
+        runner,
+        home,
+        ["chat", str(artifact), "--device", "cpu", "--show-reasoning"],
+        factory=_chat_wiring(ScriptedRuntimeFactory(runtime)),
+        stdin="What is 2+2?\n/exit\n",
+    )
+    assert result.exit_code == int(ExitCode.SUCCESS), result.output
+    out = result.stdout
+    assert "<think>" not in out
+    assert "</think>" not in out
+    assert "Reasoning" in out
+    assert out.index("Adding two and two.") < out.index("2+2 equals 4.")
+
+
+def test_reasoning_on_advice_names_an_option_chat_accepts(
+    runner: CliRunner, home: Path, tmp_path: Path
+) -> None:
+    """``/reasoning on`` with thinking off must name a flag ``yonga chat`` has.
+
+    It used to say "restart with --thinking", and ``yonga chat --thinking`` is a
+    usage error (exit 2).
+    """
+    from tests.unit.test_chat_thinking import TEMPLATE_WITH_FLAG
+
+    artifact = _staged_artifact(tmp_path)
+    (artifact / "chat_template.jinja").write_text(TEMPLATE_WITH_FLAG, encoding="utf-8")
+    result = invoke(
+        runner,
+        home,
+        ["chat", str(artifact), "--device", "cpu"],
+        factory=_chat_wiring(FakeRuntimeFactory()),
+        stdin="/reasoning on\n/exit\n",
+    )
+    assert result.exit_code == int(ExitCode.SUCCESS), result.output
+    advice = " ".join(result.output.split())
+    assert "Thinking mode is off" in advice
+    named = set(re.findall(r"--[a-z][a-z-]+", advice))
+    assert named == {"--show-reasoning"}
+    for flag in named:
+        usage = invoke(runner, home, ["chat", "--help"])
+        assert flag in usage.stdout
+
+
+@pytest.mark.parametrize(
+    "reference", ["cc24636a2f49356a", "nonexistent-xyz"], ids=["removed-artifact-id", "a-typo"]
+)
+def test_chat_never_suggests_preparing_something_that_is_not_a_model_id(
+    runner: CliRunner, home: Path, reference: str
+) -> None:
+    """An artifact id is not a Hub model; ``yonga prepare`` would look it up on the Hub."""
+    result = invoke(runner, home, ["chat", reference])
+    assert result.exit_code == int(ExitCode.REGISTRY)
+    err = " ".join(result.stderr.split())
+    assert f"yonga prepare {reference}" not in err
+    assert f"yonga chat {reference}" not in err
+    assert "yonga list" in err
+
+
+def test_chat_with_an_unknown_artifact_id_says_where_ids_come_from(
+    runner: CliRunner, home: Path
+) -> None:
+    """A 16-hex reference is read as an artifact id that is gone or mistyped."""
+    result = invoke(runner, home, ["chat", "cc24636a2f49356a"])
+    err = " ".join(result.stderr.split())
+    assert "No prepared artifact has that id" in err
+    assert "yonga remove" in err
 
 
 # ======================================================================

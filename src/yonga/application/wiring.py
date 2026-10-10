@@ -21,6 +21,7 @@ Nothing here prints, asks a question or touches ``sys.argv``.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
@@ -129,12 +130,21 @@ class AnyArtifactStore:
         return self._catalogue.manifest_for(artifact_dir)
 
 
+#: A Hugging Face model id, ``owner/name``: the only reference ``yonga prepare`` takes as given.
+_REPO_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}/[A-Za-z0-9][A-Za-z0-9._-]{0,95}")
+#: An artifact id as ``yonga list`` prints it (16 hex digits), or a prefix the store accepts.
+_ARTIFACT_ID = re.compile(r"[0-9a-f]{6,16}")
+
+
 class ArtifactResolver:
     """Adapts an artifact store to the chat service's one-method port.
 
     ``yonga chat`` must never start a multi-gigabyte conversion as a side effect
-    (``docs/CLI_SPEC.md`` section 9), so an unresolvable reference fails here with
-    the exact ``yonga prepare`` command to run instead.
+    (``docs/CLI_SPEC.md`` section 9), so an unresolvable reference fails here.
+    A model id gets the exact ``yonga prepare`` command to run instead; anything
+    else (an artifact id that is gone, a mistyped name) is pointed at
+    ``yonga list``, because preparing an artifact id would only send it to the
+    Hub as if it were a model.
     """
 
     def __init__(self, store: AnyArtifactStore) -> None:
@@ -145,12 +155,15 @@ class ArtifactResolver:
         """Return the prepared artifact directory for ``reference``.
 
         Raises:
-            ConfigurationError: when no prepared artifact matches. The diagnostic
-                names the ``yonga prepare`` command that would create one.
+            ConfigurationError: when no prepared artifact matches. For a model id
+                the diagnostic names the ``yonga prepare`` command that would
+                create one; otherwise it says how to find what is prepared.
         """
         found = self._store.find(reference)
         if found is not None:
             return found
+        if not _REPO_ID.fullmatch(reference) or Path(reference).expanduser().exists():
+            raise ConfigurationError(_no_artifact_diagnostic(reference))
         raise ConfigurationError(
             diagnostic(
                 "artifact.not_prepared",
@@ -169,6 +182,36 @@ class ArtifactResolver:
                 context={"reference": reference, "command": "prepare", "model": reference},
             )
         )
+
+
+def _no_artifact_diagnostic(reference: str) -> Diagnostic:
+    """Explain a reference that is not a model id and matches no prepared artifact."""
+    if _ARTIFACT_ID.fullmatch(reference):
+        title = "No prepared artifact has that id"
+        message = (
+            f"No artifact on this host has the id {reference}. Artifact ids are the ones "
+            "yonga list shows; an artifact deleted with yonga remove no longer has one."
+        )
+        prepare = "Prepare the model it came from again: yonga prepare OWNER/NAME"
+    else:
+        title = "No prepared artifact matches that reference"
+        message = (
+            f"{reference!r} is not the id or directory of a prepared artifact, nor a "
+            "Hugging Face model id (owner/name)."
+        )
+        prepare = "Prepare a model first: yonga prepare OWNER/NAME"
+    return diagnostic(
+        "artifact.not_found",
+        FailureCategory.CONFIGURATION_ERROR,
+        title,
+        message,
+        remediation=[
+            "See what is already prepared: yonga list",
+            prepare,
+            "Or pass the artifact directory directly.",
+        ],
+        context={"reference": reference},
+    )
 
 
 class GenAISmokeTester:

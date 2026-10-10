@@ -458,7 +458,8 @@ where it goes; otherwise it lands in the current directory as `yonga-report-<job
 These are the properties that are easy to assert and worth checking yourself.
 
 **Hidden reasoning stays hidden.** Chat a model that emits `<think>` blocks. The default panel
-should show only the answer; `--show-reasoning` should show the chain of thought.
+should show only the answer; `--show-reasoning` should show the chain of thought, without its tags, in a
+dim panel above the answer.
 
 ```bash
 printf 'What is 2+2? Answer briefly.\n/exit\n' | yonga chat ARTIFACT --device gpu

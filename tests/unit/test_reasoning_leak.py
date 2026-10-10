@@ -31,7 +31,7 @@ from yonga.application.chat import ChatOptions, ChatProfileView, sanitize_answer
 from yonga.domain.models import ModelIdentity, ModelMetadata
 from yonga.registry.loader import load_builtin_registry
 from yonga.registry.resolver import RegistryResolver
-from yonga.ui.chat_tui import render_answer
+from yonga.ui.chat_tui import render_answer, render_reasoning
 
 THINK = [("<think>", "</think>")]
 
@@ -315,7 +315,32 @@ def test_show_reasoning_still_gets_past_the_assumption(tmp_path):
 
     session = service.open_artifact(artifact, options=ChatOptions(show_reasoning=True))
     assert session.starts_in_reasoning is True
-    assert session.send("Hello").display_text == PROMPT_OPENED_REPLY
+    turn = session.send("Hello")
+    assert turn.reasoning_text == PROMPT_OPENED_REPLY
+    assert SECRET in render(render_reasoning(turn.reasoning_text or ""))
+    # The answer panel admits there was no answer instead of offering /reasoning on again.
+    assert turn.result is not None
+    answer = render(render_answer(turn.result))
+    assert "did not reach an answer" in answer
+    assert "/reasoning on" not in answer
+
+
+def test_shown_reasoning_drops_the_opener_the_model_wrote_itself(tmp_path):
+    """Qwen3 with thinking on writes its own ``<think>`` after the prompt-opened one.
+
+    Seen on the reference host: ``--show-reasoning`` printed the chain of thought
+    starting with a bare ``<think>`` and no closing tag, under the answer.
+    """
+    reply = f"<think>\n{SECRET}\n</think>\n\n2+2 equals 4."
+    service, _factory, _runtime = build_service(tmp_path, answers=[reply])
+    artifact = write_artifact(tmp_path, make_manifest())
+    (artifact / "chat_template.jinja").write_text(QWEN_TEMPLATE, encoding="utf-8")
+
+    session = service.open_artifact(artifact, options=ChatOptions(show_reasoning=True))
+    assert session.starts_in_reasoning is True
+    turn = session.send("What is 2+2?")
+    assert turn.display_text == "2+2 equals 4."
+    assert turn.reasoning_text == SECRET
 
 
 def test_the_startup_panel_admits_it_is_hiding_by_assumption(tmp_path):

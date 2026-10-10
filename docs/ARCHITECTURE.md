@@ -398,7 +398,7 @@ Configuration must be serializable for diagnostics, with secrets removed.
 
 MVP can run one preparation job per process. Downloads may use Hugging Face's native concurrency. Avoid adding an async framework without need.
 
-Chat generation remains synchronous initially. Ctrl+C should cancel the current generation when upstream permits and return to prompt rather than terminating the entire process where practical.
+Chat generation is synchronous from the user's side: one reply at a time. It runs on a worker thread while the main thread waits, so Ctrl+C reaches yonga at once; the session's streamer then asks GenAI to stop at the next token and the chat returns to the prompt with the conversation intact. A second Ctrl+C while the reply is still stopping (a long prompt still being read, say) ends the process with exit 60.
 
 ## 15. Future plugin points
 

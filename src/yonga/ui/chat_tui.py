@@ -44,6 +44,7 @@ __all__ = [
     "parse_command",
     "render_answer",
     "render_metrics",
+    "render_reasoning",
     "session_facts",
     "startup_panel",
 ]
@@ -489,6 +490,22 @@ def render_answer(answer: str | ChatAnswer) -> RenderableType:
     body = _answer_text(answer).strip()
     if body:
         return Panel(Markdown(body), border_style="green", box=ROUNDED, padding=(1, 2))
+    if (
+        not isinstance(answer, str)
+        and not answer.reasoning_hidden
+        and _attribute(answer, "reasoning_unterminated") is True
+    ):
+        # The reasoning was shown above this panel; only the missing answer is news.
+        limit = _suggested_token_limit(_whole(_attribute(answer, "output_tokens")))
+        return Panel(
+            Text.assemble(
+                ("The model did not reach an answer before the output limit.\n", ""),
+                (f"Raise the limit with /tokens {limit}.", "dim"),
+            ),
+            border_style="yellow",
+            box=ROUNDED,
+            padding=(1, 2),
+        )
     if isinstance(answer, str) or not answer.reasoning_hidden:
         return Panel(
             Text("(the model returned no text)", style="dim"),
@@ -501,6 +518,24 @@ def render_answer(answer: str | ChatAnswer) -> RenderableType:
         border_style="yellow",
         box=ROUNDED,
         padding=(1, 2),
+    )
+
+
+def render_reasoning(reasoning: str) -> RenderableType:
+    """Render reasoning the user asked to see, in a dim panel drawn before the answer.
+
+    The text is the reasoning block's content without its wrapper tags, as
+    ``yonga.application.chat`` reports it with ``--show-reasoning`` or
+    ``/reasoning on``. It is printed as plain text: chains of thought are not
+    written as Markdown, and a stray tag inside one must not vanish as HTML.
+    """
+    return Panel(
+        Text(reasoning.strip(), style="dim"),
+        title="Reasoning",
+        title_align="left",
+        border_style="dim",
+        box=ROUNDED,
+        padding=(0, 2),
     )
 
 
@@ -690,6 +725,11 @@ class ChatView:
     def render_answer(self, answer: str | ChatAnswer) -> RenderableType:
         """Return the model's answer as a Markdown panel."""
         return render_answer(answer)
+
+    def show_reasoning(self, reasoning: str) -> None:
+        """Print shown reasoning, before the answer it led to."""
+        if reasoning.strip():
+            self.console.print(render_reasoning(reasoning))
 
     def show_answer(self, answer: str | ChatAnswer) -> None:
         """Print the model's answer.

@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
@@ -41,7 +42,7 @@ import typer
 from yonga import APP_NAME, __version__
 from yonga.application.artifacts import ArtifactStore
 from yonga.application.benchmark import DEFAULT_SUITE, benchmark_result_path
-from yonga.application.chat import ChatOptions, ChatService, ChatSession
+from yonga.application.chat import ChatOptions, ChatService, ChatSession, ChatTurn
 from yonga.application.inspect_model import InspectReport
 from yonga.application.jobs import (
     JobContext,
@@ -1187,13 +1188,19 @@ def _chat(state: CliState, artifact: str, *, options: ChatOptions) -> ExitCode:
         )
     service: ChatService = state.graph.chat_service(progress=state.sink())
     session = service.open_session(artifact, options=options)
-    view = ChatView(state.console, _session_info(session), paths=state.settings.paths)
     try:
-        view.show_startup()
-        return _chat_loop(state, session, view)
+        # Load before the startup panel: a model that cannot compile on this
+        # device fails the command here, with its category's exit code, instead
+        # of failing every message and exiting 0.
+        session.load()
+        view = ChatView(state.console, _session_info(session), paths=state.settings.paths)
+        try:
+            view.show_startup()
+            return _chat_loop(state, session, view)
+        finally:
+            view.close()
     finally:
         session.close()
-        view.close()
 
 
 def _session_info(session: ChatSession) -> ChatSessionInfo:
@@ -1591,15 +1598,25 @@ def _require_port(host: str, port: int) -> None:
             ) from error
 
 
+#: How often the chat loop wakes while a reply is generated, so Ctrl-C is seen promptly.
+_TURN_POLL_SECONDS = 0.1
+
+
 def _chat_loop(state: CliState, session: ChatSession, view: ChatView) -> ExitCode:
-    """Read, dispatch and render until the user leaves."""
+    """Read, dispatch and render until the user leaves.
+
+    A failed message does not end the chat, but it is not forgotten either:
+    leaving while the last message failed exits with that failure's code, so a
+    piped conversation whose message never got an answer does not exit 0.
+    """
     console = state.console
+    failure: Diagnostic | None = None
     while True:
         try:
             line = view.prompt()
         except (EOFError, KeyboardInterrupt):
             console.print("")
-            return ExitCode.SUCCESS
+            return _chat_exit(failure)
         if not line.strip():
             continue
 
@@ -1622,20 +1639,79 @@ def _chat_loop(state: CliState, session: ChatSession, view: ChatView) -> ExitCod
                 view.info = _session_info(session)
                 view.show_model()
             elif outcome.exit_requested:
-                return ExitCode.SUCCESS
+                return _chat_exit(failure)
             continue
 
         with view.generating():
-            turn = session.send(line)
+            turn = _send_cancellable(state, session, line)
+        if turn.cancelled:
+            console.print("Reply cancelled.", style="dim")
+            continue
         if not turn.ok:
             if turn.diagnostic is not None:
                 console.diagnostic(turn.diagnostic)
+                failure = turn.diagnostic
             continue
-        view.show_answer(turn.result or turn.display_text)
+        failure = None
         if session.show_reasoning and turn.reasoning_text:
-            console.print(turn.reasoning_text, style="dim")
+            view.show_reasoning(turn.reasoning_text)
+        view.show_answer(turn.result or turn.display_text)
         if session.stats:
             view.show_metrics(turn.result)
+
+
+def _send_cancellable(state: CliState, session: ChatSession, line: str) -> ChatTurn:
+    """Answer one message on a worker thread, so Ctrl-C can stop the reply.
+
+    Generation runs in native code, where the interpreter cannot act on a Ctrl-C
+    until it returns. Here the main thread only waits, so the first Ctrl-C
+    reaches it at once and asks the session to stop at the next token; the loop
+    then returns to the prompt with the conversation intact. A second Ctrl-C
+    while that reply is still stopping ends the chat (exit 60).
+    """
+    cancel = threading.Event()
+    turns: list[ChatTurn] = []
+    errors: list[BaseException] = []
+
+    def answer() -> None:
+        try:
+            turns.append(session.send(line, should_stop=cancel.is_set))
+        except BaseException as error:  # re-raised on the main thread below
+            errors.append(error)
+
+    worker = threading.Thread(target=answer, name="yonga-chat-turn", daemon=True)
+    started = False
+    while True:
+        # Starting the worker is inside the guard too: Thread.start() waits, and
+        # a Ctrl-C landing there is the same first press as one landing later.
+        try:
+            if not started:
+                started = True
+                worker.start()
+            if not worker.is_alive():
+                break
+            worker.join(_TURN_POLL_SECONDS)
+        except KeyboardInterrupt:
+            if cancel.is_set():
+                raise
+            cancel.set()
+            state.console.print_error("Stopping the reply; Ctrl-C again quits.", style="dim")
+    if errors:
+        raise errors[0]
+    # No turn at all means the Ctrl-C came before the worker could run.
+    return turns[0] if turns else ChatTurn(cancelled=True)
+
+
+def _chat_exit(failure: Diagnostic | None) -> ExitCode:
+    """Exit 0, or the code of the failure that left the last message unanswered.
+
+    A generation failure no rule classified keeps the generation stage's code
+    (52), never 99: the runtime failed, not yonga.
+    """
+    if failure is None:
+        return ExitCode.SUCCESS
+    code = failure.exit_code()
+    return ExitCode.GENERATION if code is ExitCode.INTERNAL else code
 
 
 # ======================================================================
