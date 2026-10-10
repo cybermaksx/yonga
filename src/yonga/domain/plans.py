@@ -9,15 +9,28 @@ from __future__ import annotations
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from enum import Enum
+from fnmatch import fnmatch
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from yonga.domain.compatibility import CompatibilityDecision, ProfileSelection
+from yonga.domain.compatibility import (
+    CompatibilityDecision,
+    DeviceStatus,
+    EvidenceLevel,
+    ProfileSelection,
+)
 from yonga.domain.diagnostics import Diagnostic
 from yonga.domain.environments import EnvironmentSpec
 from yonga.domain.hardware import FilesystemInfo, HardwareInventory, normalise_device
-from yonga.domain.models import ModelIdentity, PipelineKind, ResolvedSource
+from yonga.domain.models import (
+    FormatObservation,
+    ModelFormat,
+    ModelIdentity,
+    PipelineKind,
+    RepoFile,
+    ResolvedSource,
+)
 
 _STRICT = ConfigDict(extra="forbid")
 _LENIENT = ConfigDict(extra="ignore")
@@ -89,6 +102,150 @@ def export_extra_arg_problems(arguments: Sequence[str]) -> list[str]:
         elif text.startswith("-m"):
             problems.append(f"{text!r} names -m: {RESERVED_EXPORT_OPTIONS['model']}")
     return problems
+
+
+#: Repository paths an Optimum export or an OpenVINO IR copy never reads: other
+#: runtimes' weights (ONNX, Flax, TensorFlow, Rust, Core ML), a model's native
+#: checkpoint kept beside its Transformers one (``original/``, ``consolidated*``),
+#: and training leftovers. ``fnmatch`` patterns, matched the way
+#: ``huggingface_hub`` matches ``ignore_patterns`` (``*`` crosses ``/``).
+EXPORT_IRRELEVANT_PATTERNS: tuple[str, ...] = (
+    "*.onnx",
+    "*.onnx_data",
+    "*.onnx.data",
+    "onnx/*",
+    "*.msgpack",
+    "*.h5",
+    "*.tflite",
+    "*.ot",
+    "*.mlmodel",
+    "*.mlpackage/*",
+    "coreml/*",
+    "original/*",
+    "consolidated*.pth",
+    "runs/*",
+    "*tfevents*",
+    "training_args.bin",
+    "optimizer.pt",
+    "scheduler.pt",
+    "rng_state*.pth",
+    "*.gguf",
+)
+
+#: Bits one stored weight takes, per NNCF ``weight_format`` (and backup precision).
+_WEIGHT_BITS: dict[str, int] = {
+    "int4": 4,
+    "nf4": 4,
+    "mxfp4": 4,
+    "fp4": 4,
+    "e2m1": 4,
+    "int8": 8,
+    "int8_asym": 8,
+    "int8_sym": 8,
+    "mxfp8": 8,
+    "fp8": 8,
+    "f8e4m3": 8,
+    "f8e5m2": 8,
+    "fp16": 16,
+    "bf16": 16,
+    "none": 16,
+    "fp32": 32,
+}
+
+#: How much larger a prepared artifact is than its parameters times their bits.
+#: Embeddings and the output layer stay at INT8, group scales and zero points
+#: add a little, and tokenizer IR and configs ride along. Measured on the
+#: reference host: Qwen3-0.6B, Qwen2.5-0.5B, SmolLM3-3B, Qwen2.5-VL-3B and
+#: Qwen3.5-0.8B artifacts came out at 0.83 to 1.85 times the bare figure,
+#: most of them between 1.0 and 1.4 (the VLMs, whose vision tower is not
+#: compressed like the language model, at the top).
+ARTIFACT_SIZE_OVERHEAD: float = 1.2
+
+
+def download_ignore_patterns(
+    files: Sequence[RepoFile],
+    formats: Sequence[FormatObservation],
+    *,
+    source_format: ModelFormat,
+    remote_code: bool = False,
+) -> list[str]:
+    """Patterns for the repository files a conversion of ``source_format`` never reads.
+
+    A snapshot of the whole repository can be several times the model: the
+    SmolLM2 repositories carry eight ONNX variants and TensorBoard runs, Llama
+    ships its native ``original/`` checkpoint beside the Transformers one, and
+    many repositories publish both ``.safetensors`` and ``.bin`` weights. Only
+    weights in the format the job reads are downloaded; config, tokenizer,
+    chat-template and processor files are never filtered.
+
+    Other weight formats are excluded by their exact paths, and only once the
+    chosen format is complete, so a ``.bin`` that is the model's only weight
+    file is never dropped. With remote code enabled nothing is filtered: the
+    repository's own code may open any file it ships.
+    """
+    if remote_code:
+        return []
+    patterns = list(EXPORT_IRRELEVANT_PATTERNS)
+    chosen = [observation for observation in formats if observation.format is source_format]
+    if not chosen or not any(observation.complete for observation in chosen):
+        return patterns
+    keep = {path for observation in chosen for path in observation.files}
+    for observation in formats:
+        if observation.format in (source_format, ModelFormat.GGUF):
+            continue
+        patterns.extend(_glob_escape(path) for path in observation.files if path not in keep)
+    index_suffix = _OTHER_INDEX_SUFFIXES.get(source_format, ())
+    patterns.extend(
+        _glob_escape(entry.path) for entry in files if entry.path.endswith(index_suffix)
+    )
+    return list(dict.fromkeys(patterns))
+
+
+#: Shard index documents of the weight formats a job does not read, by the format it does.
+_OTHER_INDEX_SUFFIXES: dict[ModelFormat, tuple[str, ...]] = {
+    ModelFormat.SAFETENSORS: (".bin.index.json",),
+    ModelFormat.PYTORCH_BIN: (".safetensors.index.json",),
+    ModelFormat.OPENVINO_IR: (".safetensors.index.json", ".bin.index.json"),
+}
+
+
+def _glob_escape(path: str) -> str:
+    """Escape ``fnmatch`` metacharacters so ``path`` matches only itself."""
+    return "".join(f"[{char}]" if char in "*?[" else char for char in path)
+
+
+def is_ignored(path: str, patterns: Sequence[str]) -> bool:
+    """Whether ``huggingface_hub`` would skip ``path`` for these ``ignore_patterns``."""
+    expanded = [pattern + "*" if pattern.endswith("/") else pattern for pattern in patterns]
+    return any(fnmatch(path, pattern) for pattern in expanded)
+
+
+def bytes_to_download(files: Sequence[RepoFile], patterns: Sequence[str]) -> int:
+    """Bytes a download of ``files`` fetches when ``patterns`` are ignored."""
+    return sum(entry.size or 0 for entry in files if not is_ignored(entry.path, patterns))
+
+
+def estimate_artifact_bytes(
+    parameter_count: int | None, quantization: QuantizationSettings
+) -> int | None:
+    """Estimate the prepared artifact's size from what the profile stores per weight.
+
+    ``ratio`` of the weights take the profile's format and the rest its backup
+    precision (NNCF's default backup is INT8), scaled by
+    :data:`ARTIFACT_SIZE_OVERHEAD`. ``None`` when the parameter count or the
+    format is unknown: then the caller falls back to the source weight size,
+    which over-reserves rather than under-reserves.
+    """
+    if parameter_count is None or parameter_count <= 0:
+        return None
+    primary = _WEIGHT_BITS.get(quantization.weight_format)
+    if primary is None:
+        return None
+    ratio = 1.0 if quantization.ratio is None else quantization.ratio
+    backup_name = (quantization.backup_precision or "int8_asym").strip().lower()
+    backup = _WEIGHT_BITS.get(backup_name, 8)
+    bits = ratio * primary + (1.0 - ratio) * backup
+    return int(parameter_count * bits / 8 * ARTIFACT_SIZE_OVERHEAD)
 
 
 def _json_safe(value: object) -> object:
@@ -342,6 +499,14 @@ class PreparationPlan(BaseModel):
     profile_selection: ProfileSelection | None = None
     """Why :attr:`profile` was chosen; ``applies`` is False when no profile decides
     the quantization (a GGUF import or an OpenVINO copy)."""
+    download_ignore_patterns: list[str] = Field(default_factory=list)
+    """Repository paths the download skips, because this job never reads them.
+
+    :attr:`DiskPlan.expected_download_bytes` is computed with the same patterns,
+    so the plan announces what the download will actually fetch."""
+    auth_missing: bool = False
+    """The source repository is gated or private and no Hugging Face token was
+    found, so its download is bound to be refused."""
 
     @field_validator("target_device")
     @classmethod
@@ -364,6 +529,40 @@ class PreparationPlan(BaseModel):
         return self.trust_remote_code_required and not self.trust_remote_code_enabled
 
     @property
+    def reuses_artifact(self) -> bool:
+        """True when a ready artifact is returned as-is: nothing is downloaded or exported."""
+        return self.reuse_existing_artifact is not None and not self.force
+
+    @property
+    def runtime_missing(self) -> bool:
+        """True when the OpenVINO runtime cannot be imported in this environment.
+
+        Every path -- export, GGUF import, IR copy -- validates and probes the
+        result with OpenVINO, so without it a preparation cannot finish at all.
+        """
+        return not self.hardware.openvino_available and not self.hardware.devices
+
+    @property
+    def device_known_unsupported(self) -> bool:
+        """True when the explicitly requested device is one the registry rules out.
+
+        Only an ``unsupported`` verdict backed by official or tested evidence
+        counts: weaker knowledge leaves the decision to the runtime probe. An
+        automatic choice never selects such a device in the first place.
+        """
+        decision = self.compatibility
+        return (
+            decision.explicit_request
+            and decision.status is DeviceStatus.UNSUPPORTED
+            and decision.evidence_level.rank >= EvidenceLevel.TESTED.rank
+        )
+
+    @property
+    def refused_before_work(self) -> bool:
+        """True when the job will stop before preflight, whatever is confirmed."""
+        return self.runtime_missing or self.device_known_unsupported or self.auth_missing
+
+    @property
     def exporter_requirements_block(self) -> bool:
         """True when an unmet exporter pin really will stop this job at preflight.
 
@@ -372,13 +571,17 @@ class PreparationPlan(BaseModel):
         not on that job's path at all and its version pins decide nothing.
 
         The preflight gate and the plan panel both read this one property, so
-        the panel cannot announce a block the service will not perform.
+        the panel cannot announce a block the service will not perform. A plan
+        that reuses a ready artifact, or that stops before preflight for another
+        reason, never reaches this gate.
         """
         return (
             bool(self.exporter.problems)
             and not self.resolved_source.already_openvino
             and self.resolved_source.gguf_file is None
             and self.export_environment is None
+            and not self.reuses_artifact
+            and not self.refused_before_work
         )
 
     def to_json(self) -> dict[str, object]:

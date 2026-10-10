@@ -167,11 +167,40 @@ and `--yes` does not imply it.
 installed packages cannot meet stops preparation at preflight instead. `--ignore-exporter-requirements`
 also never builds one: it means "export in this environment regardless".
 
+The plan's **Export environment** row always says where the export runs: a managed environment, or
+this environment with the interpreter's path and why (none is needed for a GGUF import or an
+OpenVINO copy). **Expected download** counts only the files the conversion reads, and the download
+fetches exactly those: other runtimes' weights (`*.onnx`, Flax, TensorFlow), a native checkpoint
+kept beside the Transformers one (`original/`), training leftovers (`runs/`, `training_args.bin`)
+and, once the chosen weight format is complete, the other weight format's files are skipped.
+Configuration, tokenizer and template files never are. With `--trust-remote-code` the whole
+repository is fetched. **Estimated artifact** is computed from the profile's weight format and
+ratio and the Hub parameter count (about 1.2 times parameters × bits); without a count it is the
+source weight size.
+
+When a ready artifact already exists for the revision and profile, the plan is a short reuse plan
+(no download, temp, repair or environment rows) and asks no confirmation, so a re-run works
+without `--yes`. `--force` prepares again.
+
+Before asking anything, `prepare` refuses a job that cannot finish, and the plan marks it
+**BLOCKED**: the OpenVINO runtime is not installed (`runtime.openvino.missing`, exit 10, naming
+`pip install 'yonga[openvino]'`); an explicit `--device` OpenVINO does not report
+(`device.not_present`, exit 50); an explicit `--device` the registry records as unsupported for this
+model with official or tested evidence (`device.known_unsupported`, exit 50, with the recommended
+fallback); a gated or private repository and no Hugging Face token (`hub.auth.gated`, exit 21).
+Nothing is downloaded in any of these cases.
+
+A confirmation that needs a prompt in a session without a terminal (stdin is not a TTY) and without
+`--yes` stops with `job.confirmation_unavailable` (exit 60), saying the question could not be asked
+and naming `--yes`; a security confirmation says `--yes` cannot answer it. An answer of "no" at a
+real prompt is `job.declined` (exit 60).
+
 When an earlier job with identical inputs completed its export and then failed, the plan shows an
 `Export` row naming that job, and stages 4 and 5 are skipped: the retained export is adopted once
 every file has been shown to be what the exporter wrote, with repaired files restored from their
 backups first. Anything that does not check out is discarded and the export runs normally. The
-manifest records `export.reused_from_job`. `--fresh-export` always exports again. An export that was
+manifest records `export.reused_from_job`, and the result prints it as a `note:`, not a warning: an
+adopted export does not change the exit code. `--fresh-export` always exports again. An export that was
 itself interrupted is never reused.
 
 A GGUF-only repository with no usable declared derivative is **imported** instead of exported,

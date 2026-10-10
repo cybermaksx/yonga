@@ -110,6 +110,8 @@ Avoid duplicate source copies. Export may point at the cached snapshot.
 
 For known file selection, use `allow_patterns`/`ignore_patterns` conservatively. Do not accidentally omit custom model/config/tokenizer files needed by Transformers.
 
+yonga passes `ignore_patterns` only (never an allow-list, except the one GGUF file of an import), built by `download_ignore_patterns` in `yonga.domain.plans`: other runtimes' weights (`*.onnx`, `onnx/`, `*.msgpack`, `*.h5`, `*.tflite`, Core ML), a native checkpoint kept beside the Transformers one (`original/`, `consolidated*.pth`), training leftovers (`runs/`, `*tfevents*`, `training_args.bin`, optimizer and scheduler states) and stray `*.gguf`. Once the format being converted is complete, the other weight formats' files are excluded by their exact paths, so a repository publishing both `.safetensors` and `.bin` is fetched once and a `.bin`-only one keeps its weights. With remote code enabled nothing is excluded. The plan's expected download is computed with the same patterns.
+
 Offline mode uses `local_files_only=True` and fails clearly if missing. It never contacts the Hub,
 for metadata either: inspection and revision resolution read the cached snapshot (file list and
 sizes, `config.json`, the model card's front matter, safetensors and GGUF headers) and fail with
