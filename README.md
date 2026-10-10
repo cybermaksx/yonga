@@ -102,10 +102,11 @@ Each [GitHub release](https://github.com/ooguz/yonga/releases) carries `yonga-X.
 ```bash
 sha256sum --check yonga-X.Y.Z-x86_64.AppImage.sha256
 chmod +x yonga-X.Y.Z-x86_64.AppImage
-./yonga-X.Y.Z-x86_64.AppImage doctor
+./yonga-X.Y.Z-x86_64.AppImage self install
+yonga doctor
 ```
 
-Rename it to `yonga` somewhere on your `PATH` to use it like the installed command. Without FUSE, set `APPIMAGE_EXTRACT_AND_RUN=1`. The GPU and NPU still need the host's Intel drivers, which no package can carry (`doctor` says what is missing). The conversion toolchain is not in the file, because it is about 1.5 GB and depends on the model: the first `prepare` that converts a model builds a managed export environment for it under `~/.cache/yonga/envs` and reuses it afterwards.
+A downloaded file is not a command yet: `self install` copies the AppImage to `~/.local/bin/yonga`, so typing `yonga` works in any shell. If `~/.local/bin` is not on your `PATH` yet, it says so and prints the line to run (on Ubuntu, `~/.profile` adds it at the next login once the directory exists); it never edits a shell startup file and never needs sudo. Running `self install` from a newer AppImage replaces the older copy after asking, and `yonga self uninstall` removes it again, leaving models and caches alone. Without FUSE, set `APPIMAGE_EXTRACT_AND_RUN=1`. The GPU and NPU still need the host's Intel drivers, which no package can carry (`doctor` says what is missing). The conversion toolchain is not in the file, because it is about 1.5 GB and depends on the model: the first `prepare` that converts a model builds a managed export environment for it under `~/.cache/yonga/envs` and reuses it afterwards.
 
 The Python packages in the image are resolved from PyPI when it is built, so each release also carries `yonga-X.Y.Z-x86_64.AppImage.packages.txt`: the exact package versions that AppImage bundles and the sha256 of the yonga wheel inside it. The same list is in the image as `usr/share/yonga/packages.txt`.
 

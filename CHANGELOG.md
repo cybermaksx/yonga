@@ -9,6 +9,31 @@ manifest may change in any minor release.
 
 ## [Unreleased]
 
+### Added
+
+- **`yonga self install` and `yonga self uninstall`.** Run from the AppImage,
+  `./yonga-X.Y.Z-x86_64.AppImage self install` copies it to `~/.local/bin/yonga` (or `--bin-dir
+  DIR`): atomically (temporary file in the directory, `fsync`, `0755`, rename), creating the
+  directory when missing. The same file again is "already installed"; another yonga AppImage
+  there is replaced after a question showing both versions where known (`--yes` answers it).
+  Anything else at that name (a pip or pipx command, a symbolic link, a directory, a script) is
+  refused and left alone; an AppImage is recognised by its ELF and `AI\x02` magic bytes, never by
+  running it. Afterwards it checks that `yonga` on `PATH` runs the copy and, if not, says what to do
+  (log out and in, or `export PATH="$HOME/.local/bin:$PATH"`) and exits 2; it never edits a shell
+  startup file and never uses sudo (an unwritable directory exits 10 with the advice to pick one you
+  own). Outside an AppImage it exits 70 and points pip users at their environment's `yonga` or
+  `pipx install 'yonga[openvino,export]'`. `self uninstall` removes only an AppImage, after a
+  question, and keeps models, logs, caches and settings, saying where they are.
+  `docs/CLI_SPEC.md` section 12c.
+
+### Changed
+
+- **`doctor` reports how yonga is installed.** A new `Install` line in the Host section names the
+  AppImage file or the Python environment, and what `yonga` on `PATH` resolves to. From an AppImage
+  it is a warning with `self install` as the remedy when `yonga` is not on `PATH`, or when it is
+  another installation (named with its path, for example an older AppImage). For a pip install it
+  is information only. `doctor --json` carries it as `installation`. `docs/CLI_SPEC.md` section 3.
+
 ## [0.4.0] - 2026-10-09
 
 ### Added

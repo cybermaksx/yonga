@@ -51,6 +51,7 @@ Host
   OS       Ubuntu 26.04
   Kernel   ...
   Python   3.14.x
+  Install  AppImage  /home/user/.local/bin/yonga; 'yonga' on PATH is this AppImage
   RAM      32 GiB
 
 OpenVINO
@@ -77,6 +78,16 @@ Storage
 ```
 
 Warnings must have remediation text.
+
+The `Install` line (`host.install`) says how yonga is running: an AppImage, with the image file's
+path, or a Python environment, with `sys.prefix`. It also says what the command `yonga` on `PATH`
+resolves to (`shutil.which`). Running from an AppImage, it is a warning when `PATH` has no `yonga`
+(remediation: `<the AppImage> self install`, section 12c) or when `yonga` there is another
+installation, such as an older AppImage, which is named with its path (and its version when
+`self install` recorded it). A copy with the same content counts as this AppImage. For a Python
+environment the line is information only. The `--json` document carries it under `installation`
+(`kind`, `version`, `appimage`, `prefix`, `path_command`, `path_command_relation`: `this`,
+`other_appimage`, `other` or `missing`, and `path_command_version`).
 
 The `compile cache` line reports the size of the OpenVINO compile cache and how much of it is
 reclaimable: orphaned plus stale-runtime entries, as `yonga cache list` classifies them (section
@@ -517,6 +528,67 @@ that model a recompile on its next load, nothing more.
 Exit codes: 0 on success, including nothing to prune and a dry run; 2 when some entries could not
 be removed (`failed` lists them); 60 when the confirmation is declined, or when it cannot be asked
 (a non-interactive session or `--json` without `--yes`); 70 for an invalid `--older-than`.
+
+## 12c. `self`
+
+```bash
+yonga self install [--bin-dir DIR] [--yes] [--json]
+yonga self uninstall [--bin-dir DIR] [--yes] [--json]
+```
+
+Puts the running AppImage on `PATH` as `yonga`, and takes it off again. `DIR` defaults to
+`~/.local/bin`; `~` is expanded and a relative `DIR` is taken from the current directory.
+
+`install` works only when yonga runs from an AppImage: `APPIMAGE` names an existing AppImage file
+and the interpreter running yonga is inside `APPDIR`. A pip-installed yonga that inherited another
+application's `APPIMAGE` does not qualify. Otherwise it exits 70 (`self.not_appimage`) and says
+where the environment's own `yonga` command is, how to activate it, and
+`pipx install 'yonga[openvino,export]'`.
+
+What already exists at `DIR/yonga` is examined with `lstat` and its first bytes, never run. A
+regular file starting with the ELF magic and carrying `AI\x02` at offset 8 is a yonga AppImage.
+
+| At `DIR/yonga` | `install` | `uninstall` |
+|---|---|---|
+| nothing | copies the AppImage there (`installed`) | nothing to remove, exit 0 |
+| an AppImage with the same size and SHA-256 | nothing (`already_installed`) | removes it after a question |
+| another AppImage | shows both versions where known, asks, replaces it (`replaced`) | removes it after a question |
+| a symbolic link, directory, pip/pipx command, other file | refuses, exit 70 (`self.target.not_appimage`), leaves it alone | refuses, exit 70 |
+
+The copy is written to a temporary file in `DIR`, flushed with `fsync`, made `0755` and renamed
+over `DIR/yonga` with `os.replace`; what is at `DIR/yonga` is checked again immediately before
+the rename, and if it changed since the question nothing is replaced (exit 70,
+`self.target.changed`). A symbolic link at `DIR/yonga` is never followed. `DIR` is created when
+missing. A `DIR` (or, when it is missing, its nearest existing parent) the user cannot write to is
+refused with exit 10 (`self.bin_dir.not_writable`) and the advice to choose a directory the user
+owns: yonga never uses sudo. Too little free space for the copy is exit 30.
+
+After installing, it checks whether `DIR` is on `PATH` (comparing resolved paths) and whether `yonga`
+on `PATH` now runs the copy. If not, it explains what to do: for `~/.local/bin`, that Ubuntu's
+`~/.profile` adds it at login only if the directory existed then (log out and in), and the
+`export PATH="$HOME/.local/bin:$PATH"` line for the current shell; for another `DIR`, the same line
+to add to a startup file; when an earlier `PATH` entry has another `yonga`, its path. yonga never
+edits a shell startup file.
+
+The version of each copy and its SHA-256 are recorded in `<data-dir>/self-install.json`, which is
+how a later `install` (and `doctor`) can name the version it would replace without running it;
+`uninstall` drops the entry. Without an entry the version is "unknown".
+
+`uninstall` removes only the file at `DIR/yonga`. Prepared models, logs, caches and settings are
+kept; it prints their directories and that `yonga remove`, `yonga cache prune --all` or deleting
+the directories frees the space.
+
+`--json` documents: `install` carries `action` (`installed`, `replaced`, `already_installed`),
+`source`, `target`, `bin_dir`, `version`, `size`, `sha256`, `created_bin_dir`, `previous`
+(`version`, `sha256`, `size`, or null), `bin_dir_on_path`, `path_command`,
+`path_command_is_target`, `advice` and `exit_code`. `uninstall` carries `target`, `removed`,
+`version` and `kept` (the data, cache and config directories).
+
+Exit codes: 0 when `yonga` on `PATH` runs the installed copy (and for `uninstall`); 2 when the copy
+is in place but `yonga` does not run it yet (`DIR` not on `PATH`, or shadowed); 10 for a directory
+the user cannot write to; 30 for too little space; 60 when the confirmation is declined, or cannot
+be asked (a non-interactive session or `--json` without `--yes`); 70 when not running from an
+AppImage or when something other than an AppImage is in the way.
 
 ## 13. `logs`
 

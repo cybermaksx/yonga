@@ -51,6 +51,7 @@ from yonga.application.probe import IsolatedSmokeTester, LocalArtifactStore, Pro
 from yonga.application.progress import ProgressSink
 from yonga.application.publish import PublishService
 from yonga.application.search import SearchService
+from yonga.application.self_install import SelfInstallService
 from yonga.config.paths import Paths
 from yonga.config.settings import Settings
 from yonga.domain.artifacts import ArtifactManifest, ProbeResult, ProbeStatus
@@ -593,7 +594,12 @@ class Wiring:
             progress=progress,
             export_environments=self.export_environments().environments,
             compile_cache=self.compile_cache_service().inventory,
+            installation=self.self_install_service().status,
         )
+
+    def self_install_service(self) -> SelfInstallService:
+        """Build the ``yonga self`` service over this process's environment."""
+        return SelfInstallService(self.paths)
 
     def compile_cache_service(self) -> CompileCacheService:
         """Build the ``yonga cache`` service over the managed compile cache."""

@@ -12,7 +12,10 @@ codes and remediation see [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md).
 ## 0. Setup
 
 To use yonga, install it from PyPI with `pip install "yonga[openvino,export,serve]"` or take the
-AppImage; [`INSTALL.md`](INSTALL.md) covers both. This tour also runs the test suite (section 8),
+AppImage; [`INSTALL.md`](INSTALL.md) covers both. A downloaded AppImage becomes the `yonga`
+command with `./yonga-X.Y.Z-x86_64.AppImage self install` (a copy in `~/.local/bin`; it prints the
+`PATH` line to run if that directory is not on `PATH` yet, and edits no startup file).
+`yonga self uninstall` removes the copy again and keeps models and caches. This tour also runs the test suite (section 8),
 so it starts from a clone of the repository with the development tools:
 
 ```bash
@@ -40,13 +43,17 @@ as JSON at `GET /health` instead.
 yonga doctor
 ```
 
-Reports OS, CPU, RAM, package versions, the OpenVINO ABI family, every device OpenVINO enumerates,
-the NPU node and driver, storage, and Hugging Face auth. Exit codes: **0** usable, **2** usable
+Reports OS, CPU, RAM, how yonga is installed, package versions, the OpenVINO ABI family, every
+device OpenVINO enumerates, the NPU node and driver, storage, and Hugging Face auth. Exit codes: **0** usable, **2** usable
 with warnings, **10** no usable runtime.
 
 What to look for:
 
 - **Devices** should list CPU, GPU and NPU by their real names if you have them.
+- **Host → Install** says whether this is an AppImage (and which file) or a Python environment,
+  and what typing `yonga` runs. From an AppImage that is not on `PATH`, it warns and gives the
+  `self install` command; if `yonga` on `PATH` is another installation (an older AppImage, a pip
+  install), it names it.
 - **ABI family** must say `aligned`. OpenVINO, GenAI and Tokenizers have to share a major.minor.
 - **NPU → /dev/accel/accel0** should say `accessible`. If it does not, doctor names the owning
   group (usually `render`) and prints the `usermod` command *for you to run* — yonga never uses
@@ -576,6 +583,8 @@ Without it those tests skip with a message telling you to run exactly that.
 ~/.cache/yonga/{tmp,compile,metadata}    managed temp, compile cache (yonga cache list)
 ~/.local/share/yonga/artifacts/          prepared artifacts, each with .yonga/manifest.json
 ~/.local/share/yonga/{logs,benchmarks,chat-history}
+~/.local/share/yonga/self-install.json   versions of the AppImage copies 'self install' made
+~/.local/bin/yonga                       the AppImage copy (yonga self install / uninstall)
 ```
 
 Source models stay in the normal Hugging Face cache and are never copied or modified. Settings
