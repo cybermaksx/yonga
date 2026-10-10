@@ -79,12 +79,17 @@ pip install "yonga[openvino,export]"
 
 On a machine without an NVIDIA GPU, install the CPU build of torch first. The `export` extra pulls
 torch in, and the default PyPI build on Linux carries CUDA — on the reference host 1.2 GB of torch
-plus 3.2 GB of NVIDIA libraries that an Intel AI PC never uses. The CPU wheel is 196 MB:
+plus 3.2 GB of NVIDIA libraries that an Intel AI PC never uses. The CPU wheel is 196 MB. Take
+torchvision from the same index: optimum-intel pulls it in too, and PyPI's build cannot load against
+a CPU torch (`operator torchvision::nms does not exist`, and no model converts):
 
 ```bash
-pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 pip install "yonga[openvino,export]"
 ```
+
+`prepare` imports the exporter before it downloads anything, so a mismatched pair is reported up
+front as `export.torchvision.build_mismatch` (exit 10).
 
 Add `serve` to the extras for the HTTP API: `pip install "yonga[openvino,export,serve]"`.
 

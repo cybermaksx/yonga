@@ -431,14 +431,27 @@ class BenchmarkService:
 
     # --- running ----------------------------------------------------------
 
-    def _classified(self, error: YongaError, device: str) -> YongaError:
-        """The registry's diagnosis of a load failure, when a rule recognises it."""
+    def _classified(
+        self,
+        error: YongaError,
+        device: str,
+        manifest: ArtifactManifest | None = None,
+    ) -> YongaError:
+        """The registry's diagnosis of a load failure, when a rule recognises it.
+
+        The diagnosis names the model the artifact was prepared from, as
+        ``probe`` and ``chat`` do, so its ``yonga prepare MODEL`` steps print
+        the real repository instead of the placeholder.
+        """
         if self._classifier is None:
             return error
         raw = error.diagnostic.raw_excerpt or error.diagnostic.message
         found = self._classifier(raw, device) if raw.strip() else None
         if found is None or found.matched_rule_id is None:
             return error
+        repo_id = None if manifest is None else manifest.resolved_source.repo_id
+        if repo_id and not found.context.get("repo_id"):
+            found = found.model_copy(update={"context": {**found.context, "repo_id": repo_id}})
         return YongaError(found)
 
     def run(
@@ -506,7 +519,7 @@ class BenchmarkService:
             # A model that cannot load has no benchmark. Writing an empty result
             # and exiting 2 hid the reason; ``probe`` and ``chat`` classify the
             # same failure and exit 51, and so does this now.
-            raise self._classified(exc, target) from exc
+            raise self._classified(exc, target, manifest) from exc
         except Exception as exc:
             raw = redact_text(_error_text(exc))
             raise self._classified(
@@ -520,6 +533,7 @@ class BenchmarkService:
                     )
                 ),
                 target,
+                manifest,
             ) from exc
         else:
             compile_seconds = time.perf_counter() - started

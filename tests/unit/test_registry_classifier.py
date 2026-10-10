@@ -354,7 +354,9 @@ def test_qwen35_export_symbol_remediation_names_the_version_and_where_to_read_it
     )
     joined = " ".join(result.remediation)
     assert "transformers==5.2.*" in joined
-    assert "yonga inspect MODEL" in joined
+    # The repository is known, so the step names it instead of the placeholder.
+    assert "yonga inspect nDimensional/Qwen3.5-9B-Uncensored-Safetensors" in joined
+    assert "MODEL" not in joined
 
 
 def test_qwen35_export_symbol_message_denies_that_a_readable_config_proves_anything():

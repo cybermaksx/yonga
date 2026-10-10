@@ -181,6 +181,26 @@ with no condition at all, for models of unknown size. And a band that can never 
 when an unbanded profile on the same specificity rung matches everything the band's other criteria
 match, at a higher priority, and no architecture or model rule names the banded profile.
 
+### 5.2 Group sizes the model cannot take
+
+Group-wise 4-bit quantization splits each weight row along its input channels into groups of
+`group_size`, and NNCF refuses any 4-bit layer whose channel count the group size does not divide
+(`InvalidGroupSizeError`). The channel counts are in `config.json` (`hidden_size`,
+`intermediate_size`, or the same keys under `text_config`), so automatic selection passes over a
+profile whose refusal is certain and says so in "Chosen because":
+
+- `hidden_size` feeds the q/k/v and gate/up projections, well over half of a decoder's weights, so
+  a group size that does not divide it fails at any `ratio` of 0.5 or more;
+- `intermediate_size` feeds only the down projections, which a mixed ratio may leave at 8 bits, so
+  it rules a profile out only at `ratio: 1.0`.
+
+A named profile (`profiles:` in an architecture or model rule) is passed over the same way. When
+no profile for the device is left, `prepare` stops before the download with
+`export.quantization.group_size_mismatch` (exit 70), unless the device was chosen automatically:
+then the next device in the ranking is tried. A profile requested with `--profile` is used anyway,
+and the plan says it will fail. Example: SmolLM2-360M has a hidden size of 960, so the CPU gets
+`cpu-int8-asym-ref`, the NPU `npu-int4-sym-cw`, and no GPU profile fits.
+
 ## 6. Issue/signature rule
 
 ```yaml
@@ -203,6 +223,15 @@ recommendation:
 ```
 
 Exact signatures should be preferred over broad regexes. Regexes require tests preventing false positives.
+
+**Placeholders in remediation.** A rule is written before any job exists, so a remediation step
+names what it cannot know with the upper-case words `MODEL` (the repository) and `JOB_ID` (the
+job): `yonga prepare MODEL --device gpu`, `yonga logs JOB_ID --raw`. Wherever the failure knows the
+value, it is filled in before the step is shown, in the terminal and in `--json` alike, so the step
+can be copied as it stands; an unknown value leaves the word, which still reads as a placeholder.
+Only the whole word is replaced (`MODEL_DIR` is left alone). A step that then repeats an earlier one,
+or ends in the same `yonga …` command, is dropped, so a rule's "run this model on the GPU instead:
+yonga prepare MODEL --device gpu" and `prepare`'s own "Prepare for GPU instead: …" print once.
 
 ## 7. Repair rule
 

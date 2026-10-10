@@ -71,6 +71,7 @@ from yonga.domain.diagnostics import (
     RegistryError,
     YongaError,
     diagnostic,
+    fill_placeholders,
 )
 from yonga.domain.hardware import normalise_device
 from yonga.domain.models import ModelIdentity
@@ -171,7 +172,8 @@ class CliState:
 
     def report(self, item: Diagnostic, *, exit_code: ExitCode) -> ExitCode:
         """Render one diagnostic the way the current output mode requires."""
-        enriched = self.attach_job(item)
+        # The job id is often only known here, so placeholders are filled last.
+        enriched = fill_placeholders(self.attach_job(item))
         self.console.diagnostic(enriched)
         if self.json_mode:
             self.console.print_json(error_document(enriched, exit_code=exit_code))
