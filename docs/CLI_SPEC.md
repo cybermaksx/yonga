@@ -234,6 +234,9 @@ yonga list [--clean] [--json]
 
 Shows prepared artifacts, source revision, profile, recommended device, size, last benchmark.
 
+On a narrow terminal the creation and benchmark times are dropped before the model and its
+revision; when the `Ready` column has to go too, unready artifacts are named under the table.
+
 `--clean` retires stale staging and temporary directories under the retention policy
 (`workspace_retention_hours`, `workspace_retention_max`) and never touches a running job's
 directories.
@@ -247,6 +250,10 @@ yonga remove ARTIFACT [--yes] [--json]
 Only removes tool-owned prepared artifact and compile cache references. It must not delete Hugging Face global cache unless a future explicit cache command is used. The compile cache entries it removes are the ones whose ownership record names the artifact, plus the ones whose key the artifact's manifest reproduces (section 12b); `yonga cache prune` handles everything else in the compile cache.
 
 Interactive confirmation unless `--yes`.
+
+`ARTIFACT` must name exactly one artifact. A repository id, artifact-id prefix or copied
+artifact id that matches several is refused with exit 70 and every candidate listed, even under
+`--yes`; the read-only commands (`chat`, `bench`, `probe`) still take the newest ready match.
 
 ## 9. `chat`
 

@@ -515,6 +515,98 @@ def test_remove_reports_an_unknown_reference(store: ArtifactStore) -> None:
     assert caught.value.diagnostic.code == "artifact.remove.not_found"
 
 
+def _three_artifacts_of_one_repository(store: ArtifactStore, tmp_path: Path) -> list[Path]:
+    """Publish one repository three times, for GPU, CPU and NPU, oldest first."""
+    published: list[Path] = []
+    start = datetime.now(tz=UTC) - timedelta(hours=3)
+    for index, (artifact_id, profile, device) in enumerate(
+        (
+            ("aaaa000000000001", "gpu-int4-asym-g128", "GPU"),
+            ("aaaa000000000002", "cpu-int8", "CPU"),
+            ("bbbb000000000003", "npu-int4-sym-g128", "NPU"),
+        )
+    ):
+        manifest = make_manifest(
+            artifact_id=artifact_id,
+            profile=profile,
+            device=device,
+            created_at=start + timedelta(hours=index),
+        )
+        published.append(publish(store, tmp_path, manifest=manifest, name=f"staging-{index}"))
+    return published
+
+
+def test_matches_returns_every_artifact_the_winning_rule_selects(
+    store: ArtifactStore, tmp_path: Path
+) -> None:
+    """A repository id answers with all its artifacts, best first; an exact id with one."""
+    gpu, cpu, npu = _three_artifacts_of_one_repository(store, tmp_path)
+
+    assert [item.path for item in store.matches(REPO_ID)] == [npu, cpu, gpu]
+    assert [item.path for item in store.matches("aaaa000000000002")] == [cpu]
+    assert [item.path for item in store.matches("aaaa0000")] == [cpu, gpu]
+    assert store.matches("nothing/at-all") == []
+    # The read-only lookup still settles the tie on the newest.
+    assert store.find(REPO_ID) == npu
+
+
+@pytest.mark.parametrize("reference", [REPO_ID, f"{REPO_ID}@{SHA[:7]}", "aaaa0000"])
+def test_remove_refuses_a_reference_that_matches_several_artifacts(
+    store: ArtifactStore, tmp_path: Path, reference: str
+) -> None:
+    """Deleting is never a guess: every candidate is named and nothing is removed."""
+    published = _three_artifacts_of_one_repository(store, tmp_path)
+
+    with pytest.raises(ConfigurationError) as caught:
+        store.remove(reference)
+
+    found = caught.value.diagnostic
+    assert found.code == "artifact.remove.ambiguous"
+    assert caught.value.exit_code() == 70
+    assert all(path.is_dir() for path in published)
+    expected = [s.artifact_id for s in store.matches(reference)]
+    assert len(expected) > 1
+    for artifact_id in expected:
+        assert any(f"yonga remove {artifact_id}" in step for step in found.remediation)
+    assert found.context["candidates"] == ", ".join(expected)
+
+
+def test_remove_by_a_unique_reference_still_removes_only_that_artifact(
+    store: ArtifactStore, tmp_path: Path
+) -> None:
+    """An exact id (or a prefix only one id has) is not ambiguous."""
+    gpu, cpu, npu = _three_artifacts_of_one_repository(store, tmp_path)
+
+    report = store.remove("bbbb0000")
+
+    assert report.removed is True
+    assert not npu.exists()
+    assert gpu.is_dir()
+    assert cpu.is_dir()
+    assert store.remove("aaaa000000000001").removed is True
+    assert not gpu.exists()
+    # One artifact left for the repository: its id is now unambiguous.
+    assert store.remove(REPO_ID).removed is True
+    assert not cpu.exists()
+
+
+def test_remove_names_copies_of_one_artifact_by_path(store: ArtifactStore, tmp_path: Path) -> None:
+    """Two directories claiming one artifact id can only be told apart by path."""
+    original = publish(store, tmp_path)
+    copy = original.parent / "copy-of-it"
+    shutil.copytree(original, copy)
+    artifact_id = make_manifest().artifact_id
+
+    with pytest.raises(ConfigurationError) as caught:
+        store.remove(artifact_id)
+
+    remediation = caught.value.diagnostic.remediation
+    assert any(f"yonga remove {original}" in step for step in remediation)
+    assert any(f"yonga remove {copy}" in step for step in remediation)
+    assert original.is_dir()
+    assert copy.is_dir()
+
+
 def test_remove_handles_an_artifact_without_a_manifest(
     store: ArtifactStore, tmp_path: Path
 ) -> None:

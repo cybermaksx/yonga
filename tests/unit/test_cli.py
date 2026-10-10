@@ -948,6 +948,41 @@ def test_remove_refuses_without_confirmation_and_then_removes(
     assert "Hugging Face download cache is never touched" in removed.stdout
 
 
+def test_remove_refuses_a_repository_id_that_names_several_artifacts(
+    runner: CliRunner, home: Path, tmp_path: Path
+) -> None:
+    """``--yes`` answers the prompt; it does not pick one of several artifacts to delete."""
+    settings = cli_settings(home)
+    store = ArtifactStore(settings.paths, settings)
+    published = [
+        publish(
+            store,
+            tmp_path,
+            manifest=make_manifest(artifact_id=artifact_id, profile=profile, device=device),
+            name=f"staging-{device}",
+        )
+        for artifact_id, profile, device in (
+            ("1111111111111111", "gpu-int4-asym-g128", "GPU"),
+            ("2222222222222222", "npu-int4-sym-g128", "NPU"),
+        )
+    ]
+    repo_id = make_manifest().resolved_source.repo_id
+
+    result = invoke(runner, home, ["remove", repo_id, "--yes", "--json"])
+
+    assert result.exit_code == int(ExitCode.REGISTRY)
+    payload = one_document(result)
+    assert payload["ok"] is False
+    assert "1111111111111111" in json.dumps(payload)
+    assert "2222222222222222" in json.dumps(payload)
+    assert all(path.is_dir() for path in published)
+
+    chosen = invoke(runner, home, ["remove", "2222222222222222", "--yes"])
+    assert chosen.exit_code == int(ExitCode.SUCCESS)
+    assert not published[1].exists()
+    assert published[0].is_dir()
+
+
 # ======================================================================
 # probe
 # ======================================================================

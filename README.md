@@ -76,7 +76,7 @@ Sixteen commands; `registry` has six subcommands, `env` and `cache` two each:
 | `yonga inspect MODEL` | Reads Hub metadata (no weights), identifies the architecture, shows per-device compatibility with its evidence level, the source that would be converted, and known limitations. |
 | `yonga prepare MODEL` | Plans, confirms, downloads, converts with an explicit quantization profile, validates the IR, applies known repairs, probes the runtime, and publishes an artifact with a manifest. |
 | `yonga list` | The artifacts prepared on this host, with profile, size, and last benchmark. |
-| `yonga remove ARTIFACT` | Deletes one artifact and its compile-cache entries, never anything outside the artifact store. |
+| `yonga remove ARTIFACT` | Deletes one artifact and its compile-cache entries, never anything outside the artifact store. A repository id that matches several artifacts is refused with each candidate's id. |
 | `yonga probe ARTIFACT --device D` | Compiles the artifact's submodels on a device and reports what worked, with timings. |
 | `yonga chat ARTIFACT` | A local chat session with slash commands, hidden reasoning by default, and a metrics footer. |
 | `yonga bench ARTIFACT` | Runs a prompt suite and writes a reproducible JSON result under the data directory. |
@@ -166,9 +166,9 @@ $ yonga prepare Qwen/Qwen3-0.6B --device cpu
 7/7 Artifact ready at ~/.local/share/yonga/artifacts/Qwen--Qwen3-0.6B/c1899de289a0--cpu-int4-asym-g128-r08
 
 $ yonga list
-Artifact          Model            Revision  Profile                 Dev     Size  Benchmark   Ready
-────────────────────────────────────────────────────────────────────────────────────────────────────
-780ff69f5ac67fb5  Qwen/Qwen3-0.6B  c1899de2  cpu-int4-asym-g128-r08  CPU  430 MiB  2026-10-08  ✓ yes
+Artifact          Model            Rev      Profile                 Dev     Size  Benchmark   Ready
+───────────────────────────────────────────────────────────────────────────────────────────────────
+780ff69f5ac67fb5  Qwen/Qwen3-0.6B  c1899de  cpu-int4-asym-g128-r08  CPU  430 MiB  2026-10-08  ✓ yes
 
 $ yonga probe 780ff69f5ac67fb5 --device cpu
 CPU  ✓ ok

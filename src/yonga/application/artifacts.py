@@ -341,6 +341,23 @@ class ArtifactStore:
         if direct is not None:
             return direct
 
+        candidates = self.matches(text)
+        return candidates[0].path if candidates else None
+
+    def matches(self, reference: str) -> list[ArtifactSummary]:
+        """Return every catalogued artifact the most precise matching rule selects.
+
+        The rules are the ones :meth:`find` tries, in the same order, and only
+        the first rule that matches anything contributes: an exact artifact id
+        is never mixed with the other artifacts of its repository. The result is
+        ordered best first (ready before unready, then newest), so ``find`` can
+        take the head while a destructive caller can see that more than one
+        artifact answered and refuse to guess. A filesystem path is not looked
+        up here; it names one directory and never needs disambiguation.
+        """
+        text = str(reference).strip()
+        if not text:
+            return []
         summaries = self.list_artifacts()
         for matcher in (
             self._match_artifact_id,
@@ -348,11 +365,11 @@ class ArtifactStore:
             self._match_repo_id,
             self._match_artifact_id_prefix,
         ):
-            matches = [summary for summary in summaries if matcher(summary, text)]
-            if matches:
-                matches.sort(key=lambda item: (item.ready, item.created_at), reverse=True)
-                return matches[0].path
-        return None
+            matched = [summary for summary in summaries if matcher(summary, text)]
+            if matched:
+                matched.sort(key=lambda item: (item.ready, item.created_at), reverse=True)
+                return matched
+        return []
 
     # --- publication --------------------------------------------------------
 
@@ -811,23 +828,71 @@ class ArtifactStore:
         elif isinstance(artifact, Path):
             candidate = artifact
         else:
-            found = self.find(artifact)
-            if found is None:
-                raise ConfigurationError(
-                    diagnostic(
-                        "artifact.remove.not_found",
-                        FailureCategory.CONFIGURATION_ERROR,
-                        "No such prepared artifact",
-                        f"Nothing in the artifact store matches {artifact!r}.",
-                        remediation=["Run 'yonga list' to see the prepared artifacts."],
-                        context={"reference": str(artifact)},
-                    )
-                )
-            candidate = found
+            candidate = self._unique_removal_match(artifact)
         try:
             return candidate.expanduser().resolve()
         except OSError:  # pragma: no cover - defensive
             return candidate
+
+    def _unique_removal_match(self, reference: str) -> Path:
+        """Resolve a textual reference to exactly one directory, or refuse.
+
+        :meth:`find` settles a tie by taking the newest ready artifact, which is
+        the right answer for a command that only reads. Deleting is not undone
+        by asking again, so a repository id (or an id prefix, or a copied
+        artifact id) that matches several artifacts is refused with every
+        candidate named, even under ``--yes``.
+        """
+        direct = self._as_directory(str(reference).strip())
+        if direct is not None:
+            return direct
+        candidates = self.matches(reference)
+        if not candidates:
+            raise ConfigurationError(
+                diagnostic(
+                    "artifact.remove.not_found",
+                    FailureCategory.CONFIGURATION_ERROR,
+                    "No such prepared artifact",
+                    f"Nothing in the artifact store matches {reference!r}.",
+                    remediation=["Run 'yonga list' to see the prepared artifacts."],
+                    context={"reference": str(reference)},
+                )
+            )
+        if len(candidates) == 1:
+            return candidates[0].path
+        # Name each candidate by its id unless two of them share one (a copied
+        # artifact); then only the path tells them apart.
+        ids = [summary.artifact_id for summary in candidates]
+        by_path = len(set(ids)) != len(ids)
+        remediation = [
+            (
+                f"yonga remove {summary.path if by_path else summary.artifact_id}"
+                f"  ({summary.profile or 'unknown profile'}, "
+                f"{summary.recommended_device or 'no device'}"
+                f"{'' if summary.ready else ', not ready'})"
+            )
+            for summary in candidates
+        ]
+        remediation.append("Run 'yonga list' to compare them.")
+        raise ConfigurationError(
+            diagnostic(
+                "artifact.remove.ambiguous",
+                FailureCategory.CONFIGURATION_ERROR,
+                "More than one prepared artifact matches",
+                (
+                    f"{reference!r} matches {len(candidates)} prepared artifacts; nothing was "
+                    "removed. Name the one to delete by its artifact id."
+                ),
+                remediation=remediation,
+                context={
+                    "reference": str(reference),
+                    "candidates": ", ".join(
+                        str(summary.path) if by_path else summary.artifact_id
+                        for summary in candidates
+                    ),
+                },
+            )
+        )
 
     def _directories_sharing_identity(
         self,
