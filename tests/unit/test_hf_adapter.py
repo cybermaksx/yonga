@@ -8,7 +8,9 @@ repositories (see ``HOST_FACTS.md``).
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
@@ -24,6 +26,7 @@ from yonga.adapters.hf import (
     CODE_INVALID_REPO_ID,
     CODE_NETWORK_ERROR,
     CODE_OFFLINE_MISSING,
+    CODE_OFFLINE_SEARCH,
     CODE_RATE_LIMITED,
     CODE_REPO_NOT_FOUND,
     CODE_REVISION_NOT_FOUND,
@@ -384,6 +387,55 @@ def adapter_for(api: FakeApi, settings: Settings | None = None) -> HuggingFaceAd
 def hub_response(status_code: int) -> Any:
     """A structural ``httpx.Response`` stand-in for building Hub errors."""
     return FakeResponse(status_code)
+
+
+def safetensors_bytes(tensors: dict[str, tuple[str, list[int]]]) -> bytes:
+    """A real safetensors header (and zeroed data) for tensors of the given dtype and shape."""
+    widths = {"BF16": 2, "F16": 2, "F32": 4, "I32": 4, "U8": 1}
+    header: dict[str, object] = {"__metadata__": {"format": "pt"}}
+    offset = 0
+    for name, (dtype, shape) in tensors.items():
+        size = widths[dtype]
+        for dim in shape:
+            size *= dim
+        header[name] = {"dtype": dtype, "shape": shape, "data_offsets": [offset, offset + size]}
+        offset += size
+    encoded = json.dumps(header).encode()
+    return len(encoded).to_bytes(8, "little") + encoded + b"\x00" * offset
+
+
+def cache_snapshot(
+    hf_home: Path,
+    repo_id: str,
+    sha: str,
+    files: dict[str, bytes],
+    *,
+    refs: dict[str, bool] | None = None,
+) -> Path:
+    """Lay out one snapshot exactly as ``huggingface_hub`` caches it under ``HF_HOME/hub``.
+
+    Files are symlinks into ``blobs/``, named by their etag: SHA-256 (64 hex
+    characters) for LFS-sized files, a 40-character SHA-1 otherwise. Each name
+    in *refs* gets a ``refs/<name>`` file pointing at *sha*.
+    """
+    repo = hf_home / "hub" / ("models--" + repo_id.replace("/", "--"))
+    snapshot = repo / "snapshots" / sha
+    blobs = repo / "blobs"
+    blobs.mkdir(parents=True, exist_ok=True)
+    snapshot.mkdir(parents=True, exist_ok=True)
+    for name, data in files.items():
+        lfs = name.endswith((".safetensors", ".gguf", ".bin"))
+        digest = hashlib.sha256(data) if lfs else hashlib.sha1(data, usedforsecurity=False)
+        blob = blobs / digest.hexdigest()
+        blob.write_bytes(data)
+        link = snapshot / name
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(os.path.relpath(blob, link.parent))
+    for ref in refs or {}:
+        target = repo / "refs" / ref
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(sha, encoding="utf-8")
+    return snapshot
 
 
 # --------------------------------------------------------------------------- #
@@ -1133,14 +1185,16 @@ def test_download_forwards_patterns(tmp_path):
 def test_offline_mode_passes_local_files_only(tmp_path):
     snapshot = tmp_path / "snapshot"
     snapshot.mkdir()
-    api = FakeApi(snapshot=snapshot)
-    adapter = adapter_for(api, Settings(offline=True))
+    hf_home = tmp_path / "hf"
+    cache_snapshot(hf_home, "acme/x", SAFETENSORS_SHA, {"config.json": b"{}"}, refs={"main": True})
+    api = FakeApi(snapshot=snapshot, model_info_error=AssertionError("no Hub call offline"))
+    adapter = adapter_for(api, Settings(offline=True, hf_home=hf_home))
 
     adapter.download(ModelIdentity(repo_id="acme/x", revision="main"))
 
     assert api.snapshot_calls[0]["local_files_only"] is True
-    # Offline mode cannot call the Hub to resolve a branch, so it keeps the ref.
-    assert api.snapshot_calls[0]["revision"] == "main"
+    # The branch is pinned through the cache's own refs/ mapping, not the Hub.
+    assert api.snapshot_calls[0]["revision"] == SAFETENSORS_SHA
     assert api.model_info_calls == []
 
 
@@ -1301,3 +1355,276 @@ def test_a_rate_limit_says_to_log_in_not_to_wait_for_a_5xx() -> None:
 
     assert "hf auth login" in " ".join(translated.diagnostic.remediation)
     assert "5xx" not in " ".join(translated.diagnostic.remediation)
+
+
+# --------------------------------------------------------------------------- #
+# Offline: everything from the local cache, nothing from the Hub
+# --------------------------------------------------------------------------- #
+
+OFFLINE_REPO = "acme/tiny-chat"
+OFFLINE_CONFIG = {"architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3"}
+OFFLINE_CARD = (
+    b"---\nlicense: apache-2.0\npipeline_tag: text-generation\n"
+    b"library_name: transformers\ntags:\n- chat\n---\n# Tiny chat\n"
+)
+OTHER_SHA = "1" * 40
+
+
+@pytest.fixture(autouse=True)
+def _hub_offline_env_unset(monkeypatch):
+    """``HF_HUB_OFFLINE`` is off: yonga's own offline setting has to be enough."""
+    import huggingface_hub
+
+    monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_OFFLINE", False)
+
+
+def offline_adapter(hf_home: Path) -> tuple[HuggingFaceAdapter, FakeApi]:
+    """An offline adapter whose every Hub call would fail loudly and be recorded."""
+    api = FakeApi(
+        model_info_error=AssertionError("model_info must not run offline"),
+        download_error=AssertionError("hf_hub_download must not run offline"),
+    )
+    return adapter_for(api, Settings(offline=True, hf_home=hf_home)), api
+
+
+def assert_no_hub_call(api: FakeApi) -> None:
+    assert api.model_info_calls == []
+    assert api.download_calls == []
+    assert api.snapshot_calls == []
+
+
+def cached_chat_model(hf_home: Path, *, refs: dict[str, bool] | None = None) -> Path:
+    return cache_snapshot(
+        hf_home,
+        OFFLINE_REPO,
+        SAFETENSORS_SHA,
+        {
+            "config.json": json.dumps(OFFLINE_CONFIG).encode(),
+            "README.md": OFFLINE_CARD,
+            "model.safetensors": safetensors_bytes(
+                {"embed.weight": ("BF16", [4, 8]), "norm.weight": ("F32", [3])}
+            ),
+            "tokenizer.json": b"{}",
+        },
+        refs=refs,
+    )
+
+
+def test_offline_inspect_reads_the_cached_snapshot_and_never_calls_the_hub(tmp_path):
+    cached_chat_model(tmp_path / "hf", refs={"main": True})
+    adapter, api = offline_adapter(tmp_path / "hf")
+
+    metadata = adapter.inspect(ModelIdentity(repo_id=OFFLINE_REPO))
+
+    assert_no_hub_call(api)
+    assert metadata.resolved_revision == SAFETENSORS_SHA
+    assert metadata.model_type == "qwen3"
+    assert metadata.architectures == ["Qwen3ForCausalLM"]
+    assert metadata.license == "apache-2.0"
+    assert metadata.pipeline_tag == "text-generation"
+    assert metadata.library_name == "transformers"
+    assert "chat" in metadata.tags
+    # Counted from the cached header the way the Hub counts it, so a profile's
+    # size band is judged on the same number online and offline.
+    assert metadata.parameter_count == 35
+    assert metadata.parameter_dtypes == {"BF16": 32, "F32": 3}
+    assert metadata.primary_format is ModelFormat.SAFETENSORS
+    assert metadata.formats[0].complete is True
+    by_path = {entry.path: entry for entry in metadata.files}
+    assert by_path["model.safetensors"].lfs is True
+    assert by_path["model.safetensors"].size == len(
+        (tmp_path / "hf" / "hub")
+        .joinpath("models--acme--tiny-chat", "snapshots", SAFETENSORS_SHA, "model.safetensors")
+        .read_bytes()
+    )
+    assert by_path["tokenizer.json"].lfs is False
+    # What only the Hub knows is absent, not invented.
+    assert metadata.downloads is None
+    assert metadata.likes is None
+    notes = " ".join(note for observation in metadata.formats for note in observation.notes)
+    assert "local Hugging Face cache" in notes
+
+
+def test_offline_inspect_of_an_uncached_model_refuses_without_any_request(tmp_path):
+    adapter, api = offline_adapter(tmp_path / "hf")
+
+    with pytest.raises(SourceResolutionError) as excinfo:
+        adapter.inspect(ModelIdentity(repo_id=OFFLINE_REPO))
+
+    assert_no_hub_call(api)
+    assert excinfo.value.diagnostic.code == CODE_OFFLINE_MISSING
+    assert excinfo.value.exit_code() is ExitCode.SOURCE_RESOLUTION
+    assert "Offline mode is active" in excinfo.value.diagnostic.message
+
+
+def test_hf_hub_offline_alone_also_keeps_inspect_off_the_network(tmp_path, monkeypatch):
+    import huggingface_hub
+
+    monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_OFFLINE", True)
+    cached_chat_model(tmp_path / "hf", refs={"main": True})
+    api = FakeApi(model_info_error=AssertionError("model_info must not run offline"))
+    adapter = adapter_for(api, Settings(offline=False, hf_home=tmp_path / "hf"))
+
+    assert adapter.inspect(ModelIdentity(repo_id=OFFLINE_REPO)).model_type == "qwen3"
+    assert api.model_info_calls == []
+
+
+def test_a_snapshot_downloaded_by_sha_is_found_without_a_ref(tmp_path):
+    """yonga downloads by commit SHA, and the Hub records no refs/main for that."""
+    cached_chat_model(tmp_path / "hf")
+    adapter, api = offline_adapter(tmp_path / "hf")
+
+    metadata = adapter.inspect(ModelIdentity(repo_id=OFFLINE_REPO))
+
+    assert_no_hub_call(api)
+    assert metadata.resolved_revision == SAFETENSORS_SHA
+    notes = " ".join(note for observation in metadata.formats for note in observation.notes)
+    assert "only cached snapshot" in notes
+
+
+def test_an_explicit_branch_is_never_guessed_from_an_unrecorded_snapshot(tmp_path):
+    cached_chat_model(tmp_path / "hf")
+    adapter, _api = offline_adapter(tmp_path / "hf")
+
+    with pytest.raises(SourceResolutionError) as excinfo:
+        adapter.inspect(ModelIdentity(repo_id=OFFLINE_REPO, revision="dev"))
+
+    assert excinfo.value.diagnostic.code == CODE_OFFLINE_MISSING
+    assert "no record of which one 'dev' is" in excinfo.value.diagnostic.message
+
+
+def test_several_unrecorded_snapshots_are_refused_and_listed(tmp_path):
+    cached_chat_model(tmp_path / "hf")
+    cache_snapshot(tmp_path / "hf", OFFLINE_REPO, OTHER_SHA, {"config.json": b"{}"})
+    adapter, _api = offline_adapter(tmp_path / "hf")
+
+    with pytest.raises(SourceResolutionError) as excinfo:
+        adapter.inspect(ModelIdentity(repo_id=OFFLINE_REPO))
+
+    message = excinfo.value.diagnostic.message
+    assert SAFETENSORS_SHA in message
+    assert OTHER_SHA in message
+    assert any("@<sha>" in item for item in excinfo.value.diagnostic.remediation)
+
+
+def test_an_explicit_commit_is_read_from_its_snapshot(tmp_path):
+    cached_chat_model(tmp_path / "hf")
+    cache_snapshot(tmp_path / "hf", OFFLINE_REPO, OTHER_SHA, {"config.json": b"{}"})
+    adapter, api = offline_adapter(tmp_path / "hf")
+
+    metadata = adapter.inspect(ModelIdentity(repo_id=OFFLINE_REPO, revision=SAFETENSORS_SHA))
+
+    assert_no_hub_call(api)
+    assert metadata.resolved_revision == SAFETENSORS_SHA
+
+
+def test_a_revision_cannot_point_outside_the_cache(tmp_path):
+    cached_chat_model(tmp_path / "hf", refs={"main": True})
+    outside = tmp_path / "hf" / "hub" / "escape"
+    outside.write_text(SAFETENSORS_SHA, encoding="utf-8")
+    adapter, _api = offline_adapter(tmp_path / "hf")
+
+    with pytest.raises(SourceResolutionError) as excinfo:
+        adapter.inspect(ModelIdentity(repo_id=OFFLINE_REPO, revision="../../escape"))
+
+    assert excinfo.value.diagnostic.code == CODE_OFFLINE_MISSING
+
+
+def test_metadata_alone_in_the_cache_is_not_a_weightless_model(tmp_path):
+    """An online inspect caches config.json; offline that must not look like a model."""
+    cache_snapshot(
+        tmp_path / "hf",
+        OFFLINE_REPO,
+        SAFETENSORS_SHA,
+        {"config.json": json.dumps(OFFLINE_CONFIG).encode()},
+        refs={"main": True},
+    )
+    adapter, _api = offline_adapter(tmp_path / "hf")
+
+    with pytest.raises(SourceResolutionError) as excinfo:
+        adapter.inspect(ModelIdentity(repo_id=OFFLINE_REPO))
+
+    assert excinfo.value.diagnostic.code == CODE_OFFLINE_MISSING
+    assert "none of its model weights" in excinfo.value.diagnostic.message
+
+
+def test_offline_parameters_need_every_indexed_shard(tmp_path):
+    shard = safetensors_bytes({"w": ("BF16", [2, 5])})
+    index = {
+        "weight_map": {
+            "a": "model-00001-of-00002.safetensors",
+            "b": "model-00002-of-00002.safetensors",
+        }
+    }
+    files = {
+        "config.json": json.dumps(OFFLINE_CONFIG).encode(),
+        "model.safetensors.index.json": json.dumps(index).encode(),
+        "model-00001-of-00002.safetensors": shard,
+    }
+    cache_snapshot(tmp_path / "hf", OFFLINE_REPO, SAFETENSORS_SHA, files, refs={"main": True})
+    adapter, _api = offline_adapter(tmp_path / "hf")
+
+    partial = adapter.inspect(ModelIdentity(repo_id=OFFLINE_REPO))
+
+    # A partial sum would put a large model into a small model's size band.
+    assert partial.parameter_count is None
+    assert partial.formats[0].complete is False
+
+    cache_snapshot(
+        tmp_path / "hf",
+        OFFLINE_REPO,
+        SAFETENSORS_SHA,
+        {"model-00002-of-00002.safetensors": safetensors_bytes({"v": ("F16", [7])})},
+    )
+    whole = adapter.inspect(ModelIdentity(repo_id=OFFLINE_REPO))
+
+    assert whole.parameter_count == 17
+    assert whole.parameter_dtypes == {"BF16": 10, "F16": 7}
+    assert whole.formats[0].complete is True
+
+
+def test_offline_gguf_identity_comes_from_the_cached_header(tmp_path):
+    from tests.unit.test_gguf import gguf_bytes
+
+    cache_snapshot(
+        tmp_path / "hf",
+        OFFLINE_REPO,
+        GGUF_SHA,
+        {
+            "model-Q4_K_M.gguf": gguf_bytes("qwen2", {"Q4_K": 2}),
+            "mmproj-model-f16.gguf": gguf_bytes("clip", {"F32": 1}),
+        },
+        refs={"main": True},
+    )
+    adapter, api = offline_adapter(tmp_path / "hf")
+
+    metadata = adapter.inspect(ModelIdentity(repo_id=OFFLINE_REPO))
+
+    assert_no_hub_call(api)
+    assert metadata.gguf_metadata["architecture"] == "qwen2"
+    assert metadata.primary_format is ModelFormat.GGUF
+
+
+def test_offline_revision_resolution_uses_the_cache_refs(tmp_path):
+    cached_chat_model(tmp_path / "hf", refs={"main": True})
+    adapter, api = offline_adapter(tmp_path / "hf")
+
+    assert adapter.resolve_revision(ModelIdentity(repo_id=OFFLINE_REPO)) == SAFETENSORS_SHA
+    assert (
+        adapter.resolve_revision(ModelIdentity(repo_id=OFFLINE_REPO, revision="main"))
+        == SAFETENSORS_SHA
+    )
+    assert_no_hub_call(api)
+
+
+def test_offline_search_says_search_needs_the_network(tmp_path):
+    adapter, _api = offline_adapter(tmp_path / "hf")
+
+    with pytest.raises(SourceResolutionError) as excinfo:
+        adapter.search("smollm2")
+
+    diagnostic = excinfo.value.diagnostic
+    assert diagnostic.code == CODE_OFFLINE_SEARCH
+    assert "network" in diagnostic.message
+    assert "not fully present" not in diagnostic.message
+    assert "cache" not in diagnostic.title.lower()

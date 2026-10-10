@@ -55,6 +55,7 @@ from yonga.registry.schema import (
     ArchitectureRule,
     ExportSpec,
     ModelRule,
+    export_needs_remote_code,
 )
 
 __all__ = ["InspectReport", "InspectService", "identified_from"]
@@ -327,8 +328,8 @@ class InspectService:
             exporter=exporter,
             source_options=source_options,
             known_limitations=self._known_limitations(architecture_rule, model_rule),
-            trust_remote_code_required=(
-                metadata.requires_remote_code or (spec is not None and spec.trust_remote_code)
+            trust_remote_code_required=export_needs_remote_code(
+                spec, repository_ships_code=metadata.requires_remote_code
             ),
             offline=self._settings.offline,
             notes=[],
@@ -456,10 +457,19 @@ class InspectService:
                 "No commit SHA could be resolved for this request. Preparation will refuse to "
                 "run from a branch, so pin a revision before preparing."
             )
-        if metadata.requires_remote_code:
+        if report.trust_remote_code_required:
             notes.append(
                 "This repository ships custom modelling code. Preparation needs an explicit "
                 "--trust-remote-code; --yes will not enable it."
+            )
+        elif metadata.requires_remote_code:
+            # The same sentence `prepare` puts in its plan, so the two commands
+            # tell one story about the repository's Python.
+            files = ", ".join(metadata.remote_code_files) or "an auto_map"
+            notes.append(
+                f"The repository ships its own modelling code ({files}). It is not run: "
+                "Transformers implements this architecture natively, and remote code stays "
+                "off."
             )
         if architecture_rule is None:
             notes.append(

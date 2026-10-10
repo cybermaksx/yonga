@@ -16,10 +16,13 @@ rest of the heavy stack are not imported here at all.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
+import struct
 import time
 from collections.abc import Iterator, Mapping, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, Final
 
@@ -36,6 +39,9 @@ from huggingface_hub.errors import (
     RepositoryNotFoundError,
     RevisionNotFoundError,
 )
+from huggingface_hub.file_download import repo_folder_name
+from huggingface_hub.repocard import metadata_load
+from huggingface_hub.utils import validate_repo_id  # type: ignore[attr-defined]
 from huggingface_hub.utils.tqdm import tqdm as hf_tqdm
 
 from yonga.adapters.gguf_header import (
@@ -77,6 +83,7 @@ __all__ = [
     "CODE_INVALID_REPO_ID",
     "CODE_NETWORK_ERROR",
     "CODE_OFFLINE_MISSING",
+    "CODE_OFFLINE_SEARCH",
     "CODE_REPO_NOT_FOUND",
     "CODE_REVISION_NOT_FOUND",
     "CODE_REVISION_UNRESOLVED",
@@ -139,6 +146,16 @@ PYTHON_SUFFIX: Final[str] = ".py"
 SAFETENSORS_INDEX_SUFFIX: Final[str] = ".safetensors.index.json"
 PYTORCH_INDEX_SUFFIX: Final[str] = ".bin.index.json"
 
+SAFETENSORS_SINGLE_FILENAME: Final[str] = "model.safetensors"
+SAFETENSORS_INDEX_FILENAME: Final[str] = "model.safetensors.index.json"
+"""The two layouts the Hub itself reads a parameter count from (``get_safetensors_metadata``)."""
+
+MAX_SAFETENSORS_HEADER_BYTES: Final[int] = 100 * 1024 * 1024
+"""The safetensors format's own ceiling on a header; a larger length is a damaged file."""
+
+README_FILENAME: Final[str] = "README.md"
+"""The model card, whose YAML front matter carries the licence, tags and pipeline tag."""
+
 CUSTOM_CODE_PREFIXES: Final[tuple[str, ...]] = (
     "modeling_",
     "configuration_",
@@ -166,6 +183,7 @@ CODE_REPO_NOT_FOUND: Final[str] = "hub.repo.not_found"
 CODE_REVISION_NOT_FOUND: Final[str] = "hub.revision.not_found"
 CODE_REVISION_UNRESOLVED: Final[str] = "hub.revision.unresolved"
 CODE_OFFLINE_MISSING: Final[str] = "hub.offline.missing"
+CODE_OFFLINE_SEARCH: Final[str] = "hub.offline.search_unavailable"
 CODE_FILE_NOT_FOUND: Final[str] = "hub.file.not_found"
 CODE_HTTP_ERROR: Final[str] = "hub.http.error"
 CODE_RATE_LIMITED: Final[str] = "hub.rate_limited"
@@ -909,6 +927,180 @@ def _attach_notes(observations: list[FormatObservation], notes: Sequence[str]) -
 
 
 # --------------------------------------------------------------------------- #
+# Offline: metadata from the local Hub cache
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class _CachedSibling:
+    """One file of a cached snapshot, shaped like ``huggingface_hub``'s ``RepoSibling``."""
+
+    rfilename: str
+    size: int | None
+    lfs: dict[str, int] | None = None
+
+
+@dataclass(frozen=True)
+class _CachedModelInfo:
+    """The part of ``ModelInfo`` a cached snapshot can answer, read from disk alone.
+
+    Offline mode builds this instead of calling ``model_info``, so
+    :meth:`HuggingFaceAdapter.inspect` reads the same fields either way. What
+    only the Hub knows -- gated or private status, downloads, likes, the last
+    commit date -- is simply absent, and the extraction helpers already treat an
+    absent field as "not reported".
+    """
+
+    sha: str
+    siblings: list[_CachedSibling]
+    tags: list[str] = field(default_factory=list)
+    pipeline_tag: str | None = None
+    library_name: str | None = None
+    card_data: dict[str, object] | None = None
+    safetensors: dict[str, object] | None = None
+    gguf: dict[str, object] | None = None
+
+
+def _safe_relative(name: str) -> bool:
+    """True when *name* is a relative path that stays inside the directory it names."""
+    parts = PurePosixPath(name).parts
+    return bool(parts) and not PurePosixPath(name).is_absolute() and ".." not in parts
+
+
+def _snapshot_files(snapshot: Path) -> list[_CachedSibling]:
+    """List the files of one cached snapshot with their sizes, reading no file.
+
+    A snapshot holds symlinks into ``blobs/``. The blob's name is the file's
+    Hub etag: a 64-character SHA-256 for an LFS file, a 40-character git SHA-1
+    otherwise, which is how the LFS column survives offline. A dangling link
+    (its blob was deleted) is a file that is not cached, so it is left out.
+    """
+    siblings: list[_CachedSibling] = []
+    for directory, _subdirs, names in os.walk(snapshot):
+        for name in names:
+            path = Path(directory) / name
+            try:
+                if not path.is_file():
+                    continue
+                size = path.stat().st_size
+                blob = Path(os.path.realpath(path)).name if path.is_symlink() else ""
+            except OSError:
+                continue
+            siblings.append(
+                _CachedSibling(
+                    rfilename=path.relative_to(snapshot).as_posix(),
+                    size=size,
+                    lfs={"size": size} if len(blob) == 64 else None,
+                )
+            )
+    siblings.sort(key=lambda entry: entry.rfilename)
+    return siblings
+
+
+def _card_metadata(snapshot: Path) -> dict[str, object]:
+    """The YAML front matter of a cached ``README.md``, or ``{}``."""
+    path = snapshot / README_FILENAME
+    try:
+        if path.stat().st_size > MAX_METADATA_FILE_BYTES:
+            return {}
+        data = metadata_load(path)
+    except Exception:  # a missing, unreadable or malformed card is just "no card"
+        return {}
+    return dict(data) if isinstance(data, Mapping) else {}
+
+
+def _safetensors_header(path: Path) -> Mapping[str, object]:
+    """Read one safetensors file's JSON header: eight length bytes, then the JSON."""
+    with path.open("rb") as handle:
+        prefix = handle.read(8)
+        if len(prefix) != 8:
+            raise ValueError(f"{path.name} is too short to be a safetensors file")
+        (length,) = struct.unpack("<Q", prefix)
+        if length > MAX_SAFETENSORS_HEADER_BYTES:
+            raise ValueError(f"{path.name} declares an implausible header length")
+        payload = json.loads(handle.read(length))
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"{path.name} has no JSON object header")
+    return payload
+
+
+def _local_safetensors_parameters(snapshot: Path) -> dict[str, object] | None:
+    """Count parameters per dtype from cached safetensors headers, as the Hub does.
+
+    The Hub's own figure is computed from the same headers, from
+    ``model.safetensors`` or else from the shards ``model.safetensors.index.json``
+    names; this reads the same layouts, so a profile's size band is judged on
+    the same number online and offline. Only headers are read, never weights.
+    A shard that is not cached means no count at all, because a partial sum
+    would put a large model into a small model's band.
+    """
+    single = snapshot / SAFETENSORS_SINGLE_FILENAME
+    index = snapshot / SAFETENSORS_INDEX_FILENAME
+    try:
+        if single.is_file():
+            shards = [single]
+        elif index.is_file() and index.stat().st_size <= MAX_METADATA_FILE_BYTES:
+            weight_map = json.loads(index.read_text(encoding="utf-8")).get("weight_map")
+            if not isinstance(weight_map, Mapping):
+                return None
+            names = {value for value in weight_map.values() if isinstance(value, str)}
+            if not names or not all(_safe_relative(name) for name in names):
+                return None
+            shards = [snapshot / name for name in sorted(names)]
+        else:
+            return None
+        counts: dict[str, int] = {}
+        for shard in shards:
+            if not shard.is_file():
+                return None
+            for name, tensor in _safetensors_header(shard).items():
+                if name == "__metadata__" or not isinstance(tensor, Mapping):
+                    continue
+                dtype, shape = tensor.get("dtype"), tensor.get("shape")
+                if not isinstance(dtype, str) or not isinstance(shape, list):
+                    return None
+                if not all(isinstance(dim, int) and not isinstance(dim, bool) for dim in shape):
+                    return None
+                counts[dtype] = counts.get(dtype, 0) + math.prod(shape)
+    except (OSError, ValueError, AttributeError, struct.error):
+        return None
+    if not counts:
+        return None
+    return {"total": sum(counts.values()), "parameters": counts}
+
+
+def _local_gguf_metadata(snapshot: Path, siblings: Sequence[_CachedSibling]) -> dict[str, object]:
+    """The identity facts the Hub reports for a GGUF repository, from a cached header.
+
+    Online, the Hub's ``gguf`` summary names the architecture a GGUF-only
+    repository (no ``config.json``) is identified by. Offline the same name is
+    read from the header of the largest cached model file -- a few megabytes,
+    never the weights.
+    """
+    models = [
+        entry
+        for entry in siblings
+        if entry.rfilename.endswith(GGUF_SUFFIX)
+        and not _is_gguf_companion(RepoFile(path=entry.rfilename, size=entry.size))
+    ]
+    if not models:
+        return {}
+    largest = max(models, key=lambda entry: entry.size or 0)
+    try:
+        header = read_local_header(snapshot / largest.rfilename)
+    except (OSError, GGUFFormatError):
+        return {}
+    architecture = header.architecture
+    if not architecture:
+        return {}
+    found: dict[str, object] = {"architecture": architecture}
+    context = header.metadata.get(f"{architecture}.context_length")
+    if isinstance(context, int) and not isinstance(context, bool):
+        found["context_length"] = context
+    return found
+
+
+# --------------------------------------------------------------------------- #
 # Download progress
 # --------------------------------------------------------------------------- #
 
@@ -1057,7 +1249,12 @@ class HuggingFaceAdapter:
         A mutable branch name is never enough: two runs a day apart would prepare
         different weights under the same name. The resolved SHA is what every
         later download for the job uses.
+
+        Offline, the answer comes from the local cache alone (see
+        :meth:`_cached_revision`); the Hub is never contacted.
         """
+        if self.offline:
+            return self._cached_revision(model, operation="revision resolution")[0]
         info = self._model_info(model, files_metadata=False, operation="revision resolution")
         sha = getattr(info, "sha", None)
         if isinstance(sha, str) and sha.strip():
@@ -1080,11 +1277,144 @@ class HuggingFaceAdapter:
         """Return the SHA to use, resolving a mutable reference when necessary."""
         if is_commit_sha(model.revision):
             return str(model.revision)
-        if self.offline:
-            # model_info needs the network; offline callers rely on the cache's
-            # own refs/ mapping for a branch name.
-            return model.revision or DEFAULT_REVISION
         return self.resolve_revision(model)
+
+    # --- offline: the local Hub cache ----------------------------------
+
+    def _repo_cache_folder(self, model: ModelIdentity, *, operation: str) -> Path:
+        """The cache folder ``huggingface_hub`` keeps *model*'s snapshots in."""
+        try:
+            validate_repo_id(model.repo_id)
+        except HFValidationError as error:
+            raise translate_hub_error(error, model=model, operation=operation) from error
+        return self._effective_cache_dir() / repo_folder_name(
+            repo_id=model.repo_id, repo_type="model"
+        )
+
+    def _offline_missing(
+        self,
+        model: ModelIdentity,
+        *,
+        operation: str,
+        message: str,
+        remediation: Sequence[str] = (),
+    ) -> SourceResolutionError:
+        """A ``hub.offline.missing`` failure that says what the cache does hold."""
+        return SourceResolutionError(
+            _hub_diagnostic(
+                CODE_OFFLINE_MISSING,
+                FailureCategory.DOWNLOAD_FAILURE,
+                "Not available offline",
+                f"Offline mode is active and {message}",
+                error=None,
+                model=model,
+                operation=operation,
+                remediation=[
+                    *remediation,
+                    "Re-run without offline mode (unset YONGA_OFFLINE / HF_HUB_OFFLINE) "
+                    "to populate the cache.",
+                    "Or point HF_HOME at a cache that already contains this revision.",
+                ],
+            )
+        )
+
+    def _cached_revision(self, model: ModelIdentity, *, operation: str) -> tuple[str, list[str]]:
+        """Resolve *model*'s revision to a cached snapshot's SHA without any network.
+
+        Returns ``(sha, notes)``. A commit SHA must have a snapshot; a branch or
+        tag is looked up in the cache's ``refs/`` mapping, exactly as
+        ``huggingface_hub`` does with ``local_files_only``. yonga downloads by
+        commit SHA, and the Hub writes no ``refs/`` entry for such a download,
+        so when nothing was asked for and the cache holds exactly one snapshot,
+        that snapshot is used and a note says so. Several unrecorded snapshots
+        are refused rather than guessed between.
+        """
+        folder = self._repo_cache_folder(model, operation=operation)
+        snapshots = folder / "snapshots"
+        revision = model.revision or DEFAULT_REVISION
+        ref = str(model)
+        notes: list[str] = []
+
+        sha: str | None = None
+        if is_commit_sha(revision):
+            sha = revision
+        elif _safe_relative(revision):
+            try:
+                recorded = (folder / "refs" / revision).read_text(encoding="utf-8").strip()
+            except (OSError, UnicodeDecodeError):
+                recorded = ""
+            sha = recorded if is_commit_sha(recorded) else None
+
+        if sha is None:
+            try:
+                cached = sorted(
+                    entry.name
+                    for entry in snapshots.iterdir()
+                    if entry.is_dir() and is_commit_sha(entry.name)
+                )
+            except OSError:
+                cached = []
+            if len(cached) == 1 and model.revision is None:
+                sha = cached[0]
+                notes.append(
+                    f"Offline: the local cache records no '{revision}' reference for "
+                    f"{model.repo_id}, so its only cached snapshot, {sha[:12]}, was used."
+                )
+            elif cached:
+                shown = ", ".join(cached[:5])
+                raise self._offline_missing(
+                    model,
+                    operation=operation,
+                    message=(
+                        f"the local Hugging Face cache holds {len(cached)} snapshot(s) of "
+                        f"{model.repo_id} ({shown}) but no record of which one "
+                        f"'{revision}' is, so none can be chosen without the Hub."
+                    ),
+                    remediation=[
+                        f"Name one with its full commit SHA: {model.repo_id}@<sha> "
+                        "(or --revision <sha>)."
+                    ],
+                )
+
+        if sha is None or not (snapshots / sha).is_dir():
+            raise self._offline_missing(
+                model,
+                operation=operation,
+                message=(
+                    f"{ref} is not in the local Hugging Face cache "
+                    f"({self._effective_cache_dir()}), so it cannot be used without "
+                    "network access."
+                ),
+            )
+        return sha, notes
+
+    def _local_model_info(
+        self, model: ModelIdentity, *, operation: str
+    ) -> tuple[_CachedModelInfo, list[str]]:
+        """Build ``model_info``'s answer from the cached snapshot, never the network."""
+        sha, notes = self._cached_revision(model, operation=operation)
+        snapshot = self._repo_cache_folder(model, operation=operation) / "snapshots" / sha
+        siblings = _snapshot_files(snapshot)
+        card = _card_metadata(snapshot)
+        licence = card.get("license")
+        if isinstance(licence, list):
+            licence = next((item for item in licence if isinstance(item, str)), None)
+        info = _CachedModelInfo(
+            sha=sha,
+            siblings=siblings,
+            tags=_string_list(card.get("tags")),
+            pipeline_tag=_optional_str(card.get("pipeline_tag")),
+            library_name=_optional_str(card.get("library_name")),
+            card_data={"license": licence} if isinstance(licence, str) else None,
+            safetensors=_local_safetensors_parameters(snapshot),
+            gguf=_local_gguf_metadata(snapshot, siblings) or None,
+        )
+        notes.append(
+            f"Offline: built from the local Hugging Face cache at {sha[:12]}. Only files "
+            "present in the cache are listed, and what only the Hub reports (gated or "
+            "private status, downloads, likes) is not shown."
+        )
+        return info, notes
 
     # --- metadata ------------------------------------------------------
 
@@ -1125,13 +1455,22 @@ class HuggingFaceAdapter:
                 f"{MAX_METADATA_FILE_BYTES}-byte metadata limit, and was not fetched."
             )
         try:
-            located = self._api.hf_hub_download(
-                repo_id,
-                filename=entry.path,
-                revision=revision,
-                cache_dir=self.cache_dir,
-                local_files_only=self.offline,
-            )
+            if self.offline:
+                # Offline, *revision* is a snapshot _cached_revision found and the
+                # entry came from that snapshot's own listing: read it in place.
+                located: str | Path = (
+                    self._repo_cache_folder(ModelIdentity(repo_id=repo_id), operation="inspection")
+                    / "snapshots"
+                    / revision
+                    / entry.path
+                )
+            else:
+                located = self._api.hf_hub_download(
+                    repo_id,
+                    filename=entry.path,
+                    revision=revision,
+                    cache_dir=self.cache_dir,
+                )
             payload = json.loads(Path(located).read_text(encoding="utf-8"))
         except Exception as error:
             return None, f"{entry.path} could not be read: {redact_text(str(error))}"
@@ -1187,14 +1526,24 @@ class HuggingFaceAdapter:
         one) is inspected successfully: ``model_type`` stays ``None``, the
         repository tags and any GGUF metadata carry the architecture hint, and a
         note records why.
+
+        Offline, no request is made at all: the same fields are read from the
+        cached snapshot (:meth:`_local_model_info`), and a snapshot holding no
+        weights raises ``hub.offline.missing`` rather than describing a
+        repository by its ``config.json`` alone.
         """
-        info = self._model_info(model, files_metadata=with_sizes, operation="inspection")
+        info: Any
+        notes: list[str]
+        if self.offline:
+            info, notes = self._local_model_info(model, operation="inspection")
+        else:
+            info = self._model_info(model, files_metadata=with_sizes, operation="inspection")
+            notes = []
 
         sha = getattr(info, "sha", None)
         resolved = sha.strip() if isinstance(sha, str) and sha.strip() else model.revision
         files = _repo_files(info)
         tags = _string_list(getattr(info, "tags", None))
-        notes: list[str] = []
 
         config: dict[str, object] = {}
         architectures: list[str] = []
@@ -1238,6 +1587,18 @@ class HuggingFaceAdapter:
             shard_indexes=shard_indexes,
             gguf_total_file_size=_optional_int(gguf_metadata.get(GGUF_TOTAL_FILE_SIZE_KEY)),
         )
+        if self.offline and not any(observation.files for observation in formats):
+            # An online inspect caches config.json and the weight index, so a
+            # snapshot of metadata alone is common. It is not a weightless model.
+            raise self._offline_missing(
+                model,
+                operation="inspection",
+                message=(
+                    f"the local Hugging Face cache holds {len(files)} file(s) of "
+                    f"{model.repo_id} at {str(resolved)[:12]} but none of its model "
+                    "weights, so it cannot be inspected or prepared without network access."
+                ),
+            )
         _attach_notes(formats, notes)
 
         requires_remote_code, remote_code_files = detect_remote_code(config, files)
@@ -1293,10 +1654,25 @@ class HuggingFaceAdapter:
         and the format is only hinted at by tags and the library name.
         """
         if self.offline:
-            raise translate_hub_error(
-                LocalEntryNotFoundError("searching the Hub needs network access"),
-                operation="search",
-                offline=True,
+            # Search is a Hub query; there is no local index to answer it from,
+            # so this is not a cache miss and must not be worded as one.
+            raise SourceResolutionError(
+                _hub_diagnostic(
+                    CODE_OFFLINE_SEARCH,
+                    FailureCategory.DOWNLOAD_FAILURE,
+                    "Search needs the network",
+                    "Offline mode is active, and searching the Hugging Face Hub is a "
+                    "network request: there is no local copy of the Hub to search.",
+                    error=None,
+                    model=None,
+                    operation="search",
+                    remediation=[
+                        "Run the search without offline mode (no --offline, and unset "
+                        "YONGA_OFFLINE / HF_HUB_OFFLINE).",
+                        "A model already in the local cache can still be inspected offline: "
+                        "yonga --offline inspect MODEL",
+                    ],
+                )
             )
         try:
             results = list(

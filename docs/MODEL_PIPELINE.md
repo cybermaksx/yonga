@@ -110,7 +110,10 @@ Avoid duplicate source copies. Export may point at the cached snapshot.
 
 For known file selection, use `allow_patterns`/`ignore_patterns` conservatively. Do not accidentally omit custom model/config/tokenizer files needed by Transformers.
 
-Offline mode uses `local_files_only=True` and fails clearly if missing.
+Offline mode uses `local_files_only=True` and fails clearly if missing. It never contacts the Hub,
+for metadata either: inspection and revision resolution read the cached snapshot (file list and
+sizes, `config.json`, the model card's front matter, safetensors and GGUF headers) and fail with
+`hub.offline.missing` when the revision or its weights are not cached.
 
 ## 7. Export
 

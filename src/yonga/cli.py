@@ -619,6 +619,7 @@ def _inspect(state: CliState, model: str, *, revision: str | None, files: bool) 
             show_files=files,
             architecture=report.architecture,
             identified_from=report.architecture_identified_from,
+            remote_code_required=report.trust_remote_code_required,
         )
     )
     if report.known_limitations:

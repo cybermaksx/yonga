@@ -834,6 +834,23 @@ class ExportSpec(BaseModel):
         return {name: spec for name, spec in pairs if spec}
 
 
+def export_needs_remote_code(spec: ExportSpec | None, *, repository_ships_code: bool) -> bool:
+    """Whether exporting cannot proceed without executing repository code.
+
+    *repository_ships_code* is what the repository declares (an ``auto_map``).
+    That means remote code *unless* the applicable export spec declares that
+    Transformers implements the architecture natively: then the repository's
+    code is ignored with ``trust_remote_code`` off and never run. A spec that
+    itself demands remote code always does. ``inspect`` and ``prepare`` both
+    decide through this one function, so they cannot disagree.
+    """
+    if spec is not None and spec.trust_remote_code:
+        return True
+    if repository_ships_code:
+        return not (spec is not None and spec.native_implementation)
+    return False
+
+
 class BaseRule(BaseModel):
     """Fields shared by every registry rule."""
 
