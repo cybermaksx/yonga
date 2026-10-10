@@ -1,14 +1,17 @@
 """The GGUF importer and the prepare path around it.
 
 The importer's one hard rule: GenAI writes the IR next to the path it is
-given, so it is only ever given a symlink inside a directory yonga owns --
-never the file in the Hugging Face cache. The prepare tests run a whole
+given and opens that file read-write, so it is only ever given a private,
+writable copy inside a directory yonga owns -- never the file in the Hugging
+Face cache, nor a link to it. The prepare tests run a whole
 preparation with a fake importer that writes what GenAI writes, including
 the ``STRiNG`` tokenizer defect, so validation and repair are exercised too.
 """
 
 from __future__ import annotations
 
+import os
+import stat
 from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 
@@ -24,13 +27,18 @@ from tests.unit.test_prepare_planning import (
     write_tokenizer_pair,
 )
 from yonga.adapters.gguf_header import parse_gguf_header
-from yonga.adapters.gguf_import import IMPORT_OUTPUTS, GGUFImporter, main
+from yonga.adapters.gguf_import import IMPORT_OUTPUTS, GGUFImporter, main, working_copy
 from yonga.adapters.hf import detect_formats
 from yonga.adapters.subprocess import CompletedCommand
 from yonga.application.jobs import JobContext, open_job
 from yonga.application.prepare import PrepareService
 from yonga.config.settings import Settings
-from yonga.domain.diagnostics import ExportError, SourceResolutionError
+from yonga.domain.diagnostics import (
+    ExitCode,
+    ExportError,
+    FailureCategory,
+    SourceResolutionError,
+)
 from yonga.domain.models import ModelIdentity, ModelMetadata, RepoFile
 from yonga.domain.plans import ExportResult
 from yonga.registry.loader import load_builtin_registry
@@ -47,13 +55,27 @@ def write_import(directory: Path) -> None:
     write_tokenizer_pair(directory, broken=True)
 
 
+class Seen:
+    """What the child process found at the path it was given."""
+
+    def __init__(self, path: Path) -> None:
+        info = path.lstat()
+        self.path = path
+        self.is_symlink = path.is_symlink()
+        self.regular = stat.S_ISREG(info.st_mode)
+        self.writable = os.access(path, os.W_OK)
+        self.links = info.st_nlink
+        self.inode = info.st_ino
+        self.data = path.read_bytes()
+
+
 class ImportRunner:
     """A CommandRunner that behaves like ``python -m yonga.adapters.gguf_import``."""
 
     def __init__(self, *, fail: bool = False) -> None:
         self.fail = fail
         self.calls: list[list[str]] = []
-        self.link_seen: tuple[bool, Path] | None = None
+        self.seen: Seen | None = None
 
     def run(
         self,
@@ -66,8 +88,8 @@ class ImportRunner:
     ) -> CompletedCommand:
         command = list(argv)
         self.calls.append(command)
-        link = Path(command[-1])
-        self.link_seen = (link.is_symlink(), link.resolve())
+        given = Path(command[-1])
+        self.seen = Seen(given)
         if self.fail:
             return CompletedCommand(
                 argv=command,
@@ -75,7 +97,7 @@ class ImportRunner:
                 duration_seconds=0.1,
                 stderr_lines=["[load_gguf] gguf_tensor_to_f16 failed"],
             )
-        write_import(link.parent)
+        write_import(given.parent)
         return CompletedCommand(argv=command, returncode=0, duration_seconds=0.1)
 
 
@@ -90,24 +112,89 @@ def ctx(settings: Settings) -> Iterator[JobContext]:
         yield job
 
 
-def test_the_importer_is_given_a_link_in_staging_never_the_cached_file(
+def read_only_cache_file(tmp_path: Path) -> Path:
+    """A cached GGUF as huggingface-hub 1.x stores it: a snapshot link to a 0444 blob."""
+    blob = tmp_path / "hf-cache" / "blobs" / "ab" / "abcdef"
+    blob.parent.mkdir(parents=True)
+    blob.write_bytes(b"GGUF" + b"\x01" * 64)
+    blob.chmod(0o444)
+    snapshot = tmp_path / "hf-cache" / "snapshots" / "rev"
+    snapshot.mkdir(parents=True)
+    cached = snapshot / "model-Q4_0.gguf"
+    cached.symlink_to(blob)
+    return cached
+
+
+def test_the_importer_is_given_a_writable_copy_in_staging_never_the_cached_file(
     tmp_path: Path, ctx: JobContext
 ) -> None:
-    cached = tmp_path / "hf-cache" / "model-Q4_0.gguf"
-    cached.parent.mkdir()
-    cached.write_bytes(b"GGUF")
+    """GenAI opens the file O_RDWR: a link to a read-only cache blob fails to open."""
+    cached = read_only_cache_file(tmp_path)
+    blob = cached.resolve()
     runner = ImportRunner()
 
     result = GGUFImporter(runner, python="python3").import_file(cached, tmp_path / "out", ctx)
 
     assert result.success
-    assert runner.link_seen == (True, cached.resolve())
+    seen = runner.seen
+    assert seen is not None
+    assert seen.path == tmp_path / "out" / "model-Q4_0.gguf"
+    assert not seen.is_symlink and seen.regular and seen.links == 1
+    assert seen.writable, "the reader opens the file read-write"
+    assert seen.inode != blob.stat().st_ino, "a new inode, so the cache blob cannot be reached"
+    assert seen.data == blob.read_bytes()
     assert runner.calls[0][:4] == ["python3", "-P", "-m", "yonga.adapters.gguf_import"]
     assert sorted(p.name for p in cached.parent.iterdir()) == ["model-Q4_0.gguf"], (
         "nothing was written next to the cached file"
     )
-    assert not (tmp_path / "out" / "model-Q4_0.gguf").exists(), "the link is removed afterwards"
+    assert stat.S_IMODE(blob.stat().st_mode) == 0o444, "the cache is never modified"
+    assert not (tmp_path / "out" / "model-Q4_0.gguf").exists(), "the copy is removed afterwards"
     assert all((tmp_path / "out" / name).is_file() for name in IMPORT_OUTPUTS)
+
+
+def test_a_link_left_in_staging_is_replaced_not_written_through(tmp_path: Path) -> None:
+    """An earlier run's link to the cache must not be truncated by the copy."""
+    cached = read_only_cache_file(tmp_path)
+    blob = cached.resolve()
+    blob.chmod(0o644)  # even a writable blob, as an older huggingface-hub left it
+    original = blob.read_bytes()
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / cached.name).symlink_to(blob)
+
+    working_copy(cached, out / cached.name)
+
+    assert blob.read_bytes() == original
+    assert not (out / cached.name).is_symlink()
+    assert (out / cached.name).read_bytes() == original
+
+
+def test_the_copy_is_owner_writable_whatever_the_umask(tmp_path: Path) -> None:
+    source = tmp_path / "m.gguf"
+    source.write_bytes(b"GGUF")
+    source.chmod(0o444)
+    previous = os.umask(0o277)
+    try:
+        working_copy(source, tmp_path / "copy.gguf")
+    finally:
+        os.umask(previous)
+
+    assert stat.S_IMODE((tmp_path / "copy.gguf").stat().st_mode) & 0o600 == 0o600
+
+
+def test_a_copy_that_cannot_be_written_fails_before_the_reader_runs(
+    tmp_path: Path, ctx: JobContext
+) -> None:
+    runner = ImportRunner()
+
+    result = GGUFImporter(runner).import_file(tmp_path / "missing.gguf", tmp_path / "out", ctx)
+
+    assert not result.success
+    assert runner.calls == [], "nothing to import"
+    assert result.diagnostic is not None
+    assert result.diagnostic.code == "export.gguf_copy_failed"
+    assert "missing.gguf" in result.diagnostic.message
+    assert not (tmp_path / "out" / "missing.gguf").exists()
 
 
 def test_a_failed_import_carries_the_readers_message(tmp_path: Path, ctx: JobContext) -> None:
@@ -119,12 +206,35 @@ def test_a_failed_import_carries_the_readers_message(tmp_path: Path, ctx: JobCon
     assert not result.success
     assert result.diagnostic is not None
     assert "gguf_tensor_to_f16 failed" in (result.diagnostic.raw_excerpt or "")
+    assert not (tmp_path / "out" / "m.gguf").exists(), "the copy is removed after a failure too"
 
 
-def test_the_entry_point_refuses_a_path_that_is_not_a_link(tmp_path: Path) -> None:
-    """Pointed at the real file, GenAI would write into the directory holding it."""
+def test_the_entry_point_refuses_a_link(tmp_path: Path) -> None:
+    """Pointed at the cache, GenAI would write into the directory holding the file."""
     real = tmp_path / "m.gguf"
     real.write_bytes(b"GGUF")
+    link = tmp_path / "link.gguf"
+    link.symlink_to(real)
+
+    assert main([str(link)]) == 2
+
+
+def test_the_entry_point_refuses_a_hard_link(tmp_path: Path) -> None:
+    """A second name for a cache blob shares its inode, so it is not a private copy."""
+    real = tmp_path / "blob"
+    real.write_bytes(b"GGUF")
+    os.link(real, tmp_path / "m.gguf")
+
+    assert main([str(tmp_path / "m.gguf")]) == 2
+
+
+def test_the_entry_point_refuses_a_read_only_file(tmp_path: Path) -> None:
+    """The reader opens it read-write; refusing here says so before gguf_open fails."""
+    real = tmp_path / "m.gguf"
+    real.write_bytes(b"GGUF")
+    real.chmod(0o444)
+    if os.access(real, os.W_OK):
+        pytest.skip("running as a user that may write any file")
 
     assert main([str(real)]) == 2
 
@@ -253,6 +363,72 @@ def test_a_failed_import_is_a_conversion_failure(settings: Settings, tmp_path: P
 
     with pytest.raises(ExportError):
         run_prepare(service, plan, settings)
+
+
+GGUF_OPEN_FAILED = (
+    "RuntimeError: Check 'ctx' failed at /home/jenkins/agent/workspace/private-ci/ie/"
+    "build-linux-manylinux_2_28/b/repos/openvino.genai/src/cpp/src/gguf_utils/gguf.cpp:317:\n"
+    "Failed to open '/data/.staging/job/model/qwen2.5-0.5b-instruct-q4_0.gguf' with gguf_open"
+)
+
+
+def test_a_reader_that_cannot_open_the_file_is_classified(
+    settings: Settings, tmp_path: Path
+) -> None:
+    """The reader's own message reaches the registry, as an optimum export failure does."""
+
+    class Failing(FakeImporter):
+        def import_file(self, gguf: Path, output_dir: Path, ctx: JobContext) -> ExportResult:
+            return ExportResult(
+                success=False, argv=["python"], returncode=1, stderr_tail=[GGUF_OPEN_FAILED]
+            )
+
+    hub = GGUFHub(tmp_path, headers())
+    service = gguf_service(settings, hub, Failing())
+    plan = service.plan(REPO, device="gpu")
+
+    with pytest.raises(ExportError) as caught:
+        run_prepare(service, plan, settings)
+
+    assert caught.value.diagnostic.code == "export.gguf.open_failed"
+    assert caught.value.diagnostic.category is FailureCategory.PERMISSION_DENIED
+    assert caught.value.exit_code() is ExitCode.ENVIRONMENT_UNUSABLE
+    assert caught.value.diagnostic.fallback_devices == [], "no device opens it either"
+
+
+class ImportingFake(FakeImporter):
+    """The real importer around a runner that fakes the child process."""
+
+    def __init__(self, *, fail: bool = False) -> None:
+        super().__init__()
+        self._importer = GGUFImporter(ImportRunner(fail=fail))
+
+    def import_file(self, gguf: Path, output_dir: Path, ctx: JobContext) -> ExportResult:
+        return self._importer.import_file(gguf, output_dir, ctx)
+
+
+def test_an_unrecognised_import_failure_keeps_the_importers_diagnostic(
+    settings: Settings, tmp_path: Path
+) -> None:
+    hub = GGUFHub(tmp_path, headers())
+    service = gguf_service(settings, hub, ImportingFake(fail=True))
+    plan = service.plan(REPO, device="cpu")
+
+    with pytest.raises(ExportError) as caught:
+        run_prepare(service, plan, settings)
+
+    assert caught.value.diagnostic.code == "export.gguf_import_failed"
+    assert caught.value.exit_code() is ExitCode.CONVERSION
+
+
+def test_the_disk_plan_holds_the_working_copy_beside_the_imported_ir(
+    settings: Settings, tmp_path: Path
+) -> None:
+    hub = GGUFHub(tmp_path, headers())
+    plan = gguf_service(settings, hub, FakeImporter()).plan(REPO, device="cpu")
+
+    assert plan.resolved_source.gguf_file_bytes == 1001
+    assert plan.disk.estimated_artifact_bytes == 2 * 1001
 
 
 def test_the_npu_reshape_failure_of_a_gguf_import_is_not_blamed_on_the_driver() -> None:

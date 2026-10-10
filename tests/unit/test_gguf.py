@@ -31,7 +31,7 @@ from yonga.application.resolve import (
     gguf_model_files,
     gguf_quant_label,
 )
-from yonga.domain.diagnostics import SourceResolutionError
+from yonga.domain.diagnostics import ExitCode, SourceResolutionError
 from yonga.domain.hardware import HuggingFaceAuthInfo
 from yonga.domain.models import ModelFormat, ModelIdentity, ModelMetadata, RepoFile
 from yonga.registry.loader import (
@@ -287,6 +287,7 @@ def test_an_unknown_named_file_lists_the_real_ones() -> None:
             policy=SourcePolicy(gguf_file="nope.gguf"),
         )
     assert caught.value.diagnostic.code == "source.gguf_file_not_found"
+    assert caught.value.exit_code() is ExitCode.SOURCE_RESOLUTION, "CLI_SPEC section 6: exit 20"
     assert "model-Q8_0.gguf" in caught.value.diagnostic.remediation[0]
     assert "mmproj" not in caught.value.diagnostic.remediation[0]
 

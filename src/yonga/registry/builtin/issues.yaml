@@ -352,6 +352,57 @@ issues:
           The iostream wording is what OpenVINO surfaces when serialisation
           cannot write the .bin file.
 
+  # Category choice: `permission_denied` (exit 10), because the one cause
+  # actually observed is a file the reader may not open read-write. OpenVINO
+  # GenAI's GGUF reader opens the file with O_RDWR|O_APPEND although it never
+  # writes to it, and huggingface-hub 1.x stores its blobs read-only (0444), so
+  # handing the reader a link into the cache failed for every fresh cache. yonga
+  # now imports from a private, writable copy in staging, so this rule should
+  # only fire for a staging directory that refuses the write (a read-only
+  # mount, an ACL) or a file that is not a GGUF at all; the message names both.
+  # Without it the failure was `unknown_runtime_error`.
+  - id: gguf-reader-open-failed
+    schema_version: 1
+    status: active
+    priority: 85
+    summary: OpenVINO GenAI's GGUF reader could not open the file
+    match:
+      case_sensitive: true
+      exception_contains:
+        - "with gguf_open"
+    classification:
+      code: export.gguf.open_failed
+      category: permission_denied
+      environment_broken: false
+      retry_same_device: false
+    recommendation:
+      title: OpenVINO GenAI could not open the GGUF file
+      message: >-
+        The GGUF reader in OpenVINO GenAI opens the file for reading and
+        writing, so a file this user may only read is refused, and so is one
+        that does not start with a GGUF header. yonga imports from its own
+        writable copy in the job's staging directory, so the usual causes are a
+        data directory this user cannot write to, or a damaged download. No
+        device is involved: nothing had been compiled.
+      fallback_devices: []
+      remediation:
+        - "Check that the data directory is writable: yonga doctor"
+        - >-
+          If the download may be damaged, check it against the Hub with
+          hf cache verify REPO, and remove a bad copy with hf cache rm model/REPO.
+        - "The reader's own message is in the job log: yonga logs JOB_ID --raw"
+    sources:
+      - kind: tested
+        note: |-
+          Reproduced on this reference host with OpenVINO GenAI 2026.4.1 and
+          Qwen/Qwen2.5-0.5B-Instruct-GGUF Q4_0 and Q8_0 from a huggingface-hub
+          1.x cache, whose blobs are mode 0444:
+            RuntimeError: Check 'ctx' failed at .../gguf_utils/gguf.cpp:317:
+            Failed to open '.../model/qwen2.5-0.5b-instruct-q4_0.gguf' with
+            gguf_open
+          strace showed openat(..., O_RDWR|O_APPEND) = -1 EACCES. A writable
+          copy of the same bytes imports in 6 s and is left unmodified.
+
   # Category choice, deliberately: `configuration_error`, not
   # `source_format_unsupported`. The source is a perfectly convertible
   # safetensors checkpoint and converts on the very next attempt once the

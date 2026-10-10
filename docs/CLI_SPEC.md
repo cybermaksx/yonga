@@ -179,7 +179,9 @@ when a registry `gguf` rule covers the installed OpenVINO GenAI (`REGISTRY_SPEC.
 Candidate files are the rule's preferred quantization labels in order, or the one `--gguf-file`
 names. Each candidate's header is read from the Hub, and the first whose architecture and every
 tensor type the rule verifies is chosen; the plan lists the files passed over and why. Only that
-file is downloaded. The plan shows it under **GGUF file**, its tensor mix as its **Quantization**
+file is downloaded. The reader opens the file read-write, so it is given a private copy in staging
+(a reflink where the filesystem supports one), never the read-only file in the Hugging Face cache;
+the disk plan reserves room for that copy beside the IR. The plan shows it under **GGUF file**, its tensor mix as its **Quantization**
 (the profile's quantization settings do not apply), and the profile as **Runtime profile**. The
 artifact is named `<revision>--gguf-<label>-<device>` and records `export.backend:
 openvino-genai-gguf`. Refusals: `source.gguf_unsupported` (no verified rule, or an architecture it

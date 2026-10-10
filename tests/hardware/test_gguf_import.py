@@ -57,7 +57,9 @@ def imported(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path]:
 
     assert result.success, result.diagnostic
     assert all((raw / name).is_file() for name in IMPORT_OUTPUTS)
-    assert not any(path.suffix == ".gguf" for path in raw.iterdir()), "the link was left behind"
+    assert not any(path.suffix == ".gguf" for path in raw.iterdir()), (
+        "the working copy was left behind"
+    )
     assert gguf.is_file(), "the import touched the cached source"
     yield repaired_copy(raw, root / "repaired", missing=GGUF_MISSING)
 

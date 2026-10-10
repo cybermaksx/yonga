@@ -93,6 +93,7 @@ set. The Exit column is the category's code, which is what `probe`, `chat` and `
 | `npu.device.permission_denied` | `npu-permission-denied` | `permission_denied` | 10 | The kernel refused access to the NPU node. | Join the `render` group (see `docs/INSTALL.md` section 3). No device fallback is offered on purpose. |
 | `runtime.out_of_memory` | `runtime-out-of-memory` | `out_of_memory` | 30 | The host or the accelerator ran out of memory. | Close other applications; choose stronger compression or a smaller group size. |
 | `storage.insufficient_disk` | `storage-no-space-left` | `insufficient_disk` | 30 | A write failed because the filesystem is full (including OpenVINO's `basic_ios::clear: iostream error`). | Free space, or point `YONGA_CACHE_DIR` at a bigger disk. |
+| `export.gguf.open_failed` | `gguf-reader-open-failed` | `permission_denied` | 10 | OpenVINO GenAI's GGUF reader could not open the file (`Failed to open ... with gguf_open`). It opens the file read-write, so a read-only file is refused, as is one that is not a GGUF file. | Check the data directory is writable (`yonga doctor`); if the download may be damaged, `hf cache verify REPO`. |
 | `export.quantization.group_size_mismatch` | `nncf-group-size-not-divisible` | `configuration_error` | 70 | The profile's group size does not divide the model's channel sizes. | `--profile npu-int4-sym-cw` (channel-wise, group size -1), or a profile with a smaller group size. |
 | `export.transformers.symbol_missing.qwen35` | `qwen35-exporter-transformers-symbol-mismatch` | `package_abi_mismatch` | 10 | The exporter's Qwen3.5 patcher imports `Qwen3_5DynamicCache` and the installed Transformers does not define it. Nothing is broken; the two releases disagree about the Qwen3.5 modelling code. | Install the release the registry pins: `pip install "transformers==5.2.*"`. `yonga inspect MODEL` prints the requirement and what is installed. |
 | `export.transformers.out_of_range` | `exporter-transformers-version-range` | `package_abi_mismatch` | 10 | optimum-intel's export config for this architecture declares a Transformers range the installed release is outside. `prepare` normally reads that range first and builds a managed environment; you see this only when that was turned off. | Drop `--no-managed-env`, or install a release in the range the message names. |
@@ -452,6 +453,12 @@ Name a different file with `--gguf-file`: `Q8_0` files hold only `Q8_0` and `F32
 `Q4_0` files usually add a single `Q8_0`. `source.gguf_unsupported` means the architecture itself
 cannot be imported, for example gemma3 or qwen35. There, a safetensors repository of the same
 model is the route, declared as a derivative or named with `--source`.
+
+`export.gguf.open_failed` (`Failed to open ... with gguf_open`) is the reader failing to open the
+file at all. It opens the file read-write although it never writes to it, and huggingface-hub 1.x
+keeps its cached files read-only, so yonga imports from its own writable copy in the job's staging
+directory, never from the cache. If you still see it, the data directory is not writable by you
+(`yonga doctor`), or the downloaded file is damaged (`hf cache verify REPO`).
 
 ## 6. Reading a job log
 
