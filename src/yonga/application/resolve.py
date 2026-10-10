@@ -1062,10 +1062,12 @@ class SourceResolver:
             wanted = policy.gguf_file.strip()
             matching = [name for name in files if name == wanted or name.endswith("/" + wanted)]
             if not matching:
+                # A source refusal like its siblings (exit 20, CLI_SPEC section 6):
+                # the repository does not hold the file; no yonga setting is wrong.
                 raise SourceResolutionError(
                     diagnostic(
                         "source.gguf_file_not_found",
-                        FailureCategory.CONFIGURATION_ERROR,
+                        FailureCategory.SOURCE_FORMAT_UNSUPPORTED,
                         "That GGUF file is not in the repository",
                         f"{wanted!r} is not one of {metadata.identity.repo_id}'s model files.",
                         remediation=[f"Available: {', '.join(files) or 'none'}"],

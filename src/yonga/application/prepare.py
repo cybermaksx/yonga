@@ -664,16 +664,21 @@ class PrepareService:
 
         download_bytes = sum(entry.size or 0 for entry in source_meta.files)
         weight_bytes = source_meta.weight_bytes
+        artifact_bytes: int | None = None
         if resolved_source.gguf_file is not None:
             # One file of the repository's many quantizations is downloaded and imported.
             download_bytes = resolved_source.gguf_file_bytes or 0
             weight_bytes = resolved_source.gguf_file_bytes or weight_bytes
+            # The import reads a private copy of the file placed in staging, next
+            # to the IR it writes, so both are on the artifact filesystem at once.
+            artifact_bytes = 2 * weight_bytes
         disk = plan_disk_usage(
             job_temp_dir=paths.job_tmp_dir(job_id),
             artifact_dir=artifact_dir,
             source_weight_bytes=weight_bytes,
             settings=self._settings,
             expected_download_bytes=download_bytes,
+            estimated_artifact_bytes=artifact_bytes,
             download_dir=inventory.hf_auth.cache_dir if inventory.hf_auth is not None else None,
             probe=self._filesystem,
         )
@@ -2244,9 +2249,10 @@ class PrepareService:
     ) -> _ExportOutcome:
         """Import the chosen GGUF file into staging with OpenVINO GenAI's reader.
 
-        The Hub cache is only read: the importer links the file into staging and
-        GenAI writes the IR beside the link. What comes out is validated,
-        repaired and probed exactly like an optimum-intel export.
+        The Hub cache is only read: the importer copies the file into staging and
+        GenAI writes the IR beside the copy. What comes out is validated,
+        repaired and probed exactly like an optimum-intel export, and a failure
+        is classified by the registry like one.
         """
         source = plan.resolved_source
         assert source.gguf_file is not None  # guarded by the caller
@@ -2287,7 +2293,19 @@ class PrepareService:
                 "OpenVINO GenAI did not produce an OpenVINO model.",
             )
             ctx.logger.error("export.failed", report.message, raw=report.raw_excerpt or "")
-            raise ExportError(report)
+            if report.category is FailureCategory.USER_CANCELLED:
+                raise ExportError(report)
+            raw = "\n".join([*result.stdout_tail, *result.stderr_tail])
+            raise ExportError(
+                self._classify(
+                    raw,
+                    device=plan.target_device,
+                    stage="export",
+                    ctx=ctx,
+                    metadata=plan.resolved_source.metadata,
+                    fallback=report,
+                )
+            )
         ctx.logger.info(
             "export.complete",
             "GGUF import finished",
