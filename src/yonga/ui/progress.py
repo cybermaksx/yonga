@@ -79,9 +79,23 @@ _STATUS_SEVERITY: dict[str, Severity] = {
     "deferred": Severity.INFO,
     "inconclusive": Severity.WARNING,
     "warning": Severity.WARNING,
+    "cancelled": Severity.WARNING,
     "failed": Severity.ERROR,
     "error": Severity.ERROR,
 }
+
+
+#: Statuses that end a task: later events of that kind are stale reports about
+#: finished work until a new ``started`` event opens the kind again.
+_TERMINAL_STATUSES: frozenset[str] = frozenset({"completed"})
+
+#: The status that opens a task, re-enabling a kind that had finished.
+_STARTED_STATUS: str = "started"
+
+
+def _status_of(event: ProgressEvent) -> str:
+    """The event's status, normalised for comparison."""
+    return (event.status or "").strip().lower()
 
 
 def _severity_for(event: ProgressEvent) -> Severity:
@@ -114,6 +128,7 @@ class RichProgressSink:
         self._progress: Progress | None = None
         self._tasks: dict[ProgressKind, TaskID] = {}
         self._announced: set[ProgressKind] = set()
+        self._finished: set[ProgressKind] = set()
         self._closed = False
 
     # ------------------------------------------------------------------
@@ -138,6 +153,7 @@ class RichProgressSink:
         progress, self._progress = self._progress, None
         self._tasks.clear()
         self._announced.clear()
+        self._finished.clear()
         if progress is not None:
             with suppress(Exception):
                 progress.stop()
@@ -200,6 +216,17 @@ class RichProgressSink:
 
     def _render_task(self, event: ProgressEvent) -> None:
         """Update (or create) the live task for this event's kind."""
+        status = _status_of(event)
+        if status == _STARTED_STATUS:
+            self._finished.discard(event.kind)
+        elif event.kind in self._finished:
+            # A late report about work already reported complete -- the Hub's byte
+            # bar is closed by the garbage collector, stages later. Drawing it
+            # would show a finished download as running (or as incomplete).
+            return
+        if status in _TERMINAL_STATUSES:
+            self._finished.add(event.kind)
+
         if not self.console.animate:
             # No terminal: a bar would be noise, so the phase is announced once
             # and the per-event detail is kept for ``--verbose``.
@@ -218,6 +245,11 @@ class RichProgressSink:
         progress = self._ensure_progress()
         determinate = event.fraction is not None
         task_id = self._tasks.get(event.kind)
+        if status in _TERMINAL_STATUSES and not determinate:
+            # Finished without figures of its own: fill the bar it already has
+            # rather than resetting it to zero.
+            self._complete_task(progress, task_id, event.kind, description)
+            return
         if task_id is None:
             task_id = progress.add_task(
                 description,
@@ -232,6 +264,21 @@ class RichProgressSink:
             total=float(event.total) if determinate and event.total else None,
             completed=float(event.current or 0),
         )
+
+    def _complete_task(
+        self,
+        progress: Progress,
+        task_id: TaskID | None,
+        kind: ProgressKind,
+        description: str,
+    ) -> None:
+        """Show the task for ``kind`` as done, keeping the total it already had."""
+        if task_id is None:
+            self._tasks[kind] = progress.add_task(description, total=1.0, completed=1)
+            return
+        task = next((task for task in progress.tasks if task.id == task_id), None)
+        total = task.total if task is not None and task.total else 1.0
+        progress.update(task_id, description=description, total=total, completed=total)
 
     def _describe(self, event: ProgressEvent, *, detail: bool) -> str:
         """Describe one task event as a phase announcement or as a detail line."""

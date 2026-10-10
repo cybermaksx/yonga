@@ -48,6 +48,7 @@ __all__ = [
     "CompletedCommand",
     "SubprocessRunner",
     "default_line_selector",
+    "progress_text",
 ]
 
 #: Number of trailing output lines kept in memory for each stream.
@@ -70,6 +71,21 @@ _NOTEWORTHY = re.compile(r"(traceback|error|failed|failure|warning|not supported
 #: A carriage-return redraw of a progress bar; only the final segment is useful.
 _PROGRESS_BAR = re.compile(r"\d+%\|")
 
+#: The first box-drawing or block glyph and everything after it. Rich draws its
+#: progress bars (``Applying Weight Compression ━━━ 100% • 0:00:05``) and its
+#: tables (nncf's bit-width statistics) with these, so what precedes them is the
+#: label and a line that starts with one is a table border or row.
+_DRAWING = re.compile(r"\s*[\u2500-\u259f].*$", re.DOTALL)
+
+
+def progress_text(line: str) -> str:
+    """Return the part of one output line worth showing as progress.
+
+    A Rich progress bar keeps its label and loses the bar; a table row or
+    border becomes empty. The job log always keeps the full line.
+    """
+    return _DRAWING.sub("", line.strip())
+
 
 def default_line_selector(line: str) -> ProgressKind | None:
     """Classify one captured output line for progress reporting.
@@ -82,7 +98,7 @@ def default_line_selector(line: str) -> ProgressKind | None:
     Parsing every progress bar is not required: an indeterminate status plus
     selected lines is enough.
     """
-    text = line.strip()
+    text = progress_text(line)
     if not text:
         return None
     if _NOTEWORTHY.search(text):
@@ -399,7 +415,9 @@ class SubprocessRunner:
             ctx.logger.raw(name, text)
         # A carriage-return redraw arrives as one long line; only its last
         # segment is the current state of the progress bar.
-        visible = text.rsplit("\r", 1)[-1].strip()
+        visible = progress_text(text.rsplit("\r", 1)[-1])
+        if not visible:
+            return
         kind = self._line_selector(visible)
         if kind is not None:
             ctx.emit(kind, visible, stream=name)

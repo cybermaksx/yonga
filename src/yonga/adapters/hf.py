@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 import time
 from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path, PurePosixPath
@@ -64,6 +65,7 @@ from yonga.domain.models import (
     ModelMetadata,
     RepoFile,
 )
+from yonga.util.library_logs import route_library_logs
 from yonga.util.redaction import redact_text
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -125,6 +127,9 @@ distinguishes it from a model file without downloading and parsing the header.
 Getting this wrong only degrades a fallback estimate, never the figure the Hub
 itself reported through :data:`GGUF_TOTAL_FILE_SIZE_KEY`.
 """
+
+HUB_LIBRARY_LOGGERS: Final[tuple[str, ...]] = ("huggingface_hub",)
+"""Library loggers whose records belong in the job log rather than on the terminal."""
 
 PROGRESS_MIN_INTERVAL_SECONDS: Final[float] = 0.2
 """Minimum wall-clock gap between two download progress events."""
@@ -913,12 +918,90 @@ def _attach_notes(observations: list[FormatObservation], notes: Sequence[str]) -
 # --------------------------------------------------------------------------- #
 
 
+class _DownloadMeter:
+    """Byte accounting shared by every Hub progress bar of one download.
+
+    ``snapshot_download`` updates its byte bar from a pool of worker threads, so
+    the count and the decision to emit are taken under one lock: an unlocked
+    ``+=`` loses updates, and two threads racing past the throttle could report
+    an older figure after a newer one. Once the download has returned, the meter
+    is finished and nothing reaches the sink any more -- the Hub never closes its
+    byte bar itself, so the garbage collector does it later, in the middle of a
+    later stage.
+    """
+
+    def __init__(
+        self, ctx: JobContext, *, repo_id: str, revision: str, min_interval: float
+    ) -> None:
+        self._ctx = ctx
+        self._repo_id = repo_id
+        self._revision = revision
+        self._min_interval = min_interval
+        self._lock = threading.Lock()
+        self._seen = 0.0
+        self._total = 0
+        self._last = 0.0
+        self._finished = False
+
+    @property
+    def total(self) -> int:
+        """The largest byte total any bar declared."""
+        with self._lock:
+            return self._total
+
+    def add(self, amount: float, *, total: object) -> None:
+        """Count ``amount`` more bytes and emit progress when the throttle allows."""
+        with self._lock:
+            if self._finished:
+                return
+            self._seen += amount
+            self._observe(total)
+            now = time.monotonic()
+            if now - self._last < self._min_interval:
+                return
+            self._last = now
+            self._emit()
+
+    def flush(self, *, total: object) -> None:
+        """Emit the current figure regardless of the throttle (a bar was closed)."""
+        with self._lock:
+            if self._finished:
+                return
+            self._observe(total)
+            self._last = time.monotonic()
+            self._emit()
+
+    def finish(self) -> None:
+        """Stop reporting: the download has returned, whatever its bars do later."""
+        with self._lock:
+            self._finished = True
+
+    def _observe(self, total: object) -> None:
+        """Remember the bar's declared total; it grows as file sizes are learned."""
+        if isinstance(total, (int, float)) and total > self._total:
+            self._total = int(total)
+
+    def _emit(self) -> None:
+        """Emit one download event; called with the lock held, so in order."""
+        self._ctx.emit(
+            ProgressKind.DOWNLOAD,
+            f"Downloading {self._repo_id}",
+            current=int(self._seen),
+            total=self._total or None,
+            status="downloading",
+            repo_id=self._repo_id,
+            revision=self._revision,
+            unit="bytes",
+        )
+
+
 def _progress_tqdm_class(
     ctx: JobContext,
     *,
     repo_id: str,
     revision: str,
     min_interval: float = PROGRESS_MIN_INTERVAL_SECONDS,
+    meter: _DownloadMeter | None = None,
 ) -> type[Any]:
     """Build a ``tqdm`` subclass that mirrors Hub byte progress into a sink.
 
@@ -927,39 +1010,28 @@ def _progress_tqdm_class(
     way to observe download progress without reimplementing the transfer. The
     returned class emits throttled :data:`ProgressKind.DOWNLOAD` events and turns
     a cancellation request into :class:`yonga.domain.diagnostics.CancelledError`.
+
+    Every bar it builds is disabled as a display: the job's progress sink is the
+    one place progress is drawn, so neither the byte bar (which ``huggingface_hub``
+    shows whenever stderr is a terminal) nor the "Fetching N files" bar (which
+    ``tqdm.contrib.concurrent`` shows even in a pipe) writes anything itself.
     """
+    shared = meter or _DownloadMeter(
+        ctx, repo_id=repo_id, revision=revision, min_interval=min_interval
+    )
 
     class _YongaProgressTqdm(hf_tqdm):
         """Hub progress bar that reports into this job's progress sink."""
 
         def __init__(self, *args: Any, **kwargs: Any) -> None:
-            """Remember whether this bar counts bytes, then build the real bar."""
+            """Remember whether this bar counts bytes, then build a silent bar."""
             self._yonga_bytes = kwargs.get("unit") == "B"
-            self._yonga_seen = float(kwargs.get("initial") or 0)
-            self._yonga_last = 0.0
+            initial = float(kwargs.get("initial") or 0)
+            kwargs["disable"] = True
             # ``huggingface_hub``'s tqdm subclass is untyped upstream.
             super().__init__(*args, **kwargs)  # type: ignore[no-untyped-call]
-
-        def _yonga_emit(self, *, force: bool) -> None:
-            """Emit a download event, at most once per ``min_interval`` seconds."""
-            if not self._yonga_bytes:
-                return
-            now = time.monotonic()
-            if not force and now - self._yonga_last < min_interval:
-                return
-            self._yonga_last = now
-            raw_total = getattr(self, "total", None)
-            total = int(raw_total) if isinstance(raw_total, (int, float)) and raw_total else None
-            ctx.emit(
-                ProgressKind.DOWNLOAD,
-                f"Downloading {repo_id}",
-                current=int(self._yonga_seen),
-                total=total,
-                status="downloading",
-                repo_id=repo_id,
-                revision=revision,
-                unit="bytes",
-            )
+            if self._yonga_bytes and initial:
+                shared.add(initial, total=getattr(self, "total", None))
 
         def update(self, n: float | None = 1) -> bool | None:
             """Account for ``n`` more bytes, emit progress and honour cancellation."""
@@ -973,14 +1045,15 @@ def _progress_tqdm_class(
                         context={"repo_id": repo_id, "revision": revision},
                     )
                 )
-            self._yonga_seen += float(n or 0)
-            self._yonga_emit(force=False)
+            if self._yonga_bytes:
+                shared.add(float(n or 0), total=getattr(self, "total", None))
             result: object = super().update(n)
             return bool(result) if result is not None else None
 
         def close(self) -> None:
             """Flush a final progress event, then close the underlying bar."""
-            self._yonga_emit(force=True)
+            if self._yonga_bytes:
+                shared.flush(total=getattr(self, "total", None))
             super().close()
 
     return _YongaProgressTqdm
@@ -1016,6 +1089,9 @@ class HuggingFaceAdapter:
         """
         self._settings: Settings = settings if settings is not None else Settings()
         self._api: HfApi = api if api is not None else HfApi()
+        # The Hub's advisory headers ("unauthenticated requests ...") are logged
+        # by ``huggingface_hub`` to stderr; during a job they go to its log.
+        route_library_logs(HUB_LIBRARY_LOGGERS)
 
     # --- environment ---------------------------------------------------
 
@@ -1359,11 +1435,18 @@ class HuggingFaceAdapter:
                 offline=offline,
             )
 
-        tqdm_class = (
-            None
-            if ctx is None
-            else _progress_tqdm_class(ctx, repo_id=source.repo_id, revision=revision)
-        )
+        meter: _DownloadMeter | None = None
+        tqdm_class: type[Any] | None = None
+        if ctx is not None:
+            meter = _DownloadMeter(
+                ctx,
+                repo_id=source.repo_id,
+                revision=revision,
+                min_interval=PROGRESS_MIN_INTERVAL_SECONDS,
+            )
+            tqdm_class = _progress_tqdm_class(
+                ctx, repo_id=source.repo_id, revision=revision, meter=meter
+            )
 
         try:
             located = self._api.snapshot_download(
@@ -1379,6 +1462,9 @@ class HuggingFaceAdapter:
             raise translate_hub_error(
                 error, model=pinned, operation="snapshot download", offline=offline
             ) from error
+        finally:
+            if meter is not None:
+                meter.finish()
 
         if not isinstance(located, str):
             raise SourceResolutionError(
@@ -1403,9 +1489,14 @@ class HuggingFaceAdapter:
                 revision=revision,
                 path=str(snapshot),
             )
+            # The snapshot is complete, so the bar is too -- even when a Xet
+            # transfer reported fewer bytes than the files' declared sizes.
+            downloaded = meter.total if meter is not None else 0
             ctx.emit(
                 ProgressKind.DOWNLOAD,
                 f"{source.repo_id} is ready in the Hugging Face cache",
+                current=downloaded or None,
+                total=downloaded or None,
                 status="completed",
                 repo_id=source.repo_id,
                 revision=revision,

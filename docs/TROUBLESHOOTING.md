@@ -487,7 +487,9 @@ Job 43984530-dfae-45d7-bf78-1c95727270bf
 
 Useful events: `job.stage` (where the job got to), `export.command` (the exact argv, redacted),
 `subprocess.output` (every line the exporter printed), `export.failed` (the tail that was
-classified, in its `raw` field), `preflight.*` (disk and requirement decisions).
+classified, in its `raw` field), `preflight.*` (disk and requirement decisions), `library.log`
+(warnings `huggingface_hub` logged during the job, such as the Hub's advice to set `HF_TOKEN`,
+kept here instead of breaking into the progress display).
 
 For a single failure, the fastest route is:
 
