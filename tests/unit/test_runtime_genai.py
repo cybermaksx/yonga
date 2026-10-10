@@ -662,6 +662,28 @@ def test_an_explicit_cache_dir_gets_no_ownership_record(artifact, settings, gena
     assert not any(mine.iterdir())
 
 
+def test_a_staged_artifact_is_never_compile_cached(settings, genai):
+    """prepare's smoke test runs on staging, which no later load can ever reuse.
+
+    The staging directory moves into the store under a new fingerprint, and the
+    blobs are keyed by the path they were compiled from: caching them there only
+    left an orphaned entry the size of the model after every prepare.
+    """
+    staged = settings.paths.job_staging_dir("82463910-98ac-41c8-9bd7-faf1a4067e6c") / "model"
+    staged.mkdir(parents=True)
+    (staged / "openvino_model.xml").write_bytes(b"<net/>")
+    (staged / "openvino_model.bin").write_bytes(b"\x00")
+
+    runtime = make_runtime(staged, settings, properties={"ATTENTION_BACKEND": "SDPA"})
+    runtime.close()
+
+    assert runtime.properties == {"ATTENTION_BACKEND": "SDPA"}
+    assert "CACHE_DIR" not in genai.pipelines[0].properties
+    assert not settings.paths.compile_cache_dir.exists() or not any(
+        settings.paths.compile_cache_dir.iterdir()
+    )
+
+
 # --- LLM generation -------------------------------------------------------------------
 
 

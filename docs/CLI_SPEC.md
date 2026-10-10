@@ -408,6 +408,13 @@ Lists and removes the managed export environments `prepare` builds when an archi
 requirements cannot be met by the installed packages. They live under the cache directory, are used
 only by the export subprocess, and never modify the environment yonga runs in.
 
+`KEY` is an environment's key, a unique prefix of it, or its directory name (`export-KEY`). `remove`
+always confirms first: without `--yes`, a non-interactive session or `--json` removes nothing and
+exits 60; an unknown or ambiguous `KEY` exits 70. Inside the AppImage, environments are made from a
+copy of the bundled Python under the same directory; `list` shows it as `base Python` (JSON:
+`base_interpreters`, counted in `total_bytes`), and it is deleted with the last environment made
+from it.
+
 ## 12b. `cache`
 
 ```bash
@@ -418,8 +425,10 @@ yonga cache prune [--older-than DAYS] [--unattributed] [--all] [--dry-run] [--ye
 
 Shows and prunes the OpenVINO compile cache, `<cache-dir>/compile/<key>/`. Every pipeline yonga
 builds compiles into one entry, keyed by a digest of (artifact identity, device, OpenVINO version,
-runtime properties). The managed temp directory, export environments (section 12a) and the Hugging
-Face cache are out of scope.
+runtime properties). The exception is `prepare`'s smoke test, which runs on the staging directory
+before it moves into the store: OpenVINO keys blobs by the path they were compiled from, so nothing
+could reuse them, and that pipeline is built without a compile cache. The managed temp directory,
+export environments (section 12a) and the Hugging Face cache are out of scope.
 
 Whenever yonga hands an entry to OpenVINO it writes `.yonga-entry.json` into it: schema version,
 key, artifact id and path, repository and profile, device, OpenVINO version, runtime properties
@@ -456,7 +465,8 @@ its entries; it only asks OpenVINO for the installed version when an entry witho
 exists.
 
 `prune` removes orphaned and stale-runtime entries. `--older-than DAYS` also removes any entry not
-used for that many days, `--unattributed` also removes unattributed entries, and `--all` empties the
+used for that many days (an age reaching back before the earliest representable date selects
+nothing), `--unattributed` also removes unattributed entries, and `--all` empties the
 compile cache. It prints the plan (entries, why each was chosen, total size) and asks for
 confirmation unless `--yes`; `--dry-run` prints the plan and deletes nothing. Only direct children
 of the compile cache root whose names are 16 lowercase hexadecimal characters, and that are real

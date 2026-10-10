@@ -36,6 +36,7 @@ import shutil
 import sys
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -69,6 +70,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 __all__ = [
     "ESTIMATED_ENVIRONMENT_BYTES",
     "MARKER_FILENAME",
+    "BaseInterpreter",
     "ExportEnvironmentManager",
     "requirement_specifiers",
 ]
@@ -99,6 +101,21 @@ print(json.dumps(versions))
 """
 
 _PIP_FLAGS: tuple[str, ...] = ("--disable-pip-version-check", "--no-input")
+
+#: Name prefix of a copy of the bundled interpreter under the environments directory.
+_BASE_PREFIX = "python-"
+
+#: Suffix of a copy of the bundled interpreter still being made.
+_PARTIAL_SUFFIX = ".partial"
+
+
+@dataclass(frozen=True)
+class BaseInterpreter:
+    """A copy of a bundled interpreter that environments are made from."""
+
+    path: Path
+    size_bytes: int
+    in_use: bool
 
 
 def requirement_specifiers(requirements: ExporterRequirements) -> dict[str, str]:
@@ -205,8 +222,13 @@ class ExportEnvironmentManager:
         ]
         return sorted(found, key=lambda env: env.created_at, reverse=True)
 
-    def remove(self, reference: str) -> ExportEnvironment:
-        """Delete one environment, by key or an unambiguous key prefix."""
+    def resolve(self, reference: str) -> ExportEnvironment:
+        """The one environment ``reference`` names: its key, an unambiguous prefix of it,
+        or its directory name (``export-KEY``, as ``env list`` and the prepare plan show it).
+
+        Raises :class:`~yonga.domain.diagnostics.ConfigurationError` when nothing,
+        or more than one environment, matches.
+        """
         wanted = reference.strip().removeprefix("export-")
         matches = (
             [env for env in self.environments() if env.key.startswith(wanted)] if wanted else []
@@ -222,11 +244,91 @@ class ExportEnvironmentManager:
                     remediation=[f"List them with: {APP_NAME} env list"],
                 )
             )
-        target = matches[0]
+        return matches[0]
+
+    def remove(self, reference: str) -> ExportEnvironment:
+        """Delete one environment, named as :meth:`resolve` accepts.
+
+        A copy of the bundled interpreter (see :meth:`base_interpreters`) that no
+        environment is made from any more goes with it.
+        """
+        target = self.resolve(reference)
         _remove_owned(target.path, self.root)
         with suppress(OSError):
             (self.root / f"{target.spec.name}.lock").unlink()
+        self.prune_base_interpreters()
         return target
+
+    # --- base interpreter copies -------------------------------------------------
+
+    def base_interpreters(self) -> list[BaseInterpreter]:
+        """The copies of a bundled interpreter environments are made from.
+
+        Only an AppImage makes them (:meth:`_base_interpreter`). They are not
+        environments, but they are disk under :attr:`root` all the same, so
+        ``env list`` shows them.
+        """
+        if not self.root.is_dir():
+            return []
+        return [
+            BaseInterpreter(
+                path=path, size_bytes=_tree_size(path), in_use=self._interpreter_in_use(path)
+            )
+            for path in sorted(self.root.glob(f"{_BASE_PREFIX}*"))
+            if _is_base_copy(path)
+        ]
+
+    def prune_base_interpreters(self) -> list[Path]:
+        """Delete every interpreter copy no environment is made from; return what went.
+
+        A copy is kept while any environment directory -- complete or not --
+        records it as its base, and while a build holds its lock: a build takes
+        the lock shared from before it creates its virtual environment until it
+        ends, so a copy is never pulled from under one. An interrupted copy
+        (``.partial``) goes whenever its lock is free. Never raises for a copy it
+        cannot remove: this is housekeeping.
+        """
+        removed: list[Path] = []
+        if not self.root.is_dir():
+            return removed
+        for path in sorted(self.root.glob(f"{_BASE_PREFIX}*")):
+            partial = path.name.endswith(_PARTIAL_SUFFIX)
+            if not (partial or _is_base_copy(path)) or path.is_symlink() or not path.is_dir():
+                continue
+            name = path.name.removesuffix(_PARTIAL_SUFFIX)
+            with suppress(OSError), (self.root / f"{name}.lock").open("a") as handle:
+                try:
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    continue  # a build is using it, or copying it
+                try:
+                    if partial or not self._interpreter_in_use(path):
+                        _remove_owned(path, self.root)
+                        removed.append(path)
+                finally:
+                    fcntl.flock(handle, fcntl.LOCK_UN)
+        return removed
+
+    def _interpreter_in_use(self, copy: Path) -> bool:
+        """Whether any environment directory under :attr:`root` is made from ``copy``.
+
+        A virtual environment names its base in ``pyvenv.cfg`` (``home = .../bin``).
+        One whose configuration cannot be read counts as using it.
+        """
+        base = copy.resolve()
+        for environment in self.root.glob("export-*"):
+            if environment.is_symlink() or not environment.is_dir():
+                continue
+            config = environment / "pyvenv.cfg"
+            if not config.exists():
+                continue
+            try:
+                home = _venv_home(config.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError):
+                return True
+            if home is not None and Path(home).resolve().is_relative_to(base):
+                return True
+        return False
 
     # --- building --------------------------------------------------------------
 
@@ -274,8 +376,29 @@ class ExportEnvironmentManager:
             key=spec.key,
             packages=dict(spec.packages),
         )
+        try:
+            with self._base_interpreter(ctx) as base:
+                environment = self._build_from(base, path, spec, ctx)
+        except BaseException:
+            # A failed build may leave a copy of the interpreter nothing uses.
+            with suppress(OSError):
+                self.prune_base_interpreters()
+            raise
+        _write_marker(path / MARKER_FILENAME, environment)
+        ctx.logger.info(
+            "export.env.ready",
+            "managed export environment built",
+            key=spec.key,
+            size_bytes=environment.size_bytes,
+            installed=environment.installed,
+        )
+        return environment
+
+    def _build_from(
+        self, base: Path, path: Path, spec: EnvironmentSpec, ctx: JobContext
+    ) -> ExportEnvironment:
+        """Create, install and verify the environment at ``path`` from ``base``."""
         python = path / "bin" / "python"
-        base = self._base_python if self._explicit_base else self._lasting_interpreter(ctx)
         steps: Sequence[tuple[str, list[str]]] = (
             ("creating the virtual environment", [str(base), "-P", "-m", "venv", str(path)]),
             (
@@ -317,24 +440,16 @@ class ExportEnvironmentManager:
         except BaseException:
             _remove_owned(path, self.root)
             raise
-        environment = ExportEnvironment(
+        return ExportEnvironment(
             spec=spec,
             path=path,
             installed=installed,
             created_at=datetime.now(UTC),
             size_bytes=_tree_size(path),
         )
-        _write_marker(path / MARKER_FILENAME, environment)
-        ctx.logger.info(
-            "export.env.ready",
-            "managed export environment built",
-            key=spec.key,
-            size_bytes=environment.size_bytes,
-            installed=installed,
-        )
-        return environment
 
-    def _lasting_interpreter(self, ctx: JobContext) -> Path:
+    @contextmanager
+    def _base_interpreter(self, ctx: JobContext) -> Iterator[Path]:
         """An interpreter that outlives this process, to create environments from.
 
         A virtual environment records its base interpreter's directory and
@@ -344,34 +459,47 @@ class ExportEnvironmentManager:
         exactly one job. There the bundled interpreter -- without yonga's own
         site-packages -- is copied once under the environments directory, and
         environments are made from the copy.
+
+        The copy's lock is held shared for as long as the caller builds, so
+        :meth:`prune_base_interpreters` (which needs it exclusively) cannot
+        remove the copy before the new environment records it as its base.
         """
         running = Path(sys.executable)
         appdir = os.environ.get("APPDIR")
+        if self._explicit_base:
+            yield self._base_python
+            return
         if not appdir or not running.resolve().is_relative_to(Path(appdir).resolve()):
-            return running
+            yield running
+            return
         prefix = Path(sys.base_prefix)
         version = f"{sys.version_info.major}.{sys.version_info.minor}"
         digest = hashlib.sha256(sys.version.encode("utf-8")).hexdigest()[:12]
         release = ".".join(str(part) for part in sys.version_info[:3])
-        target = self.root / f"python-{release}-{digest}"
+        target = self.root / f"{_BASE_PREFIX}{release}-{digest}"
         interpreter = target / "bin" / f"python{version}"
-        if interpreter.is_file():
-            return interpreter
         self.root.mkdir(parents=True, exist_ok=True)
         with (self.root / f"{target.name}.lock").open("a") as handle:
-            fcntl.flock(handle, fcntl.LOCK_EX)
             try:
-                if not interpreter.is_file():
-                    ctx.emit(
-                        ProgressKind.LOG, "Export environment: keeping a copy of the bundled Python"
-                    )
-                    _copy_interpreter(prefix, target, version=version, root=self.root)
-                    ctx.logger.info(
-                        "export.env.base_copied", "bundled interpreter copied", path=str(target)
-                    )
+                while True:
+                    fcntl.flock(handle, fcntl.LOCK_EX)
+                    if not interpreter.is_file():
+                        ctx.emit(
+                            ProgressKind.LOG,
+                            "Export environment: keeping a copy of the bundled Python",
+                        )
+                        _copy_interpreter(prefix, target, version=version, root=self.root)
+                        ctx.logger.info(
+                            "export.env.base_copied", "bundled interpreter copied", path=str(target)
+                        )
+                    # Converting to shared is not atomic: a prune may slip in
+                    # between, so the copy is checked again once it is held.
+                    fcntl.flock(handle, fcntl.LOCK_SH)
+                    if interpreter.is_file():
+                        break
+                yield interpreter
             finally:
                 fcntl.flock(handle, fcntl.LOCK_UN)
-        return interpreter
 
     def _verify(self, python: Path, spec: EnvironmentSpec, ctx: JobContext) -> dict[str, str]:
         """Import the export entry point inside the environment and check every pin."""
@@ -470,6 +598,26 @@ def _parse_versions(lines: Sequence[str]) -> dict[str, str | None] | None:
     return None
 
 
+def _is_base_copy(path: Path) -> bool:
+    """Whether ``path`` is a finished copy of a bundled interpreter."""
+    name = path.name
+    return (
+        name.startswith(_BASE_PREFIX)
+        and not name.endswith((_PARTIAL_SUFFIX, ".lock"))
+        and path.is_dir()
+        and not path.is_symlink()
+    )
+
+
+def _venv_home(config: str) -> str | None:
+    """The ``home`` value of a ``pyvenv.cfg``: the base interpreter's directory."""
+    for line in config.splitlines():
+        name, separator, value = line.partition("=")
+        if separator and name.strip().lower() == "home":
+            return value.strip() or None
+    return None
+
+
 def _write_marker(path: Path, environment: ExportEnvironment) -> None:
     temporary = path.with_suffix(".tmp")
     temporary.write_text(environment.model_dump_json(indent=2), encoding="utf-8")
@@ -478,7 +626,7 @@ def _write_marker(path: Path, environment: ExportEnvironment) -> None:
 
 def _copy_interpreter(prefix: Path, target: Path, *, version: str, root: Path) -> None:
     """Copy a relocatable Python install to ``target``, leaving out its site-packages."""
-    partial = target.with_name(f"{target.name}.partial")
+    partial = target.with_name(f"{target.name}{_PARTIAL_SUFFIX}")
     if partial.exists():
         _remove_owned(partial, root)
     site = prefix / "lib" / f"python{version}" / "site-packages"

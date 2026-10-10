@@ -60,7 +60,7 @@ from yonga.domain.compatibility import (
     EvidenceLevel,
     strongest_evidence,
 )
-from yonga.domain.compile_cache import CacheEntryStatus, CompileCachePruneReport
+from yonga.domain.compile_cache import CacheEntryStatus, CompileCachePruneReport, entry_count
 from yonga.domain.diagnostics import (
     CancelledError,
     ConfigurationError,
@@ -1715,20 +1715,31 @@ def env_list(
 
 
 def _env_list(state: CliState) -> ExitCode:
-    """List every completed managed export environment."""
-    environments = state.graph.export_environments().environments()
+    """List every completed managed export environment, and the interpreter copies under them."""
+    manager = state.graph.export_environments()
+    environments = manager.environments()
+    interpreters = manager.base_interpreters()
     total = sum(environment.size_bytes for environment in environments)
+    total += sum(interpreter.size_bytes for interpreter in interpreters)
     if state.json_mode:
         state.emit(
             {
                 "environments": [
                     environment.model_dump(mode="json") for environment in environments
                 ],
+                "base_interpreters": [
+                    {
+                        "path": str(interpreter.path),
+                        "size_bytes": interpreter.size_bytes,
+                        "in_use": interpreter.in_use,
+                    }
+                    for interpreter in interpreters
+                ],
                 "total_bytes": total,
             }
         )
         return ExitCode.SUCCESS
-    if not environments:
+    if not environments and not interpreters:
         state.console.print(
             "No managed export environments. yonga builds one when a model's exporter "
             "requirements cannot be met by the installed packages.",
@@ -1746,7 +1757,19 @@ def _env_list(state: CliState) -> ExitCode:
             f"{environment.created_at:%Y-%m-%d}  {environment.path}"
         )
         state.console.print(f"    {pins}", style="dim")
-    state.console.print(f"{len(environments)} environment(s), {human_bytes(total)} in total.")
+    for interpreter in interpreters:
+        role = "the environments' base" if interpreter.in_use else "unused"
+        state.console.print(
+            f"base Python   {human_bytes(interpreter.size_bytes):>9}  {interpreter.path}  ({role})"
+        )
+    noun = "environment" if len(environments) == 1 else "environments"
+    state.console.print(f"{len(environments)} {noun}, {human_bytes(total)} in total.")
+    if interpreters:
+        state.console.print(
+            "The base Python is a copy of the AppImage's interpreter; it is removed with the "
+            "last environment made from it.",
+            style="dim",
+        )
     return ExitCode.SUCCESS
 
 
@@ -1763,15 +1786,21 @@ def env_remove(
 
 
 def _env_remove(state: CliState, key: str, *, yes: bool) -> ExitCode:
-    """Remove one environment after confirmation."""
+    """Name the environment, confirm, then remove it (``--json`` needs ``--yes``)."""
     manager = state.graph.export_environments()
-    matches = [env for env in manager.environments() if env.key.startswith(key.strip())]
-    if len(matches) == 1 and not state.json_mode:
-        target = matches[0]
-        question = f"Delete {target.path} ({human_bytes(target.size_bytes)})?"
-        if not state.console.confirm(question, default=False, assume_yes=yes):
-            return ExitCode.CANCELLED
-    removed = manager.remove(key)
+    target = manager.resolve(key)
+    question = f"Delete {target.path} ({human_bytes(target.size_bytes)})?"
+    if not state.console.confirm(question, default=False, assume_yes=yes):
+        raise CancelledError(
+            diagnostic(
+                "export.env.remove.declined",
+                FailureCategory.USER_CANCELLED,
+                "Nothing was removed",
+                f"{target.path} was left in place.",
+                remediation=["Re-run with --yes to remove it without a prompt."],
+            )
+        )
+    removed = manager.remove(target.key)
     if state.json_mode:
         state.emit({"removed": removed.key, "path": str(removed.path), "bytes": removed.size_bytes})
         return ExitCode.SUCCESS
@@ -1821,7 +1850,7 @@ def _cache_list(state: CliState) -> ExitCode:
     counts = inventory.counts()
     breakdown = ", ".join(f"{count} {status}" for status, count in counts.items() if count)
     console.print(
-        f"{len(inventory.entries)} entries, {human_bytes(inventory.total_bytes)} in total "
+        f"{entry_count(len(inventory.entries))}, {human_bytes(inventory.total_bytes)} in total "
         f"({breakdown})."
     )
     _cache_runtime_note(state, inventory.installed_openvino)
@@ -1930,7 +1959,7 @@ def _cache_prune(
             return ExitCode.SUCCESS
         if inventory.entries:
             console.print(
-                f"Nothing to prune: {len(inventory.entries)} entries "
+                f"Nothing to prune: {entry_count(len(inventory.entries))} "
                 f"({human_bytes(inventory.total_bytes)}) are all kept under these options."
             )
         else:
@@ -1944,7 +1973,7 @@ def _cache_prune(
     console.print(tables.compile_cache_entries(plan.entries, reasons=plan.reasons))
     kept = len(inventory.entries) - len(plan.entries)
     console.print(
-        f"Prune {len(plan.entries)} of {len(inventory.entries)} entries, "
+        f"Prune {len(plan.entries)} of {entry_count(len(inventory.entries))}, "
         f"{human_bytes(plan.total_bytes)}; {kept} kept. Only {plan.root} is touched."
     )
     _cache_runtime_note(state, plan.installed_openvino)
@@ -1978,7 +2007,7 @@ def _cache_prune(
         state.emit(document(report), ok=not report.failed)
     else:
         console.print(
-            f"Removed {len(report.removed)} entries, {human_bytes(report.freed_bytes)} freed."
+            f"Removed {entry_count(len(report.removed))}, {human_bytes(report.freed_bytes)} freed."
         )
         for key in report.used_since_plan:
             console.print(f"Kept {plan.root / key}: it was used after the plan was made.")

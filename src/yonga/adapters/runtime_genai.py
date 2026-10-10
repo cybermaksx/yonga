@@ -680,6 +680,13 @@ class StreamingChatRuntime(ChatRuntime, Protocol):
 # --- lazy import ----------------------------------------------------------------------
 
 
+def _is_staged(artifact_dir: Path, staging_dir: Path) -> bool:
+    """Whether ``artifact_dir`` is a ``prepare`` job's work in progress, not a stored artifact."""
+    with suppress(OSError, ValueError):
+        return artifact_dir.resolve().is_relative_to(staging_dir.resolve())
+    return False
+
+
 def _import_genai() -> Any:
     """Import :mod:`openvino_genai` lazily. Raises ``ImportError`` when unavailable."""
     # Deliberately lazy: see the module docstring.
@@ -1069,9 +1076,17 @@ class GenAIChatRuntime:
         The managed directory gets an ownership record (artifact, device, runtime
         version, last use) so ``yonga cache prune`` can later tell whether its
         blobs still serve anything. Writing it never fails the load.
+
+        An artifact still in the staging directory is never cached: see below.
         """
         resolved = {str(name): str(value) for name, value in (properties or {}).items()}
         if not self._settings.compile_cache_enabled or _CACHE_DIR_PROPERTY in resolved:
+            return resolved
+        if _is_staged(self._artifact_dir, self._settings.paths.staging_dir):
+            # prepare's smoke test: the directory is about to move into the store
+            # under another fingerprint, and OpenVINO keys its blobs by path, so
+            # nothing could ever load them again. Caching would only leave an
+            # orphaned entry the size of the model behind every prepare.
             return resolved
         fingerprint = artifact_fingerprint(self._artifact_dir)
         version = openvino_runtime_version()

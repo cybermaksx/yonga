@@ -39,6 +39,7 @@ __all__ = [
     "CompileCachePruneReport",
     "CompileCacheRecord",
     "PruneFailure",
+    "entry_count",
     "is_cache_key",
 ]
 
@@ -61,6 +62,11 @@ def is_cache_key(name: str) -> bool:
     else under the cache root is reported and left alone.
     """
     return _KEY_PATTERN.fullmatch(name) is not None
+
+
+def entry_count(count: int) -> str:
+    """``1 entry``, ``2 entries``: a number of cache entries, for a sentence."""
+    return f"{count} {'entry' if count == 1 else 'entries'}"
 
 
 class CacheEntryStatus(str, Enum):
