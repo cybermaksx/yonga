@@ -162,6 +162,7 @@ from yonga.registry.schema import (
     ModelRule,
     ProfileRule,
     RepairRule,
+    export_needs_remote_code,
 )
 from yonga.repairs import Repair, RepairContext, RepairMatch, apply_repairs
 from yonga.util.hashing import sha256_text, short_hash
@@ -1246,11 +1247,7 @@ class PrepareService:
             if arch_rule is not None
             else None
         )
-        if spec is not None and spec.trust_remote_code:
-            return True
-        if metadata.requires_remote_code:
-            return not (spec is not None and spec.native_implementation)
-        return False
+        return export_needs_remote_code(spec, repository_ships_code=metadata.requires_remote_code)
 
     def _expected_repairs(self) -> list[RepairRule]:
         """Registry repairs that are likely to apply to a fresh export.

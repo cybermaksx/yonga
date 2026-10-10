@@ -210,6 +210,7 @@ def inspect_report(
     show_files: bool = False,
     architecture: str | None = None,
     identified_from: str | None = None,
+    remote_code_required: bool | None = None,
 ) -> RenderableType:
     """Render the ``yonga inspect`` report (``docs/CLI_SPEC.md`` section 4).
 
@@ -223,6 +224,12 @@ def inspect_report(
     in a ``--verbose`` note, because every device claim in that block rests on
     the identification and ``SPEC.md`` section 3 does not allow support to be
     presented as better established than it is.
+
+    ``remote_code_required`` is the registry-aware decision ``prepare`` acts on.
+    A repository can ship modelling code that is never run, because
+    Transformers implements the architecture natively; the row then says so
+    instead of asking for ``--trust-remote-code``. ``None`` falls back to what
+    the repository declares.
     """
     facts = _grid()
     facts.add_row(Text("Model"), _text(metadata.identity.repo_id))
@@ -257,10 +264,18 @@ def inspect_report(
             label for label, on in (("gated", metadata.gated), ("private", metadata.private)) if on
         )
         facts.add_row(Text("Access"), Text(flags, style="yellow"))
-    if metadata.requires_remote_code:
+    required = (
+        metadata.requires_remote_code if remote_code_required is None else remote_code_required
+    )
+    if required:
         facts.add_row(
             Text("Remote code"),
             Text("required (needs --trust-remote-code)", style="yellow"),
+        )
+    elif metadata.requires_remote_code:
+        facts.add_row(
+            Text("Remote code"),
+            Text("not required (shipped, but Transformers implements this architecture)"),
         )
 
     blocks: list[RenderableType] = [facts]

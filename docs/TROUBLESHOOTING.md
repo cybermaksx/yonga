@@ -357,7 +357,14 @@ Metadata for a gated repository is usually public, so `yonga inspect` works and 
 | `hub.auth.gated` | the Hub says the repo is gated | "… is gated: its owner requires you to accept conditions and authenticate before the files can be read." |
 | `hub.auth.required` | HTTP 401/403 | "The Hugging Face Hub refused access to … The repository is private, gated, or the stored credential is not valid for it." |
 | `hub.repo.not_found` | 404, or 401 on an unknown repo | "… does not exist on the Hugging Face Hub, is disabled, or is not visible to this account." |
-| `hub.offline.missing` | `--offline` and the files are not cached | "Offline mode is active and … is not fully present in the local Hugging Face cache." |
+| `hub.offline.missing` | `--offline` and the revision, or its weights, are not cached | "Offline mode is active and … is not in the local Hugging Face cache …" (or "… holds N file(s) of … but none of its model weights") |
+| `hub.offline.search_unavailable` | `yonga --offline search` | "Offline mode is active, and searching the Hugging Face Hub is a network request …" |
+
+Offline mode never contacts the Hub. `inspect` and `prepare` read a cached model from the local
+Hugging Face cache instead: the revision comes from the cache's `refs/` mapping, or, when no revision
+was asked for and none is recorded (yonga downloads by commit SHA, which records none), from the
+only cached snapshot. Several unrecorded snapshots are refused rather than guessed between; name one
+as `MODEL@<sha>`. Download counts, likes and gated status are Hub-only facts and are not shown.
 
 Remediation in all the auth cases:
 
