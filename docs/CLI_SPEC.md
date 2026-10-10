@@ -381,6 +381,14 @@ yonga probe MODEL_OR_ARTIFACT [--device DEVICE] [--all-submodels] [--quick | --t
 
 Shows per-submodel read/compile result. This is the productized form of the manual diagnostic script used during development.
 
+Each row says in one line what happened: a deferred raw compile reads "the GenAI pipeline decides",
+and a failure the registry recognised is named by its diagnostic. The raw runtime text, often
+dozens of lines of native compiler output, is shown with `--verbose`; `--json` and the job log
+always carry it. The outcome is explained once, after every device was tried: with
+`--device auto`, a device that failed while another passed is reported for information, not as a
+verdict on the artifact. Without the OpenVINO runtime the probe stops before reading anything, with
+`runtime.openvino.missing` and exit 10, as `bench` does.
+
 A raw compile the registry marks `defer_to_pipeline` (on the NPU, every dynamically shaped LLM) is
 recorded as `deferred` and settled by building the real GenAI pipeline and generating a few
 tokens. For a large model on the NPU that build is a full NPU compilation and can take many
@@ -406,7 +414,8 @@ is inconclusive, 2. `--json` has `"ok": false` and `"inconclusive": true` in tha
 
 `python -m yonga.application.probe ARTIFACT` accepts the same `--quick` and `--timeout`, prints the
 JSON report, and exits 0, 2 (inconclusive) or 1; an invalid `--quick`/`--timeout` combination exits
-70, and argparse usage errors exit 2 as usual.
+70, and argparse usage errors exit 2 as usual. A refusal before anything is probed (no such
+artifact, no OpenVINO) is printed on stderr and exits with its own code, 70 or 10.
 
 ## 12. `registry`
 
@@ -844,7 +853,9 @@ arithmetic's. `--device gpu` measures what the GPU actually computes. One model 
 the reference's log-probabilities are spilled to a memory-mapped file under the managed cache and
 deleted afterwards.
 
-Refusals (exit 70): `eval.artifact_not_found`; `eval.same_artifact`; `eval.different_sources` (the
+Refusals (exit 70): `eval.device.unsupported` (`--device npu`, refused before anything loads: the
+NPU compiler does not take the raw IR's dynamic shapes, and an NPU artifact is evaluated on the CPU
+like any other); `eval.artifact_not_found`; `eval.same_artifact`; `eval.different_sources` (the
 two were converted from different repositories or revisions); `eval.tokenizer_mismatch` (the
 corpus tokenises differently, so the vocabularies differ); `eval.vocab_mismatch`.
 `--allow-different-sources` accepts two repositories holding the same model in different formats,
@@ -853,7 +864,8 @@ result records. The tokenizer and vocabulary checks still apply. The shipped cor
 eight passages of original, CC0 text across prose, technical writing, Python, arithmetic,
 dialogue, procedure, encyclopedic writing and Turkish, 1955 tokens with the Qwen3.5 tokenizer.
 `--corpus` takes a `.json` of the same shape, or plain text split on blank lines. Results are
-saved under `<data>/evaluations/`.
+saved under `<data>/evaluations/`; the output ends with `Saved: PATH`, and `--json` carries the
+same path as `result_path`, as `bench` does.
 
 The result is relative to the reference, which is itself an artifact. The `cpu-int8-asym-ref` and
 `cpu-fp16-ref` registry profiles exist to prepare one, and never become a device's default.

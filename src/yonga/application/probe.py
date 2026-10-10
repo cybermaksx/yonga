@@ -55,6 +55,7 @@ from yonga.domain.artifacts import (
 from yonga.domain.compatibility import DeviceStatus
 from yonga.domain.diagnostics import (
     CancelledError,
+    CompileError,
     ConfigurationError,
     Diagnostic,
     FailureCategory,
@@ -79,6 +80,7 @@ __all__ = [
     "LocalArtifactStore",
     "ProbeOutcome",
     "ProbeService",
+    "RuntimeAvailability",
     "check_probe_options",
     "guard_smoke_test",
     "main",
@@ -164,6 +166,20 @@ def resolve_artifact(store: ArtifactStoreLike, reference: str | Path) -> Path:
             context={"reference": str(reference)},
         )
     )
+
+
+@runtime_checkable
+class RuntimeAvailability(Protocol):
+    """A runtime probe that can say whether OpenVINO itself imports.
+
+    :class:`~yonga.adapters.openvino_probe.OpenVINOProbe` satisfies it; the
+    ``RuntimeProbe`` port does not require it, so a probe without it is taken
+    to have a working runtime.
+    """
+
+    def available(self) -> tuple[bool, str | None]:
+        """Return ``(runtime importable, redacted import error)``."""
+        ...
 
 
 @runtime_checkable
@@ -629,6 +645,7 @@ class ProbeService:
                 )
             )
         artifact_dir = resolve_artifact(self._store, artifact_or_model)
+        self._require_runtime()
         manifest = self._store.manifest_for(artifact_dir)
         notes: list[str] = []
 
@@ -679,6 +696,29 @@ class ProbeService:
         )
 
     # --- internals --------------------------------------------------------
+
+    def _require_runtime(self) -> None:
+        """Refuse to probe when OpenVINO itself cannot be imported.
+
+        Every read and compile would fail with the same import error, which the
+        registry rightly does not recognise as a compiler signature. Without
+        this check a core-only installation reported an "unrecognised failure"
+        and a compilation exit code for what is one missing ``pip install``;
+        ``yonga bench`` already says so up front, with the environment exit
+        code, and the probe now does the same.
+        """
+        if not isinstance(self._runtime, RuntimeAvailability):
+            return
+        try:
+            available, error = self._runtime.available()
+        except Exception as exc:
+            available, error = False, redact_text(f"{type(exc).__name__}: {exc}")
+        if available:
+            return
+        # Imported here, not at module scope: see the module docstring.
+        from yonga.adapters.openvino_probe import openvino_missing_diagnostic
+
+        raise CompileError(openvino_missing_diagnostic(error))
 
     @staticmethod
     def _numeric_targets(
@@ -1058,6 +1098,18 @@ class ProbeService:
         role = (result.role or SubmodelRole.OTHER).value
         # A result without a role is the pipeline smoke test, which covers the whole model.
         label = role if result.role is not None else "pipeline smoke test"
+        # The full raw text goes to the job log: the terminal shows a summary of
+        # a long native compiler dump, and the diagnostics point here for the rest.
+        log = ctx.logger.error if severity is Severity.ERROR else ctx.logger.info
+        log(
+            "probe.result",
+            f"{label} on {result.device}: {result.status.value}",
+            device=result.device,
+            role=role,
+            status=result.status.value,
+            code=None if result.diagnostic is None else result.diagnostic.code,
+            raw=result.message or "",
+        )
         ctx.emit(
             ProgressKind.PROBE,
             f"{label} on {result.device}: {result.status.value}",
@@ -1196,7 +1248,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     when a device passed, 2 when nothing failed but something is inconclusive,
     1 otherwise. An invalid ``--quick``/``--timeout`` combination is reported on
     stderr and exits 70, as ``yonga probe`` does, so it is never mistaken for an
-    inconclusive probe; other argparse usage errors exit 2, as argparse's do.
+    inconclusive probe; other argparse usage errors exit 2, as argparse's do. A
+    refusal before anything is probed (no such artifact, no OpenVINO) is reported
+    on stderr with its own exit code, as ``yonga probe`` reports it.
     """
     import argparse
 
@@ -1251,13 +1305,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         smoke_tester=GenAISmokeTester(settings),
         isolated_smoke_tester=ChildProcessSmokeTester(smoke_child_runner(), settings=settings),
     )
-    outcome = service.probe_detailed(
-        args.artifact,
-        device=args.device,
-        all_submodels=args.all_submodels,
-        quick=args.quick,
-        timeout=args.timeout,
-    )
+    try:
+        outcome = service.probe_detailed(
+            args.artifact,
+            device=args.device,
+            all_submodels=args.all_submodels,
+            quick=args.quick,
+            timeout=args.timeout,
+        )
+    except YongaError as error:
+        found = error.diagnostic
+        print(f"{parser.prog}: {found.code}: {found.title}. {found.message}", file=sys.stderr)
+        return int(error.exit_code())
     document = outcome.model_dump(mode="json")
     document["role_matrix"] = outcome.role_matrix()
     document["inconclusive"] = outcome.inconclusive

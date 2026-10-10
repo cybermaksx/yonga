@@ -27,6 +27,7 @@ from typing import Any
 import numpy as np
 import numpy.typing as npt
 
+from yonga.adapters.native_output import capture_native_output, with_native_output
 from yonga.domain.diagnostics import CompileError, FailureCategory, diagnostic
 from yonga.util.redaction import redact_text
 
@@ -71,38 +72,48 @@ class LogitsModel:
         self.device = device.upper()
         self.properties = dict(properties or (CPU_PROPERTIES if self.device == "CPU" else {}))
         core = ov.Core()
-        try:
-            self._tokenizer = core.compile_model(str(self._dir / _TOKENIZER), "CPU")
-            if (self._dir / _VLM_LANGUAGE).is_file():
-                self._embeddings: Any = core.compile_model(
-                    str(self._dir / _VLM_EMBEDDINGS), self.device, self.properties
-                )
-                self._model = core.compile_model(
-                    str(self._dir / _VLM_LANGUAGE), self.device, self.properties
-                )
-                self._ids_input = "inputs_embeds"
-            elif (self._dir / _LLM).is_file():
-                self._embeddings = None
-                self._model = core.compile_model(
-                    str(self._dir / _LLM), self.device, self.properties
-                )
-                self._ids_input = "input_ids"
-            else:
-                raise FileNotFoundError(f"no {_LLM} or {_VLM_LANGUAGE} in {self._dir}")
-        except Exception as error:
-            raw = redact_text(str(error))
+        failure: Exception | None = None
+        # A plugin's compiler can write its real reason to the native
+        # descriptors, which would otherwise land on the terminal -- and on
+        # stdout, in the middle of a --json document.
+        with capture_native_output() as native:
+            try:
+                self._compile(core)
+            except Exception as error:
+                failure = error
+        if failure is not None:
+            raw = redact_text(with_native_output(str(failure), native))
+            reason = _last_line(redact_text(str(failure))) or type(failure).__name__
             raise CompileError(
                 diagnostic(
                     "eval.load_failed",
                     FailureCategory.UNKNOWN_RUNTIME_ERROR,
                     f"Could not load the artifact on {self.device} for evaluation",
-                    raw,
+                    f"OpenVINO could not compile {self._dir.name} on {self.device}: {reason}",
                     remediation=["Try --device cpu, or check the artifact with 'yonga probe'."],
                     raw_excerpt=raw,
                 )
-            ) from error
+            ) from failure
         self._inputs = {port.get_any_name(): port for port in self._model.inputs}
         self._request = self._model.create_infer_request()
+
+    def _compile(self, core: Any) -> None:
+        """Compile the tokenizer on CPU and the numeric submodels on the device."""
+        self._tokenizer = core.compile_model(str(self._dir / _TOKENIZER), "CPU")
+        if (self._dir / _VLM_LANGUAGE).is_file():
+            self._embeddings: Any = core.compile_model(
+                str(self._dir / _VLM_EMBEDDINGS), self.device, self.properties
+            )
+            self._model = core.compile_model(
+                str(self._dir / _VLM_LANGUAGE), self.device, self.properties
+            )
+            self._ids_input = "inputs_embeds"
+        elif (self._dir / _LLM).is_file():
+            self._embeddings = None
+            self._model = core.compile_model(str(self._dir / _LLM), self.device, self.properties)
+            self._ids_input = "input_ids"
+        else:
+            raise FileNotFoundError(f"no {_LLM} or {_VLM_LANGUAGE} in {self._dir}")
 
     def tokenize(self, text: str) -> npt.NDArray[np.int64]:
         """The artifact's own token ids for ``text``, as a 1-D array."""
@@ -140,3 +151,9 @@ class LogitsModel:
         self._model = None
         self._embeddings = None
         self._tokenizer = None
+
+
+def _last_line(text: str) -> str:
+    """The last non-blank line of ``text``: where an OpenVINO error states its reason."""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return lines[-1] if lines else ""

@@ -51,7 +51,7 @@ from yonga.application.jobs import (
     sweep_managed_workspaces,
 )
 from yonga.application.probe import ProbeOutcome, check_probe_options
-from yonga.application.progress import ProgressSink, null_sink
+from yonga.application.progress import ProgressEvent, ProgressKind, ProgressSink, null_sink
 from yonga.application.self_install import InstallAction, PathReport, TargetKind
 from yonga.application.wiring import Wiring, WiringFactory
 from yonga.config.settings import Settings, load_settings
@@ -1082,7 +1082,7 @@ def _probe(
     with open_job(
         settings=state.settings,
         requested_model=artifact,
-        progress=state.sink(),
+        progress=_ProbeProgress(state.sink()),
         target_device=target,
         create_temp=False,
     ) as job:
@@ -1102,9 +1102,18 @@ def _probe(
         payload["inconclusive"] = outcome.inconclusive
         state.emit(payload, ok=outcome.ok)
         return _probe_exit(outcome)
-    state.console.print(tables.probe_report(outcome.reports))
+    state.console.print(tables.probe_report(outcome.reports, verbose=state.console.verbose))
     for note in outcome.notes:
         state.console.print_error(note, style="dim")
+    unsettled = [report.device for report in outcome.reports if not report.ok]
+    if outcome.ok and unsettled:
+        # ``auto`` tries every candidate. A device that did not pass is worth
+        # knowing about, but it is not a verdict on an artifact that runs.
+        state.console.print_error(
+            f"This artifact runs on {', '.join(outcome.working_devices)}. The result for "
+            f"{', '.join(unsettled)} is for information only and changes nothing here.",
+            style="dim",
+        )
     if not outcome.ok:
         # The explanation shown is the one the exit code comes from: a definite
         # failure first, an inconclusive device only when nothing failed.
@@ -1113,6 +1122,28 @@ def _probe(
                 state.console.diagnostic(report.diagnostic)
                 break
     return _probe_exit(outcome)
+
+
+class _ProbeProgress:
+    """The probe's progress sink, without a diagnostic block for every failed row.
+
+    ``yonga probe`` explains its outcome once, when it knows it: a failure on
+    one device is the verdict only when no other device passed, and with
+    ``--device auto`` an NPU refusal printed in red, advice and all, read as
+    the answer for an artifact that had just passed on the GPU. Each failure
+    still has its progress line, its row in the report and its record in the
+    job log.
+    """
+
+    def __init__(self, sink: ProgressSink) -> None:
+        """Forward to ``sink``."""
+        self._sink = sink
+
+    def emit(self, event: ProgressEvent) -> None:
+        """Forward ``event``, dropping a probe result's diagnostic."""
+        if event.kind is ProgressKind.PROBE and event.diagnostic is not None:
+            event = event.model_copy(update={"diagnostic": None})
+        self._sink.emit(event)
 
 
 def _probe_verdict_order(outcome: ProbeOutcome) -> list[DeviceProbeReport]:
@@ -1371,10 +1402,15 @@ def eval_command(
     state = cli_state(ctx, json_output=json_output)
 
     def run() -> ExitCode:
+        target = _eval_device(device)
         try:
             import numpy  # noqa: F401  (eval computes distributions with it)
 
-            from yonga.application.evaluation import load_corpus, result_payload
+            from yonga.application.evaluation import (
+                evaluation_result_path,
+                load_corpus,
+                result_payload,
+            )
         except ImportError as error:
             raise ConfigurationError(
                 diagnostic(
@@ -1387,8 +1423,6 @@ def eval_command(
             ) from error
 
         service = state.graph.evaluation_service(progress=state.sink())
-        chosen = _device(device)
-        target = "CPU" if chosen in (None, "auto") else str(chosen)
         text = load_corpus(corpus) if corpus is not None else None
         result = service.evaluate(
             candidate,
@@ -1397,13 +1431,50 @@ def eval_command(
             corpus=text,
             allow_different_sources=allow_different_sources,
         )
+        path = evaluation_result_path(state.settings.paths, result)
         if state.json_mode:
-            state.emit(result_payload(result))
+            payload = result_payload(result)
+            payload["result_path"] = str(path)
+            state.emit(payload)
         else:
             state.console.print(tables.evaluation_result(result))
+            state.console.print(f"Saved: {path}")
         return ExitCode.SUCCESS
 
     _dispatch(state, run)
+
+
+#: The devices ``yonga eval`` scores on (``docs/CLI_SPEC.md`` section 13a).
+EVAL_DEVICES: tuple[str, ...] = ("cpu", "gpu")
+
+
+def _eval_device(value: str) -> str:
+    """Validate ``eval --device``: CPU or GPU, refused up front otherwise.
+
+    Scoring runs every passage through the IR as one prefill, which needs the
+    dynamic shapes the NPU compiler rejects, so the NPU is refused before any
+    model is loaded rather than after a compile failure. ``auto`` is CPU, the
+    default, as it has always been.
+    """
+    chosen = _device(value)
+    if chosen is None or chosen == "auto":
+        return "CPU"
+    if chosen.lower() not in EVAL_DEVICES:
+        raise ConfigurationError(
+            diagnostic(
+                "eval.device.unsupported",
+                FailureCategory.CONFIGURATION_ERROR,
+                "eval runs on the CPU or the GPU",
+                f"eval cannot score on {chosen}: it reads whole passages through the raw IR, "
+                "whose dynamic shapes the NPU compiler does not take.",
+                remediation=[
+                    "Use --device cpu (full precision, the default) or --device gpu.",
+                    "An artifact prepared for the NPU is evaluated on the CPU like any other.",
+                ],
+                context={"device": value},
+            )
+        )
+    return chosen
 
 
 # ======================================================================

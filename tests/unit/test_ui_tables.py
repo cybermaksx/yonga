@@ -911,3 +911,101 @@ def test_a_prune_plan_says_why_only_when_it_is_not_the_status() -> None:
     assert "Why" not in render(compile_cache_entries(entries, reasons=same), width=160)
     assert "older-than" in render(compile_cache_entries(entries, reasons=aged), width=160)
     assert "empty" in render(compile_cache_entries([]))
+
+
+#: The shape of a real deferred NPU compile: an exception chain, padding lines
+#: and the native compiler output appended after them.
+DEFERRED_NPU_TEXT = (
+    "A raw compile on NPU is not conclusive for this graph; the GenAI pipeline decides. "
+    "Raw error: Exception from src/inference/src/cpp/core.cpp:117:\n"
+    "Exception from src/plugins/intel_npu/src/plugin/src/plugin.cpp:560:\n"
+    "Compilation failed. Level0 pfnCreate2 result: ZE_RESULT_ERROR_INVALID_ARGUMENT\n"
+    "to_shape was called on a dynamic shape.\n"
+    "\n   \n\n\n\n\n"
+    "--- native output ---\n"
+    "[ERROR] [IE::FrontEnd::importNetwork] Upper bounds are not specified for node 'ShapeOf_1'"
+)
+
+
+def _deferred_npu_report() -> DeviceProbeReport:
+    """An NPU probe that passed: the raw compile deferred, the pipeline generated."""
+    return DeviceProbeReport(
+        device="NPU",
+        status=ProbeStatus.OK,
+        submodels=[
+            ProbeResult(
+                device="NPU",
+                role=SubmodelRole.LANGUAGE,
+                status=ProbeStatus.DEFERRED,
+                duration_seconds=0.7,
+                message=DEFERRED_NPU_TEXT,
+                diagnostic=diagnostic(
+                    "npu.compiler.dynamic_shape",
+                    FailureCategory.COMPILER_UNSUPPORTED_GRAPH,
+                    "The NPU needs a statically shaped graph",
+                    "The NPU compiler requires every tensor shape to be known.",
+                ),
+            ),
+            ProbeResult(device="CPU", role=SubmodelRole.TOKENIZER, status=ProbeStatus.OK),
+        ],
+        smoke_test=ProbeResult(
+            device="NPU", status=ProbeStatus.OK, message="generated 24 token(s)"
+        ),
+    )
+
+
+def test_a_passing_npu_probe_shows_its_deferred_raw_compile_in_one_line():
+    lines = render(probe_report([_deferred_npu_report()])).splitlines()
+
+    language = [line for line in lines if "language" in line]
+    assert len(language) == 1
+    assert "deferred" in language[0]
+    assert "the GenAI pipeline decides" in language[0]
+    text = "\n".join(lines)
+    assert "Exception from" not in text
+    assert "native output" not in text
+    assert "Upper bounds" not in text
+    assert all(line.strip() for line in lines), "no padded empty rows"
+    assert "generated 24 token(s)" in text
+
+
+def test_verbose_shows_the_raw_text_of_a_deferred_compile_without_its_blank_lines():
+    lines = render(probe_report([_deferred_npu_report()], verbose=True), width=200).splitlines()
+
+    text = "\n".join(lines)
+    assert "to_shape was called on a dynamic shape" in text
+    assert "Upper bounds are not specified" in text
+    assert all(line.strip() for line in lines), "no padded empty rows"
+
+
+def test_a_recognised_failure_row_is_named_by_its_diagnostic():
+    report = DeviceProbeReport(
+        device="NPU",
+        status=ProbeStatus.FAILED,
+        submodels=[ProbeResult(device="NPU", role=SubmodelRole.LANGUAGE, status=ProbeStatus.OK)],
+        smoke_test=ProbeResult(
+            device="NPU",
+            status=ProbeStatus.FAILED,
+            message="Exception from src/inference/src/cpp/core.cpp:117:\n\n\nCompilation failed",
+            diagnostic=diagnostic(
+                "npu.compiler.unsupported_graph",
+                FailureCategory.COMPILER_UNSUPPORTED_GRAPH,
+                "The NPU compiler refused this graph",
+                "One of the NPU compiler's passes could not compile this graph.",
+            ),
+        ),
+    )
+
+    text = render(probe_report([report]))
+
+    smoke = next(line for line in text.splitlines() if "smoke test" in line)
+    assert "The NPU compiler refused this graph" in smoke
+    assert "Exception from" not in text
+    assert "Exception from" in render(probe_report([report], verbose=True))
+
+
+def test_benchmark_summary_counts_runs_and_warmups_in_good_english():
+    result = benchmark().model_copy(update={"runs": 3, "warmups": 1})
+    assert "3 runs, 1 warmup)" in render(benchmark_summary(result))
+    result = benchmark().model_copy(update={"runs": 1, "warmups": 0})
+    assert "1 run, 0 warmups)" in render(benchmark_summary(result))
