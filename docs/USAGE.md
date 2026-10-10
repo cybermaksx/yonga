@@ -443,14 +443,16 @@ cleanly, by design, so a future device needs no code change.
 ## 6. When something fails
 
 ```bash
-yonga logs                      # recent jobs
-yonga logs JOB_ID               # one job as a table
+yonga logs                      # recent jobs: command, model, outcome, local start time
+yonga logs JOB_ID               # one job as a table (a unique id prefix is enough)
 yonga logs JOB_ID --raw         # the JSON Lines file
 yonga logs JOB_ID --bundle      # a .tar.gz to attach to a bug report
 ```
 
-Every job writes `~/.local/share/yonga/logs/<job>.jsonl` with the full raw error preserved, even
-when the terminal shows a short explanation. `--debug` adds the raw exception to the terminal.
+Every `prepare`, `probe` and `bench` job writes `~/.local/share/yonga/logs/<job>.jsonl` with the
+raw error preserved (the `job.error_detail` record), even when the terminal shows a short
+explanation, and ends it with `job.completed`, `job.failed` or `job.cancelled`. Record times are
+shown in local time. `--debug` adds the raw exception to the terminal.
 
 `--bundle` packs the job log, its state, the artifact's manifest and validation record when there
 is one, and a `doctor --json` host report into a single archive, with a `README.txt` listing what

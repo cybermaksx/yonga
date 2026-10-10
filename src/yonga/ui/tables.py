@@ -12,6 +12,7 @@ from __future__ import annotations
 import sys
 from collections.abc import Sequence
 from datetime import datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 
 from pydantic import BaseModel, ConfigDict
@@ -35,7 +36,7 @@ from yonga.domain.compile_cache import CacheEntryStatus, CompileCacheEntry
 from yonga.domain.diagnostics import FailureCategory, HealthSection, Severity
 from yonga.domain.evaluation import EvaluationResult
 from yonga.domain.models import ModelMetadata
-from yonga.domain.plans import PreparationPlan
+from yonga.domain.plans import JobStatus, JobSummary, PreparationPlan
 from yonga.domain.publication import PublishPlan
 from yonga.ui.console import human_bytes, human_duration, status_icon, status_style
 
@@ -50,10 +51,14 @@ __all__ = [
     "compile_cache_entries",
     "doctor_report",
     "inspect_report",
+    "job_heading",
+    "job_list",
+    "local_clock",
     "preparation_plan",
     "probe_report",
     "registry_explanation",
     "search_results",
+    "utc_offset",
 ]
 
 _DASH = "—"
@@ -1454,3 +1459,210 @@ def evaluation_result(result: EvaluationResult) -> RenderableType:
         box=ROUNDED,
         padding=(1, 2),
     )
+
+
+# ----------------------------------------------------------------------
+# logs
+# ----------------------------------------------------------------------
+#: Severity shown for each job status in ``yonga logs``.
+_JOB_STATUS_SEVERITY: dict[JobStatus, Severity] = {
+    JobStatus.OK: Severity.OK,
+    JobStatus.FAILED: Severity.ERROR,
+    JobStatus.CANCELLED: Severity.WARNING,
+    JobStatus.RUNNING: Severity.INFO,
+    JobStatus.UNFINISHED: Severity.WARNING,
+    JobStatus.UNKNOWN: Severity.UNKNOWN,
+}
+
+#: Job id characters shown in the index; ``yonga logs`` accepts any unique prefix.
+_JOB_ID_PREFIX = 8
+
+#: Narrowest the model column is squeezed to before whole columns are dropped.
+_JOB_MODEL_MIN_WIDTH = 16
+
+#: The index's columns, in order, as ``(key, header)``.
+_JOB_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("job", "job"),
+    ("started", "started"),
+    ("command", "command"),
+    ("model", "model"),
+    ("device", "device"),
+    ("status", "status"),
+    ("took", "took"),
+    ("log", "log"),
+)
+
+#: Columns given up, in this order, when the index does not fit the terminal.
+_JOB_DROP_ORDER: tuple[str, ...] = ("log", "device", "took", "started")
+
+#: Columns whose values are right-aligned.
+_JOB_NUMERIC: frozenset[str] = frozenset({"took", "log"})
+
+
+def utc_offset(moment: datetime) -> str:
+    """Name the local zone ``moment`` is shown in, as ``UTC+03:00``."""
+    offset = moment.astimezone().strftime("%z") or "+0000"
+    return f"UTC{offset[:3]}:{offset[3:]}"
+
+
+def local_clock(stamp: object) -> str:
+    """Turn a job log record's UTC ``timestamp`` into local ``HH:MM:SS.mmm``.
+
+    A value that does not parse is shown as the log wrote it, cut to the clock.
+    """
+    text = str(stamp or "")
+    try:
+        moment = datetime.fromisoformat(text)
+    except ValueError:
+        return text[11:23]
+    if moment.tzinfo is None:
+        return text[11:23]
+    local = moment.astimezone()
+    return local.strftime("%H:%M:%S.") + f"{local.microsecond // 1000:03d}"
+
+
+def _job_status_text(summary: JobSummary) -> Text:
+    """Render a job's outcome in the colour of its severity."""
+    return _status_text(_JOB_STATUS_SEVERITY[summary.status], summary.status.value)
+
+
+def _job_model(summary: JobSummary) -> str | None:
+    """The model reference as the index shows it: a path by its last component."""
+    model = summary.model
+    if model and model.startswith(("/", "~", ".")):
+        return Path(model).name or model
+    return model
+
+
+def _job_cells(summary: JobSummary, *, zone: str | None) -> dict[str, Text]:
+    """Render one job as a cell per column key."""
+    started = _timestamp(summary.started_at)
+    if summary.started_at is not None and zone is None:
+        started = f"{started} {utc_offset(summary.started_at)}"
+    duration = summary.duration_seconds
+    return {
+        "job": Text(summary.job_id[:_JOB_ID_PREFIX], style="bold"),
+        "started": _text(started),
+        "command": _text(summary.command),
+        "model": _text(_job_model(summary)),
+        "device": _text(summary.device),
+        "status": _job_status_text(summary),
+        "took": _text(human_duration(duration) if duration is not None else None),
+        "log": _text(human_bytes(summary.size_bytes)),
+    }
+
+
+def _job_table(
+    rows: Sequence[dict[str, Text]],
+    *,
+    dropped: frozenset[str],
+    model_width: int | None,
+    caption: str | None,
+) -> Table:
+    """Build the ``yonga logs`` index for one layout."""
+    table = Table(
+        box=SIMPLE,
+        show_edge=False,
+        pad_edge=False,
+        header_style="bold",
+        padding=(0, 1, 0, 0),
+        caption=caption,
+        caption_justify="left",
+        caption_style="dim",
+    )
+    keys = [key for key, _ in _JOB_COLUMNS if key not in dropped]
+    headers = dict(_JOB_COLUMNS)
+    for key in keys:
+        table.add_column(
+            headers[key],
+            no_wrap=True,
+            overflow="ellipsis",
+            justify="right" if key in _JOB_NUMERIC else "left",
+            max_width=model_width if key == "model" else None,
+        )
+    for cells in rows:
+        table.add_row(*(cells[key] for key in keys))
+    return table
+
+
+class _JobList:
+    """The ``yonga logs`` index, laid out for the terminal it is printed on.
+
+    The model column gives way first, down to :data:`_JOB_MODEL_MIN_WIDTH`;
+    after that whole columns are dropped in :data:`_JOB_DROP_ORDER`, so the job
+    prefix, the command and the outcome are never reduced to an ellipsis.
+    """
+
+    def __init__(self, summaries: Sequence[JobSummary]) -> None:
+        """Render the cells once; the layout is chosen at render time."""
+        offsets = {
+            utc_offset(summary.started_at)
+            for summary in summaries
+            if summary.started_at is not None
+        }
+        zone = next(iter(offsets)) if len(offsets) == 1 else None
+        self._caption = f"Start times are local, {zone}." if zone else None
+        self._rows = [_job_cells(summary, zone=zone) for summary in summaries]
+        self._model_width = max([len("model"), *(row["model"].cell_len for row in self._rows)])
+
+    def table_for(self, console: Console, options: ConsoleOptions) -> Table:
+        """Return the widest layout that fits ``options``."""
+        wide = options.update_width(_LIST_MEASURE_WIDTH)
+        dropped: set[str] = set()
+        for key in (None, *_JOB_DROP_ORDER):
+            if key is not None:
+                dropped.add(key)
+            candidate = self._layout(frozenset(dropped), None)
+            excess = Measurement.get(console, wide, candidate).maximum - options.max_width
+            if excess <= 0:
+                return candidate
+            squeezed = self._model_width - excess
+            if squeezed >= _JOB_MODEL_MIN_WIDTH:
+                return self._layout(frozenset(dropped), squeezed)
+        return self._layout(frozenset(dropped), _JOB_MODEL_MIN_WIDTH)
+
+    def _layout(self, dropped: frozenset[str], model_width: int | None) -> Table:
+        """One layout of the index."""
+        caption = None if "started" in dropped else self._caption
+        return _job_table(self._rows, dropped=dropped, model_width=model_width, caption=caption)
+
+    def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
+        """Render the chosen layout."""
+        yield self.table_for(console, options)
+
+    def __rich_measure__(self, console: Console, options: ConsoleOptions) -> Measurement:
+        """Measure the layout that would be chosen for ``options``."""
+        return Measurement.get(console, options, self.table_for(console, options))
+
+
+def job_list(summaries: Sequence[JobSummary]) -> RenderableType:
+    """Render the ``yonga logs`` index: which job is which, and how each ended.
+
+    Start times are local. The zone is named once, under the table, when every
+    row shares it, and on each row otherwise (a list spanning a daylight saving
+    change).
+    """
+    return _JobList(summaries)
+
+
+def job_heading(summary: JobSummary) -> RenderableType:
+    """Render the lines above one job's records: what ran, how it ended, the zone."""
+    lines: list[RenderableType] = []
+    facts = [value for value in (summary.command, summary.model, summary.device) if value]
+    status = _job_status_text(summary)
+    if summary.code:
+        status.append(f" ({summary.code})", style="dim")
+    duration = summary.duration_seconds
+    if duration is not None:
+        status.append(f", took {human_duration(duration)}", style="dim")
+    lines.append(Text.assemble(("  ", ""), (" ".join(facts) + "  " if facts else "", ""), status))
+    if summary.started_at is not None:
+        local = summary.started_at.astimezone()
+        lines.append(
+            Text(
+                f"  Started {local.strftime('%Y-%m-%d %H:%M:%S')} {utc_offset(local)}; "
+                "the times below are local.",
+                style="dim",
+            )
+        )
+    return Group(*lines)

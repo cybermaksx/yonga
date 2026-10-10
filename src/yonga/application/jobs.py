@@ -54,8 +54,8 @@ from yonga.domain.diagnostics import (
     YongaError,
     diagnostic,
 )
-from yonga.domain.plans import JobStage, JobState
-from yonga.util.jsonlog import JobLogger, null_logger
+from yonga.domain.plans import JobStage, JobState, JobStatus, JobSummary
+from yonga.util.jsonlog import LEVEL_ERROR, LEVEL_WARNING, JobLogger, null_logger
 from yonga.util.redaction import environment_secrets
 
 __all__ = [
@@ -63,11 +63,14 @@ __all__ = [
     "STATE_DOCUMENT_SUFFIX",
     "JobContext",
     "JobStateStore",
+    "JobSummary",
     "SweepReport",
     "WorkspaceSweep",
     "live_job_ids",
     "new_job_id",
     "open_job",
+    "summarise_job",
+    "summarise_jobs",
     "sweep_job_directories",
     "sweep_managed_workspaces",
 ]
@@ -281,7 +284,19 @@ class JobContext:
         _remove_tree(directory)
 
     def fail(self, stage: JobStage, diagnostic: Diagnostic) -> None:
-        """Record a terminal failure with the stage it happened in.
+        """Record a terminal failure, or a cancellation, and where the job got to.
+
+        ``stage`` is the step that was running when the job ended, which is the
+        stage it was working *towards*: a conversion cancelled half-way is
+        recorded as ``failed_before: exported``, with ``stage`` naming the last
+        stage it actually reached, so the log never claims a stage that was not.
+
+        A diagnostic in the ``user_cancelled`` category ends the job as
+        ``cancelled`` (a ``job.cancelled`` warning) rather than ``failed``: a
+        Ctrl-C is not a defect. The raw text the diagnostic carries is written
+        to the log as ``job.error_detail`` first, so ``yonga logs JOB --raw``
+        and a bug-report bundle hold the compiler's or the tool's own words and
+        not only the explanation.
 
         The staging retention policy runs first so that the path of any retained
         partial export reaches both the persisted job state and the diagnostic
@@ -293,15 +308,59 @@ class JobContext:
             hint = f"Partial output was kept for diagnosis at {retained}"
             if hint not in diagnostic.remediation:
                 diagnostic.remediation.append(hint)
-        self.logger.error(
-            "job.failed",
+        cancelled = diagnostic.category is FailureCategory.USER_CANCELLED
+        reached = self.state.stage if self.state is not None else stage
+        where: dict[str, object] = {"stage": reached.value}
+        if stage is not reached:
+            where["failed_before"] = stage.value
+        if diagnostic.raw_excerpt:
+            self.logger.log(
+                LEVEL_WARNING if cancelled else LEVEL_ERROR,
+                "job.error_detail",
+                diagnostic.title,
+                code=diagnostic.code,
+                matched_rule_id=diagnostic.matched_rule_id,
+                context=dict(diagnostic.context),
+                raw=diagnostic.raw_excerpt,
+            )
+        self.logger.log(
+            LEVEL_WARNING if cancelled else LEVEL_ERROR,
+            "job.cancelled" if cancelled else "job.failed",
             diagnostic.message,
-            stage=stage.value,
+            **where,
             code=diagnostic.code,
             category=diagnostic.category.value,
         )
         if self.state is not None:
-            self.state.fail(diagnostic)
+            self.state.fail(diagnostic, cancelled=cancelled)
+
+    def complete(self) -> None:
+        """Record that the job ran to its end. Never raises.
+
+        A preparation reaches ``ready`` itself; a probe or a benchmark has no
+        artifact to make ready, so its state used to stay at ``created`` and the
+        job looked live for :data:`LIVE_JOB_GRACE_HOURS`, with a log that held
+        nothing but ``job.created``. Every job that ends without an exception now
+        ends with ``job.completed`` and a terminal stage. A job whose service
+        already recorded a failure is left as it is.
+        """
+        state = self.state
+        if state is not None and state.stage.is_terminal and not state.stage.succeeded:
+            return
+        with suppress(Exception):
+            fields: dict[str, object] = {}
+            if state is not None:
+                if not state.stage.is_terminal:
+                    state.advance(JobStage.COMPLETED)
+                fields["stage"] = state.stage.value
+                elapsed = (_now() - state.state.created_at).total_seconds()
+                fields["duration_seconds"] = round(max(0.0, elapsed), 3)
+            self.logger.info("job.completed", "job completed", **fields)
+
+    @property
+    def cancelled_by_user(self) -> bool:
+        """Whether the job's recorded end is a cancellation."""
+        return self.state is not None and self.state.stage is JobStage.CANCELLED
 
     def fail_unfinished(self, error: BaseException) -> None:
         """Record ``error`` as the job's end, unless a terminal state is already recorded.
@@ -364,6 +423,7 @@ class JobStateStore:
         job_id: str,
         requested_model: str,
         target_device: str | None = None,
+        command: str | None = None,
     ) -> JobStateStore:
         """Create a new state document in the ``created`` stage."""
         now = _now()
@@ -373,6 +433,7 @@ class JobStateStore:
             created_at=now,
             updated_at=now,
             requested_model=requested_model,
+            command=command,
             target_device=target_device,
             history=[(now.isoformat(), JobStage.CREATED.value)],
         )
@@ -423,9 +484,9 @@ class JobStateStore:
         """The stage the job last reached."""
         return self._state.stage
 
-    def fail(self, diagnostic: Diagnostic) -> None:
-        """Move the job to ``failed``, recording the diagnostic, and persist."""
-        self._state.advance(JobStage.FAILED)
+    def fail(self, diagnostic: Diagnostic, *, cancelled: bool = False) -> None:
+        """Move the job to ``failed`` (or ``cancelled``), recording the diagnostic."""
+        self._state.advance(JobStage.CANCELLED if cancelled else JobStage.FAILED)
         self._state.diagnostic = diagnostic
         self.save()
 
@@ -527,6 +588,96 @@ def live_job_ids(paths: Paths, *, now: datetime | None = None) -> frozenset[str]
         if not terminal:
             live.add(job_id)
     return frozenset(live)
+
+
+def _first_timestamp(log_path: Path) -> datetime | None:
+    """The timestamp of a job log's first record, for a job without a state document."""
+    try:
+        with log_path.open(encoding="utf-8", errors="replace") as handle:
+            first = handle.readline()
+        record = json.loads(first)
+    except (OSError, ValueError):
+        return None
+    stamp = record.get("timestamp") if isinstance(record, dict) else None
+    if not isinstance(stamp, str):
+        return None
+    try:
+        moment = datetime.fromisoformat(stamp)
+    except ValueError:
+        return None
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
+
+
+def _job_status(state: JobState, *, live: bool) -> JobStatus:
+    """How a job ended, read from its state document."""
+    stage = state.stage
+    if stage.succeeded:
+        return JobStatus.OK
+    if stage is JobStage.CANCELLED:
+        return JobStatus.CANCELLED
+    if stage is JobStage.FAILED:
+        # Releases before ``cancelled`` existed recorded a Ctrl-C as a failure.
+        cancelled = (
+            state.diagnostic is not None
+            and state.diagnostic.category is FailureCategory.USER_CANCELLED
+        )
+        return JobStatus.CANCELLED if cancelled else JobStatus.FAILED
+    return JobStatus.RUNNING if live else JobStatus.UNFINISHED
+
+
+def summarise_job(
+    log_path: Path, *, live: frozenset[str] | None = None, paths: Paths | None = None
+) -> JobSummary:
+    """Describe one job from its log and, when there is one, its state document.
+
+    ``live`` is the result of :func:`live_job_ids`; it is computed from
+    ``paths`` when not given. Never raises: a job whose state cannot be read is
+    summarised from its log alone, with an ``unknown`` status.
+    """
+    job_id = log_path.stem
+    size = 0
+    with suppress(OSError):
+        size = log_path.stat().st_size
+    summary = JobSummary(job_id=job_id, log_path=log_path, size_bytes=size)
+    state_path = log_path.with_name(f"{job_id}{STATE_DOCUMENT_SUFFIX}")
+    try:
+        state = JobStateStore.load(state_path).state
+    except (OSError, ValueError):
+        summary.started_at = _first_timestamp(log_path)
+        return summary
+    if live is None:
+        live = live_job_ids(paths) if paths is not None else frozenset()
+    summary.started_at = state.created_at
+    summary.ended_at = state.updated_at if state.stage.is_terminal else None
+    summary.command = state.command
+    summary.model = state.requested_model
+    summary.device = state.target_device
+    summary.stage = state.stage
+    summary.status = _job_status(state, live=job_id in live)
+    if state.diagnostic is not None and summary.status in {JobStatus.FAILED, JobStatus.CANCELLED}:
+        summary.code = state.diagnostic.code
+    return summary
+
+
+def summarise_jobs(paths: Paths, *, limit: int | None = None) -> list[JobSummary]:
+    """Summarise the jobs that have a log, most recently written first. Never raises."""
+    directory = paths.logs_dir
+    try:
+        logs = [path for path in directory.glob("*.jsonl") if path.is_file()]
+    except OSError:  # pragma: no cover - unreadable log directory
+        return []
+
+    def written(path: Path) -> float:
+        try:
+            return path.stat().st_mtime
+        except OSError:  # pragma: no cover - removed while listing
+            return 0.0
+
+    logs.sort(key=written, reverse=True)
+    if limit is not None:
+        logs = logs[: max(0, limit)]
+    live = live_job_ids(paths)
+    return [summarise_job(path, live=live) for path in logs]
 
 
 def _sweepable_children(root: Path) -> list[Path]:
@@ -680,6 +831,7 @@ def open_job(
     progress: ProgressSink | None = None,
     target_device: str | None = None,
     create_temp: bool = True,
+    command: str | None = None,
 ) -> Iterator[JobContext]:
     """Open a job: allocate an id, logger, state file and managed temp directory.
 
@@ -687,10 +839,17 @@ def open_job(
     this job's id protected, so neither root can grow without limit however many
     jobs fail (``SPEC.md`` section 14).
 
-    On clean exit the managed temp directory and the emptied staging husk are
-    removed. On failure the temp directory is left in place so the job can be
-    diagnosed, matching ``SPEC.md`` section 10, and the staging directory is kept
-    only when it holds a partial export worth reading.
+    On clean exit the job records ``job.completed`` and a terminal stage, and the
+    managed temp directory and the emptied staging husk are removed. On failure
+    the temp directory is left in place so the job can be diagnosed, matching
+    ``SPEC.md`` section 10, and the staging directory is kept only when it holds
+    a partial export worth reading. A job the user cancelled has nothing to
+    diagnose, so its temp directory (the tooling's intermediates, often a
+    gigabyte or more) is removed as on success; its staging directory still
+    follows the policy, because a finished export in it is what the next
+    ``prepare`` reuses.
+
+    ``command`` names the command that opened the job, for ``yonga logs``.
     """
     paths = settings.paths
     paths.ensure()
@@ -716,6 +875,7 @@ def open_job(
         job_id=jid,
         requested_model=requested_model,
         target_device=target_device,
+        command=command,
     )
 
     ctx = JobContext(
@@ -727,7 +887,10 @@ def open_job(
         temp_env=temp_env,
         state=state,
     )
-    logger.info("job.created", "job created", model=requested_model, temp_dir=str(temp_dir))
+    created: dict[str, object] = {"model": requested_model, "temp_dir": str(temp_dir)}
+    if command is not None:
+        created["command"] = command
+    logger.info("job.created", "job created", **created)
 
     # Swept only once this job's state document exists, so a sweep running in a
     # second process already sees this job as live and leaves its directories be.
@@ -751,11 +914,19 @@ def open_job(
         raise
     finally:
         if succeeded:
+            ctx.complete()
             if create_temp:
                 _remove_tree(temp_dir)
             ctx.discard_staging()
         else:
-            if create_temp:
+            if create_temp and ctx.cancelled_by_user:
+                _remove_tree(temp_dir)
+                logger.info(
+                    "job.temp_discarded",
+                    "temporary directory of a cancelled job removed",
+                    temp_dir=str(temp_dir),
+                )
+            elif create_temp:
                 logger.info(
                     "job.temp_retained",
                     "temporary directory retained for diagnosis",

@@ -239,7 +239,7 @@ CREATED
   -> READY
 ```
 
-Failure at any stage transitions to `FAILED` and records stage, diagnostic, log path, and resumability.
+Failure at any stage transitions to `FAILED` and records stage, diagnostic, log path, and resumability. A user cancellation transitions to `CANCELLED` instead. Jobs that make no artifact (`probe`, `bench`) end in `COMPLETED` when they run to their end.
 
 Preparation jobs use a UUID job ID. Persist a small job state JSON so an interrupted conversion can be diagnosed. Do not promise generic resumability of upstream export unless verified; initial implementation may restart export while reusing cached downloads.
 
