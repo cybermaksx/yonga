@@ -27,6 +27,7 @@ Intel accelerator by handing it fake probes.
 from __future__ import annotations
 
 import os
+import shlex
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -40,6 +41,7 @@ from yonga.adapters.openvino_probe import (
     npu_driver_version,
 )
 from yonga.application.progress import ProgressEvent, ProgressKind, ProgressSink, null_sink
+from yonga.application.self_install import CommandRelation, InstallationStatus, InstallKind
 from yonga.config.settings import Settings
 from yonga.domain.compile_cache import CompileCacheInventory
 from yonga.domain.diagnostics import (
@@ -181,6 +183,8 @@ class DoctorReport(BaseModel):
     notes: list[str] = Field(default_factory=list)
     compile_cache: dict[str, object] | None = None
     """Size and reclaimable bytes of the compile cache, when it could be measured."""
+    installation: dict[str, object] | None = None
+    """How yonga runs (AppImage or Python environment) and what 'yonga' on PATH is."""
 
     @property
     def checks(self) -> list[HealthCheck]:
@@ -258,12 +262,15 @@ class DoctorService:
         progress: ProgressSink | None = None,
         export_environments: Callable[[], Sequence[ExportEnvironment]] | None = None,
         compile_cache: Callable[[], CompileCacheInventory] | None = None,
+        installation: Callable[[], InstallationStatus] | None = None,
     ) -> None:
         """Store the injected adapters. Nothing is probed until :meth:`run`.
 
         ``export_environments`` lists the managed export environments, so the
         report can say how much disk they hold. ``compile_cache`` measures the
         OpenVINO compile cache, so it can say how much of it is reclaimable.
+        ``installation`` says how yonga is running and what ``yonga`` on PATH
+        resolves to, for the Host section's install check.
         """
         self._hardware = hardware_probe
         self._runtime = runtime_probe
@@ -274,12 +281,15 @@ class DoctorService:
         self._export_environments = export_environments
         self._compile_cache = compile_cache
         self._compile_cache_summary: dict[str, object] | None = None
+        self._installation = installation
+        self._installation_summary: dict[str, object] | None = None
 
     # --- entry point ---------------------------------------------------
 
     def run(self, *, full: bool = False) -> DoctorReport:
         """Collect every health section and return the report. Never raises."""
         self._compile_cache_summary = None
+        self._installation_summary = None
         notes: list[str] = []
         inventory = self._inventory(full=full, notes=notes)
         auth = self._auth_info(inventory, notes)
@@ -310,6 +320,7 @@ class DoctorService:
             full=full,
             notes=notes,
             compile_cache=self._compile_cache_summary,
+            installation=self._installation_summary,
         )
 
     # --- adapter calls -------------------------------------------------
@@ -390,6 +401,7 @@ class DoctorService:
                 host.python_version,
                 unknown_remediation=["The running Python version could not be determined."],
             ),
+            *self._installation_checks(),
             _fact(
                 "host.cpu",
                 "CPU",
@@ -428,6 +440,25 @@ class DoctorService:
                 )
             )
         return HealthSection(id="host", title="Host", checks=_finalise(checks))
+
+    def _installation_checks(self) -> list[HealthCheck]:
+        """How yonga runs, and whether ``yonga`` on PATH is this installation."""
+        if self._installation is None:
+            return []
+        try:
+            status = self._installation()
+        except Exception as exc:
+            return [
+                _check(
+                    "host.install",
+                    "Install",
+                    Severity.UNKNOWN,
+                    value="unknown",
+                    remediation=[f"How yonga is installed could not be read: {_describe(exc)}"],
+                )
+            ]
+        self._installation_summary = status.to_json()
+        return [_installation_check(status)]
 
     def _memory_check(self, inventory: HardwareInventory) -> HealthCheck:
         """RAM total and availability, warning on a host too small to convert on."""
@@ -877,6 +908,89 @@ def _finalise(checks: Sequence[HealthCheck]) -> list[HealthCheck]:
             continue
         result.append(check)
     return result
+
+
+def _installation_check(status: InstallationStatus) -> HealthCheck:
+    """The ``host.install`` check (``docs/CLI_SPEC.md`` section 3).
+
+    Running from an AppImage, a missing or different ``yonga`` on PATH is a
+    warning with ``self install`` as the remedy: the user downloaded a file and
+    typing ``yonga`` does not run it. For a Python environment the check is
+    information only; pip put the command where pip puts commands.
+    """
+    running = status.running
+    command = status.command
+    if running.kind is InstallKind.APPIMAGE and running.appimage is not None:
+        image = running.appimage
+        rerun = f"{shlex.quote(str(image))} self install"
+        if status.relation is CommandRelation.THIS and command is not None:
+            where = "this AppImage" if _same_path(command, image) else f"{command}, a copy of it"
+            return _check(
+                "host.install",
+                "Install",
+                Severity.OK,
+                value="AppImage",
+                detail=f"{image}; 'yonga' on PATH is {where}",
+            )
+        if status.relation is CommandRelation.MISSING or command is None:
+            return _check(
+                "host.install",
+                "Install",
+                Severity.WARNING,
+                value="AppImage",
+                detail=f"{image}; no 'yonga' command on PATH",
+                remediation=[
+                    f"Put it on PATH as 'yonga' (a copy in ~/.local/bin): {rerun}",
+                ],
+            )
+        if status.relation is CommandRelation.OTHER_APPIMAGE:
+            version = (
+                f"yonga {status.command_version}" if status.command_version else "version unknown"
+            )
+            return _check(
+                "host.install",
+                "Install",
+                Severity.WARNING,
+                value="AppImage",
+                detail=(f"{image}; 'yonga' on PATH is a different AppImage: {command} ({version})"),
+                remediation=[
+                    "Typing 'yonga' runs that one, not this AppImage.",
+                    "Replace it with this one: "
+                    f"{rerun} --bin-dir {shlex.quote(str(command.parent))}",
+                ],
+            )
+        return _check(
+            "host.install",
+            "Install",
+            Severity.WARNING,
+            value="AppImage",
+            detail=f"{image}; 'yonga' on PATH is another installation: {command}",
+            remediation=[
+                "Typing 'yonga' runs that one, not this AppImage.",
+                f"Run this AppImage by its path, or remove the other installation and run {rerun}",
+            ],
+        )
+    prefix = running.prefix
+    if command is None:
+        where = "no 'yonga' command on PATH (activate the environment, or use python -m yonga)"
+    elif status.relation is CommandRelation.THIS:
+        where = f"'yonga' on PATH is this environment's ({command})"
+    elif status.relation is CommandRelation.OTHER_APPIMAGE:
+        where = f"'yonga' on PATH is an AppImage: {command}"
+    else:
+        where = f"'yonga' on PATH is another installation: {command}"
+    return _check(
+        "host.install",
+        "Install",
+        Severity.INFO,
+        value="Python environment",
+        detail=f"{prefix}; {where}",
+    )
+
+
+def _same_path(left: Path, right: Path) -> bool:
+    """Whether two paths resolve to the same place."""
+    return os.path.realpath(left) == os.path.realpath(right)
 
 
 def _package_check(

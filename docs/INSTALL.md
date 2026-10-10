@@ -44,12 +44,38 @@ Fedora 29 and later). The build fails if any bundled library needs a newer glibc
 ```bash
 sha256sum --check yonga-X.Y.Z-x86_64.AppImage.sha256
 chmod +x yonga-X.Y.Z-x86_64.AppImage
-mv yonga-X.Y.Z-x86_64.AppImage ~/.local/bin/yonga
+./yonga-X.Y.Z-x86_64.AppImage self install
 yonga doctor
 ```
 
+`self install` copies the running AppImage to `~/.local/bin/yonga` (another directory with
+`--bin-dir DIR`): written to a temporary file in that directory, flushed, made `0755` and renamed
+into place, so a shell never sees half a file. The downloaded file stays where it was and can be
+deleted afterwards. What else it does, and does not do:
+
+- **PATH.** It checks whether the directory is on `PATH` and whether `yonga` now runs the copy. If
+  not, it prints what to do and exits 2. Ubuntu's and Debian's `~/.profile` add `~/.local/bin` to
+  `PATH` at login, but only when the directory already exists then, so after the first install log
+  out and back in once, or run `export PATH="$HOME/.local/bin:$PATH"` in the current shell. yonga
+  never edits `~/.profile`, `~/.bashrc` or any other startup file.
+- **Upgrades.** Run `self install` from the new AppImage. An older yonga AppImage at the target is
+  replaced after a question (`--yes` answers it), showing both versions where they are known.
+  Running the same file again says it is already installed.
+- **What it never touches.** Anything at `~/.local/bin/yonga` that is not an AppImage (a pip or pipx
+  command, a symbolic link, a directory, a script) is refused and left as it is. A directory you
+  cannot write to is refused too: it never uses sudo, so choose one you own with `--bin-dir`.
+- **Removing it.** `yonga self uninstall` removes the copy after a question. Prepared models, logs,
+  caches and settings stay; it prints where they are.
+
+`doctor` reports how yonga is running (the AppImage's path, or the Python environment) and warns
+when an AppImage is not what `yonga` on `PATH` runs, naming the other installation when there is
+one. A pip install has no `self install`: its `yonga` command lives in the environment's `bin`
+directory (activate the environment, or use `pipx install 'yonga[openvino,export]'` for a command
+in `~/.local/bin`).
+
 - **FUSE.** The image mounts itself with FUSE. Without it (containers, some minimal installs),
-  `APPIMAGE_EXTRACT_AND_RUN=1 yonga ...` unpacks it to a temporary directory instead.
+  `APPIMAGE_EXTRACT_AND_RUN=1 yonga ...` unpacks it to a temporary directory instead (the
+  `self install` above works the same way with it).
 - **Drivers.** The Intel GPU and NPU drivers belong to the host (section 3 covers the NPU); an AppImage
   cannot carry kernel drivers or the compute runtime, and `doctor` reports what is missing.
 - **Conversion.** The export toolchain (`optimum-intel`, `nncf`, `transformers`, `torch`) is not in

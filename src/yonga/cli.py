@@ -51,6 +51,7 @@ from yonga.application.jobs import (
 )
 from yonga.application.probe import ProbeOutcome, check_probe_options
 from yonga.application.progress import ProgressSink, null_sink
+from yonga.application.self_install import InstallAction, PathReport, TargetKind
 from yonga.application.wiring import Wiring, WiringFactory
 from yonga.config.settings import Settings, load_settings
 from yonga.domain.artifacts import ArtifactSummary, DeviceProbeReport, ProbeStatus
@@ -467,6 +468,13 @@ cache_app = typer.Typer(
     add_completion=False,
 )
 app.add_typer(cache_app, name="cache")
+self_app = typer.Typer(
+    name="self",
+    help="Put the yonga AppImage on PATH as 'yonga', or take it off again.",
+    no_args_is_help=True,
+    add_completion=False,
+)
+app.add_typer(self_app, name="self")
 
 
 def _version_callback(value: bool) -> None:
@@ -1985,6 +1993,150 @@ def _cache_prune(
         for failure in report.failed:
             console.print_error(f"Could not remove {failure.path}: {failure.error}")
     return ExitCode.WARNINGS if report.failed else ExitCode.SUCCESS
+
+
+# ======================================================================
+# self
+# ======================================================================
+_BIN_DIR_HELP = "Directory to install the 'yonga' command in (default: ~/.local/bin)."
+
+
+@self_app.command("install")
+def self_install(
+    ctx: typer.Context,
+    bin_dir: Path | None = typer.Option(None, "--bin-dir", metavar="DIR", help=_BIN_DIR_HELP),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Replace an old AppImage without asking."),
+    json_output: bool = typer.Option(False, "--json", help="Emit the outcome as JSON."),
+) -> None:
+    """Copy the running AppImage to ~/.local/bin/yonga so 'yonga' works in any shell."""
+    state = cli_state(ctx, json_output=json_output)
+    _dispatch(state, lambda: _self_install(state, bin_dir=bin_dir, yes=yes))
+
+
+def _self_install(state: CliState, *, bin_dir: Path | None, yes: bool) -> ExitCode:
+    """Plan, confirm a replacement, copy atomically, then check PATH (section 12c)."""
+    service = state.graph.self_install_service()
+    plan = service.plan_install(bin_dir)
+    console = state.console
+    target = plan.target.path
+    if plan.action is InstallAction.REPLACE:
+        old = f"yonga {plan.previous_version}" if plan.previous_version else "version unknown"
+        modified = plan.target.modified
+        when = f", modified {modified:%Y-%m-%d}" if modified is not None else ""
+        console.print(f"{target} is another yonga AppImage.")
+        console.print(f"  installed  {old}, {human_bytes(plan.target.size)}{when}")
+        console.print(
+            f"  this       yonga {plan.version}, {human_bytes(plan.source_size)}  {plan.source}"
+        )
+        if not console.confirm(f"Replace {target}?", default=False, assume_yes=yes):
+            raise CancelledError(
+                diagnostic(
+                    "self.install.declined",
+                    FailureCategory.USER_CANCELLED,
+                    "Nothing was replaced",
+                    f"{target} was left as it was.",
+                    remediation=["Re-run with --yes to replace it without a prompt."],
+                )
+            )
+    result = service.install(plan)
+    report = service.path_report(plan.directory, target, created=result.created_directory)
+    code = ExitCode.SUCCESS if report.command_is_target else ExitCode.WARNINGS
+    if state.json_mode:
+        state.emit({**result.to_json(), **report.to_json(), "exit_code": int(code)})
+        return code
+    if plan.action is InstallAction.CURRENT:
+        console.print(f"yonga {plan.version} is already installed at {target}.")
+    elif plan.action is InstallAction.REPLACE:
+        console.print(f"Replaced {target} with yonga {plan.version}.")
+    else:
+        console.print(f"Installed yonga {plan.version} to {target}.")
+    if result.created_directory:
+        console.detail(f"Created {plan.directory}.")
+    if not result.receipt_written:
+        console.detail(f"Could not update {service.receipts.path}; the version is not recorded.")
+    _render_path_report(state, report)
+    return code
+
+
+def _render_path_report(state: CliState, report: PathReport) -> None:
+    """Say whether 'yonga' now works, or exactly what to do so it does."""
+    console = state.console
+    if report.command_is_target:
+        console.print("Run 'yonga doctor' to check this host.", style="dim")
+        return
+    for line in report.advice:
+        console.print_error(line, style="yellow")
+
+
+@self_app.command("uninstall")
+def self_uninstall(
+    ctx: typer.Context,
+    bin_dir: Path | None = typer.Option(None, "--bin-dir", metavar="DIR", help=_BIN_DIR_HELP),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Do not ask for confirmation."),
+    json_output: bool = typer.Option(False, "--json", help="Emit the outcome as JSON."),
+) -> None:
+    """Remove the AppImage copy at ~/.local/bin/yonga. Models and caches are kept."""
+    state = cli_state(ctx, json_output=json_output)
+    _dispatch(state, lambda: _self_uninstall(state, bin_dir=bin_dir, yes=yes))
+
+
+def _self_uninstall(state: CliState, *, bin_dir: Path | None, yes: bool) -> ExitCode:
+    """Remove ``DIR/yonga`` only when it is an AppImage, after confirmation."""
+    service = state.graph.self_install_service()
+    plan = service.plan_uninstall(bin_dir)
+    console = state.console
+    locations = service.data_locations()
+    target = plan.target.path
+
+    def document(removed: bool) -> dict[str, object]:
+        return {
+            "target": str(target),
+            "removed": removed,
+            "version": plan.version,
+            "kept": {name: str(path) for name, path in locations.items()},
+        }
+
+    if plan.target.kind is TargetKind.MISSING:
+        if state.json_mode:
+            state.emit(document(False))
+        else:
+            console.print(f"Nothing to remove: there is no yonga AppImage at {target}.")
+        return ExitCode.SUCCESS
+
+    version = f"yonga {plan.version}" if plan.version else "version unknown"
+    question = f"Remove {target} ({version}, {human_bytes(plan.target.size or 0)})?"
+    if not console.confirm(question, default=False, assume_yes=yes):
+        raise CancelledError(
+            diagnostic(
+                "self.uninstall.declined",
+                FailureCategory.USER_CANCELLED,
+                "Nothing was removed",
+                f"{target} was left as it was.",
+                remediation=["Re-run with --yes to remove it without a prompt."],
+            )
+        )
+    removed = service.uninstall(plan)
+    if state.json_mode:
+        state.emit(document(removed))
+        return ExitCode.SUCCESS
+    console.print(f"Removed {target}." if removed else f"{target} was already gone.")
+    _render_kept_data(state, locations)
+    return ExitCode.SUCCESS
+
+
+def _render_kept_data(state: CliState, locations: Mapping[str, Path]) -> None:
+    """Say what was left in place and how to remove it, without doing it."""
+    console = state.console
+    console.print(
+        f"Kept: prepared models and logs in {locations['data_dir']}, caches in "
+        f"{locations['cache_dir']}, settings in {locations['config_dir']}."
+    )
+    console.print(
+        "To free space: 'yonga remove ARTIFACT' deletes a model and 'yonga cache prune --all' "
+        "empties the compile cache (run them from the downloaded AppImage if 'yonga' is gone "
+        "now). Deleting those directories yourself removes everything.",
+        style="dim",
+    )
 
 
 @registry_app.command("validate")
