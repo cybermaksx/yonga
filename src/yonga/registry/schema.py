@@ -997,6 +997,22 @@ class ProfileRule(BaseRule):
         """The rule's match criteria."""
         return self.applies_to
 
+    def weights_label(self) -> str:
+        """The weight compression in a few words: ``int4 asym g128 ratio 0.8``."""
+        settings = self.quantization
+        parts = [settings.weight_format]
+        if settings.symmetric is not None:
+            parts.append("sym" if settings.symmetric else "asym")
+        if settings.group_size is not None:
+            parts.append("channel-wise" if settings.group_size == -1 else f"g{settings.group_size}")
+        if settings.ratio is not None and settings.ratio < 1.0:
+            parts.append(f"ratio {settings.ratio:g}")
+        if settings.awq:
+            parts.append("awq")
+        if settings.scale_estimation:
+            parts.append("scale estimation")
+        return " ".join(parts)
+
     def to_conversion_profile(self) -> ConversionProfile:
         """Convert to the domain :class:`~yonga.domain.plans.ConversionProfile`."""
         return ConversionProfile(
@@ -1691,6 +1707,11 @@ class Registry(BaseModel):
     origins: dict[str, str] = Field(default_factory=dict)
     #: Human readable origins of every layer that was merged, in order.
     layers: list[str] = Field(default_factory=list)
+    #: Layers that are present but were left out, each saying why: an installed
+    #: remote bundle that no longer verifies (``registry.remote.bad_signature:
+    #: ...``). Loading carries on without them; every surface that reports on
+    #: the registry says so instead of looking clean.
+    ignored: list[str] = Field(default_factory=list)
 
     _index: dict[str, AnyRule] = PrivateAttr(default_factory=dict)
 

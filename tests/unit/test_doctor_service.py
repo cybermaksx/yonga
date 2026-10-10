@@ -884,6 +884,33 @@ def test_full_mode_probes_deeply_and_adds_the_registry_section(tmp_path):
     assert section is not None
     assert require(report, "registry.validation").status is Severity.OK
     assert require(report, "registry.rules").value == f"{len(registry.all_rules())} rules"
+    assert report.check("registry.ignored") is None
+
+
+def test_full_mode_warns_about_an_ignored_remote_bundle(tmp_path):
+    """An installed bundle that stopped verifying must not hide behind all-green ticks."""
+    settings = make_settings(tmp_path)
+    registry = load_builtin_registry()
+    registry.ignored = [
+        "installed remote bundle version 7 is not in use (registry.remote.bad_signature: "
+        "The bundle was not signed by key abc, or was changed after signing.)"
+    ]
+    service = DoctorService(
+        FakeHardwareProbe(healthy_inventory(settings)),
+        FakeRuntimeProbe(("CPU",)),
+        FakeHubClient(),
+        registry,
+        settings,
+    )
+
+    report = service.run(full=True)
+
+    check = require(report, "registry.ignored")
+    assert check.status is Severity.WARNING
+    assert "registry.remote.bad_signature" in (check.detail or "")
+    assert any("yonga registry status" in line for line in check.remediation)
+    section = report.section("registry")
+    assert section is not None and section.status is Severity.WARNING
 
 
 def test_default_mode_omits_the_registry_section(tmp_path):

@@ -787,6 +787,29 @@ class DoctorService:
                 detail="; ".join(registry.layers) or "built-in only",
             ),
         ]
+        if registry.ignored:
+            # A layer the user installed that is quietly not applied would make
+            # every other tick here misleading: say which, and why.
+            checks.append(
+                _check(
+                    "registry.ignored",
+                    "Ignored",
+                    Severity.WARNING,
+                    value=f"{len(registry.ignored)} layer(s)",
+                    detail="; ".join(registry.ignored),
+                    remediation=[
+                        "'yonga registry status' shows the installed bundle and why it is not "
+                        "used.",
+                        (
+                            "Install a current bundle with 'yonga registry update'"
+                            if self._settings.registry_url
+                            else "Install a current bundle with 'yonga registry update --url "
+                            "URL' (or '--file BUNDLE')"
+                        )
+                        + ", or remove it with 'yonga registry reset'.",
+                    ],
+                )
+            )
         try:
             problems = validate_registry(registry, known_implementations=known_implementations())
         except Exception as exc:  # pragma: no cover - validation is pure

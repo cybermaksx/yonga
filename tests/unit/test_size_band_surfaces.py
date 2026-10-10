@@ -9,6 +9,7 @@ ones where no profile decides the quantization.
 
 from __future__ import annotations
 
+import argparse
 import base64
 import importlib.util
 import json
@@ -454,3 +455,46 @@ def test_build_writes_nothing_for_a_floor_below_the_schema(
 
     assert not output.exists()
     assert not output.with_name("bundle.json.sig").exists()
+
+
+def test_main_refuses_an_already_expired_bundle_in_one_line(
+    bundle_tool: ModuleType, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+):
+    """An expected refusal is a message for the maintainer, not a traceback."""
+    key, _trusted = generated_key(bundle_tool, tmp_path, capsys)
+    source = write_registry(tmp_path / "registry", PLAIN_REGISTRY)
+    output = tmp_path / "bundle.json"
+    argv = ["build", str(source), "--key", str(key), "--version", "7", "--expires-days", "0"]
+
+    with pytest.raises(SystemExit) as excinfo:
+        bundle_tool.main([*argv, "--output", str(output)])
+
+    message = str(excinfo.value.code)
+    assert message.startswith("refused: The registry bundle has expired: It expired at ")
+    assert "\n" not in message
+    assert not output.exists()
+
+
+def test_main_reports_a_missing_key_in_one_line(bundle_tool: ModuleType, tmp_path: Path):
+    source = write_registry(tmp_path / "registry", PLAIN_REGISTRY)
+    argv = ["build", str(source), "--key", str(tmp_path / "absent.key"), "--version", "1"]
+
+    with pytest.raises(SystemExit) as excinfo:
+        bundle_tool.main([*argv, "--output", str(tmp_path / "bundle.json")])
+
+    assert "absent.key" in str(excinfo.value.code)
+
+
+@pytest.mark.parametrize("command", ["keygen", "build"])
+def test_every_option_of_the_tool_is_described(bundle_tool: ModuleType, command: str):
+    root = bundle_tool.parser()
+    (subcommands,) = [
+        action for action in root._actions if isinstance(action, argparse._SubParsersAction)
+    ]
+    sub = subcommands.choices[command]
+    undocumented = [
+        action.dest
+        for action in sub._actions
+        if not isinstance(action, argparse._HelpAction) and not action.help
+    ]
+    assert undocumented == []

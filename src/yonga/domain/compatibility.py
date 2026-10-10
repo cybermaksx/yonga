@@ -134,7 +134,8 @@ class ProfileSelection(BaseModel):
     band_evidence: str | None = None
     """The winning band's :class:`EvidenceLevel` value."""
     automatic_profile_id: str | None = None
-    """For an explicit profile: what would have been chosen automatically, when different."""
+    """What would have been chosen without ``--profile`` (explicit) or without the naming
+    rule (``named_*``), when that is a different profile."""
     skipped: list[str] = Field(default_factory=list)
     """One sentence per size-banded profile that lost because of the model's size."""
     applies: bool = True

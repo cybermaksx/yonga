@@ -377,6 +377,7 @@ prompt hashes, and per-run metrics with warmups excluded from the aggregates.
 ```bash
 yonga registry validate
 yonga registry explain MODEL --device npu
+yonga registry profiles --device npu       # the ids --profile accepts
 yonga registry paths
 ```
 

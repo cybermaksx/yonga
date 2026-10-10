@@ -86,6 +86,9 @@ ProfileBasis = Literal[
     "device_default",
 ]
 
+#: An automatic profile choice: the profile, its basis and the rule that named it, if any.
+_Automatic = tuple[ProfileRule, ProfileBasis, str | None]
+
 
 def _size_phrase(subject: MatchSubject) -> str:
     """``has 8.19B parameters`` or ``has an unknown size (<basis>)``."""
@@ -93,6 +96,36 @@ def _size_phrase(subject: MatchSubject) -> str:
         basis = subject.parameter_count_basis or "no parameter count is known"
         return f"has an unknown size ({basis})"
     return f"has {format_parameter_count(subject.parameter_count)} parameters"
+
+
+def _named_size_clause(
+    subject: MatchSubject,
+    automatic: _Automatic | None,
+    device: str,
+) -> str:
+    """The size half of a named profile's sentence, and the choice the rule overrode.
+
+    ``The model has 751.6M parameters (<basis>); without the rule it would be
+    cpu-int4-r08, the CPU profile for models below 5B.`` A rule naming a profile
+    bypasses the size bands, so the sentence says which band it bypassed.
+    """
+    if subject.parameter_count is not None:
+        size = f"The model has {format_parameter_count(subject.parameter_count)} parameters"
+        if subject.parameter_count_basis:
+            size += f" ({subject.parameter_count_basis})"
+    else:
+        size = f"The model {_size_phrase(subject)}"
+    if automatic is None:
+        return size + "."
+    rule, basis, named_by = automatic
+    band = rule.applies_to.parameter_count
+    if basis == "size_band" and band is not None:
+        alternative = f"the {device} profile for models {band.describe()}"
+    elif basis == "named_by_architecture_rule":
+        alternative = f"named by architecture rule {named_by}"
+    else:
+        alternative = f"the highest-priority {device} profile"
+    return f"{size}; without the rule it would be {rule.id}, {alternative}."
 
 
 #: Constraint key -> distribution name used to look the installed version up.
@@ -604,20 +637,14 @@ class RegistryResolver:
                     f"Profile {profile.id} is meant for models {band.describe()}; this model "
                     f"{_size_phrase(subject)}. It is used because it was requested explicitly."
                 )
-            automatic: str | None = None
-            try:
-                scratch = ResolutionExplanation(subject=explanation.subject)
-                automatic_rule, _basis, _rule_id = self._automatic_profile(
-                    target, arch_rule, model_rule, subject, scratch
-                )
-                automatic = automatic_rule.id
-            except RegistryError:
-                automatic = None
+            automatic = self._quiet_automatic(target, arch_rule, model_rule, subject)
             explanation.profile_selection = self._profile_selection(
                 "explicit",
                 profile,
                 subject,
-                automatic_profile_id=automatic if automatic != profile.id else None,
+                automatic=automatic
+                if automatic is not None and automatic[0].id != profile.id
+                else None,
             )
             return profile.to_conversion_profile(), explanation
 
@@ -628,14 +655,40 @@ class RegistryResolver:
         # Only scoring can lose a profile to the model's size; a named
         # preference wins before any band is weighed.
         scored = basis in ("size_band", "device_default")
+        # What the naming rule overrode: for a model rule, whatever the
+        # architecture rule and scoring would choose; for an architecture rule,
+        # scoring alone.
+        bypassed = (
+            None
+            if scored
+            else self._quiet_automatic(
+                target, arch_rule if basis == "named_by_model_rule" else None, None, subject
+            )
+        )
         explanation.profile_selection = self._profile_selection(
             basis,
             winner,
             subject,
             rule_id=rule_id,
+            automatic=bypassed if bypassed is not None and bypassed[0].id != winner.id else None,
             skipped=self._size_skipped(target, subject, winner) if scored else (),
         )
         return winner.to_conversion_profile(), explanation
+
+    def _quiet_automatic(
+        self,
+        target: str,
+        arch_rule: ArchitectureRule | None,
+        model_rule: ModelRule | None,
+        subject: MatchSubject,
+    ) -> _Automatic | None:
+        """The automatic choice and its basis, worked out without touching the explanation."""
+        try:
+            scratch = ResolutionExplanation(subject=f"conversion profile for {target}")
+            choice = self._automatic_profile(target, arch_rule, model_rule, subject, scratch)
+        except RegistryError:
+            return None
+        return choice
 
     def _automatic_profile(
         self,
@@ -738,12 +791,17 @@ class RegistryResolver:
         subject: MatchSubject,
         *,
         rule_id: str | None = None,
-        automatic_profile_id: str | None = None,
+        automatic: _Automatic | None = None,
         skipped: Sequence[str] = (),
     ) -> ProfileSelection:
-        """Record why ``profile`` won, with the one sentence every surface prints."""
+        """Record why ``profile`` won, with the one sentence every surface prints.
+
+        ``automatic`` is the profile that would have been chosen without
+        ``--profile`` or without the naming rule, when it is a different one.
+        """
         band = profile.applies_to.parameter_count
         device = profile.device
+        automatic_profile_id = automatic[0].id if automatic is not None else None
         if basis == "explicit":
             sentence = "Requested with --profile."
             if automatic_profile_id is not None:
@@ -760,6 +818,7 @@ class RegistryResolver:
         else:
             kind = "model" if basis == "named_by_model_rule" else "architecture"
             sentence = f"Named by {kind} rule {rule_id} for {device}."
+            sentence += " " + _named_size_clause(subject, automatic, device)
         if skipped and basis != "explicit":
             sentence += " " + "; ".join(skipped) + "."
         return ProfileSelection(
@@ -784,6 +843,12 @@ class RegistryResolver:
         """Return an explicitly requested profile, or raise a registry error."""
         profile = self.registry.profile(profile_id)
         if profile is None:
+            on_device = [rule.id for rule in self.registry.profiles if rule.device == target]
+            available = (
+                f"Profiles for {target}: {', '.join(on_device)}."
+                if on_device
+                else f"No registry profile targets {target}."
+            )
             raise RegistryError(
                 Diagnostic(
                     code="registry.profile_unknown",
@@ -791,7 +856,11 @@ class RegistryResolver:
                     severity=Severity.ERROR,
                     title="Unknown conversion profile",
                     message=f"No registry profile is called {profile_id!r}.",
-                    remediation=["Run 'yonga registry validate' to list the available profiles."],
+                    remediation=[
+                        available,
+                        "'yonga registry profiles' lists every profile with its device, "
+                        "weights and size band.",
+                    ],
                     context={"profile_id": profile_id},
                 )
             )

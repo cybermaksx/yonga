@@ -172,8 +172,13 @@ def verify_bundle(
     now: datetime | None = None,
     installed_version: int | None = None,
     tool_version: str = __version__,
+    registry_url: str | None = None,
 ) -> VerifiedBundle:
-    """Check a bundle completely, or raise a :class:`RegistryError` saying why."""
+    """Check a bundle completely, or raise a :class:`RegistryError` saying why.
+
+    ``registry_url`` is the configured default source, only so that a refusal
+    names an update command that works as written.
+    """
     if len(bundle_bytes) > MAX_BUNDLE_BYTES:
         raise _error(
             "registry.remote.too_large",
@@ -187,7 +192,9 @@ def verify_bundle(
         raise _error(
             "registry.remote.invalid",
             "The registry bundle is malformed",
-            f"The signed document is not a registry bundle: {error.error_count()} problem(s).",
+            f"The signed document is not a registry bundle: {_problems(error)}.",
+            "Ask its publisher for a corrected bundle; docs/REGISTRY_SPEC.md section 12.1 "
+            "describes the format.",
         ) from error
     if bundle.format != BUNDLE_FORMAT:
         raise _error(
@@ -203,7 +210,8 @@ def verify_bundle(
             "The registry bundle has expired",
             f"It expired at {bundle.expires_at.isoformat()}. An expired bundle may be "
             "withholding newer knowledge, so it is not used.",
-            "Fetch a current one: yonga registry update",
+            f"Install a current one: {_refresh_command(registry_url)}",
+            "Or go back to the built-in registry: yonga registry reset",
         )
     if installed_version is not None and bundle.version < installed_version:
         raise _error(
@@ -229,6 +237,32 @@ def verify_bundle(
         sha256=hashlib.sha256(bundle_bytes).hexdigest(),
         documents=documents,
     )
+
+
+#: How many schema problems a malformed-bundle message spells out before counting the rest.
+_SHOWN_PROBLEMS = 5
+
+
+def _problems(error: ValidationError) -> str:
+    """``created_at: Input should have timezone info; ...``: what is wrong, field by field.
+
+    Pydantic's messages without the offending values: the document is
+    untrusted, so a diagnostic says where it is wrong rather than echoing it.
+    """
+    lines: list[str] = []
+    for detail in error.errors(include_url=False, include_input=False):
+        where = ".".join(str(part) for part in detail["loc"])
+        lines.append(f"{where}: {detail['msg']}" if where else str(detail["msg"]))
+    shown = "; ".join(lines[:_SHOWN_PROBLEMS])
+    hidden = len(lines) - _SHOWN_PROBLEMS
+    return f"{shown}; and {hidden} more" if hidden > 0 else shown
+
+
+def _refresh_command(registry_url: str | None) -> str:
+    """The ``registry update`` that works here: bare only when a default URL is configured."""
+    if registry_url:
+        return "yonga registry update"
+    return "yonga registry update --url https://…/bundle.json (or --file BUNDLE)"
 
 
 def _check_signature(bundle_bytes: bytes, signature_bytes: bytes, keys: list[TrustedKey]) -> str:
@@ -377,10 +411,15 @@ class RemoteRegistryStore:
     SIGNATURE = "bundle.json.sig"
     STATE = "state.json"
 
-    def __init__(self, paths: Paths) -> None:
-        """Bind the store to ``paths.remote_registry_dir``."""
+    def __init__(self, paths: Paths, *, registry_url: str | None = None) -> None:
+        """Bind the store to ``paths.remote_registry_dir``.
+
+        ``registry_url`` is the configured default source; it only shapes the
+        update command a refusal suggests.
+        """
         self._paths = paths
         self._dir = paths.remote_registry_dir
+        self._registry_url = registry_url
 
     @property
     def directory(self) -> Path:
@@ -407,6 +446,7 @@ class RemoteRegistryStore:
             trusted_keys(self._paths),
             now=now,
             installed_version=state.version if state is not None else None,
+            registry_url=self._registry_url,
         )
 
     def install(
@@ -458,7 +498,13 @@ class RemoteRegistryStore:
                 str(error),
                 "yonga registry reset",
             ) from error
-        return verify_bundle(bundle_bytes, signature_bytes, trusted_keys(self._paths), now=now)
+        return verify_bundle(
+            bundle_bytes,
+            signature_bytes,
+            trusted_keys(self._paths),
+            now=now,
+            registry_url=self._registry_url,
+        )
 
     def reset(self) -> bool:
         """Remove the installed bundle. Returns whether there was one."""

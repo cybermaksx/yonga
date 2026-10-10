@@ -32,6 +32,7 @@ from pathlib import Path
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+from yonga.domain.diagnostics import RegistryError
 from yonga.registry.loader import parse_document
 from yonga.registry.remote import (
     BUNDLE_FORMAT,
@@ -141,36 +142,78 @@ def build(
     )
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
-    commands = parser.add_subparsers(dest="command", required=True)
-    generate = commands.add_parser("keygen")
-    generate.add_argument("--output", type=Path, required=True)
-    make = commands.add_parser("build")
-    make.add_argument("directory", type=Path)
-    make.add_argument("--key", type=Path, required=True)
-    make.add_argument("--version", type=int, required=True)
-    make.add_argument("--expires-days", type=int, default=90)
-    make.add_argument("--output", type=Path, required=True)
-    make.add_argument("--description", default="")
+def parser() -> argparse.ArgumentParser:
+    """The command line: ``keygen`` and ``build``, every option described."""
+    root = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
+    commands = root.add_subparsers(dest="command", required=True)
+    generate = commands.add_parser(
+        "keygen", help="create an Ed25519 signing key pair", description="Create a key pair."
+    )
+    generate.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help="path stem: writes STEM.key (private, keep it offline) and STEM.pub",
+    )
+    make = commands.add_parser(
+        "build",
+        help="build and sign a bundle from a directory of registry YAML",
+        description="Build a bundle from every *.yaml under DIRECTORY and sign it.",
+    )
+    make.add_argument("directory", type=Path, help="directory holding the registry YAML files")
+    make.add_argument(
+        "--key", type=Path, required=True, help="the private key (.key) that signs the bundle"
+    )
+    make.add_argument(
+        "--version",
+        type=int,
+        required=True,
+        help="bundle version; a host refuses one lower than the version it has installed",
+    )
+    make.add_argument(
+        "--expires-days",
+        type=int,
+        default=90,
+        help="days until the bundle expires and yonga stops using it (default: 90)",
+    )
+    make.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help="bundle file to write; its signature goes next to it as OUTPUT.sig",
+    )
+    make.add_argument(
+        "--description", default="", help="one line 'registry update' shows to the user"
+    )
     make.add_argument(
         "--min-tool-version",
         default=None,
         help="oldest yonga that may install the bundle (default: what its schema needs)",
     )
-    arguments = parser.parse_args()
-    if arguments.command == "keygen":
-        keygen(arguments.output)
-    else:
-        build(
-            arguments.directory,
-            arguments.key,
-            arguments.version,
-            arguments.expires_days,
-            arguments.output,
-            arguments.description,
-            arguments.min_tool_version,
-        )
+    return root
+
+
+def main(argv: list[str] | None = None) -> None:
+    arguments = parser().parse_args(argv)
+    try:
+        if arguments.command == "keygen":
+            keygen(arguments.output)
+        else:
+            build(
+                arguments.directory,
+                arguments.key,
+                arguments.version,
+                arguments.expires_days,
+                arguments.output,
+                arguments.description,
+                arguments.min_tool_version,
+            )
+    except RegistryError as error:
+        # The same refusal 'yonga registry update' would print, as one line:
+        # an expected outcome, not a crash.
+        sys.exit(f"refused: {error.diagnostic.title}: {error.diagnostic.message}")
+    except OSError as error:
+        sys.exit(str(error))
 
 
 if __name__ == "__main__":

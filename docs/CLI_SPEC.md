@@ -189,7 +189,8 @@ named), `source.gguf_file_not_found`; all exit 20.
 Under **Quantization** the plan prints **Chosen because**: one sentence saying why the profile won
 (its size band, the device default, the architecture or model rule that names it, or `--profile`),
 with the parameter count and where it came from, and any size-banded profile the model's size kept
-out. The same sentence goes into the manifest (`export.profile_selection`). It is absent for a GGUF
+out. For a profile that `--profile` or a rule names, it also names the profile that would be chosen
+without it (`automatic_profile_id`), when that is a different one. The same sentence goes into the manifest (`export.profile_selection`). It is absent for a GGUF
 import or an OpenVINO copy, whose quantization no profile decides. When the revision is already
 prepared for the device under another profile id (a default that changed since), the plan's known
 limitations name that artifact and the `--profile` that would reuse it; the new export never
@@ -366,6 +367,7 @@ Desired advanced commands:
 ```bash
 yonga registry explain MODEL [--device DEVICE]
 yonga registry validate
+yonga registry profiles [--device DEVICE] [--json]
 yonga registry paths
 yonga registry update [--url URL | --file BUNDLE [--signature SIG]] [--yes] [--json]
 yonga registry status [--json]
@@ -374,6 +376,14 @@ yonga registry reset
 
 `explain` prints matched rules and why they won, and under the chat profile its tool-call format
 ("Tool calling"), or that it declares none and `serve` refuses tools.
+
+`profiles` lists the conversion profiles of the merged registry, the ids `--profile` accepts, by
+device and then by priority, with their weight compression, size band, priority and status (and in
+`--json` their evidence and the layer that supplied them). An unknown `--profile`
+(`registry.profile_unknown`, exit 70) names the profiles for the requested device and points here.
+
+`paths` inside an AppImage names the AppImage file for the built-in registry instead of its
+per-run mount, which is gone once the command exits (`builtin_appimage` in `--json`).
 
 `update` installs a remote registry bundle (`REGISTRY_SPEC.md` section 12). The URL defaults to
 `registry_url` in the configuration, which is unset: yonga contacts no registry server unless told
@@ -384,13 +394,18 @@ rules it adds or replaces, and installs it after confirmation (`--yes` approves)
 `expired`, `rollback` (older than the installed bundle), `tool_too_old`, `unsafe_path`,
 `unknown_repair_implementation` (a repair rule naming code this yonga does not contain),
 `unknown_tool_call_format` (a chat profile naming a tool-call parser this yonga does not contain),
-`too_large`, `insecure_url`. `registry_update_policy = "never"` refuses updates and ignores an
-installed bundle.
+`too_large`, `insecure_url`, and `invalid` (not a bundle document; the message names each field
+that is wrong, such as a timestamp without a UTC offset). `--url` and `--file` together are refused
+(`registry.remote.conflicting_sources`), as is `--signature` without `--file`, exit 70.
+`registry_update_policy = "never"` refuses updates and ignores an installed bundle.
 
 The installed bundle is one layer between the built-in rules and the user override directories,
 and is verified again every time the registry loads. One that no longer verifies (expired, edited
-on disk, its key removed) is left out and the built-in registry is used; `status` reports why and
-exits 2. `reset` removes the bundle.
+on disk, its key removed) is left out and the built-in registry is used. It is not left out
+silently: `status` reports why and exits 2, `validate` lists it under "Ignored" (`ignored` in
+`--json`) and exits 2, `explain` warns that it explained without it, and `doctor --full` shows a
+`registry.ignored` warning. The policy `never` is a choice and reports nothing. `reset` removes the
+bundle.
 
 Trust is configuration: a key is trusted when its public key (base64 of the raw 32-byte Ed25519 key,
 one line) is a `*.pub` file in `registry-keys/` under the configuration directory. yonga ships no

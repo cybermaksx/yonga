@@ -458,7 +458,12 @@ def test_architecture_rule_naming_a_banded_profile_wins_inside_the_band():
     assert selection.band == "below 2B"
     assert selection.band_evidence == EvidenceLevel.REPORTED
     assert selection.parameter_count == 1_000_000_000
-    assert selection.sentence == "Named by architecture rule arch-llama for GPU."
+    # Scoring alone picks the same profile, so there is no overridden choice to name.
+    assert selection.automatic_profile_id is None
+    assert selection.sentence == (
+        f"Named by architecture rule arch-llama for GPU. The model has 1B parameters "
+        f"({selection.parameter_count_basis})."
+    )
 
 
 def test_architecture_rule_naming_a_banded_profile_falls_through_outside_the_band():
@@ -512,7 +517,42 @@ def test_model_rule_beats_the_architecture_rule():
     assert selection.band_evidence is None
     # The banded profile lost to the model rule, not to the model's size.
     assert selection.skipped == []
-    assert selection.sentence == "Named by model rule model-acme-special for GPU."
+    # Without the model rule, the architecture rule's pick would have won.
+    assert selection.automatic_profile_id == "gpu-int8-small"
+    assert selection.sentence == (
+        f"Named by model rule model-acme-special for GPU. The model has 1B parameters "
+        f"({selection.parameter_count_basis}); without the rule it would be gpu-int8-small, "
+        "named by architecture rule arch-llama."
+    )
+
+
+def test_a_model_rule_sentence_names_the_size_band_it_bypassed():
+    """CLI_SPEC section 6: the sentence carries the size and any band the rule overrode."""
+    resolver = resolver_for(NAMED)
+    meta = llama(1_000_000_000, repo_id="acme/special-llama")
+    model_rule, _ = resolver.resolve_model_rule(meta)
+    assert model_rule is not None
+    # No architecture rule: without the model rule, the size band decides.
+    profile, explanation = resolver.resolve_profile(device="gpu", model_rule=model_rule, meta=meta)
+    assert profile.id == "gpu-model-pick"
+    selection = selection_of(explanation)
+    assert selection.automatic_profile_id == "gpu-int8-small"
+    assert selection.sentence.endswith(
+        "; without the rule it would be gpu-int8-small, the GPU profile for models below 2B."
+    )
+    assert "The model has 1B parameters" in selection.sentence
+    # Working the alternative out leaves no trace in the explanation.
+    assert [candidate.rule_id for candidate in explanation.candidates] == ["gpu-model-pick"]
+
+
+def test_a_named_profile_sentence_says_when_the_size_is_unknown():
+    resolver = resolver_for(NAMED)
+    meta = llama(None, repo_id="acme/special-llama")
+    model_rule, _ = resolver.resolve_model_rule(meta)
+    _, explanation = resolver.resolve_profile(device="gpu", model_rule=model_rule, meta=meta)
+    selection = selection_of(explanation)
+    assert f"The model has an unknown size ({NO_COUNT_BASIS})" in selection.sentence
+    assert selection.sentence.endswith("gpu-int4-default, the highest-priority GPU profile.")
 
 
 # ---------------------------------------------------------------------------
