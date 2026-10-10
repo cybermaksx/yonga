@@ -87,6 +87,7 @@ __all__ = [
     "CHAT_TEMPLATE_FILES",
     "DEFAULT_REASONING_WRAPPERS",
     "DEFAULT_THINKING_VARIABLES",
+    "PROMPT_TOO_LONG",
     "ChatHistory",
     "ChatImage",
     "ChatMessage",
@@ -123,6 +124,19 @@ CHAT_TEMPLATE_FILES: tuple[str, ...] = (
     "chat_template.json",
     "tokenizer_config.json",
 )
+
+#: Diagnostic code of a prompt longer than a pipeline compiled for a fixed
+#: prompt length accepts (the NPU's ``MAX_PROMPT_LEN``). It describes the
+#: request, not the runtime, so it is a configuration error.
+PROMPT_TOO_LONG = "runtime.genai.prompt_too_long"
+
+#: How OpenVINO GenAI 2026.4 refuses such a prompt, whichever NPU pipeline
+#: (stateful or static LLM, VLM) runs it: "... may only process prompts or hold
+#: chat history up to 1024 tokens. 6423 is passed." The check runs before any
+#: inference, so the refusal costs the tokenisation only, and its count is
+#: GenAI's own -- a count of yonga's could disagree with it by the special
+#: tokens.
+_PROMPT_LIMIT = re.compile(r"may only process [^.]*?up to (\d+) tokens\.\s*(\d+) is passed")
 
 _DEFAULT_DEVICE = "CPU"
 _CACHE_DIR_PROPERTY = "CACHE_DIR"
@@ -1570,6 +1584,11 @@ class GenAIChatRuntime:
     def _generation_failed_diagnostic(self, error: BaseException) -> Diagnostic:
         """Build the generation failure diagnostic, keeping the raw runtime text."""
         raw = redact_text(str(error))
+        limit = _PROMPT_LIMIT.search(raw)
+        if limit is not None:
+            return self._prompt_too_long_diagnostic(
+                raw, limit=int(limit.group(1)), passed=int(limit.group(2))
+            )
         return diagnostic(
             "runtime.genai.generation_failed",
             FailureCategory.UNKNOWN_RUNTIME_ERROR,
@@ -1584,6 +1603,33 @@ class GenAIChatRuntime:
                 "device": self._device,
                 "pipeline": self._pipeline_kind.value,
                 "artifact_dir": str(self._artifact_dir),
+            },
+        )
+
+    def _prompt_too_long_diagnostic(self, raw: str, *, limit: int, passed: int) -> Diagnostic:
+        """The pipeline refused a prompt longer than the length it was compiled for.
+
+        Nothing is wrong with the device or the model: the same pipeline answers
+        a shorter prompt, so this is the request's to change.
+        """
+        return diagnostic(
+            PROMPT_TOO_LONG,
+            FailureCategory.CONFIGURATION_ERROR,
+            "The prompt is too long for this model",
+            f"The prompt is {passed} tokens, and this model on {self._device} takes at most "
+            f"{limit}: its prompt length (MAX_PROMPT_LEN) is fixed when it is compiled. The "
+            "limit covers the whole conversation, including offered tools and images.",
+            remediation=[
+                "Send a shorter conversation, or offer fewer or shorter tools.",
+                "Or prepare the model for the GPU, whose prompt length is not fixed: "
+                "yonga prepare MODEL --device gpu",
+            ],
+            raw_excerpt=raw,
+            context={
+                "device": self._device,
+                "pipeline": self._pipeline_kind.value,
+                "prompt_tokens": str(passed),
+                "max_prompt_tokens": str(limit),
             },
         )
 

@@ -687,10 +687,11 @@ Every error response uses OpenAI's shape, `{"error": {"message", "type", "param"
 
 | Status | `code` | When |
 |---|---|---|
-| 400 | `invalid_request` | The body does not validate (missing or mistyped fields, too many messages, `stop` outside its limits, an image that does not decode or is too large, a malformed tool or tool turn); `param` names the field. |
+| 400 | `invalid_request` | The body does not validate (missing or mistyped fields, too many messages, `stop` outside its limits, an image that does not decode or is too large, a malformed tool or tool turn); `param` names the field. A body that is not JSON, or is sent without a JSON `Content-Type`, has `param` `null`. |
 | 400 | `unsupported_parameter` | A parameter yonga cannot honour (above), including an image URL that is not an accepted `data:` URL and a `tool_choice` that forces a call; `param` names it. |
 | 400 | the diagnostic code (`serve.request.*`) | A generation setting outside the ranges `chat` accepts, an image refused by `images_unsupported`, `too_many_images` or `images_earlier_turn`, or tools refused by `tools_unsupported` (above, with `param`). |
-| 401 | `invalid_api_key` | A key is configured and the request does not carry it. |
+| 400 | `context_length_exceeded` | The prompt (the conversation with its tools and images) is longer than a pipeline compiled for a fixed prompt length takes: the NPU's `MAX_PROMPT_LEN`. The message gives both token counts; `param` is `messages`. |
+| 401 | `invalid_api_key` | A key is configured and the request does not carry it. The `type` is `invalid_request_error`, as OpenAI's. |
 | 404 | `model_not_found` | `model` does not name the served model. |
 | 404 | `not_found` | No such path. |
 | 405 | `method_not_allowed` | The path exists but not for this method. |
@@ -702,8 +703,10 @@ Other HTTP errors raised by routing carry `invalid_request`.
 With `stream: true`, a request refused before generation starts gets the same status and body as
 above. A generation failure after the stream has begun cannot change the status, which is already
 200: it arrives as one event, `data: {"error": {"message", "code"}}`, where `code` is the
-diagnostic code or `internal_error`, followed by `data: [DONE]`. An image whose pixels fail to
-decode is reported the same way, with `code` `invalid_request` and the image's `param`.
+code the table above gives (the diagnostic code, `context_length_exceeded`) or `internal_error`,
+with `param` when it names one, followed by `data: [DONE]`. An image whose pixels fail to decode is
+reported the same way, with `code` `invalid_request` and the image's `param`. No error message
+carries the OpenVINO source location (`Check '...' failed at FILE:LINE`) of a runtime failure.
 
 When `YONGA_API_KEY` is set in the environment, every endpoint except `/health` requires
 `Authorization: Bearer <key>` (401 otherwise). Authentication runs before the size limit, so a

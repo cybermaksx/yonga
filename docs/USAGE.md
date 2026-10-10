@@ -324,7 +324,8 @@ function you did not offer) comes back as plain text, never as a guessed call. A
 only drafted while reasoning is never made, also with `--show-reasoning`, which then shows the
 opening reasoning block in front of the content. Small models call
 tools unreliably; the offered schemas also lengthen every prompt, which matters on the NPU, whose
-prompt length is fixed when the model is compiled.
+prompt length is fixed when the model is compiled (1024 tokens by default): a longer prompt is
+refused with 400 `context_length_exceeded`, naming its length and the limit.
 
 A VLM artifact (Qwen2.5-VL, Qwen3.5) also takes images, as OpenAI `image_url` content parts holding
 a `data:` URL; an LLM artifact refuses them with `serve.request.images_unsupported`:

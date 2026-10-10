@@ -55,6 +55,7 @@ from yonga.application.serve import (
     MAX_STOP_LENGTH,
     MAX_STOP_SEQUENCES,
     MAX_TOOLS,
+    PARAM_CONTEXT,
     TOO_MANY_IMAGES,
     TOOLS_UNSUPPORTED,
     CompletionRequest,
@@ -62,6 +63,7 @@ from yonga.application.serve import (
     PendingImage,
     ToolPolicy,
 )
+from yonga.domain.diagnostics import YongaError
 
 __all__ = [
     "MAX_MESSAGES",
@@ -214,11 +216,27 @@ class ChatCompletionRequest(BaseModel):
             parallel_tool_calls=self.parallel_tool_calls is not False,
         )
         if check is not None:
-            check(completion)
+            try:
+                check(completion)
+            except YongaError as error:
+                raise self._as_sent(error) from error
         if policy is None:
             return completion
         pending = [_pending(index, part, policy) for index, part in located]
         return completion.model_copy(update={"images": pending})
+
+    def _as_sent(self, error: YongaError) -> YongaError:
+        """``error`` naming the parameter as the client spelled it.
+
+        ``max_completion_tokens`` reaches yonga as ``max_tokens``; a refusal of
+        it names the field the client actually sent.
+        """
+        report = error.diagnostic
+        if report.context.get(PARAM_CONTEXT) != "max_tokens" or self.max_completion_tokens is None:
+            return error
+        context = {**report.context, PARAM_CONTEXT: "max_completion_tokens"}
+        message = report.message.replace("max_tokens", "max_completion_tokens", 1)
+        return type(error)(report.model_copy(update={"context": context, "message": message}))
 
     def _refuse_unsupported(self) -> None:
         if self.n is not None and self.n != 1:

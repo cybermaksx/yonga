@@ -52,6 +52,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from yonga.adapters.runtime_genai import PROMPT_TOO_LONG
 from yonga.application.chat import (
     MAX_OUTPUT_TOKENS,
     STOP_SEQUENCE_REASON,
@@ -79,6 +80,8 @@ __all__ = [
     "MAX_STOP_LENGTH",
     "MAX_STOP_SEQUENCES",
     "MAX_TOOLS",
+    "PARAM_CONTEXT",
+    "PROMPT_TOO_LONG",
     "TOOLS_UNSUPPORTED",
     "TOO_MANY_IMAGES",
     "CompletionRequest",
@@ -208,9 +211,17 @@ class CompletionRequest(BaseModel):
     """``False`` keeps only the first call of an answer that makes several."""
 
 
-def _invalid(code: str, detail: str) -> ConfigurationError:
+#: The key of a request refusal's diagnostic context naming the parameter refused,
+#: which the API layer reports as the error's ``param``.
+PARAM_CONTEXT = "param"
+
+
+def _invalid(code: str, detail: str, *, param: str | None = None) -> ConfigurationError:
+    context = {PARAM_CONTEXT: param} if param is not None else {}
     return ConfigurationError(
-        diagnostic(code, FailureCategory.CONFIGURATION_ERROR, "Invalid request", detail)
+        diagnostic(
+            code, FailureCategory.CONFIGURATION_ERROR, "Invalid request", detail, context=context
+        )
     )
 
 
@@ -315,6 +326,7 @@ class ModelServer:
                 raise _invalid(
                     "serve.request.max_tokens",
                     f"max_tokens must be between 1 and {MAX_OUTPUT_TOKENS}.",
+                    param="max_tokens",
                 )
             settings.max_new_tokens = request.max_tokens
         if request.temperature is not None:
@@ -323,24 +335,33 @@ class ModelServer:
                 raise _invalid(
                     "serve.request.temperature",
                     f"temperature must be between {low:g} and {high:g}.",
+                    param="temperature",
                 )
             settings.temperature = request.temperature
             settings.do_sample = request.temperature > 0.0
         if request.top_p is not None:
             low, high = TOP_P_RANGE
             if not low < request.top_p <= high:
-                raise _invalid("serve.request.top_p", "top_p must be above 0 and at most 1.")
+                raise _invalid(
+                    "serve.request.top_p", "top_p must be above 0 and at most 1.", param="top_p"
+                )
             settings.top_p = request.top_p
         if request.top_k is not None:
             if not 0 <= request.top_k <= TOP_K_MAX:
-                raise _invalid("serve.request.top_k", f"top_k must be between 0 and {TOP_K_MAX}.")
+                raise _invalid(
+                    "serve.request.top_k",
+                    f"top_k must be between 0 and {TOP_K_MAX}.",
+                    param="top_k",
+                )
             settings.top_k = request.top_k
         if request.seed is not None:
             settings.seed = request.seed
         if request.repetition_penalty is not None:
             if request.repetition_penalty <= 0.0:
                 raise _invalid(
-                    "serve.request.repetition_penalty", "repetition_penalty must be positive."
+                    "serve.request.repetition_penalty",
+                    "repetition_penalty must be positive.",
+                    param="repetition_penalty",
                 )
             settings.repetition_penalty = request.repetition_penalty
         return settings
@@ -363,7 +384,7 @@ class ModelServer:
         settings = self.generation_for(request)
         self._check_images(request)
         if request.tools and not self._tool_policy.accepted:
-            raise _invalid(TOOLS_UNSUPPORTED, self._tool_policy.refusal)
+            raise _invalid(TOOLS_UNSUPPORTED, self._tool_policy.refusal, param="tools")
         offered = request.tools if request.tool_choice == "auto" else []
         with self._lock:
             # Decoded only now, so that requests waiting for the pipeline hold

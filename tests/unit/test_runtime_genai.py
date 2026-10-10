@@ -755,6 +755,52 @@ def test_generation_failure_preserves_the_raw_error(artifact, settings, genai):
     runtime.close()
 
 
+#: OpenVINO GenAI 2026.4's refusal of a prompt over the NPU's MAX_PROMPT_LEN, as
+#: seen on the reference host through ``yonga serve``.
+NPU_PROMPT_LIMIT_ERROR = (
+    "Check 'data->input_ids.get_size() <= m_max_prompt_len' failed at /home/jenkins/agent/"
+    "workspace/private-ci/ie/build-linux-manylinux_2_28/b/repos/openvino.genai/src/cpp/src/llm/"
+    "pipeline_stateful.cpp:359:\nStateful LLM pipeline on NPU may only process prompts or hold "
+    'chat history up to 1024 tokens. 6423 is passed.\n Set the "MAX_PROMPT_LEN" config option '
+    "to increase the limit.\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("raw", "limit", "passed"),
+    [
+        (NPU_PROMPT_LIMIT_ERROR, "1024", "6423"),
+        (
+            "VLM pipeline on NPU may only process input embeddings up to 2048 tokens. "
+            "2100 is passed.",
+            "2048",
+            "2100",
+        ),
+    ],
+)
+def test_a_prompt_over_the_compiled_length_is_the_requests_to_change(
+    artifact, settings, genai, raw, limit, passed
+):
+    """Not an unknown runtime failure: the same pipeline answers a shorter prompt."""
+    genai.generate_error = RuntimeError(raw)
+    runtime = make_runtime(artifact, settings, device="NPU")
+    history = ChatHistory()
+    history.add_user("Hello")
+
+    with pytest.raises(GenerationError) as excinfo:
+        runtime.generate(history, GenerationSettings())
+    report = excinfo.value.diagnostic
+    assert report.code == runtime_module.PROMPT_TOO_LONG
+    assert report.category is FailureCategory.CONFIGURATION_ERROR
+    assert f"The prompt is {passed} tokens" in report.message
+    assert f"at most {limit}" in report.message
+    assert "jenkins" not in report.message
+    assert report.context["prompt_tokens"] == passed
+    assert report.context["max_prompt_tokens"] == limit
+    assert report.raw_excerpt == raw, "the runtime's own words stay for the log"
+    runtime.close()
+
+
 def test_generate_without_metrics_still_returns_a_result(artifact, settings, genai):
     genai.result = FakeResults(text="ok", perf_metrics=None)
     runtime = make_runtime(artifact, settings)
