@@ -39,6 +39,16 @@ manifest may change in any minor release.
 - The probe job log records every probe result with its raw runtime text (`probe.result`), as the
   diagnostics already said it did.
 - `yonga eval` prints `Saved: PATH`, and `--json` includes `result_path`, as `bench` does.
+- `doctor` reports whether the exporter imports (`exporter import`), reusing the check `prepare`
+  recorded, so a CPU torch next to PyPI's torchvision shows as a warning with the registry's
+  remedy; `--full` checks a recorded failure again.
+- `chat`, `bench`, `probe`, `eval` and `publish` say which artifact a model id chose when several
+  ready ones match ("Using ID (PROFILE, DEVICE), the newest of N ready artifacts for MODEL; pass the
+  artifact id to choose another").
+- Registry schema 4 (needs yonga 0.5.0): an issue rule's `blocks_export` lists model types whose
+  export is certain to fail when the rule's constraints hold for the interpreter that will run the
+  export, and `prepare` refuses such an export before the download and before any question
+  (overridable with `--ignore-exporter-requirements`, recorded in the manifest).
 
 ### Changed
 
@@ -67,6 +77,14 @@ manifest may change in any minor release.
 - While a job runs, warnings logged by huggingface_hub (such as the Hub's "You are sending
   unauthenticated requests" advice) go to the job log as `library.log` records instead of breaking
   into the progress line.
+- An explicit `--profile` whose group size cannot divide the model's `config.json` channel widths
+  is refused at the plan, before any download (exit 70, `export.quantization.group_size_mismatch`).
+  The message names the profiles that fit, as your command with `--profile` changed, and never
+  swaps the profile itself.
+- The `context_length_exceeded` message no longer repeats "The prompt". It names the offered tools
+  and images when they count toward the limit, and says what to do: shorten the conversation, offer
+  fewer tools or send fewer images, or use a GPU or CPU artifact, whose prompt length is not fixed.
+- The README quick-start `doctor` sample and its exit-2 explanation match the current output.
 
 ### Fixed
 
@@ -192,7 +210,8 @@ manifest may change in any minor release.
 - `yonga cache prune --older-than` with a very large number of days no longer crashes with an
   internal error; such an age selects nothing.
 - `cache list`, `cache prune`, `doctor` and `env list` say "1 entry" and "1 environment" for a
-  single item.
+  single item, as do "Nothing to prune: 1 entry (...) is kept", "1 stale working directory" and the
+  `remove` note about other directories that still claim a compile cache.
 - `yonga doctor` run from the AppImage no longer warns about optimum-intel, nncf and transformers,
   which the image never carries by design; one `export toolchain` line says that `prepare`
   converts in a managed export environment, so an AppImage host can reach exit 0.
@@ -219,9 +238,11 @@ manifest may change in any minor release.
 - `yonga remove` no longer deletes the newest of several artifacts when a repository id, id prefix
   or copied artifact id matches more than one; it refuses with exit 70 (even under `--yes`) and
   lists each candidate's artifact id, profile and device.
-- `yonga list` on an 80-column terminal keeps the model and its revision, dropping the creation and
-  benchmark times first; long repository ids are shortened instead of the column being dropped,
-  and if the Ready column has to go, unready artifacts are named under the table.
+- `yonga list` no longer cuts every column short when a repository id is long (such as
+  `HuggingFaceTB/SmolLM2-360M-Instruct` at 80-100 columns). It drops whole columns in order
+  (creation and benchmark times, then revision, Ready, size) and lets the repository id lose its
+  organisation first; the artifact id, profile and device are never shortened. If the Ready column
+  has to go, unready artifacts are named under the table.
 - The pip install instructions take torchvision from PyTorch's CPU index together with torch.
   With torch alone from there, pip installed PyPI's torchvision, which cannot load against a CPU
   torch, and every conversion failed. `docs/TROUBLESHOOTING.md` section 5.7 gives a repair that
@@ -229,6 +250,75 @@ manifest may change in any minor release.
 - The README command overview lists `self` (seventeen commands). `docs/TROUBLESHOOTING.md`
   documents every `self install`/`self uninstall` diagnostic code and its exit code.
   `docs/INSTALL.md`'s quoted doctor line and its Qwen3-0.6B artifact size (430 MiB) match reality.
+- Square brackets in console output are no longer read as Rich markup: `doctor`'s closing line
+  again says `pip install 'yonga[openvino]'`, and messages, paths, model ids, table cells, prompts
+  and progress lines print as written.
+- `doctor`'s export-environment size includes the bundled-Python copy, matching `yonga env list`.
+- Every "run it again with `--yes`" remediation (`prepare` without a terminal, `remove`,
+  `publish`, `env remove`, `cache prune`, `self install`/`uninstall`, `registry update`), and those
+  for `--trust-remote-code`, `--ignore-exporter-requirements` and dropping `--no-repair`, print your
+  whole command, root options such as `--data-dir` and `--offline` included, shell-quoted, with only
+  that flag changed; credential-named options are left out and secret-shaped values masked. Before,
+  `prepare M --device cpu` advised `prepare M --yes`, which auto-selected the GPU.
+- The `--debug` hint places `--debug` before the command (`yonga --debug list`); appended to the
+  end it was a usage error.
+- After a validation failure the advice names `--fresh-export`, not `--force`: a plain re-run
+  adopts the export the failed job left behind.
+- A system `/tmp` too small for the conversion is reported as a note, not a warning, because the
+  managed directory was used; a successful `prepare` on such a host exits 0 instead of 2.
+- Offline, `inspect`'s Parameters row and the profile choice's basis say the count was taken locally
+  from the cached safetensors headers instead of calling it a Hub count.
+- The group-size remediation's ratio-0.8 suggestion includes `--device cpu` / `--device gpu`, so the
+  CPU profile is not prepared for an auto-selected GPU.
+- `chat`, `bench` and `probe` answer a device failure with the same command on a device the
+  artifact already passed on (for example `yonga chat ID --device gpu`) instead of telling you to
+  prepare the model again.
+- `chat`, `serve`, `eval` and `publish` no longer print a `yonga logs JOB_ID --raw` step with a
+  literal placeholder; they open no job, and `--debug` still shows the raw error.
+- `probe`, `bench`, `eval` and `publish` explain an unknown reference as `chat` does: a model id
+  that is not prepared gets its `yonga prepare` command, and anything else points at `yonga list`.
+- `chat` no longer draws an empty reply panel for an answer such as `361.` that Markdown reads as an
+  empty numbered list.
+- `bench` prints where it saved the result once.
+- A cancelled `prepare` is no longer logged as a failed export, and a retry that reuses its export
+  says "reused from cancelled job".
+- `serve` with `stream: true` refuses a request that fails before generation starts with the same
+  status and body as without stream: a prompt over the NPU's `MAX_PROMPT_LEN` (400
+  `context_length_exceeded`), an image whose pixels do not decode, and a failure before the first
+  token. These used to come as a 200 stream whose only event was an error. A failure after the
+  stream has begun is still an error event, now with the full `{message, type, param, code}` body.
+- `serve` refuses an out-of-range `max_completion_tokens` with the code
+  `serve.request.max_completion_tokens`, matching its `param`; it used to be
+  `serve.request.max_tokens`.
+- A conversion profile's runtime properties are applied only on the profile's own device:
+  `--profile npu-int4-sym-cw` on the CPU or GPU, or auto mode falling back from the NPU, no longer
+  passes `MAX_PROMPT_LEN`/`MIN_RESPONSE_LEN` to the smoke test (both plugins refused it, exit 50)
+  or records them in the manifest's recommended runtime.
+- phi3, mistral, mixtral, gpt2, bloom and the other model types optimum 2.3.0 cannot export on
+  Python 3.14 are refused before the download with the existing advice (exit 10), instead of after
+  a multi-gigabyte download and the start of the conversion; Python 3.13, a fixed optimum and
+  unknown versions are not affected.
+- The export runner keeps the first 50 and last 300 lines of each output stream plus the header
+  lines of exceptions in between, so a long NNCF failure listing no longer hides the exception line
+  the registry classifies.
+- The torchvision repair for `export.torchvision.build_mismatch` replaces torchvision alone from the
+  CPU index instead of force-reinstalling torch and every dependency, which upgraded numpy past
+  nncf's bound and left `pip check` failing.
+- `yonga registry profiles` no longer breaks profile ids across lines in non-TTY or 80-column
+  output. The summary wraps instead, and on a narrow terminal the weights column (which the id
+  spells out) gives way.
+- `yonga cache list` and `cache prune` plans no longer squeeze cache keys beside a long
+  directory-name owner or the Why column: optional columns are dropped first, then the owner is cut
+  or dropped. The logs index shortens a repository id from its organisation.
+- Paths on `Saved:` (`bench`, `eval`), `env list`, `cache list` and `logs` lines are no longer
+  folded mid-path on narrow terminals, so they can be copied whole.
+
+### Security
+
+- **OpenVINO's usage reporting no longer loads.** `openvino_telemetry` sent every `import openvino`
+  to Google Analytics and counted it in `~/intel/stats`. yonga keeps it from loading in every Python
+  process it runs, including `optimum-cli` in managed export environments, without writing to
+  `~/intel`.
 
 ## [0.4.0] - 2026-10-09
 
