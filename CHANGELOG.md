@@ -9,6 +9,12 @@ manifest may change in any minor release.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-11
+
+The first public release, and the first on PyPI. It fixes everything an end-to-end campaign of
+fresh-user runs on real hardware found (AppImage, pip, every command, GPU, NPU and CPU), keeps
+OpenVINO's usage reporting from running, and installs the AppImage on `PATH`.
+
 ### Added
 
 - **`yonga self install` and `yonga self uninstall`.** Run from the AppImage,
@@ -915,7 +921,8 @@ printing compiler tracebacks. Linux x86_64 only.
 - `yonga` never installs, upgrades or removes packages, and never runs `sudo`. When
   the environment is wrong it prints the command for you to run.
 
-[Unreleased]: https://github.com/ooguz/yonga/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/ooguz/yonga/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/ooguz/yonga/releases/tag/v0.5.0
 [0.4.0]: https://github.com/ooguz/yonga/releases/tag/v0.4.0
 [0.3.0]: https://github.com/ooguz/yonga/releases/tag/v0.3.0
 [0.2.0]: https://github.com/ooguz/yonga/releases/tag/v0.2.0

@@ -26,8 +26,8 @@ A run started from a branch fails at once, and the `pypi` environment would refu
 
 A manual run uses the `release.yml` stored in the tag, so this path works only for tags cut after
 the workflow took its current form. `v0.2.0` carries the earlier workflow, which takes the tag as
-an input and publishes without the AppImage gate, and it will not be published to PyPI. 0.3.0 is
-the first version released there.
+an input and publishes without the AppImage gate. None of 0.1.0 to 0.4.0 is published to PyPI:
+those were private releases, and 0.5.0 is the first version released there.
 
 ## One-time setup
 

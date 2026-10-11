@@ -25,7 +25,7 @@ APP_SLUG: str = "yonga"
 ENV_PREFIX: str = "YONGA_"
 """Prefix for every environment variable the tool reads for configuration."""
 
-FALLBACK_VERSION: str = "0.4.0"
+FALLBACK_VERSION: str = "0.5.0"
 """Version reported when the distribution metadata is unavailable.
 
 Kept in sync by hand with ``[project].version`` in ``pyproject.toml``; it is only
