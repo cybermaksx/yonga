@@ -56,7 +56,6 @@ from yonga.application.artifact_refs import artifact_not_found, newest_choice_no
 from yonga.application.artifacts import ArtifactStore
 from yonga.application.benchmark import BenchmarkService
 from yonga.application.chat import ChatOptions
-from yonga.application.evaluation import EvaluationService
 from yonga.application.jobs import JobContext, JobStateStore
 from yonga.application.probe import LocalArtifactStore, resolve_artifact
 from yonga.application.progress import CollectingSink
@@ -393,6 +392,9 @@ def test_an_artifact_id_that_is_gone_is_pointed_at_yonga_list(tmp_path: Path) ->
 
 
 def test_eval_keeps_its_code_and_gains_the_prepare_advice(tmp_path: Path) -> None:
+    pytest.importorskip("numpy")
+    from yonga.application.evaluation import EvaluationService
+
     settings = settings_for(tmp_path)
     service = EvaluationService(
         ArtifactStore(settings.paths, settings),

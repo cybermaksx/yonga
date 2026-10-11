@@ -15,7 +15,6 @@ import sys
 from collections.abc import Mapping
 from pathlib import Path
 
-import click
 import pytest
 from typer.main import get_command
 from typer.testing import CliRunner
@@ -507,13 +506,12 @@ def test_cli_doctor_reports_the_install_check(cli_host: Host) -> None:
 
 
 def _bin_dir_help(command: str) -> str:
-    group = get_command(app)
-    assert isinstance(group, click.Group)
-    self_group = group.commands["self"]
-    assert isinstance(self_group, click.Group)
-    option = next(p for p in self_group.commands[command].params if p.name == "bin_dir")
-    assert isinstance(option, click.Option)
-    return option.help or ""
+    # By attribute, not isinstance: typer 0.27 vendors click, so the classes
+    # ``import click`` names are not the ones get_command builds.
+    self_group = getattr(get_command(app), "commands", {})["self"]
+    params = getattr(self_group, "commands", {})[command].params
+    option = next(p for p in params if p.name == "bin_dir")
+    return str(getattr(option, "help", None) or "")
 
 
 def test_cli_uninstall_help_says_remove_not_install() -> None:

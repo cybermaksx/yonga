@@ -1733,9 +1733,9 @@ def test_reasoning_on_advice_names_an_option_chat_accepts(
     assert "Thinking mode is off" in advice
     named = set(re.findall(r"--[a-z][a-z-]+", advice))
     assert named == {"--show-reasoning"}
-    for flag in named:
-        usage = invoke(runner, home, ["chat", "--help"])
-        assert flag in usage.stdout
+    chat = getattr(typer.main.get_command(app), "commands", {})["chat"]
+    accepted = {opt for param in chat.params for opt in getattr(param, "opts", ())}
+    assert named <= accepted
 
 
 @pytest.mark.parametrize(
@@ -3516,6 +3516,7 @@ def test_eval_of_an_unprepared_model_repeats_the_whole_command(
     runner: CliRunner, home: Path, tmp_path: Path, args: list[str], unknown: str
 ) -> None:
     """'Then run it again: yonga eval X' dropped --reference and could swap the two."""
+    pytest.importorskip("numpy")
     result = invoke(
         runner,
         home,
