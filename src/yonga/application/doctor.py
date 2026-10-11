@@ -45,10 +45,13 @@ from yonga.application.self_install import CommandRelation, InstallationStatus, 
 from yonga.config.settings import Settings
 from yonga.domain.compile_cache import CompileCacheInventory, entry_count
 from yonga.domain.diagnostics import (
+    Diagnostic,
     ExitCode,
+    FailureCategory,
     HealthCheck,
     HealthSection,
     Severity,
+    fill_placeholders,
     worst_severity,
 )
 from yonga.domain.environments import ESTIMATED_ENVIRONMENT_BYTES, ExportEnvironment
@@ -291,13 +294,23 @@ class DoctorService:
         *,
         progress: ProgressSink | None = None,
         export_environments: Callable[[], Sequence[ExportEnvironment]] | None = None,
+        base_interpreter_bytes: Callable[[], int] | None = None,
+        exporter_import: Callable[[bool], bool | str | None] | None = None,
+        classify_failure: Callable[[str], Diagnostic] | None = None,
         compile_cache: Callable[[], CompileCacheInventory] | None = None,
         installation: Callable[[], InstallationStatus] | None = None,
     ) -> None:
         """Store the injected adapters. Nothing is probed until :meth:`run`.
 
         ``export_environments`` lists the managed export environments, so the
-        report can say how much disk they hold. ``compile_cache`` measures the
+        report can say how much disk they hold. ``base_interpreter_bytes`` measures
+        the copies of the bundled Python kept beside them, which ``yonga env
+        list`` counts in its total, so both commands give the same figure.
+        ``exporter_import(run)`` is the exporter's import check: ``True`` it
+        imports, a ``str`` the failure, ``None`` nothing to check; with ``run``
+        false it only reads what an earlier check recorded, ``False`` when there
+        is none. ``classify_failure`` turns that failure into the registry's
+        diagnostic, as 'prepare' does. ``compile_cache`` measures the
         OpenVINO compile cache, so it can say how much of it is reclaimable.
         ``installation`` says how yonga is running and what ``yonga`` on PATH
         resolves to, for the Host section's install check.
@@ -309,6 +322,9 @@ class DoctorService:
         self._settings = settings if settings is not None else Settings()
         self._progress: ProgressSink = progress if progress is not None else null_sink()
         self._export_environments = export_environments
+        self._base_interpreter_bytes = base_interpreter_bytes
+        self._exporter_import = exporter_import
+        self._classify_failure = classify_failure
         self._compile_cache = compile_cache
         self._compile_cache_summary: dict[str, object] | None = None
         self._installation = installation
@@ -332,6 +348,7 @@ class DoctorService:
         )
         installation = self._installation_status()
         environments = self._list_export_environments()
+        base_bytes = self._measure_base_interpreters() if environments is not None else 0
         appimage = (
             isinstance(installation, InstallationStatus)
             and installation.running.kind is InstallKind.APPIMAGE
@@ -340,11 +357,17 @@ class DoctorService:
         sections = [
             self._emit(self._host_section(inventory, installation)),
             self._emit(
-                self._openvino_section(inventory, appimage=appimage, environments=environments)
+                self._openvino_section(
+                    inventory,
+                    appimage=appimage,
+                    environments=environments,
+                    base_bytes=base_bytes,
+                    full=full,
+                )
             ),
             self._emit(devices_section),
             self._emit(self._npu_section(inventory)),
-            self._emit(self._storage_section(inventory, environments, full=full)),
+            self._emit(self._storage_section(inventory, environments, base_bytes, full=full)),
             self._emit(self._huggingface_section(inventory, auth)),
         ]
         if full:
@@ -414,6 +437,16 @@ class DoctorService:
         except Exception:
             # Reporting disk use must never make doctor fail.
             return None
+
+    def _measure_base_interpreters(self) -> int:
+        """Bytes held by the bundled-Python copies under the environments directory."""
+        if self._base_interpreter_bytes is None:
+            return 0
+        try:
+            return max(int(self._base_interpreter_bytes()), 0)
+        except Exception:
+            # Reporting disk use must never make doctor fail.
+            return 0
 
     def _emit(self, section: HealthSection) -> HealthSection:
         """Publish one finished section on the progress sink and return it."""
@@ -564,6 +597,8 @@ class DoctorService:
         *,
         appimage: bool,
         environments: Sequence[ExportEnvironment] | None,
+        base_bytes: int = 0,
+        full: bool = False,
     ) -> HealthSection:
         """Package versions plus the OpenVINO/GenAI/Tokenizers ABI family check.
 
@@ -571,6 +606,9 @@ class DoctorService:
         in a managed export environment instead, by design. There the missing
         packages are one ``export toolchain`` line saying so, not a warning
         per package that no one can act on.
+
+        Where the toolchain is installed, versions alone cannot say it works,
+        so the exporter's import check is reported after the packages.
         """
         checks: list[HealthCheck] = []
         absent: list[str] = []
@@ -585,10 +623,70 @@ class DoctorService:
         if absent:
             checks.insert(
                 position,
-                _managed_toolchain_check(absent, environments, self._settings.paths.envs_dir),
+                _managed_toolchain_check(
+                    absent, environments, self._settings.paths.envs_dir, base_bytes
+                ),
             )
+        exporter_import = self._exporter_import_check(full=full)
+        if exporter_import is not None:
+            # Right after the packages it vouches for.
+            toolchain = {f"openvino.{name.replace('-', '_')}" for name in EXPORT_PACKAGES}
+            last = max(
+                (index for index, check in enumerate(checks) if check.id in toolchain),
+                default=len(checks) - 1,
+            )
+            checks.insert(last + 1, exporter_import)
         checks.append(_abi_family_check(inventory))
         return HealthSection(id="openvino", title="OpenVINO", checks=_finalise(checks))
+
+    def _exporter_import_check(self, *, full: bool) -> HealthCheck | None:
+        """Whether ``optimum.exporters.openvino`` imports in this environment.
+
+        torch from the CPU index next to PyPI's torchvision passes every version
+        check above and still fails on the first import, so every conversion
+        here would fail. The import takes seconds, so it runs once per set of
+        installed package versions -- here, or in 'prepare', which checks before
+        every download -- and doctor reports what was recorded after that.
+        ``--full`` checks a recorded failure again.
+        """
+        if self._exporter_import is None:
+            return None
+        try:
+            state = self._exporter_import(False)
+            fresh = state is False or (full and isinstance(state, str))
+            if fresh:
+                state = self._exporter_import(True)
+        except Exception as exc:
+            return _check(
+                "openvino.exporter_import",
+                "exporter import",
+                Severity.UNKNOWN,
+                value="not checked",
+                detail=redact_text(f"The import check could not run: {exc}"),
+            )
+        if state is None or state is False:
+            return None
+        if state is True:
+            return _check(
+                "openvino.exporter_import",
+                "exporter import",
+                Severity.OK,
+                value="imports",
+                detail="optimum.exporters.openvino imports in this environment.",
+            )
+        return _exporter_import_failure(state, self._classify(state), recorded=not fresh)
+
+    def _classify(self, failure: str) -> Diagnostic | None:
+        """The registry's reading of a failure, or ``None`` when no rule knows it."""
+        if self._classify_failure is None:
+            return None
+        try:
+            classified = self._classify_failure(failure)
+        except Exception:
+            return None
+        if classified.category is FailureCategory.UNKNOWN_RUNTIME_ERROR:
+            return None
+        return classified
 
     # --- devices --------------------------------------------------------
 
@@ -693,6 +791,7 @@ class DoctorService:
         self,
         inventory: HardwareInventory,
         environments: Sequence[ExportEnvironment] | None,
+        base_bytes: int = 0,
         *,
         full: bool,
     ) -> HealthSection:
@@ -718,7 +817,7 @@ class DoctorService:
             _managed_temp_check(inventory.managed_temp, paths.tmp_dir),
         ]
         if environments is not None:
-            checks.append(_environment_check(environments, paths.envs_dir))
+            checks.append(_environment_check(environments, paths.envs_dir, base_bytes))
         compile_cache = self._compile_cache_check(
             _filesystem_for(inventory, paths.compile_cache_dir) or inventory.managed_temp
         )
@@ -1135,6 +1234,7 @@ def _managed_toolchain_check(
     absent: Sequence[str],
     environments: Sequence[ExportEnvironment] | None,
     root: Path,
+    base_bytes: int = 0,
 ) -> HealthCheck:
     """The ``openvino.export_toolchain`` line of an AppImage.
 
@@ -1145,7 +1245,7 @@ def _managed_toolchain_check(
     names = _listing(absent)
     verb = "is" if len(absent) == 1 else "are"
     if environments:
-        total = sum(environment.size_bytes for environment in environments)
+        total = sum(environment.size_bytes for environment in environments) + base_bytes
         value = f"managed environment, {len(environments)} built"
         detail = (
             f"{names} {verb} not in the AppImage; 'prepare' converts in a managed export "
@@ -1167,16 +1267,61 @@ def _managed_toolchain_check(
     )
 
 
-def _environment_check(environments: Sequence[ExportEnvironment], root: Path) -> HealthCheck:
-    """How many managed export environments exist and the disk they use."""
-    total = sum(environment.size_bytes for environment in environments)
-    value = f"{len(environments)} built, {format_bytes(total)}" if environments else "none built"
+def _exporter_import_failure(
+    failure: str, classified: Diagnostic | None, *, recorded: bool
+) -> HealthCheck:
+    """The ``openvino.exporter_import`` line when the export entry point does not import.
+
+    A warning, not an error: the runtime still loads and runs prepared models;
+    only converting in this environment is broken. The registry's diagnostic,
+    when a rule knows the failure, supplies the title and the remedy -- the same
+    ones 'prepare' prints when it stops on it.
+    """
+    lines = [line.strip() for line in redact_text(failure).splitlines() if line.strip()]
+    last = lines[-1] if lines else "the import failed"
+    if classified is not None:
+        filled = fill_placeholders(classified)
+        title = filled.title.strip() or filled.code
+        remediation = [step for step in filled.remediation if step.strip()]
+    else:
+        title = "optimum.exporters.openvino does not import"
+        remediation = [
+            'Reproduce it: python -c "import optimum.exporters.openvino"',
+            NEVER_INSTALLS_NOTE,
+        ]
+    if recorded:
+        remediation.append("This is what the last check found; `yonga doctor --full` checks again.")
+    return _check(
+        "openvino.exporter_import",
+        "exporter import",
+        Severity.WARNING,
+        value="fails",
+        detail=f"{title}: {last}",
+        remediation=remediation,
+    )
+
+
+def _environment_check(
+    environments: Sequence[ExportEnvironment], root: Path, base_bytes: int = 0
+) -> HealthCheck:
+    """How many managed export environments exist and the disk they use.
+
+    The total is everything ``yonga env list`` totals: the environments and
+    the copy of the bundled Python they are made from.
+    """
+    total = sum(environment.size_bytes for environment in environments) + base_bytes
+    value = f"{len(environments)} built" if environments else "none built"
+    if total:
+        value += f", {format_bytes(total)}"
+    base = (
+        f", including a {format_bytes(base_bytes)} copy of the bundled Python" if base_bytes else ""
+    )
     return _check(
         "storage.export_environments",
         "export environments",
         Severity.OK,
         value=value,
-        detail=f"{root} — isolated environments exports run in; `yonga env list`",
+        detail=f"{root} — isolated environments exports run in{base}; `yonga env list`",
     )
 
 

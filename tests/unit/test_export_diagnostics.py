@@ -35,7 +35,7 @@ from tests.unit.test_prepare_planning import (
     run_prepare,
     safetensors_metadata,
 )
-from yonga.adapters import ChecksToolchainImport
+from yonga.adapters import ChecksToolchainImport, RecordsToolchainImport
 from yonga.adapters import exporter_optimum as exporter_module
 from yonga.adapters.exporter_optimum import TAIL_LINES, OptimumExporter
 from yonga.application.benchmark import BenchmarkService
@@ -55,6 +55,7 @@ from yonga.domain.diagnostics import (
 )
 from yonga.domain.models import ModelIdentity, ModelMetadata
 from yonga.domain.plans import QuantizationSettings
+from yonga.privacy import TELEMETRY_BOOTSTRAP
 from yonga.registry.loader import load_builtin_registry
 from yonga.registry.resolver import (
     GROUP_SIZE_MISMATCH_CODE,
@@ -243,6 +244,29 @@ def test_an_import_that_works_is_checked_once_per_environment(tmp_path: Path) ->
     argv = runner.calls[0].argv
     assert argv[1:3] == ["-P", "-c"]
     assert "import optimum.exporters.openvino" in argv[3]
+    # The check imports OpenVINO, which reports the import unless told not to.
+    assert argv[3].startswith(TELEMETRY_BOOTSTRAP)
+
+
+@pytest.mark.usefixtures("optimum_present")
+def test_doctor_reads_the_recorded_import_check_without_importing(tmp_path: Path) -> None:
+    """``run=False`` never starts the import; it reports what the last check found."""
+    failing = FakeRunner(returncode=1, stderr=TORCHVISION_STDERR)
+    exporter = OptimumExporter(failing, cache_dir=tmp_path / "cache")
+    assert exporter.toolchain_import_state(run=False) is False
+    assert failing.calls == []
+
+    exporter.toolchain_import_failure()  # what prepare's preflight does
+    recorded = exporter.toolchain_import_state(run=False)
+    assert isinstance(recorded, str)
+    assert "operator torchvision::nms does not exist" in recorded
+    assert len(failing.calls) == 1
+
+    # Once the environment imports, the success replaces the recorded failure.
+    fixed = OptimumExporter(FakeRunner(returncode=0), cache_dir=tmp_path / "cache")
+    assert fixed.toolchain_import_state() is True
+    assert fixed.toolchain_import_state(run=False) is True
+    assert isinstance(fixed, RecordsToolchainImport)
 
 
 @pytest.mark.usefixtures("optimum_present")

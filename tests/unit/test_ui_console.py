@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from rich.progress import TextColumn
+from rich.text import Text
 
 from yonga.application.progress import ProgressEvent, ProgressKind, ProgressSink
 from yonga.domain.diagnostics import Diagnostic, FailureCategory, Severity, diagnostic
@@ -460,3 +462,92 @@ def test_progress_sink_close_is_idempotent():
     sink = RichProgressSink(console)
     sink.close()
     sink.close()
+
+
+# ----------------------------------------------------------------------
+# plain text: brackets are never markup
+# ----------------------------------------------------------------------
+BRACKETED = ("pip install 'yonga[openvino]'", "[bold]not a style[/bold] and [red]")
+
+
+@pytest.mark.parametrize("text", BRACKETED)
+def test_printed_strings_keep_their_brackets(text: str) -> None:
+    """A remediation command or upstream message is printed as written, not as markup."""
+    console, out, err = make_console()
+    console.print(text)
+    console.print_error(text, style="dim")
+    console.detail(text)
+    assert out.getvalue().strip() == text
+    assert err.getvalue().strip() == text
+
+
+@pytest.mark.parametrize("text", BRACKETED)
+def test_strings_stay_literal_on_a_caller_supplied_console(text: str) -> None:
+    """A plain Rich console (markup on) handed in still gets literal text."""
+    from rich.console import Console
+
+    out, err = io.StringIO(), io.StringIO()
+    console = YongaConsole(
+        out=Console(file=out, width=100, force_terminal=False),
+        err=Console(file=err, width=100, force_terminal=False),
+        env={},
+    )
+    console.print(text)
+    console.print_error(text)
+    assert out.getvalue().strip() == text
+    assert err.getvalue().strip() == text
+
+
+@pytest.mark.parametrize("text", BRACKETED)
+def test_table_cells_and_diagnostics_keep_their_brackets(text: str) -> None:
+    """Tables and diagnostics carry model ids, paths and messages yonga did not write."""
+    from rich.table import Table
+
+    console, out, err = make_console()
+    table = Table(text)
+    table.add_row(text)
+    console.print(table)
+    console.diagnostic(
+        diagnostic(
+            "runtime.missing",
+            FailureCategory.CONFIGURATION_ERROR,
+            text,
+            text,
+            remediation=[text],
+        )
+    )
+    assert out.getvalue().count(text) == 2
+    assert err.getvalue().count(text) == 3
+
+
+def test_progress_descriptions_are_literal() -> None:
+    """A live task named after a file keeps its brackets in the progress column."""
+    console, _, _ = make_console()
+    sink = RichProgressSink(console)
+    try:
+        progress = sink._ensure_progress()
+        progress.add_task(BRACKETED[1])
+        column = progress.columns[1]
+        assert isinstance(column, TextColumn)
+        rendered = column.render(progress.tasks[0])
+        assert isinstance(rendered, Text)
+        assert rendered.plain == BRACKETED[1]
+    finally:
+        sink.close()
+
+
+def test_confirm_prompt_is_literal(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The question can name a model; it reaches the prompt as text, not markup."""
+    from rich.prompt import Confirm
+
+    asked: list[object] = []
+
+    def fake_ask(prompt: object, **_: object) -> bool:
+        asked.append(prompt)
+        return True
+
+    monkeypatch.setattr(Confirm, "ask", fake_ask)
+    console, _, _ = make_console(interactive=True)
+    assert console.confirm(f"Prepare {BRACKETED[1]}?")
+    assert isinstance(asked[0], Text)
+    assert asked[0].plain == f"Prepare {BRACKETED[1]}?"

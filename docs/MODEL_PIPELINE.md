@@ -141,7 +141,7 @@ TEMP=<managed temp>
 
 Build Optimum argv from profile.
 
-`optimum-cli` in the examples stands for the launcher. In a managed export environment yonga runs `<env python> -P -m optimum.commands.optimum_cli`; in its own environment it runs `<python> -P -m optimum.commands.optimum_cli` when that module is importable and falls back to the `optimum-cli` executable on `PATH` otherwise. `-P` keeps the current directory off `sys.path`, so a module of the same name there cannot stand in for a real one.
+`optimum-cli` in the examples stands for the launcher. In a managed export environment yonga runs `optimum.commands.optimum_cli` as a module of `<env python>`; in its own environment it runs it with `<python>` when that module is importable and falls back to the `optimum-cli` executable on `PATH` otherwise, through the interpreter its `#!` line names when that is a plain path. The module is started as `<python> -P -c "<bootstrap>" ARGS`, where the bootstrap makes `import openvino_telemetry` fail and then runs the module with `runpy.run_module(..., run_name="__main__", alter_sys=True)`, which is what `-m` does: the same `sys.argv`, the same exit status, and no usage report from OpenVINO (`src/yonga/privacy.py`). `-P` keeps the current directory off `sys.path`, so a module of the same name there cannot stand in for a real one.
 
 Example GPU profile:
 

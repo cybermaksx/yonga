@@ -328,7 +328,8 @@ class RichProgressSink:
         if self._progress is None:
             self._progress = Progress(
                 SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
+                # Descriptions carry file and model names: literal text, not markup.
+                TextColumn("{task.description}", style="progress.description", markup=False),
                 BarColumn(),
                 TaskProgressColumn(),
                 TimeElapsedColumn(),

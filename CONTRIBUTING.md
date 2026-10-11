@@ -59,7 +59,11 @@ A test whose device or input is missing skips with the command that provides it.
 - A few rules are not negotiable: tokens and other secrets are never logged or written out;
   remote code stays off unless the user passes `--trust-remote-code`, and `--yes` never implies
   it; subprocesses take argument lists, never a shell string; the Hugging Face cache is never
-  modified; and yonga sends no telemetry.
+  modified; and yonga sends no telemetry. That includes the libraries it runs: OpenVINO's own
+  usage reporting (the `openvino_telemetry` package, which Optimum Intel and NNCF reach too) is
+  kept from loading in every Python process yonga starts, without writing anything under `~/intel`
+  (`src/yonga/privacy.py`). A new child interpreter is started through
+  `python_code_argv`/`python_module_argv` there, or imports `yonga` first.
 
 By contributing you agree that your contribution is licensed under the GNU Affero General Public License v3.0 or later, as
 the rest of the project is (`LICENSE`).

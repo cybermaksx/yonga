@@ -47,6 +47,7 @@ __all__ = [
     "HubClient",
     "HubPublisher",
     "HubSearch",
+    "RecordsToolchainImport",
     "ReportsToolchain",
     "RuntimeProbe",
 ]
@@ -147,6 +148,19 @@ class ChecksToolchainImport(Protocol):
 
     def toolchain_import_failure(self) -> str | None:
         """``None`` when the in-environment exporter imports, else the failure text."""
+        ...
+
+
+@runtime_checkable
+class RecordsToolchainImport(Protocol):
+    """An exporter that remembers its last import check, so doctor can report it cheaply."""
+
+    def toolchain_import_state(self, *, run: bool = True) -> bool | str | None:
+        """``True`` imports, a ``str`` is the failure, ``None`` is nothing to check.
+
+        With ``run=False`` only what an earlier check recorded is read and nothing
+        is imported; ``False`` then means no check is recorded.
+        """
         ...
 
 

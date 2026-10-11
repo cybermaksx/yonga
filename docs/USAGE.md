@@ -55,6 +55,10 @@ What to look for:
   `self install` command; if `yonga` on `PATH` is another installation (an older AppImage, a pip
   install), it names it.
 - **ABI family** must say `aligned`. OpenVINO, GenAI and Tokenizers have to share a major.minor.
+- **OpenVINO → exporter import** says whether the conversion toolchain installed next to yonga
+  actually loads, which version numbers cannot show (a CPU torch next to PyPI's torchvision
+  passes them all). The first doctor imports it once, in a few seconds; later runs report that
+  answer until a package version changes, and `--full` checks a recorded failure again.
 - **NPU → /dev/accel/accel0** should say `accessible`. If it does not, doctor names the owning
   group (usually `render`) and prints the `usermod` command *for you to run* — yonga never uses
   sudo and never changes your system.

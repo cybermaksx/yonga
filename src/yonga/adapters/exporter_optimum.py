@@ -52,6 +52,7 @@ from yonga.domain.plans import (
     QuantizationSettings,
     export_extra_arg_problems,
 )
+from yonga.privacy import python_code_argv, python_module_argv
 from yonga.util.redaction import redact_argv, redact_env, redact_text
 from yonga.util.versions import installed_version, satisfies
 
@@ -74,8 +75,10 @@ __all__ = [
     "resolve_launcher",
 ]
 
-#: Module path of the Optimum CLI entry point. Running it with ``python -m`` keeps
-#: the export inside the interpreter yonga itself runs in (verified on this host).
+#: Module path of the Optimum CLI entry point. Running it as a module keeps the
+#: export inside the interpreter yonga itself runs in (verified on this host). It
+#: is started through :func:`yonga.privacy.python_module_argv`, the ``-m`` of an
+#: interpreter that has OpenVINO's telemetry switched off first.
 OPTIMUM_CLI_MODULE: str = "optimum.commands.optimum_cli"
 
 #: Console-script fallback used when the module above cannot be located.
@@ -243,18 +246,45 @@ def missing_exporter_diagnostic() -> Diagnostic:
 def resolve_launcher() -> list[str]:
     """Return the argv prefix that runs the Optimum CLI, or raise ``ConfigurationError``.
 
-    ``[sys.executable, "-P", "-m", "optimum.commands.optimum_cli"]`` is preferred
-    because it pins the export to the interpreter yonga is running in — no ``PATH``
-    games, no second virtual environment. ``-P`` keeps the current directory off
-    ``sys.path``, so a module of the same name there cannot stand in for a real one.
-    ``shutil.which("optimum-cli")`` is the fallback.
+    Running ``optimum.commands.optimum_cli`` as a module of ``sys.executable`` is
+    preferred because it pins the export to the interpreter yonga is running in —
+    no ``PATH`` games, no second virtual environment. ``-P`` keeps the current
+    directory off ``sys.path``, so a module of the same name there cannot stand
+    in for a real one. ``shutil.which("optimum-cli")`` is the fallback, run
+    through the interpreter its ``#!`` line names when there is one, so that it
+    too starts with vendor telemetry off (:mod:`yonga.privacy`).
     """
     if _module_importable(OPTIMUM_CLI_MODULE):
-        return [sys.executable, "-P", "-m", OPTIMUM_CLI_MODULE]
+        return python_module_argv(sys.executable, OPTIMUM_CLI_MODULE)
     executable = shutil.which(OPTIMUM_CLI_EXECUTABLE)
     if executable:
+        interpreter = _script_interpreter(Path(executable))
+        if interpreter is not None:
+            return python_module_argv(interpreter, OPTIMUM_CLI_MODULE)
         return [executable]
     raise ConfigurationError(missing_exporter_diagnostic())
+
+
+def _script_interpreter(script: Path) -> Path | None:
+    """The Python a console script's ``#!`` line names, or ``None`` when it names none.
+
+    Only the plain form pip writes (``#!/abs/path/bin/python3``) is accepted: an
+    ``env`` lookup or extra arguments are left to the script itself.
+    """
+    try:
+        with script.open("rb") as handle:
+            first = handle.readline(4096)
+    except OSError:
+        return None
+    if not first.startswith(b"#!"):
+        return None
+    command = first[2:].decode("utf-8", errors="replace").strip()
+    if not command or " " in command:
+        return None
+    interpreter = Path(command)
+    if not interpreter.is_absolute() or not interpreter.name.startswith("python"):
+        return None
+    return interpreter if interpreter.is_file() else None
 
 
 def is_disk_exhaustion(text: str) -> bool:
@@ -349,7 +379,7 @@ class OptimumExporter:
         if self._launcher is not None:
             return list(self._launcher)
         if request is not None and request.interpreter is not None:
-            return [str(request.interpreter), "-P", "-m", OPTIMUM_CLI_MODULE]
+            return python_module_argv(request.interpreter, OPTIMUM_CLI_MODULE)
         return resolve_launcher()
 
     def build_argv(self, request: ExportRequest) -> list[str]:
@@ -381,25 +411,45 @@ class OptimumExporter:
         environments are verified by importing ``optimum.exporters.openvino``;
         this asks the same of the environment yonga runs in, before the
         download rather than after it. The import takes seconds, so a success
-        is cached per interpreter and package versions; a failure never is.
+        is cached per interpreter and package versions; a failure is always
+        checked again (it is only recorded for ``yonga doctor`` to show).
 
         ``None`` too when there is nothing in this interpreter to check: no
         Optimum module, or a launcher configured from outside.
+        """
+        state = self.toolchain_import_state()
+        return state if isinstance(state, str) else None
+
+    def toolchain_import_state(self, *, run: bool = True) -> bool | str | None:
+        """The import check of :meth:`toolchain_import_failure`, with what was recorded.
+
+        ``True`` when the export entry point imports, the failure text when it
+        does not, ``None`` when there is nothing to check. A failure is recorded
+        too, under the same key, but only for ``yonga doctor`` to show: a
+        recorded failure is never trusted as an answer and is checked again
+        whenever ``run`` is true. With ``run=False`` nothing is imported, and
+        ``False`` means no check has been recorded for these package versions.
         """
         if self._launcher is not None or not _module_importable(OPTIMUM_CLI_MODULE):
             return None
         versions = {name: installed_version(name) for name in (*EXPORT_PACKAGES, "torchvision")}
         key = json.dumps([sys.executable, versions], sort_keys=True)
         cached = self._read_cache(_IMPORT_CACHE_FILE)
-        if cached.get(key) is True:
-            return None
-        result = self._runner.run([sys.executable, "-P", "-c", _IMPORT_CHECK_SCRIPT])
+        recorded = cached.get(key)
+        if recorded is True:
+            return True
+        if not run:
+            return recorded if isinstance(recorded, str) and recorded else False
+        result = self._runner.run(python_code_argv(sys.executable, _IMPORT_CHECK_SCRIPT))
         if result.returncode == 0:
             cached[key] = True
             self._write_cache(_IMPORT_CACHE_FILE, cached)
-            return None
+            return True
         lines = _failure_tail(result.stderr_lines) or _tail(result.stdout_lines)
-        return "\n".join(lines).strip() or f"the import exited with status {result.returncode}"
+        failure = "\n".join(lines).strip() or f"the import exited with status {result.returncode}"
+        cached[key] = failure
+        self._write_cache(_IMPORT_CACHE_FILE, cached)
+        return failure
 
     def declared_requirements(
         self, model_type: str, task: str | None
@@ -472,7 +522,7 @@ class OptimumExporter:
             "                  'max': text(getattr(cls, 'MAX_TRANSFORMERS_VERSION', None)),\n"
             "                  'config': cls.__name__}))\n"
         )
-        result = self._runner.run([str(python), "-P", "-c", script, model_type, task or ""])
+        result = self._runner.run(python_code_argv(python, script, model_type, task or ""))
         if result.returncode != 0:
             return None
         for line in reversed(list(result.stdout_lines)):

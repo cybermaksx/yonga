@@ -9,6 +9,7 @@ is covered by ``tests/integration/test_exporter_fake.py``.
 from __future__ import annotations
 
 import json
+import sys
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -37,6 +38,7 @@ from yonga.domain.plans import (
     ExportRequest,
     QuantizationSettings,
 )
+from yonga.privacy import TELEMETRY_BOOTSTRAP, python_module_argv
 from yonga.util.redaction import REDACTED
 from yonga.util.versions import installed_version
 
@@ -361,7 +363,7 @@ def test_resolve_launcher_prefers_the_module_in_this_interpreter(
         "yonga.adapters.exporter_optimum._module_importable",
         lambda name: name == OPTIMUM_CLI_MODULE,
     )
-    assert resolve_launcher()[1:] == ["-P", "-m", OPTIMUM_CLI_MODULE]
+    assert resolve_launcher() == python_module_argv(sys.executable, OPTIMUM_CLI_MODULE)
 
 
 def test_a_managed_interpreter_runs_without_the_current_directory_on_sys_path(
@@ -374,12 +376,27 @@ def test_a_managed_interpreter_runs_without_the_current_directory_on_sys_path(
         profile=make_profile("gpu-int4-asym-g128"),
         interpreter=python,
     )
-    assert OptimumExporter().resolve_launcher(request) == [
-        str(python),
-        "-P",
-        "-m",
-        OPTIMUM_CLI_MODULE,
-    ]
+    launcher = OptimumExporter().resolve_launcher(request)
+    assert launcher == python_module_argv(python, OPTIMUM_CLI_MODULE)
+    assert launcher[:3] == [str(python), "-P", "-c"]
+    assert TELEMETRY_BOOTSTRAP in launcher[3]
+
+
+def test_a_console_script_runs_through_its_own_interpreter(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The ``optimum-cli`` fallback starts with telemetry off too, in the Python it names."""
+    python = tmp_path / "venv" / "bin" / "python3"
+    python.parent.mkdir(parents=True)
+    python.write_text("")
+    script = tmp_path / "venv" / "bin" / "optimum-cli"
+    script.write_text(f"#!{python}\nimport sys\n", encoding="utf-8")
+    monkeypatch.setattr("yonga.adapters.exporter_optimum._module_importable", lambda name: False)
+    monkeypatch.setattr("yonga.adapters.exporter_optimum.shutil.which", lambda name: str(script))
+    assert resolve_launcher() == python_module_argv(python, OPTIMUM_CLI_MODULE)
+
+    script.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+    assert resolve_launcher() == [str(script)]
 
 
 def test_resolve_launcher_falls_back_to_the_console_script(
