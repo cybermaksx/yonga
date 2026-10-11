@@ -39,14 +39,18 @@ from tests.unit.test_prepare_planning import (
 from yonga.adapters.hf import detect_formats
 from yonga.application.jobs import JobContext
 from yonga.config.settings import Settings
+from yonga.domain.artifacts import ValidationReport
 from yonga.domain.diagnostics import (
     CancelledError,
     DeviceUnsupportedError,
     ExitCode,
     HubAuthError,
     PreflightError,
+    RemoteCodeRequiredError,
+    RepairError,
 )
 from yonga.domain.hardware import HuggingFaceAuthInfo
+from yonga.domain.invocation import CommandLine
 from yonga.domain.models import ModelFormat, ModelIdentity, ModelMetadata, RepoFile
 from yonga.domain.plans import (
     CONFIRMATION_REMOTE_CODE,
@@ -591,3 +595,120 @@ def test_the_plan_always_says_where_the_export_runs(settings: Settings, hub: Rec
     assert "this environment" in text
     assert sys.executable in text
     assert "the installed packages meet the exporter requirements" in text
+
+
+# --- PREP-11: a /tmp too small for the job is a note when it was not used --------------
+
+
+def test_a_small_system_temp_the_managed_directory_replaced_is_a_note(
+    settings: Settings, hub: RecordingHub
+) -> None:
+    """Every prepare on a host with a small /tmp exited 2 for something that was no risk."""
+    service = build_service(settings=settings, hub=hub)
+    plan = service.plan(SAFETENSORS_REPO, device="gpu")
+    assert plan.disk.temp.system_temp_would_fail
+
+    outcome = run_prepare(service, plan, settings)
+
+    assert not any("too small" in warning for warning in outcome.warnings)
+    assert any("the managed directory was used instead" in note for note in outcome.notes)
+    assert any("the managed directory was used instead" in n for n in outcome.manifest.notes)
+
+
+# --- PREP-12: advice to run the command again repeats the whole command ----------------
+
+#: What the user typed: a device, a profile and a root option the advice must keep.
+TYPED = CommandLine(
+    command=("prepare",),
+    arguments=(SAFETENSORS_REPO,),
+    options=(("--device", "gpu"), ("--profile", "gpu-int4-asym-g128-r08")),
+    root_options=(("--data-dir", "/srv/my models"),),
+)
+TYPED_TEXT = (
+    f"yonga --data-dir '/srv/my models' prepare {SAFETENSORS_REPO} --device gpu "
+    "--profile gpu-int4-asym-g128-r08"
+)
+
+
+def test_the_yes_advice_repeats_the_whole_command(settings: Settings, hub: RecordingHub) -> None:
+    service = build_service(settings=settings, hub=hub)
+    plan = service.plan(
+        SAFETENSORS_REPO, device="gpu", profile_id="gpu-int4-asym-g128-r08", command_line=TYPED
+    )
+
+    with pytest.raises(CancelledError) as caught:
+        with_unattended(service, plan, settings)
+
+    steps = caught.value.diagnostic.remediation
+    assert any(step.endswith(f": {TYPED_TEXT} --yes") for step in steps)
+    assert hub.downloaded == []
+
+
+def test_without_a_command_line_the_advice_names_the_bare_command(
+    settings: Settings, hub: RecordingHub
+) -> None:
+    service = build_service(settings=settings, hub=hub)
+    plan = service.plan(SAFETENSORS_REPO, device="gpu")
+
+    with pytest.raises(CancelledError) as caught:
+        with_unattended(service, plan, settings)
+
+    steps = caught.value.diagnostic.remediation
+    assert any(step.endswith(f": yonga prepare {SAFETENSORS_REPO} --yes") for step in steps)
+
+
+def test_the_remote_code_advice_repeats_the_whole_command(
+    settings: Settings, tmp_path: Path
+) -> None:
+    repo = "acme/remote-code-model"
+    hub = RecordingHub(
+        repos={repo: safetensors_metadata(repo, sha="a" * 40, requires_remote_code=True)},
+        snapshots={repo: make_snapshot(tmp_path)},
+    )
+    service = build_service(settings=settings, hub=hub)
+    typed = TYPED.model_copy(update={"arguments": (repo,), "options": (("--yes",),)})
+    plan = service.plan(repo, device="gpu", command_line=typed)
+
+    with pytest.raises(RemoteCodeRequiredError) as caught:
+        run_prepare(service, plan, settings)
+
+    expected = f"yonga --data-dir '/srv/my models' prepare {repo} --yes --trust-remote-code"
+    assert any(step.endswith(f": {expected}") for step in caught.value.diagnostic.remediation)
+
+
+def test_the_no_repair_advice_drops_only_that_flag(settings: Settings, hub: RecordingHub) -> None:
+    service = build_service(settings=settings, hub=hub)
+    typed = TYPED.model_copy(update={"options": (*TYPED.options, ("--no-repair",))})
+    plan = service.plan(
+        SAFETENSORS_REPO, device="gpu", profile_id="gpu-int4-asym-g128-r08", command_line=typed
+    )
+
+    with pytest.raises(RepairError) as caught:
+        run_prepare(service, plan, settings, allow_repairs=False)
+
+    assert caught.value.diagnostic.code == "repair.declined"
+    assert caught.value.diagnostic.remediation[0].endswith(f": {TYPED_TEXT}")
+
+
+def test_a_failed_validation_advises_a_fresh_export_not_force(
+    settings: Settings, hub: RecordingHub
+) -> None:
+    """A plain re-run adopts the export this job leaves behind; a fresh export redoes it.
+
+    Only an unclassified report reaches this advice, which no fake export
+    produces, so the report is handed to the failure builder directly.
+    """
+    from yonga.application.jobs import open_job
+
+    service = build_service(settings=settings, hub=hub)
+    plan = service.plan(
+        SAFETENSORS_REPO, device="gpu", profile_id="gpu-int4-asym-g128-r08", command_line=TYPED
+    )
+    report = ValidationReport(ok=False, problems=["something nobody has classified"])
+
+    with open_job(settings=settings, requested_model=SAFETENSORS_REPO) as ctx:
+        failure = service._validation_failure(report, plan, ctx)
+
+    assert failure.code == "validation.failed"
+    assert any(step.endswith(f": {TYPED_TEXT} --fresh-export") for step in failure.remediation)
+    assert not any("--force" in step for step in failure.remediation)

@@ -23,6 +23,7 @@ from yonga.domain.compatibility import (
 from yonga.domain.diagnostics import Diagnostic
 from yonga.domain.environments import EnvironmentSpec
 from yonga.domain.hardware import FilesystemInfo, HardwareInventory, normalise_device
+from yonga.domain.invocation import CommandLine
 from yonga.domain.models import (
     FormatObservation,
     ModelFormat,
@@ -507,6 +508,9 @@ class PreparationPlan(BaseModel):
     auth_missing: bool = False
     """The source repository is gated or private and no Hugging Face token was
     found, so its download is bound to be refused."""
+    command_line: CommandLine | None = Field(default=None, exclude=True)
+    """The command that asked for this plan, so that remediation can repeat it
+    with a flag added. ``None`` when the plan was not made from a command line."""
 
     @field_validator("target_device")
     @classmethod

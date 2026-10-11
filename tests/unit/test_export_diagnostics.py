@@ -53,6 +53,7 @@ from yonga.domain.diagnostics import (
     diagnostic,
     fill_placeholders,
 )
+from yonga.domain.invocation import CommandLine
 from yonga.domain.models import ModelIdentity, ModelMetadata
 from yonga.domain.plans import QuantizationSettings
 from yonga.privacy import TELEMETRY_BOOTSTRAP
@@ -478,16 +479,102 @@ def test_without_widths_nothing_is_ruled_out() -> None:
     assert profile_id == "cpu-int4-asym-g128-r08"
 
 
-def test_an_explicit_profile_that_cannot_fit_is_used_but_flagged() -> None:
+def test_an_explicit_profile_that_cannot_fit_is_refused_naming_the_ones_that_do() -> None:
+    """``--profile`` is the user's choice: refused before the download, never swapped."""
     meta = smollm2_metadata()
     registry = resolver()
     arch_rule, _ = registry.resolve_architecture(meta)
-    profile, explanation = registry.resolve_profile(
-        device="cpu", arch_rule=arch_rule, meta=meta, explicit_profile_id="cpu-int4-asym-g128"
+
+    with pytest.raises(RegistryError) as caught:
+        registry.resolve_profile(
+            device="cpu", arch_rule=arch_rule, meta=meta, explicit_profile_id="cpu-int4-asym-g128"
+        )
+
+    found = caught.value.diagnostic
+    assert found.code == GROUP_SIZE_MISMATCH_CODE
+    assert found.exit_code() is ExitCode.REGISTRY
+    assert "hidden_size of 960" in found.message
+    assert "Nothing has been downloaded" in found.message
+    steps = fill_placeholders(found).remediation
+    # The automatic choice comes first, as a command that keeps the device.
+    assert steps[0].endswith(
+        f"yonga prepare {SMOLLM2_REPO} --device cpu --profile cpu-int8-asym-ref"
+    )
+    assert "the one yonga chooses" in steps[0]
+    assert any("cpu-fp16-ref" in step for step in steps[1:])
+    # Neither a group-wise CPU profile nor another device's profile is offered.
+    assert not any("cpu-int4-asym-g128" in step for step in steps)
+    assert not any("npu-" in step or "gpu-" in step for step in steps)
+
+
+def test_an_unfit_profile_for_another_device_also_names_what_fits_there() -> None:
+    """``--profile cpu-...`` while auto picked the GPU: the CPU's own way out is named too."""
+    meta = smollm2_metadata()
+    registry = resolver()
+    arch_rule, _ = registry.resolve_architecture(meta)
+
+    with pytest.raises(RegistryError) as caught:
+        registry.resolve_profile(
+            device="gpu", arch_rule=arch_rule, meta=meta, explicit_profile_id="cpu-int4-asym-g128"
+        )
+
+    steps = fill_placeholders(caught.value.diagnostic).remediation
+    assert steps[0] == "No GPU profile can quantize this model."
+    assert steps[1].endswith(
+        f"yonga prepare {SMOLLM2_REPO} --device cpu --profile cpu-int8-asym-ref"
     )
 
+
+def test_an_explicit_profile_that_fits_is_used() -> None:
+    meta = smollm2_metadata(hidden_size=1024)
+    registry = resolver()
+    arch_rule, _ = registry.resolve_architecture(meta)
+    profile, _explanation = registry.resolve_profile(
+        device="cpu", arch_rule=arch_rule, meta=meta, explicit_profile_id="cpu-int4-asym-g128"
+    )
     assert profile.id == "cpu-int4-asym-g128"
-    assert any(GROUP_SIZE_MISMATCH_CODE in note for note in explanation.notes)
+
+
+def test_an_unfit_explicit_profile_is_refused_at_planning_with_the_users_command(
+    settings: Settings, tmp_path: Path
+) -> None:
+    """The refusal comes before the download, and repeats every option the user gave."""
+    hub = smollm2_hub(tmp_path)
+    service = build_service(settings=settings, hub=hub)
+    command = CommandLine(
+        command=("prepare",),
+        arguments=(SMOLLM2_REPO,),
+        options=(("--device", "cpu"), ("--profile", "cpu-int4-asym-g128"), ("--yes",)),
+        root_options=(("--data-dir", "/srv/my models"),),
+    )
+
+    with pytest.raises(RegistryError) as caught:
+        service.plan(
+            SMOLLM2_REPO, device="cpu", profile_id="cpu-int4-asym-g128", command_line=command
+        )
+
+    assert caught.value.diagnostic.code == GROUP_SIZE_MISMATCH_CODE
+    assert caught.value.diagnostic.remediation[0].endswith(
+        f"yonga --data-dir '/srv/my models' prepare {SMOLLM2_REPO} --device cpu "
+        "--profile cpu-int8-asym-ref --yes"
+    )
+    assert hub.downloaded == []
+
+
+def test_auto_does_not_move_another_device_past_an_unfit_explicit_profile(
+    settings: Settings, tmp_path: Path
+) -> None:
+    """Auto mode tries the next device for its own choice, never for the user's profile."""
+    hub = smollm2_hub(tmp_path)
+    service = build_service(settings=settings, hub=hub)
+
+    with pytest.raises(RegistryError) as caught:
+        service.plan(SMOLLM2_REPO, device="auto", profile_id="gpu-int4-asym-g128")
+
+    found = caught.value.diagnostic
+    assert found.code == GROUP_SIZE_MISMATCH_CODE
+    assert found.context["profile_id"] == "gpu-int4-asym-g128"
+    assert hub.downloaded == []
 
 
 def smollm2_hub(tmp_path: Path) -> FakeHub:

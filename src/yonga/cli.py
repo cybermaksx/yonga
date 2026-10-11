@@ -81,6 +81,7 @@ from yonga.domain.diagnostics import (
     fill_placeholders,
 )
 from yonga.domain.hardware import normalise_device
+from yonga.domain.invocation import CommandLine, Option
 from yonga.domain.models import ModelIdentity
 from yonga.registry.loader import registry_override_dirs, validate_registry
 from yonga.registry.resolver import installed_registry_versions
@@ -89,6 +90,7 @@ from yonga.ui import tables
 from yonga.ui.chat_tui import ChatCommandKind, ChatSessionInfo, ChatView, parse_command
 from yonga.ui.console import YongaConsole, human_bytes
 from yonga.ui.progress import RichProgressSink
+from yonga.util.redaction import redact_text
 
 __all__ = ["CliState", "app", "cli_state", "main"]
 
@@ -123,6 +125,8 @@ class CliState:
     console: YongaConsole
     factory: WiringFactory
     job: JobContext | None = None
+    command_line: CommandLine = field(default_factory=CommandLine)
+    """What the user typed, for remediation that tells them to run it again."""
     _graph: Wiring | None = field(default=None, init=False, repr=False)
     _sink: ProgressSink | None = field(default=None, init=False, repr=False)
 
@@ -177,11 +181,17 @@ class CliState:
         """Render a typed failure and return its exit code."""
         return self.report(error.diagnostic, exit_code=exit_code_for(error))
 
+    def rerun(self, *flags: str) -> str:
+        """The command the user ran, with ``flags`` added, ready to paste."""
+        return self.command_line.rerun(add=flags)
+
     def report(self, item: Diagnostic, *, exit_code: ExitCode) -> ExitCode:
         """Render one diagnostic the way the current output mode requires."""
         # The job id is often only known here, so placeholders are filled last.
         enriched = fill_placeholders(self.attach_job(item))
-        self.console.diagnostic(enriched)
+        self.console.diagnostic(
+            enriched, debug_command=self.command_line.rerun(add_root=("--debug",))
+        )
         if self.json_mode:
             self.console.print_json(error_document(enriched, exit_code=exit_code))
         return exit_code
@@ -214,7 +224,8 @@ class CliState:
                 "once they are complete."
             ),
             remediation=[
-                "Re-run the same command with --debug to see the raw error.",
+                "Re-run the same command with --debug to see the raw error: "
+                + self.command_line.rerun(add_root=("--debug",)),
                 f"Job logs are kept under {logs_dir}",
                 "Please report the code above with the raw error.",
             ],
@@ -230,7 +241,74 @@ def cli_state(ctx: typer.Context, *, json_output: bool = False) -> CliState:
         raise RuntimeError("the yonga root callback did not run")
     if json_output:
         state.enable_json()
+    state.command_line = command_line(ctx)
     return state
+
+
+def command_line(ctx: typer.Context) -> CommandLine:
+    """Rebuild what the user typed from the parsed contexts, root options included.
+
+    Click keeps no copy of the raw arguments, but it records where each
+    parameter's value came from; only those given on the command line are
+    repeated, in their long spelling. A value that looks like a secret is
+    masked, and :class:`~yonga.domain.invocation.CommandLine` drops any option
+    whose name says it carries one.
+    """
+    chain: list[Any] = []
+    current: Any = ctx
+    while current is not None:
+        chain.append(current)
+        current = current.parent
+    chain.reverse()
+    root, commands = chain[0], chain[1:]
+    arguments: list[str] = []
+    options: list[Option] = []
+    for context in commands:
+        found_arguments, found_options = _typed_parameters(context)
+        arguments.extend(found_arguments)
+        options.extend(found_options)
+    return CommandLine(
+        command=tuple(str(context.info_name) for context in commands),
+        arguments=tuple(arguments),
+        options=tuple(options),
+        root_options=_typed_parameters(root)[1],
+    )
+
+
+def _typed_parameters(context: Any) -> tuple[tuple[str, ...], tuple[Option, ...]]:
+    """The arguments and options of one context that came from the command line."""
+    arguments: list[str] = []
+    options: list[Option] = []
+    for parameter in context.command.params:
+        name = parameter.name
+        if name is None or name not in context.params:
+            continue
+        source = context.get_parameter_source(name)
+        if source is None or source.name != "COMMANDLINE":
+            continue
+        value = context.params[name]
+        values = list(value) if isinstance(value, (list, tuple)) else [value]
+        if parameter.param_type_name == "argument":
+            arguments.extend(_word(item) for item in values)
+            continue
+        flags = [*parameter.opts, *parameter.secondary_opts]
+        spelling = next((flag for flag in parameter.opts if flag.startswith("--")), flags[0])
+        if getattr(parameter, "is_flag", False):
+            if value:
+                options.append((spelling,))
+            elif parameter.secondary_opts:
+                options.append((parameter.secondary_opts[0],))
+            continue
+        options.extend((spelling, _word(item)) for item in values)
+    return tuple(arguments), tuple(options)
+
+
+def _word(value: object) -> str:
+    """One parsed value as it would be typed, with anything secret-shaped masked."""
+    raw = getattr(value, "value", value)
+    if isinstance(raw, float) and raw.is_integer():
+        raw = int(raw)  # ``--older-than 30`` parses to 30.0
+    return redact_text(str(raw))
 
 
 def exit_code_for(error: YongaError) -> ExitCode:
@@ -873,6 +951,7 @@ def _prepare(
             managed_env=managed_env,
             reuse_export=reuse_export,
             gguf_file=gguf_file,
+            command_line=state.command_line,
         )
         console.print(tables.preparation_plan(plan))
         with _quiet_native_stdout(state.json_mode):
@@ -1063,7 +1142,9 @@ def _remove(state: CliState, artifact: str, *, yes: bool) -> ExitCode:
                 FailureCategory.USER_CANCELLED,
                 "Nothing was removed",
                 f"{preview.artifact_dir} was left in place.",
-                remediation=["Re-run with --yes to remove it without a prompt."],
+                remediation=[
+                    f"Re-run with --yes to remove it without a prompt: {state.rerun('--yes')}"
+                ],
             )
         )
 
@@ -1658,7 +1739,9 @@ def _publish(
                 FailureCategory.USER_CANCELLED,
                 "Nothing was uploaded",
                 f"{plan.repo_id} was left as it was.",
-                remediation=["Re-run with --yes to upload without a prompt."],
+                remediation=[
+                    f"Re-run with --yes to upload without a prompt: {state.rerun('--yes')}"
+                ],
             )
         )
     console.print(f"Uploading to {plan.url} ...")
@@ -2028,7 +2111,9 @@ def _env_remove(state: CliState, key: str, *, yes: bool) -> ExitCode:
                 FailureCategory.USER_CANCELLED,
                 "Nothing was removed",
                 f"{target.path} was left in place.",
-                remediation=["Re-run with --yes to remove it without a prompt."],
+                remediation=[
+                    f"Re-run with --yes to remove it without a prompt: {state.rerun('--yes')}"
+                ],
             )
         )
     removed = manager.remove(target.key)
@@ -2229,7 +2314,9 @@ def _cache_prune(
                 FailureCategory.USER_CANCELLED,
                 "Nothing was pruned",
                 f"The compile cache under {plan.root} was left as it was.",
-                remediation=["Re-run with --yes to prune without a prompt."],
+                remediation=[
+                    f"Re-run with --yes to prune without a prompt: {state.rerun('--yes')}"
+                ],
             )
         )
 
@@ -2288,7 +2375,9 @@ def _self_install(state: CliState, *, bin_dir: Path | None, yes: bool) -> ExitCo
                     FailureCategory.USER_CANCELLED,
                     "Nothing was replaced",
                     f"{target} was left as it was.",
-                    remediation=["Re-run with --yes to replace it without a prompt."],
+                    remediation=[
+                        f"Re-run with --yes to replace it without a prompt: {state.rerun('--yes')}"
+                    ],
                 )
             )
     result = service.install(plan)
@@ -2374,7 +2463,9 @@ def _self_uninstall(state: CliState, *, bin_dir: Path | None, yes: bool) -> Exit
                 FailureCategory.USER_CANCELLED,
                 "Nothing was removed",
                 f"{target} was left as it was.",
-                remediation=["Re-run with --yes to remove it without a prompt."],
+                remediation=[
+                    f"Re-run with --yes to remove it without a prompt: {state.rerun('--yes')}"
+                ],
             )
         )
     removed = service.uninstall(plan)
@@ -2751,7 +2842,9 @@ def _registry_update(
                 FailureCategory.USER_CANCELLED,
                 "The registry was not changed",
                 "The bundle verified, but was not installed.",
-                remediation=["Re-run with --yes to install it without a prompt."],
+                remediation=[
+                    f"Re-run with --yes to install it without a prompt: {state.rerun('--yes')}"
+                ],
             )
         )
     store.install(verified, bundle_bytes, signature_bytes, source=source)

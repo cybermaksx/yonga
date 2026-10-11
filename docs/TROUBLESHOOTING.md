@@ -336,9 +336,10 @@ model. Nothing had been compiled when this failed, so no device is implicated.
     pipeline's MAX_PROMPT_LEN, which the CPU and GPU plugins reject when the artifact is probed.
   - When only a few small layers fail (Qwen3.5 0.8B-4B fail on one one-channel rotary_emb weight),
     the ratio-0.8 profile for the device may do, because it keeps a fifth of the weights at INT8:
-    yonga prepare MODEL --profile cpu-int4-asym-g128-r08 (or gpu-int4-asym-g128-r08). It prepared
-    those models; that it skips the failing layer is observed, not guaranteed. When most layers
-    fail, as they do when the hidden size is not a multiple of 128, it cannot help.
+    yonga prepare MODEL --device cpu --profile cpu-int4-asym-g128-r08 (or --device gpu --profile
+    gpu-int4-asym-g128-r08). It prepared those models; that it skips the failing layer is
+    observed, not guaranteed. When most layers fail, as they do when the hidden size is not a
+    multiple of 128, it cannot help.
   - Or pick a profile whose group size divides every channel size in the error; the shipped
     group-wise profiles all use 128.
   - The failing nodes and their channel sizes are in the job log: yonga logs JOB_ID --raw
@@ -374,6 +375,32 @@ its runtime properties come with it, and the NPU profiles' `MAX_PROMPT_LEN` fail
 CPU (`Unsupported property MAX_PROMPT_LEN by CPU plugin`) and on the GPU (`Option not found:
 MAX_PROMPT_LEN`). Verified with `Qwen/Qwen3-0.6B` on the reference host, 2026-10-11; that is why
 neither message offers the NPU profile for another device.
+
+A profile named with `--profile` is checked the same way and refused at the plan, before the
+download, with the same code. yonga does not swap it for another: the remediation names the
+profiles that fit, for the device being prepared and for the profile's own device, and repeats
+your command with the first of them. Verified with `HuggingFaceTB/SmolLM2-360M-Instruct` on the
+reference host, where auto selection picked the GPU (exit 70 after one second, nothing
+downloaded):
+
+```text
+✗ Profile cpu-int4-asym-g128 cannot quantize this model
+
+cpu-int4-asym-g128 quantizes in groups of 128, which does not divide this model's hidden_size of
+960, so NNCF would refuse the export after the download. The profile was named with --profile, so
+yonga does not pick another one in its place. Nothing has been downloaded.
+
+  - No GPU profile can quantize this model.
+  - Prepare it for the CPU with cpu-int8-asym-ref, the one yonga chooses for this model: yonga
+    prepare HuggingFaceTB/SmolLM2-360M-Instruct --profile cpu-int8-asym-ref --yes --device cpu
+  - Other CPU profiles that fit this model: cpu-fp16-ref.
+  - 'yonga registry profiles' lists every profile with its device, weights and size band.
+```
+
+Only the widths `config.json` declares are checked. Qwen3.5 0.8B-4B fail `cpu-int4-asym-g128` on
+a one-channel `rotary_emb` weight that no `config.json` key gives away (the 9B of the same
+architecture prepares with it), so naming that profile for them still fails after the download;
+the plan lists it under "Known limitations".
 
 ### 5.5 Gated or private repositories
 

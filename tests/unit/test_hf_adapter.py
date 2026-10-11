@@ -1544,6 +1544,12 @@ def test_offline_inspect_reads_the_cached_snapshot_and_never_calls_the_hub(tmp_p
     # size band is judged on the same number online and offline.
     assert metadata.parameter_count == 35
     assert metadata.parameter_dtypes == {"BF16": 32, "F32": 3}
+    # ...but it was counted here, and the basis the plan prints says so.
+    assert metadata.parameter_count_local is True
+    assert metadata.size_for_matching() == (
+        35,
+        "counted locally from the cached safetensors headers",
+    )
     assert metadata.primary_format is ModelFormat.SAFETENSORS
     assert metadata.formats[0].complete is True
     by_path = {entry.path: entry for entry in metadata.files}

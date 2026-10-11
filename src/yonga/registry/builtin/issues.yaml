@@ -453,7 +453,8 @@ issues:
           When only a few small layers fail (Qwen3.5 0.8B-4B fail on one
           one-channel rotary_emb weight), the ratio-0.8 profile for the device
           may do, because it keeps a fifth of the weights at INT8: yonga prepare
-          MODEL --profile cpu-int4-asym-g128-r08 (or gpu-int4-asym-g128-r08).
+          MODEL --device cpu --profile cpu-int4-asym-g128-r08 (or --device gpu
+          --profile gpu-int4-asym-g128-r08).
           It prepared those models; that it skips the failing layer is observed,
           not guaranteed. When most layers fail, as they do when the hidden size
           is not a multiple of 128, it cannot help.

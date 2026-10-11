@@ -737,6 +737,23 @@ def test_size_for_matching_refuses_packed_integer_weights():
     )
 
 
+def test_size_for_matching_offline_names_the_local_count_as_the_basis():
+    """Offline the count comes from the cached headers; calling it the Hub's was untrue."""
+    meta = llama(1_000_000_000).model_copy(update={"parameter_count_local": True})
+    assert meta.size_for_matching() == (
+        1_000_000_000,
+        "counted locally from the cached safetensors headers",
+    )
+    packed = llama(1_000_000_000, dtypes={"BF16": 500_000_000, "I32": 500_000_000})
+    packed = packed.model_copy(update={"parameter_count_local": True})
+    assert "the local count understates" in packed.size_for_matching()[1]
+    missing = llama(None).model_copy(update={"parameter_count_local": True})
+    assert missing.size_for_matching() == (
+        None,
+        "the cached safetensors headers give no parameter total",
+    )
+
+
 def test_size_for_matching_treats_lowercase_integer_dtypes_as_packed():
     meta = llama(1_000_000_000, dtypes={"bf16": 500_000_000, "i32": 500_000_000})
     count, basis = meta.size_for_matching()

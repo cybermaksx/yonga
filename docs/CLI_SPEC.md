@@ -230,6 +230,18 @@ A confirmation that needs a prompt in a session without a terminal (stdin is not
 and naming `--yes`; a security confirmation says `--yes` cannot answer it. An answer of "no" at a
 real prompt is `job.declined` (exit 60).
 
+Every remediation that says to run the command again with a flag added or removed (`--yes`,
+`--trust-remote-code`, `--ignore-exporter-requirements`, `--fresh-export`, without `--no-repair`,
+`--debug`, and `--yes` for `remove`, `publish`, `env remove`, `cache prune`, `self install`,
+`self uninstall` and `registry update`) prints the user's own command with that change: every
+argument and option given, root options such as `--data-dir` and `--offline` included (and
+`--debug` placed among them, where it parses), shell-quoted. An option whose name marks a credential
+is left out, and a secret-shaped value is masked.
+
+A system `/tmp` too small for the conversion is a `note:`, not a warning: the managed directory
+was used, so it does not change the exit code. A managed temp directory on a RAM-backed filesystem
+stays a warning.
+
 When an earlier job with identical inputs completed its export and then failed, the plan shows an
 `Export` row naming that job, and stages 4 and 5 are skipped: the retained export is adopted once
 every file has been shown to be what the exporter wrote, with repaired files restored from their

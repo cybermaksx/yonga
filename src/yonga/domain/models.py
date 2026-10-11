@@ -285,6 +285,10 @@ class ModelMetadata(BaseModel):
     parameter_count: int | None = None
     parameter_dtypes: dict[str, int] = Field(default_factory=dict)
     """Parameter count per stored dtype (``BF16``, ``I32``…), as the Hub reports it."""
+    parameter_count_local: bool = False
+    """Whether the counts were taken here, offline, from the cached safetensors
+    headers rather than reported by the Hub. The method is the Hub's, so the
+    number is the same; only where it came from differs."""
     gguf_metadata: dict[str, object] = Field(default_factory=dict)
     downloads: int | None = None
     likes: int | None = None
@@ -320,6 +324,8 @@ class ModelMetadata(BaseModel):
         fallback from bytes to parameters: bytes depend on the dtype.
         """
         if self.parameter_count is None or self.parameter_count <= 0:
+            if self.parameter_count_local:
+                return None, "the cached safetensors headers give no parameter total"
             return None, "the Hub reports no safetensors or GGUF parameter total"
         packed = {
             dtype: count
@@ -331,13 +337,23 @@ class ModelMetadata(BaseModel):
             dtype, count = max(packed.items(), key=lambda item: item[1])
             return None, (
                 f"the checkpoint stores packed integer weights ({dtype}: {count:,}), "
-                "so the Hub count understates the model"
+                f"so the {'local' if self.parameter_count_local else 'Hub'} count understates "
+                "the model"
             )
         if "quantization_config" in self.config:
             return None, "the checkpoint is already quantized (quantization_config in config.json)"
+        if self.parameter_count_local:
+            return self.parameter_count, "counted locally from the cached safetensors headers"
         if not self.parameter_dtypes and self.gguf_metadata:
             return self.parameter_count, "Hugging Face Hub count from GGUF metadata"
         return self.parameter_count, "Hugging Face Hub count from safetensors headers"
+
+    @property
+    def parameter_count_origin(self) -> str:
+        """Where :attr:`parameter_count` came from, in a few words."""
+        if self.parameter_count_local:
+            return "counted locally from the cached safetensors headers"
+        return "Hub count"
 
     def _observation(self, fmt: ModelFormat) -> FormatObservation | None:
         """Return the strongest observation recorded for *fmt*, if any."""

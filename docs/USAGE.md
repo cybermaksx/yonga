@@ -147,9 +147,10 @@ probe.
 
 Re-running `prepare` for an artifact that is already ready reuses it without a question, so it
 works in a script without `--yes`. When a question does need answering and there is no terminal,
-`prepare` stops with exit 60 and says to re-run with `--yes`. A job that cannot finish — no
-OpenVINO runtime, a `--device` the registry rules out for the model, a gated repository without a
-token — is refused before anything is downloaded, and the plan marks it **BLOCKED**.
+`prepare` stops with exit 60 and prints your command again with `--yes` added, every other option
+kept. A job that cannot finish — no OpenVINO runtime, a `--device` the registry rules out for the
+model, a gated repository without a token — is refused before anything is downloaded, and the plan
+marks it **BLOCKED**.
 
 Useful flags: `--device auto|npu|gpu|cpu`, `--profile ID`, `--source REPO`, `--revision REV`,
 `--force`, `--no-repair`, `--yes`, `--trust-remote-code`, `--ignore-exporter-requirements`.

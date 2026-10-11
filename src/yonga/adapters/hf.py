@@ -1698,6 +1698,8 @@ class HuggingFaceAdapter:
             remote_code_files=remote_code_files,
             parameter_count=_parameter_count(info),
             parameter_dtypes=_parameter_dtypes(info),
+            # Offline the counts come from the cached headers, not from the Hub.
+            parameter_count_local=isinstance(info, _CachedModelInfo),
             gguf_metadata=gguf_metadata,
             downloads=_optional_int(getattr(info, "downloads", None)),
             likes=_optional_int(getattr(info, "likes", None)),

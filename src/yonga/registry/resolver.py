@@ -672,10 +672,18 @@ class RegistryResolver:
         model_rule: ModelRule | None = None,
         explicit_profile_id: str | None = None,
         size_applies: bool = True,
+        profile_command: Callable[[str, str], str] | None = None,
     ) -> tuple[ConversionProfile, ResolutionExplanation]:
         """Resolve the conversion profile to use for ``device``.
 
-        An explicit profile id always wins. Otherwise a profile named by the
+        An explicit profile id always wins, unless ``config.json`` shows that its
+        group size cannot quantize the model: NNCF would refuse it after the
+        download, so it is refused here, before it, naming the profiles that
+        fit. It is never swapped for one of them, because the user chose it.
+        ``profile_command`` prints the command that prepares the model with
+        another profile, given the device and the profile id; without it the
+        remediation says ``yonga prepare MODEL --device DEVICE --profile ID``.
+        Otherwise a profile named by the
         exact-model rule is preferred, then one named by the architecture rule,
         then the best-scoring profile that targets the device. A named profile
         is a preference, not an override: it must itself be usable, satisfy its
@@ -712,10 +720,17 @@ class RegistryResolver:
                 )
             conflict = group_size_conflict(profile.quantization, widths)
             if conflict is not None:
-                explanation.notes.append(
-                    f"Profile {profile.id} cannot quantize this model: {conflict}, and NNCF "
-                    f"refuses such a layer ({GROUP_SIZE_MISMATCH_CODE}). It is used "
-                    "because it was requested explicitly."
+                raise RegistryError(
+                    self._unfit_explicit_profile(
+                        profile,
+                        target,
+                        conflict,
+                        widths,
+                        arch_rule=arch_rule,
+                        model_rule=model_rule,
+                        subject=subject,
+                        command=profile_command,
+                    )
                 )
             automatic = self._quiet_automatic(target, arch_rule, model_rule, subject, widths=widths)
             explanation.profile_selection = self._profile_selection(
@@ -950,6 +965,83 @@ class RegistryResolver:
             ),
             remediation=remediation,
             context={"device": target, **({"repo_id": repo_id} if repo_id else {})},
+        )
+
+    def _unfit_explicit_profile(
+        self,
+        profile: ProfileRule,
+        target: str,
+        conflict: str,
+        widths: Mapping[str, int],
+        *,
+        arch_rule: ArchitectureRule | None,
+        model_rule: ModelRule | None,
+        subject: MatchSubject,
+        command: Callable[[str, str], str] | None,
+    ) -> Diagnostic:
+        """Refuse, before the download, a ``--profile`` whose group size cannot fit.
+
+        The way out is a profile that fits, for the device being prepared and,
+        when the profile was made for another one, for that device too; the
+        automatic choice comes first. Nothing is chosen on the user's behalf.
+        """
+
+        def prepare_with(device: str, profile_id: str) -> str:
+            if command is not None:
+                return command(device, profile_id)
+            return f"yonga prepare MODEL --device {device.lower()} --profile {profile_id}"
+
+        remediation: list[str] = []
+        for device in dict.fromkeys((target, profile.device)):
+            fitting = [
+                rule
+                for rule in self.registry.profiles
+                if rule.device == device
+                and rule.status.is_usable
+                and self._constraints_ok(rule.constraints)[0]
+                and group_size_conflict(rule.quantization, widths) is None
+            ]
+            automatic = self._quiet_automatic(
+                device,
+                arch_rule,
+                model_rule,
+                subject.model_copy(update={"device": device}),
+                widths=widths,
+            )
+            chosen = automatic[0] if automatic is not None else None
+            if chosen is not None and chosen in fitting:
+                fitting.remove(chosen)
+                fitting.insert(0, chosen)
+            if not fitting:
+                remediation.append(f"No {device} profile can quantize this model.")
+                continue
+            first = fitting[0]
+            why = "the one yonga chooses for this model" if first is chosen else "which fits"
+            remediation.append(
+                f"Prepare it for the {device} with {first.id}, {why}: "
+                f"{prepare_with(device, first.id)}"
+            )
+            if len(fitting) > 1:
+                others = ", ".join(rule.id for rule in fitting[1:])
+                remediation.append(f"Other {device} profiles that fit this model: {others}.")
+        remediation.append(
+            "'yonga registry profiles' lists every profile with its device, weights and size band."
+        )
+        return diagnostic(
+            GROUP_SIZE_MISMATCH_CODE,
+            FailureCategory.CONFIGURATION_ERROR,
+            f"Profile {profile.id} cannot quantize this model",
+            (
+                f"{profile.id} {conflict.removeprefix('it ')}, so NNCF would refuse the export "
+                "after the download. The profile was named with --profile, so yonga does not "
+                "pick another one in its place. Nothing has been downloaded."
+            ),
+            remediation=remediation,
+            context={
+                "device": target,
+                "profile_id": profile.id,
+                **({"repo_id": subject.repo_id} if subject.repo_id else {}),
+            },
         )
 
     def _size_skipped(self, target: str, subject: MatchSubject, winner: ProfileRule) -> list[str]:
