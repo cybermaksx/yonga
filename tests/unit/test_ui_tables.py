@@ -549,7 +549,7 @@ def widest_line(text: str) -> int:
 def test_artifact_list_renders_rows():
     text = render(artifact_list(list_summaries()))
     assert ARTIFACT_ID in text
-    assert "01234567" in text
+    assert "0123456" in text
     assert "6.0 GiB" in text
     assert "✓ yes" in text
     assert "! no" in text
@@ -561,29 +561,35 @@ def test_artifact_list_handles_empty_input():
 
 @pytest.mark.parametrize("width", [80, 100, 120])
 def test_artifact_list_keeps_the_spec_columns_legible(width: int):
-    """``docs/CLI_SPEC.md`` section 7: id, revision, profile, device, size, benchmark."""
+    """``docs/CLI_SPEC.md`` section 7: id, model, revision, profile, device, size, benchmark."""
     text = render(artifact_list(list_summaries()), width=width)
 
     assert widest_line(text) <= width
     # Nothing that identifies the artifact is abbreviated away.
     assert ARTIFACT_ID in text
     assert PROFILE in text
-    assert "01234567" in text
+    assert "Qwen3-0.6B" in text
+    assert "0123456" in text
     assert "CPU" in text
     assert "6.0 GiB" in text
-    assert "2026-09-22" in text
-    assert "…" not in text
+    # Readiness is never lost: a column, or a note naming the unready artifact.
+    assert "! no" in text or "Not ready: broken" in text
+    if width >= 100:
+        assert "2026-09-22" in text
+        assert "…" not in text
 
 
-def test_artifact_list_drops_columns_rather_than_truncating_them():
-    """A narrow terminal loses whole columns; a wide one gets every column."""
+def test_artifact_list_drops_the_timestamps_before_the_model():
+    """A narrow terminal gives up when an artifact was made, not what it was made from."""
     summaries = list_summaries()
 
     narrow = render(artifact_list(summaries), width=80)
     wide = render(artifact_list(summaries), width=140)
 
-    assert "Model" not in narrow
+    assert "Model" in narrow
+    assert "Rev " in narrow
     assert "Created" not in narrow
+    assert "Benchmark" not in narrow
     assert "Model" in wide
     assert "Qwen/Qwen3-0.6B" in wide
     assert "Created" in wide
@@ -591,8 +597,71 @@ def test_artifact_list_drops_columns_rather_than_truncating_them():
     assert NOW.astimezone().strftime("%Y-%m-%d %H:%M") in wide
 
 
+def test_artifact_list_shows_model_and_revision_on_an_80_column_terminal():
+    """The row from a real 'yonga list' fits 80 columns whole, model and revision included."""
+    summary = ArtifactSummary(
+        artifact_id="780ff69f5ac67fb5",
+        path=Path("/artifacts/qwen3"),
+        repo_id="Qwen/Qwen3-0.6B",
+        resolved_revision="c1899de289a04d12100db370d81485cdf75e47ca",
+        profile="cpu-int4-asym-g128-r08",
+        recommended_device="CPU",
+        size_bytes=430 * 1024**2,
+        created_at=NOW,
+        ready=True,
+    )
+
+    text = render(artifact_list([summary]), width=80)
+
+    assert widest_line(text) <= 80
+    row = next(line for line in text.splitlines() if line.startswith("780ff69f5ac67fb5"))
+    for value in ("Qwen/Qwen3-0.6B", "c1899de", "cpu-int4-asym-g128-r08", "CPU", "430 MiB"):
+        assert value in row
+    assert "…" not in text
+    # Every artifact is ready, so there is nothing for a note to say.
+    assert "Not ready" not in text
+
+
+def test_artifact_list_tells_two_models_with_one_profile_apart_when_narrow():
+    """Long repository ids lose their namespace and tail, never the part that differs."""
+    summaries = [
+        ArtifactSummary(
+            artifact_id=f"{index}" * 16,
+            path=Path(f"/artifacts/{index}"),
+            repo_id=f"meta-llama/Llama-3.2-{size}-Instruct",
+            resolved_revision=SHA,
+            profile="cpu-int4-asym-g128-r08",
+            recommended_device="CPU",
+            size_bytes=2 * 1024**3,
+            created_at=NOW,
+            ready=True,
+        )
+        for index, size in enumerate(("1B", "3B"), start=1)
+    ]
+
+    text = render(artifact_list(summaries), width=80)
+
+    assert widest_line(text) <= 80
+    assert "Llama-3.2-1B" in text
+    assert "Llama-3.2-3B" in text
+    assert "cpu-int4-asym-g128-r08" in text
+
+
+def test_artifact_list_names_unready_artifacts_when_the_ready_column_goes():
+    """Dropping ``Ready`` for width must not make a broken artifact look usable."""
+    summaries = list_summaries()
+    summaries[0] = summaries[0].model_copy(update={"profile": "cpu-int4-asym-g128-r08"})
+    summaries[1] = summaries[1].model_copy(update={"profile": "npu-int4-sym-g128-cw"})
+
+    text = render(artifact_list(summaries), width=80)
+
+    assert widest_line(text) <= 80
+    assert "Ready" not in text
+    assert "Not ready: broken" in text
+
+
 def test_artifact_list_elides_only_an_over_long_repository_id():
-    """One 50-character repo id must not push the columns beside it out of view."""
+    """One 50-character repo id must not push the columns beside them out of view."""
     summaries = list_summaries()
     summaries[0] = summaries[0].model_copy(
         update={"repo_id": "HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive"}
@@ -603,7 +672,9 @@ def test_artifact_list_elides_only_an_over_long_repository_id():
     assert widest_line(text) <= 120
     assert ARTIFACT_ID in text
     assert PROFILE in text
-    assert "HauhauCS/Qwen3.5" in text
+    assert "Qwen3.5-9B-Uncensored" in text
+    # The short id beside it is not touched.
+    assert " a/b " in text
 
 
 # ----------------------------------------------------------------------

@@ -707,10 +707,12 @@ def _bullet_block(title: str, items: Sequence[str], *, style: str) -> list[Rende
 # list
 # ----------------------------------------------------------------------
 #: Every column ``yonga list`` can show, in display order, with its header.
+#: ``Rev`` and ``Dev`` are abbreviated because a header wider than its values
+#: sets the column's width, and an 80-column terminal has no cell to spare.
 _LIST_COLUMNS: tuple[tuple[str, str], ...] = (
     ("artifact", "Artifact"),
     ("model", "Model"),
-    ("revision", "Revision"),
+    ("revision", "Rev"),
     ("profile", "Profile"),
     ("device", "Dev"),
     ("size", "Size"),
@@ -720,16 +722,19 @@ _LIST_COLUMNS: tuple[tuple[str, str], ...] = (
 )
 
 #: Order in which columns are given up when the terminal cannot fit them all.
-#: ``docs/CLI_SPEC.md`` section 7 asks for the artifact, its source revision,
-#: profile, recommended device, size and last benchmark, so the columns it does
-#: not ask for go first and the ones it does go last.
+#: The repository id and its revision are what tell two artifacts apart, so they
+#: outlast everything but the artifact id, the profile and the device; the
+#: creation time goes first, then the last benchmark, a timestamp the wider
+#: layouts and ``--json`` still carry. ``Ready`` is given up before the size,
+#: but never silently: an artifact that is not ready is then named under the
+#: table instead.
 _LIST_DROP_ORDER: tuple[str, ...] = (
     "created",
-    "model",
-    "revision",
     "benchmark",
-    "size",
     "ready",
+    "size",
+    "revision",
+    "model",
 )
 
 #: Columns whose values are right-aligned.
@@ -739,8 +744,13 @@ _LIST_NUMERIC: frozenset[str] = frozenset({"size"})
 #: to push the columns beside them out of the table.
 _LIST_MODEL_MAX_WIDTH = 32
 
-#: Commit sha length in the list. The full sha is one ``--json`` away.
-_LIST_REVISION_LENGTH = 8
+#: Narrowest the repository id is elided to before the layout gives up another
+#: column instead; any shorter and the tail no longer names the model.
+_LIST_MODEL_MIN_WIDTH = 12
+
+#: Commit sha length in the list, the length ``git`` abbreviates to. The full
+#: sha is one ``--json`` away.
+_LIST_REVISION_LENGTH = 7
 
 #: A width no real table reaches, used to measure a layout's natural size.
 _LIST_MEASURE_WIDTH = 10_000
@@ -768,14 +778,33 @@ def _list_variants() -> tuple[_ListVariant, ...]:
 _LIST_VARIANTS: tuple[_ListVariant, ...] = _list_variants()
 
 
-def _list_cells(summary: ArtifactSummary, *, long_timestamps: bool) -> dict[str, Text]:
+def _elide_repo_id(repo_id: str, width: int) -> str:
+    """Fit ``repo_id`` into ``width`` cells, giving up the organisation first.
+
+    The model name is what tells the artifacts in one list apart, and its start
+    (family, version, size) more than its end; the organisation is the part
+    they most often share. So a repository id that does not fit loses its
+    namespace to ``…/`` first, and only a name that still does not fit is cut,
+    from the right.
+    """
+    if Text(repo_id).cell_len <= width:
+        return repo_id
+    name = repo_id.rpartition("/")[2]
+    if name != repo_id and Text(f"…/{name}").cell_len <= width:
+        return f"…/{name}"
+    return name[: max(width - 1, 0)] + "…"
+
+
+def _list_cells(
+    summary: ArtifactSummary, *, long_timestamps: bool, model_width: int
+) -> dict[str, Text]:
     """Render one artifact as a cell per column key."""
     severity = Severity.OK if summary.ready else Severity.WARNING
     ready = _status_text(severity, "yes" if summary.ready else "no")
     revision = _short_revision(summary.resolved_revision, length=_LIST_REVISION_LENGTH)
     return {
         "artifact": _text(summary.artifact_id),
-        "model": _text(summary.repo_id),
+        "model": _text(_elide_repo_id(summary.repo_id, model_width)),
         "revision": _text(revision),
         "profile": _text(summary.profile),
         "device": _text(summary.recommended_device),
@@ -786,7 +815,12 @@ def _list_cells(summary: ArtifactSummary, *, long_timestamps: bool) -> dict[str,
     }
 
 
-def _artifact_table(summaries: Sequence[ArtifactSummary], variant: _ListVariant) -> Table:
+def _artifact_table(
+    summaries: Sequence[ArtifactSummary],
+    variant: _ListVariant,
+    *,
+    model_width: int = _LIST_MODEL_MAX_WIDTH,
+) -> Table:
     """Build the ``yonga list`` table for one rung of the ladder."""
     table = Table(
         box=SIMPLE,
@@ -806,10 +840,11 @@ def _artifact_table(summaries: Sequence[ArtifactSummary], variant: _ListVariant)
             no_wrap=True,
             overflow="ellipsis",
             justify="right" if key in _LIST_NUMERIC else "left",
-            max_width=_LIST_MODEL_MAX_WIDTH if key == "model" else None,
         )
     for summary in summaries:
-        cells = _list_cells(summary, long_timestamps=variant.long_timestamps)
+        cells = _list_cells(
+            summary, long_timestamps=variant.long_timestamps, model_width=model_width
+        )
         table.add_row(*(cells[key] for key in keys))
     return table
 
@@ -820,28 +855,56 @@ class _ArtifactList:
     Nine columns do not fit an 80-column terminal, and Rich's answer to that is
     to shrink every column until each one is an ellipsis. This renderable
     answers differently: it drops whole columns, in a fixed order, until the
-    rest fit at their natural width. The artifact id, the profile and the
-    device are never truncated, and the detail ``docs/CLI_SPEC.md`` section 7
-    asks for survives down to 80 columns.
+    rest fit at their natural width. Once the creation time has gone, the
+    repository id may also be elided from the left (down to
+    ``_LIST_MODEL_MIN_WIDTH`` cells) before another column is given up, since
+    without it two artifacts of different models with one profile look alike.
+
+    The artifact id, the profile and the device are never truncated. On an
+    80-column terminal the list keeps the model, its revision, the size and
+    readiness (the last as a note under the table when its column has had to
+    go), and leaves the creation and benchmark times to wider terminals and to
+    ``--json``.
     """
 
     def __init__(self, summaries: Sequence[ArtifactSummary]) -> None:
         """Keep the summaries; the layout is chosen at render time."""
         self._summaries = tuple(summaries)
 
-    def table_for(self, console: Console, options: ConsoleOptions) -> Table:
-        """Return the widest layout whose natural width fits ``options``."""
+    def _natural_model_width(self) -> int:
+        """Cells the model column needs before any elision."""
+        widest = max((Text(item.repo_id).cell_len for item in self._summaries), default=0)
+        return min(_LIST_MODEL_MAX_WIDTH, max(widest, len("Model")))
+
+    def layout_for(self, console: Console, options: ConsoleOptions) -> tuple[_ListVariant, Table]:
+        """Return the widest layout that fits ``options``, with the rung it came from."""
         wide = options.update_width(_LIST_MEASURE_WIDTH)
-        narrowest = _artifact_table(self._summaries, _LIST_VARIANTS[-1])
+        natural = self._natural_model_width()
         for variant in _LIST_VARIANTS[:-1]:
-            candidate = _artifact_table(self._summaries, variant)
-            if Measurement.get(console, wide, candidate).maximum <= options.max_width:
-                return candidate
-        return narrowest
+            candidate = _artifact_table(self._summaries, variant, model_width=natural)
+            width = Measurement.get(console, wide, candidate).maximum
+            if width <= options.max_width:
+                return variant, candidate
+            elidable = "created" in variant.dropped and "model" not in variant.dropped
+            narrower = natural - (width - options.max_width)
+            if elidable and narrower >= _LIST_MODEL_MIN_WIDTH:
+                return variant, _artifact_table(self._summaries, variant, model_width=narrower)
+        last = _LIST_VARIANTS[-1]
+        return last, _artifact_table(self._summaries, last)
+
+    def table_for(self, console: Console, options: ConsoleOptions) -> Table:
+        """Return the table of the layout chosen for ``options``."""
+        return self.layout_for(console, options)[1]
 
     def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
-        """Render the chosen layout."""
-        yield self.table_for(console, options)
+        """Render the chosen layout, naming unready artifacts if ``Ready`` was dropped."""
+        variant, table = self.layout_for(console, options)
+        yield table
+        if "ready" not in variant.dropped:
+            return
+        unready = [item.artifact_id for item in self._summaries if not item.ready]
+        if unready:
+            yield _status_text(Severity.WARNING, f"Not ready: {', '.join(unready)}")
 
     def __rich_measure__(self, console: Console, options: ConsoleOptions) -> Measurement:
         """Measure the layout that would be chosen for ``options``."""
