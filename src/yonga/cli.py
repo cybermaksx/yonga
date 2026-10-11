@@ -1064,11 +1064,14 @@ def _stale_note(state: CliState, sweep: WorkspaceSweep | None, *, clean: bool) -
     """Print the one honest line about space held outside the artifact catalogue."""
     if sweep is None:
         return
+    directories = (
+        "stale working directory" if sweep.removed_count == 1 else "stale working directories"
+    )
     if clean:
         if sweep.removed_count:
             state.console.print(
                 f"Reclaimed {human_bytes(sweep.freed_bytes)} from {sweep.removed_count} "
-                "stale working directories."
+                f"{directories}."
             )
         else:
             state.console.print("No stale working directories to reclaim.")
@@ -1076,8 +1079,8 @@ def _stale_note(state: CliState, sweep: WorkspaceSweep | None, *, clean: bool) -
     if sweep.freed_bytes < STALE_NOTE_THRESHOLD_BYTES:
         return
     state.console.print(
-        f"{human_bytes(sweep.freed_bytes)} in {sweep.removed_count} stale working "
-        "directories can be reclaimed: yonga list --clean"
+        f"{human_bytes(sweep.freed_bytes)} in {sweep.removed_count} {directories} can be "
+        "reclaimed: yonga list --clean"
     )
 
 
@@ -1623,7 +1626,7 @@ def eval_command(
             state.emit(payload)
         else:
             state.console.print(tables.evaluation_result(result))
-            state.console.print(f"Saved: {path}")
+            state.console.print(f"Saved: {path}", soft_wrap=True)
         return ExitCode.SUCCESS
 
     _dispatch(state, run)
@@ -2040,7 +2043,7 @@ def _bench(
         state.emit(payload, ok=not result.errors)
         return _bench_exit(result.errors, result.has_measurements)
     state.console.print(tables.benchmark_summary(result))
-    state.console.print(f"Saved: {path}")
+    state.console.print(f"Saved: {path}", soft_wrap=True)
     for error in result.errors:
         state.console.print_error(f"  {error}", style="yellow")
     return _bench_exit(result.errors, result.has_measurements)
@@ -2106,13 +2109,15 @@ def _env_list(state: CliState) -> ExitCode:
         )
         state.console.print(
             f"{environment.key}  {human_bytes(environment.size_bytes):>9}  "
-            f"{environment.created_at:%Y-%m-%d}  {environment.path}"
+            f"{environment.created_at:%Y-%m-%d}  {environment.path}",
+            soft_wrap=True,
         )
         state.console.print(f"    {pins}", style="dim")
     for interpreter in interpreters:
         role = "the environments' base" if interpreter.in_use else "unused"
         state.console.print(
-            f"base Python   {human_bytes(interpreter.size_bytes):>9}  {interpreter.path}  ({role})"
+            f"base Python   {human_bytes(interpreter.size_bytes):>9}  {interpreter.path}  ({role})",
+            soft_wrap=True,
         )
     noun = "environment" if len(environments) == 1 else "environments"
     state.console.print(f"{len(environments)} {noun}, {human_bytes(total)} in total.")
@@ -2196,7 +2201,7 @@ def _cache_list(state: CliState) -> ExitCode:
         state.emit(inventory.to_json())
         return ExitCode.SUCCESS
     console = state.console
-    console.print(f"Compile cache  {inventory.root}")
+    console.print(f"Compile cache  {inventory.root}", soft_wrap=True)
     if not inventory.entries:
         console.print("The compile cache is empty.", style="dim")
         return ExitCode.SUCCESS
@@ -2312,9 +2317,10 @@ def _cache_prune(
             state.emit(document(CompileCachePruneReport(dry_run=dry_run)))
             return ExitCode.SUCCESS
         if inventory.entries:
+            verb = "is" if len(inventory.entries) == 1 else "are all"
             console.print(
                 f"Nothing to prune: {entry_count(len(inventory.entries))} "
-                f"({human_bytes(inventory.total_bytes)}) are all kept under these options."
+                f"({human_bytes(inventory.total_bytes)}) {verb} kept under these options."
             )
         else:
             console.print("Nothing to prune: the compile cache is empty.")
@@ -3098,7 +3104,7 @@ def _log_index(state: CliState, logs_dir: Path) -> ExitCode:
     if not jobs:
         state.console.print(f"No job logs in {logs_dir}.")
         return ExitCode.SUCCESS
-    state.console.print(f"Job logs in {logs_dir}")
+    state.console.print(f"Job logs in {logs_dir}", soft_wrap=True)
     state.console.print(tables.job_list(jobs))
     state.console.print("")
     state.console.print("Show one with: yonga logs JOB_ID (a unique prefix is enough)")

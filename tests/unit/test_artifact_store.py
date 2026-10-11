@@ -683,7 +683,20 @@ def test_removing_a_copy_leaves_the_originals_compile_cache_alone(
     assert original.is_dir()
     assert cache_entry.is_dir()
     assert report.compile_cache_paths == []
-    assert any("still claims" in note for note in report.notes)
+    assert any("another directory in the store still claims" in note for note in report.notes)
+
+
+def test_removing_one_of_three_copies_counts_the_other_two_in_the_plural(
+    store: ArtifactStore, settings: Settings, tmp_path: Path
+) -> None:
+    manifest = make_manifest()
+    original = publish(store, tmp_path, manifest=manifest)
+    copy_artifact(store, original, family="someone--else")
+    third = copy_artifact(store, original, family="a--third")
+
+    report = store.remove(third, dry_run=True)
+
+    assert any("2 other directories in the store still claim;" in note for note in report.notes)
 
 
 def test_the_last_copy_standing_does_take_the_compile_cache(

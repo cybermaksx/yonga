@@ -444,7 +444,7 @@ def test_list_says_when_stale_working_directories_hold_real_space(tmp_path: Path
     result = run_cli(home, "list")
 
     assert result.exit_code == 0
-    assert "yonga list --clean" in result.stdout
+    assert "in 1 stale working directory can be reclaimed: yonga list --clean" in result.stdout
     assert stale.is_dir()
 
 
@@ -457,7 +457,7 @@ def test_list_clean_reclaims_the_space_and_reports_it(tmp_path: Path) -> None:
     result = run_cli(home, "list", "--clean")
 
     assert result.exit_code == 0
-    assert "Reclaimed" in result.stdout
+    assert "from 1 stale working directory." in result.stdout
     assert not stale.exists()
 
 
