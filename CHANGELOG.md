@@ -9,9 +9,23 @@ manifest may change in any minor release.
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-10-11
+
+### Changed
+
+- **License: GNU Affero General Public License v3.0 or later (`AGPL-3.0-or-later`).** `LICENSE`,
+  the package metadata and `CONTRIBUTING.md` say so. 0.5.1 is the first release on PyPI and the
+  only one with downloads on GitHub; 0.5.0 was withdrawn.
+
+### Fixed
+
+- A remediation that repeats the command without offline mode no longer keeps `--offline` when
+  it was the only option given before the command (`yonga --offline inspect …` suggested
+  `yonga --offline inspect …`).
+
 ## [0.5.0] - 2026-10-11
 
-The first public release, and the first on PyPI. It fixes everything an end-to-end campaign of
+The first public release, withdrawn the same day for 0.5.1. It fixes everything an end-to-end campaign of
 fresh-user runs on real hardware found (AppImage, pip, every command, GPU, NPU and CPU), keeps
 OpenVINO's usage reporting from running, and installs the AppImage on `PATH`.
 
@@ -921,9 +935,10 @@ printing compiler tracebacks. Linux x86_64 only.
 - `yonga` never installs, upgrades or removes packages, and never runs `sudo`. When
   the environment is wrong it prints the command for you to run.
 
-[Unreleased]: https://github.com/ooguz/yonga/compare/v0.5.0...HEAD
-[0.5.0]: https://github.com/ooguz/yonga/releases/tag/v0.5.0
-[0.4.0]: https://github.com/ooguz/yonga/releases/tag/v0.4.0
-[0.3.0]: https://github.com/ooguz/yonga/releases/tag/v0.3.0
-[0.2.0]: https://github.com/ooguz/yonga/releases/tag/v0.2.0
-[0.1.0]: https://github.com/ooguz/yonga/tree/941cf2e8029624ba78a93a8a8e4eed94cc9c2dc2
+[Unreleased]: https://github.com/ooguz/yonga/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/ooguz/yonga/releases/tag/v0.5.1
+[0.5.0]: https://github.com/ooguz/yonga/tree/v0.5.0
+[0.4.0]: https://github.com/ooguz/yonga/tree/v0.4.0
+[0.3.0]: https://github.com/ooguz/yonga/tree/v0.3.0
+[0.2.0]: https://github.com/ooguz/yonga/tree/v0.2.0
+[0.1.0]: https://github.com/ooguz/yonga/tree/9bc1a6acc20720cb53656a052f04257e9e09ece9

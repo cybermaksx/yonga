@@ -329,3 +329,11 @@ The MVP also does not aim to support every Hugging Face task. Focus first on tex
 7. **Useful diagnostics:** collapse known failures into actionable messages while preserving raw logs.
 8. **Upstream-friendly:** model repairs and compatibility rules should be narrow, traceable, and suitable for turning into upstream bug reports.
 9. **Private:** no telemetry. yonga reports nothing about its use, and keeps OpenVINO's own usage reporting (`openvino_telemetry`, which otherwise sends each import to Google Analytics and counts it in `~/intel/stats`) from loading in every Python process it starts, without writing anything to your home directory.
+
+## License
+
+yonga is free software: you can redistribute it and/or modify it under the terms of the
+[GNU Affero General Public License](LICENSE) as published by the Free Software Foundation, either
+version 3 of the License, or (at your option) any later version (`AGPL-3.0-or-later`). It is
+distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; see the license for
+details. yonga is an independent project and is not affiliated with or endorsed by Intel.

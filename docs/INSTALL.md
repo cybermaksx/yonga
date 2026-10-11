@@ -94,8 +94,7 @@ every package version.
 
 ### pip
 
-From PyPI, into a virtual environment. PyPI carries yonga from 0.5.0 on; 0.1.0 to 0.4.0 were released on GitHub
-only.
+From PyPI, into a virtual environment. PyPI carries yonga from 0.5.1 on; earlier versions are kept only as git tags.
 
 ```bash
 python3 -m venv .venv

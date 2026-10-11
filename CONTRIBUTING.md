@@ -65,5 +65,5 @@ A test whose device or input is missing skips with the command that provides it.
   (`src/yonga/privacy.py`). A new child interpreter is started through
   `python_code_argv`/`python_module_argv` there, or imports `yonga` first.
 
-By contributing you agree that your contribution is licensed under the GNU Affero General Public License v3.0 or later, as
-the rest of the project is (`LICENSE`).
+By contributing you agree that your contribution is licensed under the GNU Affero General
+Public License v3.0 or later (`AGPL-3.0-or-later`), as the rest of the project is (`LICENSE`).
