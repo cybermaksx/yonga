@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import sys
 from collections.abc import Iterator, Mapping, Sequence
@@ -78,6 +79,10 @@ class FakeRunner:
             python = Path(command[-1]) / "bin" / "python"
             python.parent.mkdir(parents=True, exist_ok=True)
             python.write_text("#!/bin/sh\n")
+            # As ``python -m venv`` does: the base interpreter's directory.
+            (python.parents[1] / "pyvenv.cfg").write_text(
+                f"home = {Path(command[0]).parent}\ninclude-system-site-packages = false\n"
+            )
         if step == "verify":
             reported = self.versions if self.versions is not None else self._pinned()
             return CompletedCommand(
@@ -246,6 +251,90 @@ def test_inside_an_appimage_environments_are_made_from_a_lasting_copy(
     assert (copy / "lib" / f"python{version}" / "os.py").is_file()
     assert list((copy / "lib" / f"python{version}" / "site-packages").iterdir()) == []
     assert not list(paths.envs_dir.glob("*.partial"))
+
+
+def inside_an_appimage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run as if from an AppImage mount holding a relocatable Python."""
+    version = f"{sys.version_info.major}.{sys.version_info.minor}"
+    appdir = tmp_path / "mount"
+    prefix = appdir / "usr" / "python"
+    running = prefix / "bin" / f"python{version}"
+    running.parent.mkdir(parents=True)
+    running.write_text("#!/bin/sh\n")
+    (prefix / "lib" / f"python{version}" / "os.py").parent.mkdir(parents=True)
+    (prefix / "lib" / f"python{version}" / "os.py").write_text("")
+    monkeypatch.setenv("APPDIR", str(appdir))
+    monkeypatch.setattr(sys, "executable", str(running))
+    monkeypatch.setattr(sys, "base_prefix", str(prefix))
+
+
+OTHER = ExporterRequirements(transformers="==5.1.*")
+
+
+def test_the_python_copy_goes_with_the_last_environment_made_from_it(
+    paths: Paths, ctx: JobContext, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Nothing else lists or removes it, so it must not outlive its environments."""
+    inside_an_appimage(tmp_path, monkeypatch)
+    envs = ExportEnvironmentManager(paths, FakeRunner())
+    first = envs.ensure(envs.spec_for(QWEN35, installed=INSTALLED), ctx)
+    reported = {**{k: v for k, v in INSTALLED.items() if v}, "transformers": "5.1.0"}
+    other = ExportEnvironmentManager(paths, FakeRunner(versions=reported))
+    second = other.ensure(other.spec_for(OTHER, installed=INSTALLED), ctx)
+    (copy,) = envs.base_interpreters()
+    assert copy.in_use and copy.size_bytes > 0
+
+    envs.remove(first.key)
+    assert copy.path.is_dir(), "the other environment is still made from it"
+
+    envs.remove(f"export-{second.key}")
+    assert not copy.path.exists()
+    assert envs.base_interpreters() == []
+
+
+def test_the_python_copy_is_kept_while_a_build_holds_it(
+    paths: Paths, ctx: JobContext, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A build that copied it but has no venv yet must not lose it to a prune."""
+    inside_an_appimage(tmp_path, monkeypatch)
+    envs = ExportEnvironmentManager(paths, FakeRunner())
+    built = envs.ensure(envs.spec_for(QWEN35, installed=INSTALLED), ctx)
+    (copy,) = envs.base_interpreters()
+    (built.path / "pyvenv.cfg").unlink()  # as if its venv were not made yet
+
+    with (paths.envs_dir / f"{copy.path.name}.lock").open("a") as handle:
+        fcntl.flock(handle, fcntl.LOCK_SH)
+        assert envs.prune_base_interpreters() == []
+        fcntl.flock(handle, fcntl.LOCK_UN)
+
+    assert copy.path.is_dir()
+    assert envs.prune_base_interpreters() == [copy.path]
+
+
+def test_a_failed_build_leaves_no_python_copy_behind(
+    paths: Paths, ctx: JobContext, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inside_an_appimage(tmp_path, monkeypatch)
+    envs = ExportEnvironmentManager(paths, FakeRunner(fail_step="packages"))
+
+    with pytest.raises(PreflightError):
+        envs.ensure(envs.spec_for(QWEN35, installed=INSTALLED), ctx)
+
+    assert [path.name for path in paths.envs_dir.iterdir() if path.is_dir()] == []
+
+
+def test_an_environment_is_named_by_key_prefix_or_directory_name(
+    paths: Paths, ctx: JobContext
+) -> None:
+    envs = manager(paths, FakeRunner())
+    built = envs.ensure(envs.spec_for(QWEN35, installed=INSTALLED), ctx)
+
+    assert envs.resolve(built.key[:4]).key == built.key
+    assert envs.resolve(built.path.name).key == built.key
+    for wrong in ("", "export-", "ffff"):
+        with pytest.raises(ConfigurationError):
+            envs.resolve(wrong)
+    assert built.path.is_dir(), "resolving deletes nothing"
 
 
 def test_outside_an_appimage_the_running_interpreter_is_used(

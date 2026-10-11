@@ -219,6 +219,18 @@ def check_older_than(days: float | None) -> float | None:
     return float(days)
 
 
+def _age_cutoff(now: datetime, days: float) -> datetime | None:
+    """The last-use moment ``days`` before ``now``; ``None`` when that is before any date.
+
+    No entry can have gone unused for longer than the calendar reaches back, so
+    such an age selects nothing, rather than overflowing ``datetime``.
+    """
+    try:
+        return now - timedelta(days=days)
+    except OverflowError:
+        return None
+
+
 @dataclass(frozen=True)
 class _Owner:
     """An artifact a cache entry can belong to."""
@@ -516,7 +528,7 @@ class CompileCacheService:
         nothing can be traced to, and ``everything`` takes the whole cache.
         """
         days = check_older_than(older_than_days)
-        cutoff = self._clock() - timedelta(days=days) if days is not None else None
+        cutoff = _age_cutoff(self._clock(), days) if days is not None else None
         plan = CompileCachePrunePlan(
             root=inventory.root,
             older_than_days=days,

@@ -43,7 +43,7 @@ from yonga.adapters.openvino_probe import (
 from yonga.application.progress import ProgressEvent, ProgressKind, ProgressSink, null_sink
 from yonga.application.self_install import CommandRelation, InstallationStatus, InstallKind
 from yonga.config.settings import Settings
-from yonga.domain.compile_cache import CompileCacheInventory
+from yonga.domain.compile_cache import CompileCacheInventory, entry_count
 from yonga.domain.diagnostics import (
     ExitCode,
     HealthCheck,
@@ -696,7 +696,7 @@ class DoctorService:
         if not cache.entries:
             value = "empty"
         else:
-            value = f"{len(cache.entries)} entries, {format_bytes(total)}"
+            value = f"{entry_count(len(cache.entries))}, {format_bytes(total)}"
             if reclaimable:
                 value += f", {format_bytes(reclaimable)} reclaimable"
         detail = f"{cache.root} — compiled blobs; `yonga cache list`"

@@ -1910,6 +1910,151 @@ def test_cache_prune_rejects_a_negative_age(runner: CliRunner, home: Path) -> No
     assert document["diagnostic"]["code"] == "cache.prune.older_than_invalid"
 
 
+def test_cache_prune_with_an_age_past_the_calendar_takes_nothing_for_age(
+    runner: CliRunner, home: Path, tmp_path: Path
+) -> None:
+    """No entry can be unused for longer than dates go back: not a crash."""
+    entries = populated_cache(home, tmp_path)
+
+    for days in ("3000000", "1e6", "99999999999"):
+        result = invoke(
+            runner, home, ["cache", "prune", "--dry-run", "--older-than", days, "--json"]
+        )
+
+        payload = one_document(result)
+        assert result.exit_code == int(ExitCode.SUCCESS), result.stdout
+        planned = {entry["key"] for entry in records(payload["planned"])}
+        assert planned == {entries["orphaned"].name, entries["stale-runtime"].name}
+
+
+def test_cache_counts_say_entry_for_one(runner: CliRunner, home: Path, tmp_path: Path) -> None:
+    settings = cli_settings(home)
+    store = ArtifactStore(settings.paths, settings)
+    gone = publish(
+        store,
+        tmp_path,
+        manifest=make_manifest(artifact_id="bbbbbbbbbbbbbbbb", profile="cpu-int4-asym-g128"),
+        name="only-one",
+    )
+    recorded_entry(settings, gone, device="CPU", size=5000)
+    shutil.rmtree(gone)
+
+    listed = plain_text(invoke(runner, home, ["cache", "list"]).stdout)
+    pruned = plain_text(invoke(runner, home, ["cache", "prune", "--yes"]).stdout)
+
+    assert "1 entry," in listed and "1 entries" not in listed
+    assert "Prune 1 of 1 entry," in pruned
+    assert "Removed 1 entry," in pruned
+
+
+def make_export_env(home: Path, *, size: int = 1000) -> Path:
+    """Put one completed managed export environment where ``env`` looks for them."""
+    from yonga.adapters.export_env import MARKER_FILENAME
+    from yonga.domain.environments import EnvironmentSpec, ExportEnvironment
+
+    spec = EnvironmentSpec(python="3.14", packages={"transformers": "==5.2.0"})
+    path = home / "cache" / "envs" / spec.name
+    (path / "bin").mkdir(parents=True)
+    (path / "bin" / "python").write_text("#!/bin/sh\n")
+    environment = ExportEnvironment(
+        spec=spec, path=path, created_at=datetime.now(UTC), size_bytes=size
+    )
+    (path / MARKER_FILENAME).write_text(environment.model_dump_json(), encoding="utf-8")
+    return path
+
+
+def as_tty(monkeypatch: pytest.MonkeyPatch, *, answer: bool) -> list[str]:
+    """Make the console interactive and answer every question with ``answer``."""
+    from yonga.ui.console import YongaConsole
+
+    asked: list[str] = []
+
+    def ask(self: YongaConsole, question: str, *, default: bool) -> bool:
+        asked.append(question)
+        return answer
+
+    monkeypatch.setattr(YongaConsole, "interactive", property(lambda self: not self.json_mode))
+    monkeypatch.setattr(YongaConsole, "_ask", ask)
+    return asked
+
+
+@pytest.mark.parametrize("prefix", ["", "export-"])
+def test_env_remove_asks_whatever_the_environment_is_called(
+    runner: CliRunner, home: Path, monkeypatch: pytest.MonkeyPatch, prefix: str
+) -> None:
+    """``export-KEY`` (what the plan and ``env list`` show) is asked about like ``KEY``."""
+    path = make_export_env(home)
+    asked = as_tty(monkeypatch, answer=False)
+    key = path.name.removeprefix("export-")
+
+    result = invoke(runner, home, ["env", "remove", f"{prefix}{key}"])
+
+    assert result.exit_code == int(ExitCode.CANCELLED)
+    assert asked and str(path) in asked[0]
+    assert path.is_dir(), "declining must keep the environment"
+    assert "Nothing was removed" in plain_text(result.stderr)
+
+
+def test_env_remove_without_yes_in_json_mode_refuses(runner: CliRunner, home: Path) -> None:
+    path = make_export_env(home)
+
+    result = invoke(runner, home, ["env", "remove", path.name, "--json"])
+
+    document = one_document(result)
+    assert result.exit_code == int(ExitCode.CANCELLED)
+    assert document["ok"] is False
+    diagnostic_document = document["diagnostic"]
+    assert isinstance(diagnostic_document, dict)
+    assert diagnostic_document["code"] == "export.env.remove.declined"
+    assert path.is_dir()
+
+
+def test_env_remove_non_interactive_says_how_to_go_ahead(runner: CliRunner, home: Path) -> None:
+    path = make_export_env(home)
+
+    result = invoke(runner, home, ["env", "remove", path.name])
+
+    assert result.exit_code == int(ExitCode.CANCELLED)
+    error = plain_text(result.stderr)
+    assert "Nothing was removed" in error
+    assert "--yes" in error
+    assert path.is_dir()
+
+
+def test_env_remove_yes_deletes_and_an_unknown_key_is_refused(
+    runner: CliRunner, home: Path
+) -> None:
+    path = make_export_env(home)
+
+    unknown = invoke(runner, home, ["env", "remove", "deadbeef", "--yes", "--json"])
+    removed = invoke(runner, home, ["env", "remove", path.name, "--yes", "--json"])
+
+    assert unknown.exit_code == int(ExitCode.REGISTRY)
+    unknown_diagnostic = one_document(unknown)["diagnostic"]
+    assert isinstance(unknown_diagnostic, dict)
+    assert unknown_diagnostic["code"] == "export.env.not_found"
+    document = one_document(removed)
+    assert removed.exit_code == int(ExitCode.SUCCESS)
+    assert document["removed"] == path.name.removeprefix("export-")
+    assert not path.exists()
+
+
+def test_env_list_counts_a_copy_of_the_bundled_python(runner: CliRunner, home: Path) -> None:
+    path = make_export_env(home, size=1000)
+    base = home / "cache" / "envs" / "python-3.14.7-3d38950fe1ce"
+    (base / "bin").mkdir(parents=True)
+    (base / "bin" / "python3.14").write_bytes(b"p" * 500)
+    (path / "pyvenv.cfg").write_text(f"home = {base / 'bin'}\n", encoding="utf-8")
+
+    document = one_document(invoke(runner, home, ["env", "list", "--json"]))
+    human = plain_text(invoke(runner, home, ["env", "list"]).stdout)
+
+    assert document["base_interpreters"] == [{"path": str(base), "size_bytes": 500, "in_use": True}]
+    assert document["total_bytes"] == 1500
+    assert str(base) in human
+    assert "1 environment," in human
+
+
 def test_doctor_warns_about_a_large_reclaimable_compile_cache(
     runner: CliRunner, home: Path, tmp_path: Path
 ) -> None:
