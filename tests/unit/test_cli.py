@@ -3553,6 +3553,30 @@ def test_offline_advice_prints_the_command_without_the_offline_flag(
     assert not any("--offline publish" in step for step in _remediation(result))
 
 
+def test_offline_advice_drops_the_flag_when_it_is_the_only_root_option(
+    runner: CliRunner, home: Path
+) -> None:
+    """With --offline alone, carrying the root options put it back into that very command."""
+    result = runner.invoke(
+        app,
+        ["--offline", "publish", "abc", "--repo", "me/m", "--json"],
+        obj=lambda settings: FakeWiring(settings),
+        env={
+            "YONGA_CONFIG_DIR": str(home / "config"),
+            "YONGA_DATA_DIR": str(home / "data"),
+            "YONGA_CACHE_DIR": str(home / "cache"),
+            "NO_COLOR": "1",
+            "HF_TOKEN": FAKE_TOKEN,
+            "COLUMNS": "200",
+        },
+    )
+
+    assert result.exit_code == int(ExitCode.REGISTRY), result.output
+    steps = _remediation(result)
+    assert any(step.endswith(": yonga publish abc --repo me/m --json") for step in steps)
+    assert not any("--offline publish" in step for step in steps)
+
+
 def test_eval_json_is_one_document(runner: CliRunner, home: Path, tmp_path: Path) -> None:
     pytest.importorskip("numpy")
     result = invoke(

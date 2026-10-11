@@ -210,19 +210,21 @@ class CliState:
         other ``yonga`` command a step names gets the root options the user gave.
         """
         typed = self.command_line
-        item = with_rerun(
-            item,
-            typed.rerun() if typed.command else None,
-            online=typed.rerun(drop_root=("--offline",)) if typed.command else None,
-        )
         steps = [self.hint(step) for step in item.remediation]
         context = dict(item.context)
         fallback = fallback_command(item)
         if fallback:
             context["fallback_command"] = self.hint(fallback)
-        if steps == item.remediation and context == item.context:
-            return item
-        return item.model_copy(update={"remediation": steps, "context": context})
+        if steps != item.remediation or context != item.context:
+            item = item.model_copy(update={"remediation": steps, "context": context})
+        # The re-run commands go in last, already whole: carrying the root
+        # options into them afterwards put --offline back into the command
+        # that is meant to run without it whenever it was the only root option.
+        return with_rerun(
+            item,
+            typed.rerun() if typed.command else None,
+            online=typed.rerun(drop_root=("--offline",)) if typed.command else None,
+        )
 
     def report(self, item: Diagnostic, *, exit_code: ExitCode) -> ExitCode:
         """Render one diagnostic the way the current output mode requires."""
