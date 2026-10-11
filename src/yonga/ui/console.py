@@ -360,11 +360,18 @@ class YongaConsole:
     # ------------------------------------------------------------------
     # plain output
     # ------------------------------------------------------------------
-    def print(self, renderable: RenderableType = "", *, style: str | None = None) -> None:
-        """Write a renderable to stdout; silent in ``--json`` mode."""
+    def print(
+        self, renderable: RenderableType = "", *, style: str | None = None, soft_wrap: bool = False
+    ) -> None:
+        """Write a renderable to stdout; silent in ``--json`` mode.
+
+        ``soft_wrap`` leaves a long line whole for the terminal to wrap, for a
+        line ending in a path or an id that would otherwise be folded into
+        pieces no one can copy back together.
+        """
         if not self.show_decoration:
             return
-        self.out.print(renderable, style=style, highlight=False)
+        self.out.print(renderable, style=style, highlight=False, soft_wrap=soft_wrap)
 
     def print_error(self, renderable: RenderableType = "", *, style: str | None = None) -> None:
         """Write a renderable to stderr; silent in ``--json`` mode."""

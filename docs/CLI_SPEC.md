@@ -287,8 +287,11 @@ yonga list [--clean] [--json]
 
 Shows prepared artifacts, source revision, profile, recommended device, size, last benchmark.
 
-On a narrow terminal the creation and benchmark times are dropped before the model and its
-revision; when the `Ready` column has to go too, unready artifacts are named under the table.
+On a narrow terminal whole columns are dropped instead of every column being cut short: the
+creation and benchmark times first, then the revision, `Ready`, the size and the model. The
+repository id may instead lose its organisation (`…/SmolLM2-360M-Instruct`) and, once the revision
+is gone, the end of its name. The artifact id, the profile and the device are never shortened.
+When the `Ready` column has gone, unready artifacts are named under the table.
 
 `--clean` retires stale staging and temporary directories under the retention policy
 (`workspace_retention_hours`, `workspace_retention_max`) and never touches a running job's
@@ -454,7 +457,9 @@ yonga registry reset
 
 `profiles` lists the conversion profiles of the merged registry, the ids `--profile` accepts, by
 device and then by priority, with their weight compression, size band, priority and status (and in
-`--json` their evidence and the layer that supplied them). An unknown `--profile`
+`--json` their evidence and the layer that supplied them). A profile id is never wrapped or cut
+short; the summary is the column that wraps, and on a narrow terminal the weights column, which
+the id spells out already, makes room for it. An unknown `--profile`
 (`registry.profile_unknown`, exit 70) names the profiles for the requested device and points here.
 
 `paths` inside an AppImage names the AppImage file for the built-in registry instead of its
@@ -528,7 +533,10 @@ and never fails a load.
 
 `list` prints, per entry: key, size, last use (the record's, or the newest file time), device,
 OpenVINO version, owner (artifact id; `*` when the artifact exists outside this artifact store)
-and status, then the total size and count. Statuses:
+and status, then the total size and count. On a narrow terminal the model, last use, OpenVINO
+version and device columns are dropped, in that order, then an owner known only by its directory
+name is cut and finally the owner column goes; the key, the size, the status and an owning artifact
+id are never shortened. Statuses:
 
 | Status | Meaning |
 |---|---|

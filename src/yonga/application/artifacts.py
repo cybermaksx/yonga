@@ -505,9 +505,14 @@ class ArtifactStore:
         shared = self._directories_sharing_identity(target, manifest)
         cache_dirs = [] if shared else self._compile_cache_dirs(manifest)
         if shared and manifest is not None:
+            claimants = (
+                "another directory in the store still claims"
+                if len(shared) == 1
+                else f"{len(shared)} other directories in the store still claim"
+            )
             notes.append(
                 f"The compile cache is keyed on artifact id {manifest.artifact_id}, which "
-                f"{len(shared)} other directory in the store still claims; it is kept."
+                f"{claimants}; it is kept."
             )
         elif manifest is not None and not cache_dirs:
             notes.append("No compile-cache entries were found for this artifact.")

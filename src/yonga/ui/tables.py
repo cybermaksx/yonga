@@ -722,18 +722,19 @@ _LIST_COLUMNS: tuple[tuple[str, str], ...] = (
 )
 
 #: Order in which columns are given up when the terminal cannot fit them all.
-#: The repository id and its revision are what tell two artifacts apart, so they
-#: outlast everything but the artifact id, the profile and the device; the
-#: creation time goes first, then the last benchmark, a timestamp the wider
-#: layouts and ``--json`` still carry. ``Ready`` is given up before the size,
-#: but never silently: an artifact that is not ready is then named under the
-#: table instead.
+#: The creation time goes first, then the last benchmark, timestamps the wider
+#: layouts and ``--json`` still carry. The revision follows: it only tells apart
+#: two artifacts of one model and one profile, and the full sha is one
+#: ``--json`` away. ``Ready`` is given up before the size, but never silently:
+#: an artifact that is not ready is then named under the table instead. The
+#: model goes last of all; the artifact id, the profile and the device always
+#: stay, and are never cut short.
 _LIST_DROP_ORDER: tuple[str, ...] = (
     "created",
     "benchmark",
+    "revision",
     "ready",
     "size",
-    "revision",
     "model",
 )
 
@@ -754,6 +755,11 @@ _LIST_REVISION_LENGTH = 7
 
 #: A width no real table reaches, used to measure a layout's natural size.
 _LIST_MEASURE_WIDTH = 10_000
+
+
+def _natural_width(console: Console, options: ConsoleOptions, table: Table) -> int:
+    """Cells ``table`` needs to show every cell whole."""
+    return Measurement.get(console, options.update_width(_LIST_MEASURE_WIDTH), table).maximum
 
 
 class _ListVariant(NamedTuple):
@@ -784,15 +790,26 @@ def _elide_repo_id(repo_id: str, width: int) -> str:
     The model name is what tells the artifacts in one list apart, and its start
     (family, version, size) more than its end; the organisation is the part
     they most often share. So a repository id that does not fit loses its
-    namespace to ``…/`` first, and only a name that still does not fit is cut,
-    from the right.
+    namespace to ``…/`` (or to a bare ``…`` when the slash is one cell too
+    many) first, and only a name that still does not fit is cut, from the
+    right.
     """
     if Text(repo_id).cell_len <= width:
         return repo_id
     name = repo_id.rpartition("/")[2]
-    if name != repo_id and Text(f"…/{name}").cell_len <= width:
-        return f"…/{name}"
+    if name != repo_id:
+        for elided in (f"…/{name}", f"…{name}"):
+            if Text(elided).cell_len <= width:
+                return elided
     return name[: max(width - 1, 0)] + "…"
+
+
+def _repo_name_width(repo_id: str) -> int:
+    """Cells ``repo_id`` needs once its organisation is elided, and no fewer."""
+    name = repo_id.rpartition("/")[2]
+    if name == repo_id:
+        return Text(repo_id).cell_len
+    return min(Text(repo_id).cell_len, Text(f"…{name}").cell_len)
 
 
 def _list_cells(
@@ -820,8 +837,14 @@ def _artifact_table(
     variant: _ListVariant,
     *,
     model_width: int = _LIST_MODEL_MAX_WIDTH,
+    fold_profile: bool = False,
 ) -> Table:
-    """Build the ``yonga list`` table for one rung of the ladder."""
+    """Build the ``yonga list`` table for one rung of the ladder.
+
+    ``fold_profile`` lets a profile id wrap onto a second line, the last resort
+    of a terminal too narrow for even the narrowest rung: wrapped, the id can
+    still be read and copied; cut short with an ellipsis, it could not.
+    """
     table = Table(
         box=SIMPLE,
         show_edge=False,
@@ -835,10 +858,11 @@ def _artifact_table(
     keys = [key for key, _ in _LIST_COLUMNS if key not in variant.dropped]
     headers = dict(_LIST_COLUMNS)
     for key in keys:
+        folds = fold_profile and key == "profile"
         table.add_column(
             headers[key],
-            no_wrap=True,
-            overflow="ellipsis",
+            no_wrap=not folds,
+            overflow="fold" if folds else "ellipsis",
             justify="right" if key in _LIST_NUMERIC else "left",
         )
     for summary in summaries:
@@ -855,16 +879,18 @@ class _ArtifactList:
     Nine columns do not fit an 80-column terminal, and Rich's answer to that is
     to shrink every column until each one is an ellipsis. This renderable
     answers differently: it drops whole columns, in a fixed order, until the
-    rest fit at their natural width. Once the creation time has gone, the
-    repository id may also be elided from the left (down to
-    ``_LIST_MODEL_MIN_WIDTH`` cells) before another column is given up, since
+    rest fit at their natural width, and never lets Rich shrink a column.
+
+    The repository id is the one column that may be shortened instead. Once
+    the creation time has gone it may lose its organisation (``…/name``);
+    once the revision has gone too, its name may also be cut, down to
+    ``_LIST_MODEL_MIN_WIDTH`` cells, before another column is given up, since
     without it two artifacts of different models with one profile look alike.
 
     The artifact id, the profile and the device are never truncated. On an
-    80-column terminal the list keeps the model, its revision, the size and
-    readiness (the last as a note under the table when its column has had to
-    go), and leaves the creation and benchmark times to wider terminals and to
-    ``--json``.
+    80-column terminal the list keeps the model, the size and readiness, and
+    leaves the creation and benchmark times (and, beside a long repository id,
+    the revision) to wider terminals and to ``--json``.
     """
 
     def __init__(self, summaries: Sequence[ArtifactSummary]) -> None:
@@ -872,25 +898,41 @@ class _ArtifactList:
         self._summaries = tuple(summaries)
 
     def _natural_model_width(self) -> int:
-        """Cells the model column needs before any elision."""
-        widest = max((Text(item.repo_id).cell_len for item in self._summaries), default=0)
-        return min(_LIST_MODEL_MAX_WIDTH, max(widest, len("Model")))
+        """Cells the model column takes before any elision beyond the cap."""
+        cells = (
+            Text(_elide_repo_id(item.repo_id, _LIST_MODEL_MAX_WIDTH)).cell_len
+            for item in self._summaries
+        )
+        return max([len("Model"), *cells])
+
+    def _model_floor(self, variant: _ListVariant, natural: int) -> int:
+        """The narrowest the model column may get on ``variant``'s rung."""
+        if "created" not in variant.dropped:
+            return natural
+        if "revision" not in variant.dropped:
+            names = (_repo_name_width(item.repo_id) for item in self._summaries)
+            return min(natural, max([len("Model"), *names]))
+        return min(natural, _LIST_MODEL_MIN_WIDTH)
 
     def layout_for(self, console: Console, options: ConsoleOptions) -> tuple[_ListVariant, Table]:
         """Return the widest layout that fits ``options``, with the rung it came from."""
-        wide = options.update_width(_LIST_MEASURE_WIDTH)
         natural = self._natural_model_width()
         for variant in _LIST_VARIANTS[:-1]:
             candidate = _artifact_table(self._summaries, variant, model_width=natural)
-            width = Measurement.get(console, wide, candidate).maximum
-            if width <= options.max_width:
+            excess = _natural_width(console, options, candidate) - options.max_width
+            if excess <= 0:
                 return variant, candidate
-            elidable = "created" in variant.dropped and "model" not in variant.dropped
-            narrower = natural - (width - options.max_width)
-            if elidable and narrower >= _LIST_MODEL_MIN_WIDTH:
-                return variant, _artifact_table(self._summaries, variant, model_width=narrower)
+            narrower = natural - excess
+            if narrower < self._model_floor(variant, natural):
+                continue
+            candidate = _artifact_table(self._summaries, variant, model_width=narrower)
+            if _natural_width(console, options, candidate) <= options.max_width:
+                return variant, candidate
         last = _LIST_VARIANTS[-1]
-        return last, _artifact_table(self._summaries, last)
+        candidate = _artifact_table(self._summaries, last)
+        if _natural_width(console, options, candidate) <= options.max_width:
+            return last, candidate
+        return last, _artifact_table(self._summaries, last, fold_profile=True)
 
     def table_for(self, console: Console, options: ConsoleOptions) -> Table:
         """Return the table of the layout chosen for ``options``."""
@@ -939,11 +981,18 @@ def _release(version: str | None) -> str | None:
     return version.split("-", 1)[0].strip() or version
 
 
-def _cache_owner(entry: CompileCacheEntry) -> Text:
-    """The owning artifact; ``*`` marks one that lives outside the artifact store."""
+def _cache_owner(entry: CompileCacheEntry, *, width: int | None = None) -> Text:
+    """The owning artifact; ``*`` marks one that lives outside the artifact store.
+
+    An artifact id is always shown whole. An owner known only by its directory
+    name (a copy outside the store, a staging directory) may be cut to
+    ``width`` cells when the terminal is narrow.
+    """
     label = entry.artifact_id or (entry.artifact_path.name if entry.artifact_path else None)
     if label is None:
         return Text(_DASH, style="dim")
+    if width is not None and entry.artifact_id is None and Text(label).cell_len > width:
+        label = label[: max(width - 1, 0)] + "…"
     owner = Text(label, style="" if entry.owner_exists else "dim")
     if entry.owner_exists and not entry.owner_in_store:
         owner.append("*", style="cyan")
@@ -951,42 +1000,51 @@ def _cache_owner(entry: CompileCacheEntry) -> Text:
 
 
 #: Optional ``yonga cache`` columns, in the order they are given up when the
-#: terminal is too narrow. Key, size, owner and status always stay.
+#: terminal is too narrow. Key, size, status (and why, in a prune plan) always
+#: stay; the owner goes last, once an owner known only by its directory name
+#: has been cut as far as :data:`_CACHE_OWNER_MIN_WIDTH`.
 _CACHE_DROP_ORDER: tuple[str, ...] = ("Model", "Last used", "OpenVINO", "Dev")
+
+#: Narrowest a directory-name owner is cut to; an artifact id is never cut.
+_CACHE_OWNER_MIN_WIDTH = 16
 
 
 class _CacheTable:
     """The compile cache entries, laid out for the terminal they are printed on.
 
     Like ``yonga list``, whole columns are dropped, in a fixed order, until the
-    rest fit at their natural width, so a key or a status is never cut short.
+    rest fit at their natural width, so a key, an owning artifact id or a
+    status is never cut short.
     """
 
     def __init__(
         self, entries: Sequence[CompileCacheEntry], reasons: dict[str, str] | None
     ) -> None:
-        """Build every cell once; the layout is chosen at render time."""
+        """Keep the entries; the layout is chosen at render time."""
+        self._entries = tuple(entries)
+        self._reasons = reasons or {}
         self._why = reasons is not None and any(
             reasons.get(entry.key) != entry.status.value for entry in entries
         )
-        self._rows: list[dict[str, Text]] = []
-        for entry in entries:
-            severity = _CACHE_STATUS_SEVERITY[entry.status]
-            row = {
-                "Key": Text(entry.key),
-                "Size": Text(human_bytes(entry.size_bytes)),
-                "Last used": Text(_timestamp(entry.last_used_at, minutes=False)),
-                "Dev": _text(entry.device),
-                "OpenVINO": _text(_release(entry.openvino_version)),
-                "Owner": _cache_owner(entry),
-                "Status": _status_text(severity, entry.status.value),
-                "Model": _text(entry.repo_id),
-            }
-            if self._why and reasons is not None:
-                row["Why"] = _text(reasons.get(entry.key))
-            self._rows.append(row)
+        self._outside = any(entry.owner_exists and not entry.owner_in_store for entry in entries)
 
-    def _table(self, dropped: frozenset[str]) -> Table:
+    def _row(self, entry: CompileCacheEntry, owner_width: int | None) -> dict[str, Text]:
+        severity = _CACHE_STATUS_SEVERITY[entry.status]
+        row = {
+            "Key": Text(entry.key),
+            "Size": Text(human_bytes(entry.size_bytes)),
+            "Last used": Text(_timestamp(entry.last_used_at, minutes=False)),
+            "Dev": _text(entry.device),
+            "OpenVINO": _text(_release(entry.openvino_version)),
+            "Owner": _cache_owner(entry, width=owner_width),
+            "Status": _status_text(severity, entry.status.value),
+            "Model": _text(entry.repo_id),
+        }
+        if self._why:
+            row["Why"] = _text(self._reasons.get(entry.key))
+        return row
+
+    def _table(self, dropped: frozenset[str], owner_width: int | None = None) -> Table:
         headers = ["Key", "Size", "Last used", "Dev", "OpenVINO", "Owner", "Status"]
         if self._why:
             headers.append("Why")
@@ -1003,25 +1061,43 @@ class _CacheTable:
                 justify="right" if header == "Size" else "left",
                 max_width=_LIST_MODEL_MAX_WIDTH if header == "Model" else None,
             )
-        for row in self._rows:
+        for entry in self._entries:
+            row = self._row(entry, owner_width)
             table.add_row(*(row[header] for header in shown))
         return table
 
-    def table_for(self, console: Console, options: ConsoleOptions) -> Table:
-        """Return the widest layout whose natural width fits ``options``."""
-        wide = options.update_width(_LIST_MEASURE_WIDTH)
+    def layout_for(self, console: Console, options: ConsoleOptions) -> tuple[frozenset[str], Table]:
+        """Return the widest layout whose natural width fits ``options``, and what it drops."""
         dropped: set[str] = set()
-        candidate = self._table(frozenset())
-        for header in _CACHE_DROP_ORDER:
-            if Measurement.get(console, wide, candidate).maximum <= options.max_width:
-                return candidate
-            dropped.add(header)
+        for header in (None, *_CACHE_DROP_ORDER):
+            if header is not None:
+                dropped.add(header)
             candidate = self._table(frozenset(dropped))
-        return candidate
+            excess = _natural_width(console, options, candidate) - options.max_width
+            if excess <= 0:
+                return frozenset(dropped), candidate
+        # The ``*`` marker is not part of the label, so the cut that fits is
+        # found by measuring rather than by subtraction alone.
+        widest = max(_cache_owner(entry).cell_len for entry in self._entries)
+        ids = [len(entry.artifact_id) for entry in self._entries if entry.artifact_id]
+        floor = max([_CACHE_OWNER_MIN_WIDTH, *ids])
+        for width in range(widest - excess, floor - 1, -1):
+            candidate = self._table(frozenset(dropped), owner_width=width)
+            if _natural_width(console, options, candidate) <= options.max_width:
+                return frozenset(dropped), candidate
+        dropped.add("Owner")
+        return frozenset(dropped), self._table(frozenset(dropped))
+
+    def table_for(self, console: Console, options: ConsoleOptions) -> Table:
+        """Return the table of the layout chosen for ``options``."""
+        return self.layout_for(console, options)[1]
 
     def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
-        """Render the chosen layout."""
-        yield self.table_for(console, options)
+        """Render the chosen layout, and the ``*`` footnote while owners are shown."""
+        dropped, table = self.layout_for(console, options)
+        yield table
+        if self._outside and "Owner" not in dropped:
+            yield Text("* the artifact exists, outside this artifact store", style="dim")
 
     def __rich_measure__(self, console: Console, options: ConsoleOptions) -> Measurement:
         """Measure the layout that would be chosen for ``options``."""
@@ -1042,10 +1118,7 @@ def compile_cache_entries(
     """
     if not entries:
         return Text("The compile cache is empty.", style="dim")
-    table = _CacheTable(entries, reasons)
-    if not any(entry.owner_exists and not entry.owner_in_store for entry in entries):
-        return table
-    return Group(table, Text("* the artifact exists, outside this artifact store", style="dim"))
+    return _CacheTable(entries, reasons)
 
 
 # ----------------------------------------------------------------------
@@ -1379,6 +1452,95 @@ def registry_explanation(explanation: RegistryExplanation) -> RenderableType:
     return Group(*blocks)
 
 
+#: The ``yonga registry profiles`` columns, in order, as ``(key, header)``.
+_PROFILE_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("id", "Profile"),
+    ("device", "Device"),
+    ("weights", "Weights"),
+    ("band", "Size band"),
+    ("priority", "Prio"),
+    ("summary", "Summary"),
+)
+
+#: Columns that never wrap: an id broken across two lines cannot be copied.
+_PROFILE_NO_WRAP: frozenset[str] = frozenset({"id", "device", "priority"})
+
+#: Narrowest the summary may wrap to before the weights column is given up for
+#: it; the profile id spells its weights out already (``cpu-int4-asym-g128``).
+_PROFILE_SUMMARY_MIN_WIDTH = 24
+
+
+class _ProfileTable:
+    """The ``yonga registry profiles`` table, laid out for its terminal.
+
+    The profile id, the device and the priority never wrap and are never cut
+    short; the summary is the column that wraps. When that would leave it
+    fewer than :data:`_PROFILE_SUMMARY_MIN_WIDTH` cells, the weights column,
+    which the id repeats, makes room for it.
+    """
+
+    def __init__(self, rows: Sequence[Mapping[str, object]]) -> None:
+        """Render every cell once; the layout is chosen at render time."""
+        self._rows: list[dict[str, Text]] = []
+        for row in rows:
+            status = str(row.get("status") or "")
+            summary = _text(row.get("summary"), style="dim")
+            if status and status != "active":
+                summary = Text.assemble((status, "yellow"), ("  ", ""), summary)
+            self._rows.append(
+                {
+                    "id": Text(str(row["id"]), style="bold"),
+                    "device": Text(str(row["device"])),
+                    "weights": Text(str(row["weights"])),
+                    "band": _text(row.get("band")),
+                    "priority": Text(str(row["priority"])),
+                    "summary": summary,
+                }
+            )
+
+    def _table(self, keys: Sequence[str]) -> Table:
+        table = Table(
+            box=SIMPLE, show_edge=False, pad_edge=False, header_style="bold", padding=(0, 1, 0, 0)
+        )
+        headers = dict(_PROFILE_COLUMNS)
+        for key in keys:
+            table.add_column(
+                headers[key],
+                no_wrap=key in _PROFILE_NO_WRAP,
+                overflow="ellipsis" if key in _PROFILE_NO_WRAP else "fold",
+                justify="right" if key == "priority" else "left",
+                # Rich shrinks every column alike when the wrapping ones cannot
+                # give enough; the id is held at its width even then.
+                min_width=max(row["id"].cell_len for row in self._rows) if key == "id" else None,
+            )
+        for row in self._rows:
+            table.add_row(*(row[key] for key in keys))
+        return table
+
+    def table_for(self, console: Console, options: ConsoleOptions) -> Table:
+        """Return the widest layout that leaves the summary room to wrap in."""
+        keys = [key for key, _ in _PROFILE_COLUMNS]
+        summary = max(
+            (row["summary"].cell_len for row in self._rows), default=_PROFILE_SUMMARY_MIN_WIDTH
+        )
+        wanted = min(summary, _PROFILE_SUMMARY_MIN_WIDTH)
+        for dropped in ((), ("weights",)):
+            shown = [key for key in keys if key not in dropped]
+            others = _natural_width(console, options, self._table(shown[:-1]))
+            # Two cells separate the summary from the column before it.
+            if options.max_width - others - 2 >= wanted:
+                return self._table(shown)
+        return self._table(shown)
+
+    def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
+        """Render the chosen layout."""
+        yield self.table_for(console, options)
+
+    def __rich_measure__(self, console: Console, options: ConsoleOptions) -> Measurement:
+        """Measure the layout that would be chosen for ``options``."""
+        return Measurement.get(console, options, self.table_for(console, options))
+
+
 def registry_profiles(rows: Sequence[Mapping[str, object]]) -> RenderableType:
     """Render ``yonga registry profiles``: one line per profile ``--profile`` accepts.
 
@@ -1386,27 +1548,9 @@ def registry_profiles(rows: Sequence[Mapping[str, object]]) -> RenderableType:
     decide the automatic choice, so both are shown; a profile that is not
     active has its status in front of its summary.
     """
-    table = Table(box=SIMPLE, show_edge=False, pad_edge=False, header_style="bold")
-    table.add_column("Profile", overflow="fold")
-    table.add_column("Device", no_wrap=True)
-    table.add_column("Weights", overflow="fold")
-    table.add_column("Size band", overflow="fold")
-    table.add_column("Prio", justify="right", no_wrap=True)
-    table.add_column("Summary", overflow="fold")
-    for row in rows:
-        status = str(row.get("status") or "")
-        summary = _text(row.get("summary"), style="dim")
-        if status and status != "active":
-            summary = Text.assemble((status, "yellow"), ("  ", ""), summary)
-        table.add_row(
-            Text(str(row["id"]), style="bold"),
-            str(row["device"]),
-            str(row["weights"]),
-            _text(row.get("band")),
-            str(row["priority"]),
-            summary,
-        )
-    return table
+    if not rows:
+        return Text("No registry profiles.", style="dim")
+    return _ProfileTable(rows)
 
 
 def _resolution_table(resolution: ResolutionExplanation, winner_id: str | None) -> RenderableType:
@@ -1696,6 +1840,7 @@ class _JobList:
         zone = next(iter(offsets)) if len(offsets) == 1 else None
         self._caption = f"Start times are local, {zone}." if zone else None
         self._rows = [_job_cells(summary, zone=zone) for summary in summaries]
+        self._models = [_job_model(summary) for summary in summaries]
         self._model_width = max([len("model"), *(row["model"].cell_len for row in self._rows)])
 
     def table_for(self, console: Console, options: ConsoleOptions) -> Table:
@@ -1717,7 +1862,14 @@ class _JobList:
     def _layout(self, dropped: frozenset[str], model_width: int | None) -> Table:
         """One layout of the index."""
         caption = None if "started" in dropped else self._caption
-        return _job_table(self._rows, dropped=dropped, model_width=model_width, caption=caption)
+        rows = self._rows
+        if model_width is not None:
+            # A repository id gives up its organisation before its name.
+            rows = [
+                {**row, "model": _text(_elide_repo_id(model, model_width) if model else None)}
+                for row, model in zip(self._rows, self._models, strict=True)
+            ]
+        return _job_table(rows, dropped=dropped, model_width=model_width, caption=caption)
 
     def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
         """Render the chosen layout."""

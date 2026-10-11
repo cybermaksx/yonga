@@ -1904,6 +1904,23 @@ def test_cache_prune_all_and_unattributed_go_further(
     assert "Nothing to prune" in nothing.stdout
 
 
+def test_cache_prune_with_nothing_to_do_agrees_with_the_count(
+    runner: CliRunner, home: Path, tmp_path: Path
+) -> None:
+    """'2 entries ... are all kept', but '1 entry ... is kept'."""
+    entries = populated_cache(home, tmp_path)
+    assert invoke(runner, home, ["cache", "prune", "--yes"]).exit_code == int(ExitCode.SUCCESS)
+
+    two = invoke(runner, home, ["cache", "prune", "--dry-run"])
+    shutil.rmtree(entries["unattributed"])
+    one = invoke(runner, home, ["cache", "prune", "--dry-run"])
+
+    assert "Nothing to prune: 2 entries (" in two.stdout
+    assert ") are all kept under these options." in two.stdout
+    assert "Nothing to prune: 1 entry (" in one.stdout
+    assert ") is kept under these options." in one.stdout
+
+
 def test_cache_prune_dry_run_in_human_mode_lists_the_plan(
     runner: CliRunner, home: Path, tmp_path: Path
 ) -> None:
@@ -2128,6 +2145,23 @@ def test_env_list_counts_a_copy_of_the_bundled_python(runner: CliRunner, home: P
     assert document["total_bytes"] == 1500
     assert str(base) in human
     assert "1 environment," in human
+
+
+def test_env_and_cache_lists_keep_a_long_path_on_one_line(
+    runner: CliRunner, home: Path, tmp_path: Path
+) -> None:
+    """A path folded at the terminal width cannot be copied back in one piece."""
+    path = make_export_env(home, size=1000)
+    populated_cache(home, tmp_path)
+    narrow = {"COLUMNS": "40"}
+
+    environments = invoke(runner, home, ["env", "list"], env=narrow)
+    cache = invoke(runner, home, ["cache", "list"], env=narrow)
+
+    assert environments.exit_code == int(ExitCode.SUCCESS)
+    assert str(path) in environments.stdout
+    assert cache.exit_code == int(ExitCode.SUCCESS)
+    assert f"Compile cache  {home / 'cache' / 'compile'}" in cache.stdout
 
 
 def test_doctor_warns_about_a_large_reclaimable_compile_cache(
@@ -3271,6 +3305,21 @@ def test_registry_profiles_lists_what_profile_accepts(runner: CliRunner, home: P
     assert priorities == sorted(priorities, reverse=True)
 
 
+@pytest.mark.parametrize("columns", ["60", "80"])
+def test_registry_profiles_keeps_each_id_on_one_line_when_narrow(
+    runner: CliRunner, home: Path, columns: str
+) -> None:
+    """'cpu-int4-asym-g1' / '28-r08' could not be pasted into --profile."""
+    from yonga.registry import load_builtin_registry
+
+    result = invoke(runner, home, ["registry", "profiles"], env={"COLUMNS": columns})
+
+    assert result.exit_code == int(ExitCode.SUCCESS)
+    starts = [line.split(" ", 1)[0] for line in result.stdout.splitlines()]
+    for rule in load_builtin_registry().profiles:
+        assert rule.id in starts
+
+
 def test_registry_paths_inside_an_appimage_names_the_appimage(
     runner: CliRunner, home: Path, tmp_path: Path
 ) -> None:
@@ -3365,6 +3414,23 @@ def test_eval_says_where_it_saved_the_result(runner: CliRunner, home: Path, tmp_
         home,
         ["eval", "cand", "--reference", "ref"],
         factory=lambda settings: EvaluatingWiring(settings, tmp_path),
+    )
+
+    assert result.exit_code == int(ExitCode.SUCCESS), result.stderr
+    (saved,) = (home / "data" / "evaluations").glob("*.json")
+    assert f"Saved: {saved}" in result.stdout
+
+
+def test_eval_keeps_the_saved_path_whole_on_a_narrow_terminal(
+    runner: CliRunner, home: Path, tmp_path: Path
+) -> None:
+    pytest.importorskip("numpy")
+    result = invoke(
+        runner,
+        home,
+        ["eval", "cand", "--reference", "ref"],
+        factory=lambda settings: EvaluatingWiring(settings, tmp_path),
+        env={"COLUMNS": "60"},
     )
 
     assert result.exit_code == int(ExitCode.SUCCESS), result.stderr

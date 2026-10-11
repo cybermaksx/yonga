@@ -71,6 +71,7 @@ from yonga.ui.tables import (
     probe_report,
     publication_plan,
     registry_explanation,
+    registry_profiles,
 )
 
 NOW = datetime(2026, 9, 22, 10, 30, tzinfo=UTC)
@@ -597,8 +598,8 @@ def test_artifact_list_drops_the_timestamps_before_the_model():
     assert NOW.astimezone().strftime("%Y-%m-%d %H:%M") in wide
 
 
-def test_artifact_list_shows_model_and_revision_on_an_80_column_terminal():
-    """The row from a real 'yonga list' fits 80 columns whole, model and revision included."""
+def test_artifact_list_shows_the_real_row_whole_on_an_80_column_terminal():
+    """The row from a real 'yonga list' fits 80 columns whole; the revision waits for 100."""
     summary = ArtifactSummary(
         artifact_id="780ff69f5ac67fb5",
         path=Path("/artifacts/qwen3"),
@@ -612,14 +613,90 @@ def test_artifact_list_shows_model_and_revision_on_an_80_column_terminal():
     )
 
     text = render(artifact_list([summary]), width=80)
+    wide = render(artifact_list([summary]), width=100)
 
     assert widest_line(text) <= 80
     row = next(line for line in text.splitlines() if line.startswith("780ff69f5ac67fb5"))
-    for value in ("Qwen/Qwen3-0.6B", "c1899de", "cpu-int4-asym-g128-r08", "CPU", "430 MiB"):
+    for value in ("Qwen/Qwen3-0.6B", "cpu-int4-asym-g128-r08", "CPU", "430 MiB", "✓ yes"):
         assert value in row
     assert "…" not in text
     # Every artifact is ready, so there is nothing for a note to say.
     assert "Not ready" not in text
+    assert "c1899de" in wide
+
+
+#: The row the E2E retest squeezed: a 35-character repository id.
+SMOLLM2 = ArtifactSummary(
+    artifact_id="02270ff455b13173",
+    path=Path("/artifacts/smollm2"),
+    repo_id="HuggingFaceTB/SmolLM2-360M-Instruct",
+    resolved_revision="a10cc15e2b3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b",
+    profile="cpu-int8-asym-ref",
+    recommended_device="CPU",
+    size_bytes=355 * 1024**2,
+    created_at=NOW,
+    ready=True,
+)
+
+
+def cells(line: str) -> list[str]:
+    """Split a rendered table line into its cells (they are two spaces apart)."""
+    return [cell.strip() for cell in line.split("  ") if cell.strip()]
+
+
+@pytest.mark.parametrize("width", [60, 80, 100, 120])
+@pytest.mark.parametrize("with_qwen", [False, True])
+def test_artifact_list_gives_up_columns_instead_of_squeezing_them(width: int, with_qwen: bool):
+    """Only the model may ever be shortened; every other cell is whole or gone."""
+    qwen = SMOLLM2.model_copy(
+        update={
+            "artifact_id": "780ff69f5ac67fb5",
+            "repo_id": "Qwen/Qwen3-0.6B",
+            "profile": "cpu-int4-asym-g128-r08",
+            "recommended_device": "GPU",
+            "ready": False,
+        }
+    )
+    summaries = [SMOLLM2, qwen] if with_qwen else [SMOLLM2]
+
+    text = render(artifact_list(summaries), width=width)
+
+    assert widest_line(text) <= width
+    lines = text.splitlines()
+    header = cells(lines[0])
+    for line in lines[2:]:
+        if line.startswith("! Not ready"):
+            continue
+        row = dict(zip(header, cells(line), strict=True))
+        assert row["Artifact"] in {"02270ff455b13173", "780ff69f5ac67fb5"}
+        assert row["Profile"] in {"cpu-int8-asym-ref", "cpu-int4-asym-g128-r08"}
+        assert row["Dev"] in {"CPU", "GPU"}
+        for key in ("Rev", "Size", "Ready"):
+            assert "…" not in row.get(key, "")
+        if "Model" in row and "…" in row["Model"]:
+            assert len(row["Model"]) >= 12
+    if width >= 80:
+        assert {"Model", "Size", "Ready"} <= set(header)
+    if width >= 100:
+        assert "Rev" in header
+        assert "SmolLM2-360M-Instruct" in text
+
+
+def test_artifact_list_elides_the_organisation_before_the_model_name():
+    """'…SmolLM2-360M-Instruct' beats 'SmolLM2-360M-Instruc…': the name is the point."""
+    text = render(artifact_list([SMOLLM2]), width=80)
+
+    assert "SmolLM2-360M-Instruct" in text
+    assert "355 MiB" in text
+    assert "✓ yes" in text
+
+
+def test_artifact_list_folds_a_profile_rather_than_cut_the_id_when_very_narrow():
+    """Below the narrowest layout the id still reads whole; the profile wraps."""
+    text = render(artifact_list([SMOLLM2]), width=34)
+
+    assert "02270ff455b13173" in text
+    assert "…" not in text
 
 
 def test_artifact_list_tells_two_models_with_one_profile_apart_when_narrow():
@@ -653,9 +730,9 @@ def test_artifact_list_names_unready_artifacts_when_the_ready_column_goes():
     summaries[0] = summaries[0].model_copy(update={"profile": "cpu-int4-asym-g128-r08"})
     summaries[1] = summaries[1].model_copy(update={"profile": "npu-int4-sym-g128-cw"})
 
-    text = render(artifact_list(summaries), width=80)
+    text = render(artifact_list(summaries), width=72)
 
-    assert widest_line(text) <= 80
+    assert widest_line(text) <= 72
     assert "Ready" not in text
     assert "Not ready: broken" in text
 
@@ -675,6 +752,52 @@ def test_artifact_list_elides_only_an_over_long_repository_id():
     assert "Qwen3.5-9B-Uncensored" in text
     # The short id beside it is not touched.
     assert " a/b " in text
+
+
+# ----------------------------------------------------------------------
+# registry profiles
+# ----------------------------------------------------------------------
+def profile_rows() -> list[dict[str, object]]:
+    """The 'registry profiles' rows of the built-in CPU profiles, as the CLI builds them."""
+    return [
+        {
+            "id": "cpu-int4-asym-g128-r08",
+            "device": "CPU",
+            "weights": "int4 asym g128 ratio 0.8",
+            "band": "below 5B",
+            "priority": 110,
+            "status": "active",
+            "summary": "CPU INT4 asymmetric group-128 with 20% of layers at INT8; "
+            "the CPU default below 5B parameters",
+        },
+        {
+            "id": "cpu-int8-asym-ref",
+            "device": "CPU",
+            "weights": "int8 asym",
+            "band": None,
+            "priority": 10,
+            "status": "experimental",
+            "summary": "INT8 asymmetric per-channel reference for quality evaluation",
+        },
+    ]
+
+
+@pytest.mark.parametrize("width", [60, 80, 100, 200])
+def test_registry_profiles_never_wraps_or_cuts_a_profile_id(width: int) -> None:
+    """Each id sits whole on one line; the summary is the column that wraps."""
+    text = render(registry_profiles(profile_rows()), width=width)
+
+    assert widest_line(text) <= width
+    lines = text.splitlines()
+    for profile in ("cpu-int4-asym-g128-r08", "cpu-int8-asym-ref"):
+        assert any(line.startswith(f"{profile} ") for line in lines), text
+    assert "…" not in text
+    if width >= 80:
+        assert "experimental" in text
+    if width >= 100:
+        assert "int4 asym g128 ratio 0.8" in text
+    if width >= 200:
+        assert "the CPU default below 5B parameters" in text
 
 
 # ----------------------------------------------------------------------
@@ -972,6 +1095,51 @@ def test_compile_cache_entries_never_cut_a_key_or_a_status_short() -> None:
     assert "2026.4.0 " in wide
     assert "22959" not in wide, "the release is shown, not the build string"
     assert "nDimensional/Qwen3.5" in wide
+
+
+def outside_owner_entry() -> CompileCacheEntry:
+    """An entry owned by a staging directory: an owner known only by its long name."""
+    return CompileCacheEntry(
+        key="fedcba9876543210",
+        path=Path("/home/user/.cache/yonga/compile/fedcba9876543210"),
+        size_bytes=10 * 2**30,
+        last_used_at=datetime(2026, 10, 1, tzinfo=UTC),
+        device="NPU",
+        openvino_version="2026.4.1",
+        artifact_path=Path("/a/.staging/job/7ae557604adf--cpu-int4-asym-g128-r08"),
+        repo_id="HuggingFaceTB/SmolLM2-360M-Instruct",
+        owner_exists=True,
+        owner_in_store=False,
+        status=CacheEntryStatus.STALE_RUNTIME,
+    )
+
+
+@pytest.mark.parametrize("width", [60, 80, 100])
+@pytest.mark.parametrize("why", [False, True])
+def test_compile_cache_entries_never_squeeze_a_key_beside_a_long_owner(
+    width: int, why: bool
+) -> None:
+    """A long directory-name owner is cut, then dropped; keys and ids stay whole."""
+    entries = [*cache_entries(), outside_owner_entry()]
+    reasons = {entry.key: "older-than" for entry in entries} if why else None
+
+    text = render(compile_cache_entries(entries, reasons=reasons), width=width)
+
+    assert widest_line(text) <= width
+    for entry in entries:
+        assert entry.key in text
+        assert entry.status.value in text
+    if why:
+        assert text.count("older-than") == len(entries)
+    if "Owner" in text:
+        assert "201e471c1669050f" in text
+        assert "bbbbbbbbbbbbbbbb*" in text
+        assert "* the artifact exists, outside this artifact store" in text
+    else:
+        # No owner column, so no '*' for the footnote to explain.
+        assert "outside this artifact store" not in text
+    if width >= 80:
+        assert "Owner" in text
 
 
 def test_a_prune_plan_says_why_only_when_it_is_not_the_status() -> None:

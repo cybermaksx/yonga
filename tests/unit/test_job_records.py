@@ -537,3 +537,26 @@ def test_a_narrow_index_drops_columns_before_it_hides_which_job_is_which(
     # A path is shown by its last component, never as the home directory.
     assert "/home/someone" not in text
     assert "7ae557604adf" in text
+
+
+def test_a_narrow_index_shortens_a_repository_id_from_its_organisation(
+    settings: Settings, three_hours_east: None
+) -> None:
+    """The model name tells jobs apart; the organisation is what gives way first."""
+    write_job(
+        settings,
+        "61926a20-16b1-45e4-8392-5089d9f8c25e",
+        stage="exported",
+        command="prepare",
+        model="HuggingFaceTB/SmolLM2-360M-Instruct",
+        started=STARTED,
+        took=timedelta(seconds=6),
+    )
+    console = Console(width=80, record=True, color_system=None)
+    console.print(job_list(summarise_jobs(settings.paths)))
+    text = console.export_text()
+
+    assert all(len(line.rstrip()) <= 80 for line in text.splitlines())
+    assert "61926a20" in text
+    assert "SmolLM2-360M" in text
+    assert "HuggingFaceTB" not in text
