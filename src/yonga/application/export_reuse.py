@@ -39,7 +39,7 @@ from pydantic import ValidationError
 
 from yonga import __version__
 from yonga.adapters.filesystem import INCOMPLETE_MARKER_NAME, mark_incomplete
-from yonga.application.jobs import JobContext, live_job_ids
+from yonga.application.jobs import JobContext, live_job_ids, summarise_job
 from yonga.config.paths import Paths
 from yonga.domain.artifacts import (
     EXPORT_CHECKPOINT_FILENAME,
@@ -190,7 +190,11 @@ def find_reusable(
         )
         if best is None or candidate.completed_at > best.completed_at:
             best = candidate
-    return best
+    if best is None:
+        return None
+    # Said in the plan and the manifest: a cancelled job is not a failed one.
+    status = summarise_job(paths.job_log_path(best.job_id), live=live).status
+    return best.model_copy(update={"job_status": status})
 
 
 def adopt(candidate: ReusableExport, staging: Path, ctx: JobContext) -> ExportCheckpoint | None:

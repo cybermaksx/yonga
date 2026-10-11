@@ -54,7 +54,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from itertools import pairwise
 from pathlib import Path
-from typing import Literal, Protocol, runtime_checkable
+from typing import Literal, Protocol, TypeGuard, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -158,6 +158,7 @@ from yonga.domain.plans import (
     ExportResult,
     JobStage,
     PreparationPlan,
+    ReusableExport,
     bytes_to_download,
     download_ignore_patterns,
     estimate_artifact_bytes,
@@ -426,6 +427,11 @@ def _artifact_key(resolved: ResolvedSource, profile: ConversionProfile) -> str:
 def _now() -> datetime:
     """Return the current UTC timestamp."""
     return datetime.now(tz=UTC)
+
+
+def _cancelled(report: Diagnostic | None) -> TypeGuard[Diagnostic]:
+    """True when ``report`` says the user interrupted the step, which is no failure."""
+    return report is not None and report.category is FailureCategory.USER_CANCELLED
 
 
 def _as_identity(value: ModelIdentity | str) -> ModelIdentity:
@@ -1731,7 +1737,9 @@ class PrepareService:
         self._stage(ctx, 5)
         tracker.stage = JobStage.EXPORTED
         if adopted is not None or snapshot is None:
-            export = self._reused_export_outcome(adopted, plan.profile_selection)
+            export = self._reused_export_outcome(
+                adopted, plan.profile_selection, plan.reusable_export
+            )
             ctx.emit(
                 ProgressKind.EXPORT,
                 f"Reusing the completed export of job {export.record.reused_from_job}",
@@ -2437,7 +2445,9 @@ class PrepareService:
 
     @staticmethod
     def _reused_export_outcome(
-        checkpoint: ExportCheckpoint | None, selection: ProfileSelection | None
+        checkpoint: ExportCheckpoint | None,
+        selection: ProfileSelection | None,
+        source: ReusableExport | None = None,
     ) -> _ExportOutcome:
         """The export stage's result when an earlier job's export was adopted.
 
@@ -2450,10 +2460,11 @@ class PrepareService:
             update={"reused_from_job": checkpoint.job_id, "profile_selection": selection}
         )
         finished = checkpoint.completed_at.strftime("%Y-%m-%d %H:%M UTC")
+        label = source.job_label if source is not None else "earlier job"
         return _ExportOutcome(
             record=record,
             notes=[
-                f"The export was reused from failed job {checkpoint.job_id}, which completed "
+                f"The export was reused from {label} {checkpoint.job_id}, which completed "
                 f"it at {finished} with identical inputs; it was not run again."
             ],
         )
@@ -2665,9 +2676,10 @@ class PrepareService:
                 "The GGUF import failed",
                 "OpenVINO GenAI did not produce an OpenVINO model.",
             )
-            ctx.logger.error("export.failed", report.message, raw=report.raw_excerpt or "")
-            if report.category is FailureCategory.USER_CANCELLED:
+            if _cancelled(report):
+                ctx.logger.warning("export.cancelled", report.message)
                 raise ExportError(report)
+            ctx.logger.error("export.failed", report.message, raw=report.raw_excerpt or "")
             raw = "\n".join([*result.stdout_tail, *result.stderr_tail])
             raise ExportError(
                 self._classify(
@@ -2801,6 +2813,17 @@ class PrepareService:
             return _ExportOutcome(record=record, result=result)
 
         raw = "\n".join([*result.stdout_tail, *result.stderr_tail])
+        if _cancelled(result.diagnostic):
+            # A Ctrl-C is not a failure: no ``export.failed`` record, and no
+            # classification of the interrupted exporter's traceback. The job
+            # ends as cancelled when the error reaches it.
+            ctx.logger.warning(
+                "export.cancelled",
+                "conversion cancelled",
+                returncode=result.returncode,
+                profile=plan.profile.id,
+            )
+            raise ExportError(result.diagnostic)
         ctx.logger.error(
             "export.failed",
             "conversion failed",

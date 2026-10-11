@@ -78,6 +78,7 @@ from yonga.domain.diagnostics import (
     Severity,
     YongaError,
     diagnostic,
+    for_artifact_run,
 )
 from yonga.domain.hardware import normalise_device
 from yonga.domain.models import ModelIdentity, ModelMetadata, PipelineKind
@@ -1102,6 +1103,13 @@ class ChatOptions(BaseModel):
     system_prompt: str | None = None
     stats: bool = True
     display_name: str | None = None
+    command: str | None = None
+    """The yonga command running the session (``chat``, ``serve``), when advice may repeat it.
+
+    A load failure's fallback advice then names this command with the artifact
+    id and another ``--device`` rather than preparing the model again; with
+    ``None`` the registry's advice is reported as it stands.
+    """
 
 
 class ChatTurn(BaseModel):
@@ -2234,20 +2242,35 @@ class ChatService:
             properties=self._runtime_properties(found, device),
             options=chosen,
             progress=self._progress,
-            classifier=self._load_classifier(found),
+            classifier=self._load_classifier(found, command=chosen.command),
         )
 
-    def _load_classifier(self, manifest: ArtifactManifest | None) -> LoadClassifier:
-        """Return the callable a session uses to classify a runtime load failure."""
+    def _load_classifier(
+        self, manifest: ArtifactManifest | None, *, command: str | None = None
+    ) -> LoadClassifier:
+        """Return the callable a session uses to classify a runtime load failure.
+
+        With ``command`` the advice is for the artifact in hand: a device it
+        already passed on is offered as ``yonga <command> <id> --device D``, and
+        the steps that need a job id are dropped, because a session opens no job.
+        """
         meta = _metadata_from_manifest(manifest)
 
         def classify(raw: str, device: str) -> Diagnostic | None:
             try:
-                return self._resolver.classify(
+                found = self._resolver.classify(
                     raw_error=raw, device=device, meta=meta, stage="chat"
                 )
             except Exception:  # pragma: no cover - classify is documented total
                 return None
+            if found is None or command is None or manifest is None:
+                return found
+            return for_artifact_run(
+                found,
+                run_command=f"yonga {command} {manifest.artifact_id}",
+                devices=manifest.supported_devices,
+                has_job=False,
+            )
 
         return classify
 

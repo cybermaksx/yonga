@@ -439,7 +439,7 @@ class DeclaredRequirement(BaseModel):
 
 
 class ReusableExport(BaseModel):
-    """A failed job's completed export that an identical preparation can adopt."""
+    """An unfinished job's completed export that an identical preparation can adopt."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -449,6 +449,21 @@ class ReusableExport(BaseModel):
     """Its retained staging directory."""
     completed_at: datetime
     fingerprint: str
+    job_status: JobStatus | None = None
+    """How that job ended, read from its state document; ``None`` when not known."""
+
+    @property
+    def job_label(self) -> str:
+        """``failed job`` or ``cancelled job``; ``earlier job`` when neither is known.
+
+        A Ctrl-C after the export is the commonest way to leave one behind, and
+        calling that job "failed" in the plan and the manifest was wrong.
+        """
+        if self.job_status is JobStatus.CANCELLED:
+            return "cancelled job"
+        if self.job_status is JobStatus.FAILED:
+            return "failed job"
+        return "earlier job"
 
 
 class PreparationPlan(BaseModel):

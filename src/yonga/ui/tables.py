@@ -508,7 +508,7 @@ def preparation_plan(plan: PreparationPlan) -> RenderableType:
         body.add_row(
             Text("Export"),
             Text.assemble(
-                Text(f"reused from failed job {reusable.job_id[:8]}", style="cyan"),
+                Text(f"reused from {reusable.job_label} {reusable.job_id[:8]}", style="cyan"),
                 (f"  completed {finished}, identical inputs; --fresh-export to redo", "dim"),
             ),
         )

@@ -63,6 +63,7 @@ from yonga.domain.diagnostics import (
     ValidationError,
     YongaError,
     diagnostic,
+    for_artifact_run,
 )
 from yonga.domain.hardware import HardwareInventory, normalise_device
 from yonga.domain.models import PipelineKind
@@ -448,12 +449,15 @@ class BenchmarkService:
         error: YongaError,
         device: str,
         manifest: ArtifactManifest | None = None,
+        suite: str = DEFAULT_SUITE,
     ) -> YongaError:
         """The registry's diagnosis of a load failure, when a rule recognises it.
 
         The diagnosis names the model the artifact was prepared from, as
         ``probe`` and ``chat`` do, so its ``yonga prepare MODEL`` steps print
-        the real repository instead of the placeholder.
+        the real repository instead of the placeholder. A fallback device the
+        artifact already passed on is offered as the same benchmark there
+        (``yonga bench <id> --device gpu``), not as a new preparation.
         """
         if self._classifier is None:
             return error
@@ -461,9 +465,17 @@ class BenchmarkService:
         found = self._classifier(raw, device) if raw.strip() else None
         if found is None or found.matched_rule_id is None:
             return error
-        repo_id = None if manifest is None else manifest.resolved_source.repo_id
+        if manifest is None:
+            return YongaError(found)
+        repo_id = manifest.resolved_source.repo_id
         if repo_id and not found.context.get("repo_id"):
             found = found.model_copy(update={"context": {**found.context, "repo_id": repo_id}})
+        command = f"yonga bench {manifest.artifact_id}"
+        if suite != DEFAULT_SUITE:
+            command += f" --suite {suite}"
+        found = for_artifact_run(
+            found, run_command=command, devices=manifest.supported_devices, has_job=True
+        )
         return YongaError(found)
 
     def run(
@@ -490,7 +502,7 @@ class BenchmarkService:
         document is written under ``Paths.benchmarks_dir``; the file it lands in
         is :func:`benchmark_result_path`.
         """
-        artifact_dir = resolve_artifact(self._store, artifact)
+        artifact_dir = resolve_artifact(self._store, artifact, command="bench")
         manifest = self._store.manifest_for(artifact_dir)
         fixtures = self._prompts.suite(suite)
         suite_name = (suite or self._prompts.default_suite).strip()
@@ -531,7 +543,7 @@ class BenchmarkService:
             # A model that cannot load has no benchmark. Writing an empty result
             # and exiting 2 hid the reason; ``probe`` and ``chat`` classify the
             # same failure and exit 51, and so does this now.
-            raise self._classified(exc, target, manifest) from exc
+            raise self._classified(exc, target, manifest, suite_name) from exc
         except Exception as exc:
             raw = redact_text(_error_text(exc))
             raise self._classified(
@@ -546,6 +558,7 @@ class BenchmarkService:
                 ),
                 target,
                 manifest,
+                suite_name,
             ) from exc
         else:
             compile_seconds = time.perf_counter() - started
@@ -599,12 +612,9 @@ class BenchmarkService:
         )
         if save:
             path = self.save(result)
-            ctx.emit(
-                ProgressKind.STAGE,
-                f"Benchmark saved to {path}",
-                status="saved",
-                path=str(path),
-            )
+            # Recorded, not announced: the command prints where the result went,
+            # once, under the table it belongs to.
+            ctx.logger.info("bench.saved", "benchmark result saved", path=str(path))
         return result
 
     def _run_suite(

@@ -778,7 +778,8 @@ def test_the_saved_json_validates_and_round_trips(
     restored = BenchmarkResult.model_validate(document)
     assert restored.to_json() == result.to_json()
     assert load_result(path).benchmark_id == result.benchmark_id
-    assert any("Benchmark saved" in event.message for event in sink.events)
+    # The command prints where the result went, once; the service only records it.
+    assert not any(str(path) in event.message for event in sink.events)
 
 
 def test_saving_can_be_turned_off(

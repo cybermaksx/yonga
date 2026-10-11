@@ -332,7 +332,12 @@ Interactive confirmation unless `--yes`.
 
 `ARTIFACT` must name exactly one artifact. A repository id, artifact-id prefix or copied
 artifact id that matches several is refused with exit 70 and every candidate listed, even under
-`--yes`; the read-only commands (`chat`, `bench`, `probe`) still take the newest ready match.
+`--yes`; the read-only commands (`chat`, `bench`, `probe`, `eval`, `publish`) still take the newest
+ready match, and say so on stderr when there was a choice: `Using ID (PROFILE, DEVICE), the newest
+of N ready artifacts for MODEL; pass the artifact id to choose another.` A reference that matches
+nothing is explained the same way by all of them: a model id that is not prepared gets the
+`yonga prepare MODEL` command to run first (`artifact.not_prepared`; `eval` and `publish` keep their
+own `*.artifact_not_found` codes), anything else is pointed at `yonga list`.
 
 ## 9. `chat`
 

@@ -38,6 +38,7 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from yonga.application.artifact_refs import artifact_not_found
 from yonga.application.jobs import JobContext
 from yonga.application.progress import ProgressKind
 from yonga.config.paths import Paths
@@ -62,6 +63,7 @@ from yonga.domain.diagnostics import (
     Severity,
     YongaError,
     diagnostic,
+    for_artifact_run,
 )
 from yonga.domain.hardware import normalise_device
 from yonga.domain.models import ModelIdentity, ModelMetadata, PipelineKind
@@ -147,25 +149,20 @@ class ArtifactStoreLike(Protocol):
         ...
 
 
-def resolve_artifact(store: ArtifactStoreLike, reference: str | Path) -> Path:
-    """Resolve ``reference`` through ``store``, raising when nothing matches."""
+def resolve_artifact(
+    store: ArtifactStoreLike, reference: str | Path, *, command: str = "probe"
+) -> Path:
+    """Resolve ``reference`` through ``store``, raising when nothing matches.
+
+    The failure is worded for ``yonga <command>`` by
+    :func:`~yonga.application.artifact_refs.artifact_not_found`, as ``chat``
+    words it: a model id that is not prepared yet gets its ``yonga prepare``
+    command, anything else is pointed at ``yonga list``.
+    """
     found = store.find(reference)
     if found is not None:
         return found
-    raise ConfigurationError(
-        diagnostic(
-            "artifact.not_found",
-            FailureCategory.CONFIGURATION_ERROR,
-            "No prepared artifact matches that reference",
-            f"{reference!r} is neither a directory nor a prepared artifact in the catalogue.",
-            remediation=[
-                "List what is prepared: yonga list",
-                "Prepare the model first: yonga prepare MODEL",
-                "Or pass the artifact directory directly.",
-            ],
-            context={"reference": str(reference)},
-        )
-    )
+    raise ConfigurationError(artifact_not_found(str(reference), command=command))
 
 
 @runtime_checkable
@@ -1021,14 +1018,26 @@ class ProbeService:
         manifest: ArtifactManifest | None,
         ctx: JobContext | None,
     ) -> Diagnostic:
-        """Turn raw runtime text into a diagnostic without losing the raw text."""
-        return self._resolver.classify(
+        """Turn raw runtime text into a diagnostic without losing the raw text.
+
+        A fallback device the artifact already passed on is offered as a probe
+        of this artifact there, not as preparing the model again.
+        """
+        found = self._resolver.classify(
             raw_error=text,
             device=device,
             meta=self._metadata(manifest),
             stage="probe",
             job_id=None if ctx is None else ctx.job_id,
             log_path=None if ctx is None else ctx.logger.path,
+        )
+        if manifest is None:
+            return found
+        return for_artifact_run(
+            found,
+            run_command=f"yonga probe {manifest.artifact_id}",
+            devices=manifest.supported_devices,
+            has_job=True,
         )
 
     @staticmethod

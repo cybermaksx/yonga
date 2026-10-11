@@ -29,6 +29,7 @@ from pathlib import Path, PurePosixPath
 
 from yonga import __version__
 from yonga.adapters import HubClient, HubPublisher
+from yonga.application.artifact_refs import artifact_not_found
 from yonga.application.artifacts import ArtifactStore
 from yonga.application.model_card import render_model_card
 from yonga.application.report import anonymise
@@ -193,11 +194,8 @@ class PublishService:
         found = self._store.find(reference)
         manifest = self._store.manifest_for(found) if found is not None else None
         if found is None or manifest is None:
-            raise _refusal(
-                "publish.artifact_not_found",
-                "No prepared artifact by that name",
-                f"{reference!r} is not an artifact yonga prepared.",
-                "Run 'yonga list' to see the prepared artifacts.",
+            raise ConfigurationError(
+                artifact_not_found(reference, command="publish", code="publish.artifact_not_found")
             )
         if not self._store.is_ready(found):
             raise _refusal(
