@@ -88,6 +88,11 @@ MAX_ARGUMENT_DEPTH = 64
 #: A function name as OpenAI accepts one.
 _FUNCTION_NAME = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
+#: OpenAI fields that reach yonga's request under another name: yonga's name to
+#: the client's. ``max_completion_tokens`` is the newer spelling of
+#: ``max_tokens`` and wins when a request sends both.
+_SENT_AS = {"max_tokens": "max_completion_tokens"}
+
 #: Why the legacy function-calling parameters are refused.
 _LEGACY_FUNCTIONS = "Legacy function calling is not supported; send tools instead."
 
@@ -228,15 +233,22 @@ class ChatCompletionRequest(BaseModel):
     def _as_sent(self, error: YongaError) -> YongaError:
         """``error`` naming the parameter as the client spelled it.
 
-        ``max_completion_tokens`` reaches yonga as ``max_tokens``; a refusal of
-        it names the field the client actually sent.
+        A field of :data:`_SENT_AS` reaches yonga under another name; a refusal
+        of it names the field the client actually sent, in its ``param``, its
+        message and the last part of its code alike.
         """
         report = error.diagnostic
-        if report.context.get(PARAM_CONTEXT) != "max_tokens" or self.max_completion_tokens is None:
+        field = report.context.get(PARAM_CONTEXT)
+        sent = _SENT_AS.get(field) if field is not None else None
+        if field is None or sent is None or getattr(self, sent) is None:
             return error
-        context = {**report.context, PARAM_CONTEXT: "max_completion_tokens"}
-        message = report.message.replace("max_tokens", "max_completion_tokens", 1)
-        return type(error)(report.model_copy(update={"context": context, "message": message}))
+        context = {**report.context, PARAM_CONTEXT: sent}
+        message = report.message.replace(field, sent, 1)
+        code = report.code
+        if code.endswith(f".{field}"):
+            code = f"{code.removesuffix(field)}{sent}"
+        update = {"context": context, "message": message, "code": code}
+        return type(error)(report.model_copy(update=update))
 
     def _refuse_unsupported(self) -> None:
         if self.n is not None and self.n != 1:

@@ -970,6 +970,19 @@ def _leading_system(messages: Sequence[ChatMessage]) -> list[ChatMessage]:
     return leading
 
 
+def _count(number: int, noun: str) -> str:
+    """``the 30 offered tools``, ``the image``, or ``""`` for none."""
+    if number == 0:
+        return ""
+    return f"the {noun}" if number == 1 else f"the {number} {noun}s"
+
+
+def _one_of(choices: Sequence[str]) -> str:
+    """``a``, ``a or b``, or ``a, b or c``, leaving out empty choices."""
+    kept = [choice for choice in choices if choice]
+    return " or ".join(kept) if len(kept) < 3 else f"{', '.join(kept[:-1])} or {kept[-1]}"
+
+
 def _streamer(on_text: TextCallback | None) -> tuple[Any, list[BaseException]]:
     """Wrap ``on_text`` as a GenAI streamer, and a slot for anything it raised.
 
@@ -1295,7 +1308,8 @@ class GenAIChatRuntime:
         except YongaError:
             raise
         except Exception as exc:
-            raise GenerationError(self._generation_failed_diagnostic(exc), cause=exc) from exc
+            report = self._generation_failed_diagnostic(exc, history)
+            raise GenerationError(report, cause=exc) from exc
         if callback_error:
             # The consumer's own failure stopped generation; it is not a model failure,
             # and the consumer is the one that has to hear about it.
@@ -1596,13 +1610,19 @@ class GenAIChatRuntime:
             self._chat_started = False
         self._sent = []
 
-    def _generation_failed_diagnostic(self, error: BaseException) -> Diagnostic:
-        """Build the generation failure diagnostic, keeping the raw runtime text."""
+    def _generation_failed_diagnostic(
+        self, error: BaseException, history: ChatHistory | None = None
+    ) -> Diagnostic:
+        """Build the generation failure diagnostic, keeping the raw runtime text.
+
+        ``history`` is the conversation that failed, when there is one, so a
+        refusal of its length can say what in it counts.
+        """
         raw = redact_text(str(error))
         limit = _PROMPT_LIMIT.search(raw)
         if limit is not None:
             return self._prompt_too_long_diagnostic(
-                raw, limit=int(limit.group(1)), passed=int(limit.group(2))
+                raw, limit=int(limit.group(1)), passed=int(limit.group(2)), history=history
             )
         return diagnostic(
             "runtime.genai.generation_failed",
@@ -1621,22 +1641,33 @@ class GenAIChatRuntime:
             },
         )
 
-    def _prompt_too_long_diagnostic(self, raw: str, *, limit: int, passed: int) -> Diagnostic:
+    def _prompt_too_long_diagnostic(
+        self, raw: str, *, limit: int, passed: int, history: ChatHistory | None
+    ) -> Diagnostic:
         """The pipeline refused a prompt longer than the length it was compiled for.
 
         Nothing is wrong with the device or the model: the same pipeline answers
-        a shorter prompt, so this is the request's to change.
+        a shorter prompt, so this is the request's to change. The message itself
+        says how, because it is all a client of ``yonga serve`` sees, and it
+        names the offered tools and the images when the conversation has any:
+        they count as much as its text does.
         """
+        tools = len(history.tools) if history is not None else 0
+        images = sum(len(m.images) for m in history.messages) if history is not None else 0
+        counted = [_count(tools, "offered tool"), _count(images, "image")]
+        fewer = ["offer fewer tools" if tools else "", "send fewer images" if images else ""]
+        counting = " and ".join(part for part in counted if part)
+        advice = _one_of(["Shorten the conversation", *fewer])
         return diagnostic(
             PROMPT_TOO_LONG,
             FailureCategory.CONFIGURATION_ERROR,
             "The prompt is too long for this model",
-            f"The prompt is {passed} tokens, and this model on {self._device} takes at most "
-            f"{limit}: its prompt length (MAX_PROMPT_LEN) is fixed when it is compiled. The "
-            "limit covers the whole conversation, including offered tools and images.",
+            f"It has {passed} tokens{f', counting {counting}' if counting else ''}, and this "
+            f"model on {self._device} takes at most {limit}: its prompt length (MAX_PROMPT_LEN) "
+            f"is fixed when it is compiled. {advice}, or use a GPU or CPU artifact of this "
+            "model, whose prompt length is not fixed.",
             remediation=[
-                "Send a shorter conversation, or offer fewer or shorter tools.",
-                "Or prepare the model for the GPU, whose prompt length is not fixed: "
+                "Prepare the model for the GPU, whose prompt length is not fixed: "
                 "yonga prepare MODEL --device gpu",
             ],
             raw_excerpt=raw,

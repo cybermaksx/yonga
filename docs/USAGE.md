@@ -342,7 +342,8 @@ only drafted while reasoning is never made, also with `--show-reasoning`, which 
 opening reasoning block in front of the content. Small models call
 tools unreliably; the offered schemas also lengthen every prompt, which matters on the NPU, whose
 prompt length is fixed when the model is compiled (1024 tokens by default): a longer prompt is
-refused with 400 `context_length_exceeded`, naming its length and the limit.
+refused with 400 `context_length_exceeded`, naming its length, the limit and the offered tools,
+streamed or not.
 
 A VLM artifact (Qwen2.5-VL, Qwen3.5) also takes images, as OpenAI `image_url` content parts holding
 a `data:` URL; an LLM artifact refuses them with `serve.request.images_unsupported`:
@@ -380,9 +381,10 @@ Requests are bounded. A body over 8 MiB (or `--max-body-mb`) is refused with 413
 `request_too_large`, counted on the bytes received, so a chunked upload without a `Content-Length` is held to it too.
 More than 4096 messages in one request is a 400 with `param` set to `messages`. With a key set,
 authentication runs first, so a client without the key is refused before its body is read. Error
-responses use OpenAI's shape, `{"error": {"message", "type", "param", "code"}}`; a failure in the
-middle of a stream arrives as a final `data: {"error": ...}` event instead. `docs/CLI_SPEC.md`
-section 14 lists the codes.
+responses use OpenAI's shape, `{"error": {"message", "type", "param", "code"}}`. A streamed
+request refused before generation starts gets the same status and body; only a failure in the
+middle of a stream arrives as a final `data: {"error": ...}` event, with the same body.
+`docs/CLI_SPEC.md` section 14 lists the codes.
 
 `bench` writes a reproducible JSON result under `~/.local/share/yonga/benchmarks/` recording the
 hardware, package versions, device properties, generation settings and their fingerprint, the exact

@@ -814,12 +814,47 @@ def test_a_prompt_over_the_compiled_length_is_the_requests_to_change(
     report = excinfo.value.diagnostic
     assert report.code == runtime_module.PROMPT_TOO_LONG
     assert report.category is FailureCategory.CONFIGURATION_ERROR
-    assert f"The prompt is {passed} tokens" in report.message
-    assert f"at most {limit}" in report.message
+    assert report.message == (
+        f"It has {passed} tokens, and this model on NPU takes at most {limit}: its prompt "
+        "length (MAX_PROMPT_LEN) is fixed when it is compiled. Shorten the conversation, or "
+        "use a GPU or CPU artifact of this model, whose prompt length is not fixed."
+    )
+    assert not report.message.startswith("The prompt"), "the title already says so"
     assert "jenkins" not in report.message
     assert report.context["prompt_tokens"] == passed
     assert report.context["max_prompt_tokens"] == limit
     assert report.raw_excerpt == raw, "the runtime's own words stay for the log"
+    runtime.close()
+
+
+def test_a_prompt_too_long_names_its_tools_and_says_to_offer_fewer(artifact, settings, genai):
+    genai.generate_error = RuntimeError(NPU_PROMPT_LIMIT_ERROR)
+    runtime = make_runtime(artifact, settings, device="NPU")
+    history = ChatHistory(tools=[WEATHER_TOOL] * 30)
+    history.add_user("Hello")
+
+    with pytest.raises(GenerationError) as excinfo:
+        runtime.generate(history, GenerationSettings())
+    message = excinfo.value.diagnostic.message
+    assert message.startswith("It has 6423 tokens, counting the 30 offered tools, and this ")
+    assert "Shorten the conversation or offer fewer tools, or use a GPU or CPU" in message
+    runtime.close()
+
+
+def test_a_prompt_too_long_names_its_images_too(artifact, settings, genai, tensors):
+    genai.vlm_accepts_history = True
+    genai.generate_error = RuntimeError(
+        "VLM pipeline on NPU may only process input embeddings up to 2048 tokens. 2100 is passed."
+    )
+    runtime = make_runtime(artifact, settings, device="NPU", pipeline=PipelineKind.VLM)
+    history = _asking_with_images(_image(), _image())
+    history.tools = [WEATHER_TOOL]
+
+    with pytest.raises(GenerationError) as excinfo:
+        runtime.generate(history, GenerationSettings())
+    message = excinfo.value.diagnostic.message
+    assert message.startswith("It has 2100 tokens, counting the offered tool and the 2 images,")
+    assert "Shorten the conversation, offer fewer tools or send fewer images, or use" in message
     runtime.close()
 
 

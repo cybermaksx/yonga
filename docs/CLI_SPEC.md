@@ -818,8 +818,8 @@ Only the image headers are read before a request waits for the pipeline, on a wo
 on the event loop. The pixels are decoded once the request holds the pipeline, so however many
 requests are queued, at most one holds decoded images; a waiting request costs its body and no
 more. An image whose header is fine but whose pixel data is broken (a truncated file, say) is
-therefore found only then: a 400 `invalid_request` with the same `param` without `stream`, and
-with `stream: true` an error event (below) that also carries `param`. Any failure inside Pillow
+therefore found only then, still before generation starts: a 400 `invalid_request` with the same
+`param`, with or without `stream`. Any failure inside Pillow
 counts as a broken image, never as a server error. An accepted image is used as sent: the first
 frame of an animation, an EXIF rotation applied as a browser shows it (an EXIF block that cannot
 be read leaves the image as stored), transparency on white, 16-bit greyscale scaled to 8 bits;
@@ -856,8 +856,8 @@ Every error response uses OpenAI's shape, `{"error": {"message", "type", "param"
 |---|---|---|
 | 400 | `invalid_request` | The body does not validate (missing or mistyped fields, too many messages, `stop` outside its limits, an image that does not decode or is too large, a malformed tool or tool turn); `param` names the field. A body that is not JSON, or is sent without a JSON `Content-Type`, has `param` `null`. |
 | 400 | `unsupported_parameter` | A parameter yonga cannot honour (above), including an image URL that is not an accepted `data:` URL and a `tool_choice` that forces a call; `param` names it. |
-| 400 | the diagnostic code (`serve.request.*`) | A generation setting outside the ranges `chat` accepts, an image refused by `images_unsupported`, `too_many_images` or `images_earlier_turn`, or tools refused by `tools_unsupported` (above, with `param`). |
-| 400 | `context_length_exceeded` | The prompt (the conversation with its tools and images) is longer than a pipeline compiled for a fixed prompt length takes: the NPU's `MAX_PROMPT_LEN`. The message gives both token counts; `param` is `messages`. |
+| 400 | the diagnostic code (`serve.request.*`) | A generation setting outside the ranges `chat` accepts, an image refused by `images_unsupported`, `too_many_images` or `images_earlier_turn`, or tools refused by `tools_unsupported` (above, with `param`). A setting ends the code as the client spelled it: `max_completion_tokens` out of range is `serve.request.max_completion_tokens`, `param` `max_completion_tokens`. |
+| 400 | `context_length_exceeded` | The prompt (the conversation with its tools and images) is longer than a pipeline compiled for a fixed prompt length takes: the NPU's `MAX_PROMPT_LEN`. The message gives both token counts, names the offered tools and images when there are any, and says what to do: shorten the conversation, offer fewer tools or send fewer images, or use a GPU or CPU artifact, whose prompt length is not fixed. `param` is `messages`. |
 | 401 | `invalid_api_key` | A key is configured and the request does not carry it. The `type` is `invalid_request_error`, as OpenAI's. |
 | 404 | `model_not_found` | `model` does not name the served model. |
 | 404 | `not_found` | No such path. |
@@ -867,13 +867,15 @@ Every error response uses OpenAI's shape, `{"error": {"message", "type", "param"
 
 Other HTTP errors raised by routing carry `invalid_request`.
 
-With `stream: true`, a request refused before generation starts gets the same status and body as
-above. A generation failure after the stream has begun cannot change the status, which is already
-200: it arrives as one event, `data: {"error": {"message", "code"}}`, where `code` is the
-code the table above gives (the diagnostic code, `context_length_exceeded`) or `internal_error`,
-with `param` when it names one, followed by `data: [DONE]`. An image whose pixels fail to decode is
-reported the same way, with `code` `invalid_request` and the image's `param`. No error message
-carries the OpenVINO source location (`Check '...' failed at FILE:LINE`) of a runtime failure.
+With `stream: true`, the status waits until the pipeline has accepted the prompt, so a request
+refused before generation starts gets the same status and body as above: a prompt over the NPU's
+`MAX_PROMPT_LEN`, an image whose pixels fail to decode, and a generation that fails before its
+first token are a 400 or 500, never a 200 stream. The role chunk that opens a stream is sent with
+the status. A generation failure after the stream has begun cannot change the status, which is
+already 200: it arrives as one event, `data: {"error": {"message", "type", "param", "code"}}`,
+the body the table above gives (`code` `internal_error` for an unclassified failure), followed by
+`data: [DONE]`. No error message carries the OpenVINO source location
+(`Check '...' failed at FILE:LINE`) of a runtime failure.
 
 When `YONGA_API_KEY` is set in the environment, every endpoint except `/health` requires
 `Authorization: Bearer <key>` (401 otherwise). Authentication runs before the size limit, so a
