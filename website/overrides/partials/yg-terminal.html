@@ -1,0 +1,25 @@
+{#- Lines taken from real yonga 0.5.0 runs on the reference machine (Intel Core Ultra 7 268V),
+    trimmed with "…". Keep them real: re-capture rather than edit numbers. -#}
+<pre class="yg-terminal__body"><code><span class="t-p">$</span> yonga prepare Qwen/Qwen3-0.6B --device npu --yes
+<span class="t-d">╭─────────────── Preparation plan ───────────────╮</span>
+<span class="t-d">│</span>  <span class="t-k">Architecture</span>        qwen3  rule arch-qwen3
+<span class="t-d">│</span>  <span class="t-k">Device decision</span>     <span class="t-g">NPU</span>  supported (tested)
+<span class="t-d">│</span>  <span class="t-k">Profile</span>             npu-int4-sym-g128
+<span class="t-d">│</span>  <span class="t-k">Expected download</span>   1.4 GiB  only the files the
+<span class="t-d">│</span>                      conversion reads
+<span class="t-d">│</span>  <span class="t-k">Estimated artifact</span>  about 430 MiB
+<span class="t-d">│</span>  …
+<span class="t-c">1/7</span> Inspecting source
+<span class="t-c">2/7</span> Resolving compatibility
+<span class="t-c">…</span>
+<span class="t-c">7/7</span> Probing runtime
+<span class="t-d">·</span> NPU  Generating 24 tokens on NPU
+<span class="t-g">Ready</span>
+  Artifact  cc24636a2f49356a
+  Device    NPU
+
+<span class="t-p">$</span> yonga bench cc24636a2f49356a
+Prompt              In tok  Out tok     TTFT  tok/s
+short-instruction       31      256  164.4 ms  <span class="t-g">68.2</span>
+medium-explanation     104      256  164.7 ms  <span class="t-g">67.7</span>
+long-context           623      256  165.0 ms  <span class="t-g">67.7</span></code></pre>

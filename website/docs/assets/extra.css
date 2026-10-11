@@ -1,0 +1,638 @@
+/* yonga website: brand colours for Material, and the landing page (overrides/home.html).
+   Colours come from the logo: deep navy #0b3d5c and chip cyan #7fd1ff. */
+
+:root {
+  --yg-navy: #0b3d5c;
+  --yg-navy-deep: #06263a;
+  --yg-ink: #041a28;
+  --yg-cyan: #7fd1ff;
+  --yg-cyan-strong: #1f9bd6;
+  --yg-green: #5fd4a0;
+  --yg-radius: 14px;
+  --yg-max: 61rem;
+}
+
+[data-md-color-primary="custom"] {
+  --md-primary-fg-color: #0b3d5c;
+  --md-primary-fg-color--light: #1d5a80;
+  --md-primary-fg-color--dark: #06263a;
+  --md-primary-bg-color: #ffffff;
+  --md-primary-bg-color--light: rgba(255, 255, 255, 0.7);
+}
+
+[data-md-color-accent="custom"] {
+  --md-accent-fg-color: #1f9bd6;
+  --md-accent-fg-color--transparent: rgba(31, 155, 214, 0.1);
+}
+
+[data-md-color-scheme="default"] {
+  --yg-surface: #ffffff;
+  --yg-surface-tint: #f2f7fb;
+  --yg-text: #0d2233;
+  --yg-text-soft: #46596a;
+  --yg-line: #dbe6ef;
+  --yg-card: #ffffff;
+  --md-typeset-a-color: #12709f;
+}
+
+[data-md-color-scheme="slate"] {
+  --md-hue: 205;
+  --md-default-bg-color: #0a1822;
+  --md-code-bg-color: #0f2230;
+  --yg-surface: #0a1822;
+  --yg-surface-tint: #0d1f2c;
+  --yg-text: #e6f1f8;
+  --yg-text-soft: #a7bccb;
+  --yg-line: #1d3446;
+  --yg-card: #102433;
+  --md-typeset-a-color: #7fd1ff;
+}
+
+[data-md-color-scheme="slate"][data-md-color-primary="custom"] {
+  --md-primary-fg-color: #08283c;
+}
+
+/* ---------- Landing page ---------- */
+
+.yg-home {
+  color: var(--yg-text);
+  font-size: 0.8rem;
+}
+
+.yg-wrap {
+  max-width: var(--yg-max);
+  margin: 0 auto;
+  padding: 0 1rem;
+}
+
+.yg-home code {
+  font-family: var(--md-code-font-family);
+}
+
+/* Hero */
+.yg-hero {
+  position: relative;
+  overflow: hidden;
+  color: #e9f6ff;
+  background:
+    radial-gradient(60rem 30rem at 85% -10%, rgba(127, 209, 255, 0.18), transparent 60%),
+    radial-gradient(40rem 24rem at -10% 110%, rgba(95, 212, 160, 0.10), transparent 60%),
+    linear-gradient(160deg, var(--yg-navy) 0%, var(--yg-navy-deep) 55%, var(--yg-ink) 100%);
+  padding: 3.2rem 0 3.6rem;
+}
+
+/* A faint circuit grid, echoing the chip in the logo. */
+.yg-hero::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background-image:
+    linear-gradient(rgba(127, 209, 255, 0.07) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(127, 209, 255, 0.07) 1px, transparent 1px);
+  background-size: 2.4rem 2.4rem;
+  mask-image: linear-gradient(180deg, rgba(0, 0, 0, 0.9), transparent 85%);
+  -webkit-mask-image: linear-gradient(180deg, rgba(0, 0, 0, 0.9), transparent 85%);
+  pointer-events: none;
+}
+
+.yg-hero__grid {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.05fr);
+  gap: 2.4rem;
+  align-items: center;
+}
+
+.yg-badge {
+  display: inline-block;
+  font-size: 0.62rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--yg-cyan) !important;
+  border: 1px solid rgba(127, 209, 255, 0.35);
+  background: rgba(127, 209, 255, 0.08);
+  padding: 0.25rem 0.7rem;
+  border-radius: 999px;
+}
+
+.yg-badge:hover {
+  background: rgba(127, 209, 255, 0.16);
+}
+
+.yg-hero__title {
+  margin: 0.9rem 0 0.8rem;
+  font-size: 2.15rem;
+  line-height: 1.12;
+  font-weight: 750;
+  letter-spacing: -0.02em;
+  color: #ffffff;
+}
+
+.yg-hero__title em {
+  font-style: normal;
+  background: linear-gradient(90deg, #7fd1ff, #5fd4a0);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+.yg-hero__lead {
+  font-size: 0.92rem;
+  line-height: 1.6;
+  color: #c5dceb;
+  margin: 0 0 1.4rem;
+  max-width: 34rem;
+}
+
+.yg-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+}
+
+.yg-actions--center {
+  justify-content: center;
+}
+
+.yg-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.6rem 1.05rem;
+  border-radius: 10px;
+  font-weight: 650;
+  font-size: 0.76rem;
+  transition: transform 0.12s ease, background-color 0.12s ease, border-color 0.12s ease;
+}
+
+.yg-btn svg {
+  width: 1.05em;
+  height: 1.05em;
+  fill: currentColor;
+}
+
+.yg-btn:hover {
+  transform: translateY(-1px);
+}
+
+.yg-btn--primary {
+  background: var(--yg-cyan);
+  color: var(--yg-ink) !important;
+}
+
+.yg-btn--primary:hover {
+  background: #a6e0ff;
+}
+
+.yg-btn--ghost {
+  color: #e9f6ff !important;
+  border: 1px solid rgba(233, 246, 255, 0.28);
+}
+
+.yg-btn--ghost:hover {
+  border-color: rgba(233, 246, 255, 0.6);
+}
+
+.yg-section .yg-btn--ghost {
+  color: var(--yg-text) !important;
+  border-color: var(--yg-line);
+}
+
+/* Install box */
+.yg-install {
+  margin-top: 1.6rem;
+  max-width: 36rem;
+  border: 1px solid rgba(127, 209, 255, 0.22);
+  border-radius: var(--yg-radius);
+  background: rgba(4, 26, 40, 0.55);
+  overflow: hidden;
+}
+
+.yg-install__bar {
+  display: flex;
+  align-items: center;
+  gap: 0.2rem;
+  padding: 0.35rem 0.5rem;
+  border-bottom: 1px solid rgba(127, 209, 255, 0.15);
+}
+
+.yg-install__label {
+  font-size: 0.6rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: #8fb0c4;
+  margin: 0 0.5rem 0 0.3rem;
+}
+
+.yg-install__tab {
+  font: inherit;
+  font-size: 0.66rem;
+  font-weight: 600;
+  color: #a9c4d6;
+  background: none;
+  border: 0;
+  padding: 0.25rem 0.6rem;
+  border-radius: 7px;
+  cursor: pointer;
+}
+
+.yg-install__tab[aria-selected="true"] {
+  color: var(--yg-ink);
+  background: var(--yg-cyan);
+}
+
+.yg-install__panel {
+  position: relative;
+}
+
+.yg-install__panel pre {
+  margin: 0;
+  padding: 0.8rem 2.6rem 0.8rem 0.9rem;
+  overflow-x: auto;
+}
+
+.yg-install__panel code {
+  background: none;
+  color: #dff2ff;
+  font-size: 0.64rem;
+  line-height: 1.7;
+  white-space: pre;
+}
+
+.yg-copy {
+  position: absolute;
+  top: 0.5rem;
+  right: 0.5rem;
+  width: 1.6rem;
+  height: 1.6rem;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 7px;
+  background: #0c3046;
+  box-shadow: -0.6rem 0 0.6rem #071f2e;
+  cursor: pointer;
+}
+
+.yg-copy svg {
+  width: 0.85rem;
+  height: 0.85rem;
+  fill: #a9c4d6;
+}
+
+.yg-copy:hover {
+  background: rgba(127, 209, 255, 0.2);
+}
+
+.yg-copy--done {
+  background: rgba(95, 212, 160, 0.3);
+}
+
+.yg-install__note {
+  margin: 0;
+  padding: 0.45rem 0.9rem 0.55rem;
+  font-size: 0.6rem;
+  color: #8fb0c4;
+  border-top: 1px solid rgba(127, 209, 255, 0.12);
+}
+
+/* Terminal */
+.yg-terminal {
+  margin: 0;
+  border-radius: var(--yg-radius);
+  background: #03131e;
+  border: 1px solid rgba(127, 209, 255, 0.2);
+  box-shadow: 0 1.5rem 3rem rgba(0, 0, 0, 0.45), 0 0 0 1px rgba(0, 0, 0, 0.2);
+  overflow: hidden;
+}
+
+.yg-terminal__bar {
+  display: flex;
+  gap: 0.35rem;
+  padding: 0.55rem 0.7rem;
+  background: #071d2b;
+  border-bottom: 1px solid rgba(127, 209, 255, 0.12);
+}
+
+.yg-terminal__bar span {
+  width: 0.55rem;
+  height: 0.55rem;
+  border-radius: 50%;
+  background: #24465c;
+}
+
+.yg-terminal__body {
+  margin: 0;
+  padding: 0.9rem 1rem;
+  overflow-x: auto;
+}
+
+.yg-terminal__body code {
+  background: none;
+  color: #cfe6f5;
+  font-size: 0.6rem;
+  line-height: 1.55;
+  white-space: pre;
+}
+
+.yg-terminal figcaption {
+  font-size: 0.56rem;
+  color: #6f8fa3;
+  padding: 0 1rem 0.7rem;
+}
+
+.t-p { color: var(--yg-green); }
+.t-d { color: #4b6b80; }
+.t-k { color: #8fb0c4; }
+.t-c { color: var(--yg-cyan); }
+.t-g { color: var(--yg-green); font-weight: 600; }
+
+/* Sections */
+.yg-section {
+  padding: 3.2rem 0;
+  background: var(--yg-surface);
+}
+
+.yg-section--tint {
+  background: var(--yg-surface-tint);
+}
+
+.yg-section__title {
+  font-size: 1.4rem;
+  font-weight: 720;
+  letter-spacing: -0.01em;
+  line-height: 1.25;
+  margin: 0 0 1.6rem;
+  color: var(--yg-text);
+}
+
+.yg-steps {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1rem;
+}
+
+.yg-step {
+  position: relative;
+  padding: 1.1rem 1.1rem 1rem;
+  border: 1px solid var(--yg-line);
+  border-radius: var(--yg-radius);
+  background: var(--yg-card);
+}
+
+.yg-step__n {
+  display: inline-grid;
+  place-items: center;
+  width: 1.5rem;
+  height: 1.5rem;
+  border-radius: 50%;
+  font-size: 0.68rem;
+  font-weight: 700;
+  color: var(--yg-ink);
+  background: var(--yg-cyan);
+  margin-bottom: 0.7rem;
+}
+
+.yg-step__cmd {
+  display: block;
+  font-size: 0.66rem;
+  padding: 0.45rem 0.6rem;
+  border-radius: 8px;
+  background: var(--md-code-bg-color);
+  color: var(--md-code-fg-color);
+  overflow-x: auto;
+  white-space: nowrap;
+}
+
+.yg-step p,
+.yg-feature p {
+  margin: 0.7rem 0 0;
+  line-height: 1.6;
+  color: var(--yg-text-soft);
+}
+
+.yg-features {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1rem;
+}
+
+.yg-feature {
+  padding: 1.2rem;
+  border: 1px solid var(--yg-line);
+  border-radius: var(--yg-radius);
+  background: var(--yg-card);
+}
+
+.yg-feature h3 {
+  margin: 0.7rem 0 0;
+  font-size: 0.86rem;
+  font-weight: 680;
+  color: var(--yg-text);
+}
+
+.yg-feature__icon {
+  display: inline-grid;
+  place-items: center;
+  width: 2rem;
+  height: 2rem;
+  border-radius: 10px;
+  background: rgba(31, 155, 214, 0.12);
+}
+
+.yg-feature__icon svg {
+  width: 1.15rem;
+  height: 1.15rem;
+  fill: var(--yg-cyan-strong);
+}
+
+[data-md-color-scheme="slate"] .yg-feature__icon svg {
+  fill: var(--yg-cyan);
+}
+
+/* Proof */
+.yg-proof {
+  display: grid;
+  grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr);
+  gap: 2.4rem;
+  align-items: center;
+}
+
+.yg-proof__copy p {
+  line-height: 1.65;
+  color: var(--yg-text-soft);
+  margin: 0 0 1rem;
+}
+
+.yg-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-weight: 650;
+}
+
+.yg-link svg {
+  width: 1em;
+  height: 1em;
+  fill: currentColor;
+}
+
+.yg-stats {
+  margin: 0;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1rem;
+}
+
+.yg-stat {
+  padding: 1.1rem;
+  border-radius: var(--yg-radius);
+  border: 1px solid var(--yg-line);
+  background: var(--yg-card);
+}
+
+.yg-stat dt {
+  font-size: 1.5rem;
+  font-weight: 760;
+  letter-spacing: -0.02em;
+  color: var(--yg-cyan-strong);
+}
+
+[data-md-color-scheme="slate"] .yg-stat dt {
+  color: var(--yg-cyan);
+}
+
+.yg-stat dd {
+  margin: 0.4rem 0 0;
+  line-height: 1.5;
+  color: var(--yg-text-soft);
+  font-size: 0.7rem;
+}
+
+/* Pipeline */
+.yg-pipeline {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 0.5rem;
+  counter-reset: none;
+}
+
+.yg-pipeline li {
+  position: relative;
+  padding: 0.8rem 0.7rem;
+  border-radius: 10px;
+  border: 1px solid var(--yg-line);
+  background: var(--yg-card);
+  font-weight: 600;
+  font-size: 0.7rem;
+  line-height: 1.35;
+  color: var(--yg-text);
+}
+
+.yg-pipeline li span {
+  display: block;
+  font-family: var(--md-code-font-family);
+  font-size: 0.6rem;
+  font-weight: 500;
+  color: var(--yg-cyan-strong);
+  margin-bottom: 0.3rem;
+}
+
+[data-md-color-scheme="slate"] .yg-pipeline li span {
+  color: var(--yg-cyan);
+}
+
+.yg-pipeline__note {
+  margin: 1rem 0 0;
+  color: var(--yg-text-soft);
+}
+
+/* Call to action */
+.yg-cta {
+  text-align: center;
+}
+
+.yg-cta h2 {
+  font-size: 1.5rem;
+  font-weight: 740;
+  margin: 0 0 0.6rem;
+  color: var(--yg-text);
+}
+
+.yg-cta p {
+  color: var(--yg-text-soft);
+  margin: 0 0 1.3rem;
+}
+
+.yg-disclaimer {
+  margin-top: 2rem !important;
+  font-size: 0.62rem;
+}
+
+/* The landing page has no article body. */
+.md-content__inner:empty {
+  display: none;
+}
+
+/* Responsive */
+@media screen and (max-width: 76.1875em) {
+  .yg-pipeline {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+}
+
+@media screen and (max-width: 60em) {
+  .yg-hero__grid,
+  .yg-proof {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .yg-hero__title {
+    font-size: 1.75rem;
+  }
+
+  .yg-features,
+  .yg-steps {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media screen and (max-width: 44.9375em) {
+  .yg-wrap {
+    padding: 0 0.8rem;
+  }
+
+  .yg-hero {
+    padding: 2.2rem 0 2.6rem;
+  }
+
+  .yg-hero__title {
+    font-size: 1.5rem;
+  }
+
+  .yg-features,
+  .yg-steps,
+  .yg-stats {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .yg-pipeline {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .yg-section {
+    padding: 2.4rem 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .yg-btn {
+    transition: none;
+  }
+}

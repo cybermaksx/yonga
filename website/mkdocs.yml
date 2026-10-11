@@ -1,0 +1,140 @@
+# The yonga website: landing page and user documentation, in English and Turkish.
+# Build: pip install -r website/requirements.txt && mkdocs build --strict -f website/mkdocs.yml
+site_name: yonga
+site_url: https://ooguz.github.io/yonga/
+site_description: >-
+  Run Hugging Face models on Intel AI PCs. yonga inspects your machine, prepares a validated
+  OpenVINO model for the NPU, GPU or CPU, and explains every fallback.
+site_author: Özcan Oğuz
+repo_url: https://github.com/ooguz/yonga
+repo_name: ooguz/yonga
+edit_uri: edit/main/website/docs/
+copyright: Copyright &copy; 2026 Özcan Oğuz. Licensed under AGPL-3.0-or-later. Not affiliated with Intel.
+
+docs_dir: docs
+site_dir: ../build/site
+
+theme:
+  name: material
+  custom_dir: overrides
+  logo: assets/logo.svg
+  favicon: assets/logo.svg
+  font: false
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  features:
+    - content.code.copy
+    - content.tabs.link
+    - navigation.footer
+    - navigation.indexes
+    - navigation.sections
+    - navigation.tabs
+    - navigation.top
+    - navigation.tracking
+    - search.highlight
+    - search.suggest
+    - toc.follow
+  icon:
+    repo: fontawesome/brands/github
+
+extra_css:
+  - assets/extra.css
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/ooguz/yonga
+    - icon: fontawesome/brands/python
+      link: https://pypi.org/project/yonga/
+  generator: false
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.keys
+  - pymdownx.snippets
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+
+plugins:
+  - search
+  - i18n:
+      docs_structure: folder
+      fallback_to_default: false
+      languages:
+        - locale: en
+          name: English
+          default: true
+          build: true
+        - locale: tr
+          name: Türkçe
+          build: true
+          site_description: >-
+            Hugging Face modellerini Intel AI PC'lerde çalıştırın. yonga makinenizi inceler,
+            NPU, GPU veya CPU için doğrulanmış bir OpenVINO modeli hazırlar ve her geri dönüşü
+            açıklar.
+          copyright: Telif hakkı &copy; 2026 Özcan Oğuz. AGPL-3.0-or-later lisanslıdır. Intel ile bağlantılı değildir.
+          nav_translations:
+            Home: Ana sayfa
+            Get started: Başlarken
+            Quick start: Hızlı başlangıç
+            Installation: Kurulum
+            How yonga works: yonga nasıl çalışır
+            Tested hardware and models: Test edilen donanım ve modeller
+            Guides: Kılavuzlar
+            Preparing models: Model hazırlama
+            Chat, probe, bench and eval: Sohbet, yoklama, ölçüm ve değerlendirme
+            OpenAI-compatible server: OpenAI uyumlu sunucu
+            Maintenance: Bakım
+            Reference: Başvuru
+            Command reference: Komut başvurusu
+            Exit codes: Çıkış kodları
+            Troubleshooting: Sorun giderme
+            Privacy and security: Gizlilik ve güvenlik
+            FAQ: SSS
+
+nav:
+  - Home: index.md
+  - Get started:
+      - Quick start: getting-started.md
+      - Installation: installation.md
+      - How yonga works: concepts.md
+      - Tested hardware and models: hardware.md
+  - Guides:
+      - Preparing models: guide/prepare.md
+      - Chat, probe, bench and eval: guide/run.md
+      - OpenAI-compatible server: guide/serve.md
+      - Maintenance: guide/maintain.md
+  - Reference:
+      - Command reference: reference/cli.md
+      - Exit codes: reference/exit-codes.md
+      - Troubleshooting: troubleshooting.md
+      - Privacy and security: privacy.md
+      - FAQ: faq.md

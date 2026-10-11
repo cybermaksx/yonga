@@ -1,0 +1,157 @@
+{#- Landing page. Every string comes from the page's front matter (home: …), so the
+    English and Turkish index.md files share this one template. -#}
+{% extends "main.html" %}
+
+{% block tabs %}
+{{ super() }}
+{% set h = page.meta.home %}
+<div class="yg-home">
+
+  <section class="yg-hero">
+    <div class="yg-wrap yg-hero__grid">
+      <div class="yg-hero__copy">
+        <a class="yg-badge" href="{{ h.badge_link }}">{{ h.badge }}</a>
+        <h1 class="yg-hero__title">{{ h.title }}</h1>
+        <p class="yg-hero__lead">{{ h.lead }}</p>
+        <div class="yg-actions">
+          <a class="yg-btn yg-btn--primary" href="{{ h.primary_link }}">
+            {{ h.primary }} {% include ".icons/material/arrow-right.svg" %}
+          </a>
+          <a class="yg-btn yg-btn--ghost" href="{{ config.repo_url }}">
+            {% include ".icons/fontawesome/brands/github.svg" %} {{ h.secondary }}
+          </a>
+        </div>
+
+        <div class="yg-install" data-yg-tabs>
+          <div class="yg-install__bar" role="tablist" aria-label="{{ h.install_label }}">
+            <span class="yg-install__label">{{ h.install_label }}</span>
+            {% for tab in h.install_tabs %}
+            <button class="yg-install__tab" role="tab" type="button"
+                    aria-selected="{{ 'true' if loop.first else 'false' }}"
+                    aria-controls="yg-install-{{ loop.index }}"
+                    id="yg-install-tab-{{ loop.index }}">{{ tab.name }}</button>
+            {% endfor %}
+          </div>
+          {% for tab in h.install_tabs %}
+          <div class="yg-install__panel" role="tabpanel" id="yg-install-{{ loop.index }}"
+               aria-labelledby="yg-install-tab-{{ loop.index }}" {% if not loop.first %}hidden{% endif %}>
+            <pre><code>{{ tab.code | e }}</code></pre>
+            <button class="yg-copy" type="button" data-yg-copy aria-label="Copy">
+              {% include ".icons/material/content-copy.svg" %}
+            </button>
+          </div>
+          {% endfor %}
+          <p class="yg-install__note">{{ h.install_note }}</p>
+        </div>
+      </div>
+
+      <figure class="yg-terminal" aria-label="Terminal">
+        <div class="yg-terminal__bar"><span></span><span></span><span></span></div>
+        {% include "partials/yg-terminal.html" %}
+        <figcaption>{{ h.terminal_caption }}</figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <section class="yg-section">
+    <div class="yg-wrap">
+      <h2 class="yg-section__title">{{ h.steps_title }}</h2>
+      <ol class="yg-steps">
+        {% for step in h.steps %}
+        <li class="yg-step">
+          <span class="yg-step__n">{{ loop.index }}</span>
+          <code class="yg-step__cmd">{{ step.command }}</code>
+          <p>{{ step.text }}</p>
+        </li>
+        {% endfor %}
+      </ol>
+    </div>
+  </section>
+
+  <section class="yg-section yg-section--tint">
+    <div class="yg-wrap">
+      <h2 class="yg-section__title">{{ h.features_title }}</h2>
+      <div class="yg-features">
+        {% for f in h.features %}
+        <article class="yg-feature">
+          <span class="yg-feature__icon">{% include ".icons/" ~ f.icon ~ ".svg" %}</span>
+          <h3>{{ f.title }}</h3>
+          <p>{{ f.text }}</p>
+        </article>
+        {% endfor %}
+      </div>
+    </div>
+  </section>
+
+  <section class="yg-section">
+    <div class="yg-wrap yg-proof">
+      <div class="yg-proof__copy">
+        <h2 class="yg-section__title">{{ h.proof_title }}</h2>
+        <p>{{ h.proof_lead }}</p>
+        <a class="yg-link" href="{{ h.proof_href }}">{{ h.proof_link }} {% include ".icons/material/arrow-right.svg" %}</a>
+      </div>
+      <dl class="yg-stats">
+        {% for s in h.stats %}
+        <div class="yg-stat"><dt>{{ s.value }}</dt><dd>{{ s.label }}</dd></div>
+        {% endfor %}
+      </dl>
+    </div>
+  </section>
+
+  <section class="yg-section yg-section--tint">
+    <div class="yg-wrap">
+      <h2 class="yg-section__title">{{ h.pipeline_title }}</h2>
+      <ol class="yg-pipeline">
+        {% for p in h.pipeline %}
+        <li><span>{{ loop.index }}/{{ loop.length }}</span>{{ p }}</li>
+        {% endfor %}
+      </ol>
+      <p class="yg-pipeline__note">{{ h.pipeline_note }}</p>
+    </div>
+  </section>
+
+  <section class="yg-section yg-cta">
+    <div class="yg-wrap">
+      <h2>{{ h.cta_title }}</h2>
+      <p>{{ h.cta_text }}</p>
+      <div class="yg-actions yg-actions--center">
+        <a class="yg-btn yg-btn--primary" href="{{ h.primary_link }}">{{ h.cta_primary }} {% include ".icons/material/arrow-right.svg" %}</a>
+        <a class="yg-btn yg-btn--ghost" href="{{ h.cta_secondary_link }}">{{ h.cta_secondary }}</a>
+      </div>
+      <p class="yg-disclaimer">{{ h.disclaimer }}</p>
+    </div>
+  </section>
+</div>
+{% endblock %}
+
+{% block content %}{% endblock %}
+
+{% block scripts %}
+{{ super() }}
+<script>
+  (function () {
+    document.querySelectorAll("[data-yg-tabs]").forEach(function (box) {
+      var tabs = box.querySelectorAll("[role=tab]");
+      tabs.forEach(function (tab) {
+        tab.addEventListener("click", function () {
+          tabs.forEach(function (t) {
+            var on = t === tab;
+            t.setAttribute("aria-selected", on ? "true" : "false");
+            document.getElementById(t.getAttribute("aria-controls")).hidden = !on;
+          });
+        });
+      });
+    });
+    document.querySelectorAll("[data-yg-copy]").forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        var code = btn.parentElement.querySelector("code").innerText;
+        if (!navigator.clipboard) return;
+        navigator.clipboard.writeText(code).then(function () {
+          btn.classList.add("yg-copy--done");
+          setTimeout(function () { btn.classList.remove("yg-copy--done"); }, 1500);
+        });
+      });
+    });
+  })();
+</script>
+{% endblock %}
