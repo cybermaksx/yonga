@@ -46,6 +46,7 @@ from typing import TYPE_CHECKING
 from yonga import APP_NAME, APP_SLUG
 from yonga.application.progress import ProgressKind
 from yonga.domain.diagnostics import (
+    ONLINE_RERUN_PLACEHOLDER,
     ConfigurationError,
     FailureCategory,
     PreflightError,
@@ -351,7 +352,8 @@ class ExportEnvironmentManager:
                     f"({_summary(spec)}) that has not been built yet, and building "
                     "one downloads packages.",
                     remediation=[
-                        "Run once without offline mode to build it; it is reused afterwards.",
+                        "Run once without offline mode to build it; it is reused afterwards: "
+                        f"{ONLINE_RERUN_PLACEHOLDER}",
                     ],
                 )
             )

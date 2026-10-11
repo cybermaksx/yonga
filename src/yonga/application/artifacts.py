@@ -49,7 +49,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from yonga.adapters.filesystem import INCOMPLETE_MARKER_NAME, finalize_directory
 from yonga.application.jobs import SweepReport, sweep_job_directories
 from yonga.application.progress import NullSink, ProgressEvent, ProgressKind, ProgressSink
-from yonga.config.paths import Paths
+from yonga.config.paths import STAGING_MODEL_DIRNAME, Paths
 from yonga.config.settings import Settings
 from yonga.domain.artifacts import (
     MANIFEST_DIRNAME,
@@ -57,6 +57,7 @@ from yonga.domain.artifacts import (
     ArtifactFileRecord,
     ArtifactManifest,
     ArtifactSummary,
+    DeviceProbeReport,
     ValidationReport,
     manifest_path,
 )
@@ -89,9 +90,6 @@ VALIDATION_FILENAME: str = "validation.json"
 
 #: Name of the provenance document written next to the manifest.
 SOURCE_FILENAME: str = "source.json"
-
-#: Sub-directory of a job staging directory that holds the model itself.
-STAGING_MODEL_DIRNAME: str = "model"
 
 #: Characters of a commit SHA kept in the artifact directory name.
 SHA_SHORT_LENGTH: int = 12
@@ -441,6 +439,40 @@ class ArtifactStore:
                 ProgressEvent(kind=ProgressKind.LOG, message=note, severity=Severity.INFO),
             )
         return published
+
+    def record_device_probe(
+        self, artifact_dir: Path, report: DeviceProbeReport
+    ) -> ArtifactManifest:
+        """Add ``report`` to a ready artifact's manifest, replacing that device's last one.
+
+        ``prepare`` settles every probe it runs in the manifest. When it reuses
+        an artifact for an explicit ``--device`` the artifact was never probed
+        on, it probes that device first and records the result here, so ``list``,
+        ``publish`` and the next ``prepare`` see the same evidence. The rest of
+        the manifest -- the file inventory above all -- is unchanged, and the
+        document is replaced atomically, so a reader sees the old manifest or
+        the new one and never a torn one.
+        """
+        directory = Path(artifact_dir)
+        manifest = self.manifest_for(directory)
+        if manifest is None:
+            raise ValidationError(
+                diagnostic(
+                    "artifact.manifest.missing",
+                    FailureCategory.CONFIGURATION_ERROR,
+                    "The artifact has no readable manifest",
+                    f"{directory} has no manifest to record the {report.device} probe in.",
+                    context={"artifact_dir": str(directory)},
+                )
+            )
+        probes = {**manifest.device_probes, report.device: report}
+        updated = manifest.model_copy(update={"device_probes": probes})
+        target = manifest_path(directory)
+        pending = target.with_name(f"{target.name}.tmp")
+        _write_document(pending, updated.to_json_text())
+        pending.replace(target)
+        _fsync_directory(target.parent)
+        return updated
 
     # --- removal ------------------------------------------------------------
 

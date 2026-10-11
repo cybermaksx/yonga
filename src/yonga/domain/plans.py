@@ -516,6 +516,14 @@ class PreparationPlan(BaseModel):
     known_limitations: list[str] = Field(default_factory=list)
     confirmations: list[ConfirmationReason] = Field(default_factory=list)
     reuse_existing_artifact: Path | None = None
+    reuse_check_device: str | None = None
+    """The explicitly requested device the reused artifact has no passing probe for.
+
+    Reuse is keyed by revision and profile, not by device, so an artifact
+    prepared on the CPU answers a ``--device gpu`` request too. An explicit
+    device is never taken on trust: ``prepare`` probes the artifact there (the
+    compile and the smoke test a fresh preparation runs) before reusing it, and
+    fails without falling back when it does not run there."""
     force: bool = False
     export_environment: EnvironmentSpec | None = None
     """The managed environment the export will run in, when the installed packages

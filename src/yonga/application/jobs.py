@@ -220,11 +220,22 @@ class JobContext:
         """Return whether cancellation has been requested."""
         return self.cancelled.is_set()
 
-    def advance(self, stage: JobStage) -> None:
-        """Record a state-machine transition in both the log and the state file."""
+    def advance(
+        self,
+        stage: JobStage,
+        *,
+        profile_id: str | None = None,
+        target_device: str | None = None,
+    ) -> None:
+        """Record a state-machine transition in both the log and the state file.
+
+        ``profile_id`` and ``target_device`` record what the plan chose, so a
+        job that ends early -- cancelled during the conversion, say -- still
+        says which profile it was building.
+        """
         self.logger.info("job.stage", f"stage -> {stage.value}", stage=stage.value)
         if self.state is not None:
-            self.state.advance(stage)
+            self.state.advance(stage, profile_id=profile_id, target_device=target_device)
 
     def retain_staging_for_diagnosis(self) -> Path | None:
         """Apply the failure half of the staging retention policy. Never raises.

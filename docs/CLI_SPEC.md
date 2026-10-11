@@ -31,7 +31,10 @@ yonga [GLOBAL OPTIONS] COMMAND ...
 ```
 
 Global options go before the command name: `yonga --offline --debug prepare MODEL`, not
-`yonga prepare MODEL --offline`. `--json` is the one global option that commands also accept after
+`yonga prepare MODEL --offline`. Every command yonga suggests next (a hint after success, a
+remediation step) repeats the global options that say where the data is and how to reach it
+(`--config`, `--data-dir`, `--cache-dir`, `--offline`), so it runs against the same store;
+advice that only the network can satisfy prints the command without `--offline`. `--json` is the one global option that commands also accept after
 their own name (`yonga list --json`).
 
 `--json` suppresses decorative UI and emits one JSON document for commands that support it. `chat`
@@ -173,6 +176,10 @@ This command is optional in milestone 1 but desired for MVP.
 
 Use Hugging Face API search and enrich results with compatibility where architecture metadata is available. Do not claim compatibility without evidence.
 
+The table shows the repository id, the architecture, one column per device, the formats hinted from
+Hub tags and the download count. A repository id is never wrapped or cut short, and a count is never
+cut: on a narrow terminal the format, download and architecture columns are dropped, in that order.
+
 ## 6. `prepare`
 
 ```bash
@@ -218,7 +225,12 @@ source weight size.
 
 When a ready artifact already exists for the revision and profile, the plan is a short reuse plan
 (no download, temp, repair or environment rows) and asks no confirmation, so a re-run works
-without `--yes`. `--force` prepares again.
+without `--yes`. `--force` prepares again. Reuse is keyed by revision and profile, not by device,
+so with an explicit `--device` the artifact must already have passed a probe there; when it has
+not (the CPU build of a profile, asked for with `--device gpu`), the plan says so and `prepare`
+runs the same compile and smoke test on that device that a fresh preparation would, records the
+probe in the manifest, and reports that device. A failure there stops the job without falling
+back (exit 50), and the artifact stays ready for the devices it already runs on.
 
 Before asking anything, `prepare` refuses a job that cannot finish, and the plan marks it
 **BLOCKED**: the OpenVINO runtime is not installed (`runtime.openvino.missing`, exit 10, naming
@@ -492,8 +504,8 @@ yonga registry reset
 `profiles` lists the conversion profiles of the merged registry, the ids `--profile` accepts, by
 device and then by priority, with their weight compression, size band, priority and status (and in
 `--json` their evidence and the layer that supplied them). A profile id is never wrapped or cut
-short; the summary is the column that wraps, and on a narrow terminal the weights column, which
-the id spells out already, makes room for it. An unknown `--profile`
+short; the summary is the column that wraps, between words, and on a narrow terminal the weights
+column, which the id spells out already, and then the size band make room for it. An unknown `--profile`
 (`registry.profile_unknown`, exit 70) names the profiles for the requested device and points here.
 
 `paths` inside an AppImage names the AppImage file for the built-in registry instead of its
@@ -566,8 +578,9 @@ files it names itself, so the record never interferes; a record that cannot be w
 and never fails a load.
 
 `list` prints, per entry: key, size, last use (the record's, or the newest file time), device,
-OpenVINO version, owner (artifact id; `*` when the artifact exists outside this artifact store)
-and status, then the total size and count. On a narrow terminal the model, last use, OpenVINO
+OpenVINO version, owner (artifact id; `staging (job 0745994f)` for a `prepare` job's staging
+directory, by the job id prefix `yonga logs` accepts; `*` when the owner exists outside this
+artifact store) and status, then the total size and count. On a narrow terminal the model, last use, OpenVINO
 version and device columns are dropped, in that order, then an owner known only by its directory
 name is cut and finally the owner column goes; the key, the size, the status and an owning artifact
 id are never shortened. Statuses:

@@ -54,6 +54,7 @@ from yonga.adapters.gguf_header import (
 from yonga.application.progress import ProgressKind
 from yonga.config.settings import Settings
 from yonga.domain.diagnostics import (
+    ONLINE_RERUN_PLACEHOLDER,
     CancelledError,
     Diagnostic,
     FailureCategory,
@@ -444,8 +445,8 @@ def translate_hub_error(
                 model=model,
                 operation=operation,
                 remediation=[
-                    "Re-run without offline mode (unset YONGA_OFFLINE / HF_HUB_OFFLINE) "
-                    "to populate the cache.",
+                    "Re-run without offline mode (no --offline, and YONGA_OFFLINE / "
+                    f"HF_HUB_OFFLINE unset) to populate the cache: {ONLINE_RERUN_PLACEHOLDER}",
                     "Or point HF_HOME at a cache that already contains this revision.",
                 ],
             ),
@@ -1387,8 +1388,8 @@ class HuggingFaceAdapter:
                 operation=operation,
                 remediation=[
                     *remediation,
-                    "Re-run without offline mode (unset YONGA_OFFLINE / HF_HUB_OFFLINE) "
-                    "to populate the cache.",
+                    "Re-run without offline mode (no --offline, and YONGA_OFFLINE / "
+                    f"HF_HUB_OFFLINE unset) to populate the cache: {ONLINE_RERUN_PLACEHOLDER}",
                     "Or point HF_HOME at a cache that already contains this revision.",
                 ],
             )
@@ -1745,8 +1746,8 @@ class HuggingFaceAdapter:
                     model=None,
                     operation="search",
                     remediation=[
-                        "Run the search without offline mode (no --offline, and unset "
-                        "YONGA_OFFLINE / HF_HUB_OFFLINE).",
+                        "Run the search without offline mode (no --offline, and "
+                        f"YONGA_OFFLINE / HF_HUB_OFFLINE unset): {ONLINE_RERUN_PLACEHOLDER}",
                         "A model already in the local cache can still be inspected offline: "
                         "yonga --offline inspect MODEL",
                     ],

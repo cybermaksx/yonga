@@ -283,7 +283,10 @@ interpreter that will run the export: a managed export environment's Python and 
 known never blocks, and the rule keeps classifying the failure as before wherever the block does
 not apply. `--ignore-exporter-requirements` overrides the refusal, as it overrides an unmet
 exporter pin, and the artifact's manifest records that it did; `--yes` does not. The plan panel
-shows the refusal as a `BLOCKED` section, and `prepare --json` carries it as `export_blocked`.
+shows the refusal as a `BLOCKED` section. `prepare --json` prints no plan, so the refusal is its
+usual failure document (`docs/CLI_SPEC.md` section 2): `ok: false`, the `exit_code`, and the rule's
+diagnostic under `diagnostic`, whose `code` names the rule and whose `remediation` ends in the
+`--ignore-exporter-requirements` command.
 
 - **Version.** An issue rule with `blocks_export` needs `schema_version: 4`. A rule without its own
   `schema_version` takes its document's, and no rule may declare a newer version than its document.

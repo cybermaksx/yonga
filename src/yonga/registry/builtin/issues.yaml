@@ -791,7 +791,9 @@ issues:
           Replace torchvision with the build from torch's CPU index, in the
           environment yonga runs in: pip uninstall -y torchvision && pip install
           torchvision --index-url https://download.pytorch.org/whl/cpu
-        - "Then check that the exporter imports: python -c \"import optimum.exporters.openvino\""
+        - >-
+          Then check that the exporter imports: yonga doctor --full (it imports
+          the exporter again, with OpenVINO's usage reporting switched off)
         - yonga does not change your environment for you; that choice stays yours.
     sources:
       - kind: tested

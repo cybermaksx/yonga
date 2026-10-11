@@ -862,7 +862,8 @@ def test_prepare_succeeds_and_prints_the_artifact(
     )
     assert result.exit_code in (int(ExitCode.SUCCESS), int(ExitCode.WARNINGS))
     assert "Ready" in result.stdout
-    assert "yonga chat" in result.stdout
+    # The data directory came from --data-dir, so the next step must name it too.
+    assert f"Chat with it: {_root(home)} chat " in " ".join(result.stdout.split())
     assert (home / "data" / "artifacts").is_dir()
 
 
@@ -1117,7 +1118,7 @@ def test_list_is_empty_and_says_what_to_do(runner: CliRunner, home: Path) -> Non
     """An empty catalogue explains how to fill it."""
     result = invoke(runner, home, ["list"])
     assert result.exit_code == int(ExitCode.SUCCESS)
-    assert "yonga prepare MODEL" in result.stdout
+    assert f"{_root(home)} prepare MODEL" in " ".join(result.stdout.split())
 
 
 def test_list_json_is_one_document(runner: CliRunner, home: Path) -> None:
@@ -1423,7 +1424,7 @@ def test_chat_without_a_prepared_artifact_explains_prepare(runner: CliRunner, ho
     """``chat`` never starts a multi-gigabyte conversion as a side effect."""
     result = invoke(runner, home, ["chat", SAFETENSORS_REPO])
     assert result.exit_code == int(ExitCode.REGISTRY)
-    assert f"yonga prepare {SAFETENSORS_REPO}" in result.stderr
+    assert f"{_root(home)} prepare {SAFETENSORS_REPO}" in " ".join(result.stderr.split())
     assert "does not convert a model as a side effect" in result.stderr
 
 
@@ -1747,9 +1748,10 @@ def test_chat_never_suggests_preparing_something_that_is_not_a_model_id(
     result = invoke(runner, home, ["chat", reference])
     assert result.exit_code == int(ExitCode.REGISTRY)
     err = " ".join(result.stderr.split())
-    assert f"yonga prepare {reference}" not in err
-    assert f"yonga chat {reference}" not in err
-    assert "yonga list" in err
+    assert f" prepare {reference}" not in err
+    assert f" chat {reference}" not in err
+    assert f"{_root(home)} list" in err
+    assert "OWNER/NAME" not in err, "a placeholder pasted as it stands goes to the Hub"
 
 
 def test_chat_with_an_unknown_artifact_id_says_where_ids_come_from(
@@ -1866,7 +1868,7 @@ def test_cache_list_shows_every_status_and_the_prune_hint(
         assert status in output
     assert "bbbbbbbbbbbbbbbb" in output, "the owner of an orphan is still named"
     assert "4 entries" in output
-    assert "yonga cache prune" in output
+    assert f"{_root(home)} cache prune" in " ".join(output.split())
     assert "--unattributed" in output
 
 
@@ -2097,12 +2099,14 @@ def test_cache_counts_say_entry_for_one(runner: CliRunner, home: Path, tmp_path:
     assert "Removed 1 entry," in pruned
 
 
-def make_export_env(home: Path, *, size: int = 1000) -> Path:
+def make_export_env(
+    home: Path, *, size: int = 1000, packages: Mapping[str, str] | None = None
+) -> Path:
     """Put one completed managed export environment where ``env`` looks for them."""
     from yonga.adapters.export_env import MARKER_FILENAME
     from yonga.domain.environments import EnvironmentSpec, ExportEnvironment
 
-    spec = EnvironmentSpec(python="3.14", packages={"transformers": "==5.2.0"})
+    spec = EnvironmentSpec(python="3.14", packages=dict(packages or {"transformers": "==5.2.0"}))
     path = home / "cache" / "envs" / spec.name
     (path / "bin").mkdir(parents=True)
     (path / "bin" / "python").write_text("#!/bin/sh\n")
@@ -2203,6 +2207,52 @@ def test_env_list_counts_a_copy_of_the_bundled_python(runner: CliRunner, home: P
     assert document["total_bytes"] == 1500
     assert str(base) in human
     assert "1 environment," in human
+
+
+def test_env_list_wraps_a_long_pin_list_under_its_indent(runner: CliRunner, home: Path) -> None:
+    """Continuation lines started at column 0 and read as further rows."""
+    pins = {
+        "nncf": "==3.4.0",
+        "openvino": "==2026.4.1",
+        "openvino-tokenizers": "==2026.4.1.0",
+        "optimum": "==2.3.0",
+        "optimum-intel": "==2.2.0",
+        "torch": "==2.14.0",
+        "torchvision": "==0.29.0",
+        "transformers": "==5.2.*",
+    }
+    make_export_env(home, packages=pins)
+
+    result = invoke(runner, home, ["env", "list"], env={"COLUMNS": "60"})
+
+    assert result.exit_code == int(ExitCode.SUCCESS)
+    lines = result.stdout.splitlines()
+    first = next(index for index, line in enumerate(lines) if "nncf==3.4.0" in line)
+    block = []
+    for line in lines[first:]:
+        if not line.startswith("    "):
+            break
+        block.append(line)
+    assert len(block) > 1, result.stdout
+    joined = " ".join(" ".join(block).split())
+    for name, specifier in pins.items():
+        assert f"{name}{specifier}" in joined
+
+
+def test_cache_list_names_a_staging_owner_by_its_job(runner: CliRunner, home: Path) -> None:
+    """Every '.staging/<job>/model' owner used to read 'model'."""
+    job = "0745994f-1f2e-4b6a-9c0d-5e8f7a6b3c21"
+    staging = home / "data" / "artifacts" / ".staging" / job / "model"
+    staging.mkdir(parents=True)
+    (staging / "openvino_model.xml").write_text("<net/>", encoding="utf-8")
+    recorded_entry(cli_settings(home), staging, device="CPU")
+    shutil.rmtree(staging.parent)  # the job finished; its smoke-test blobs stayed
+
+    result = invoke(runner, home, ["cache", "list"], env={"COLUMNS": "80"})
+
+    assert result.exit_code == int(ExitCode.SUCCESS), result.output
+    assert "staging (job 0745994f)" in result.stdout
+    assert " model " not in result.stdout
 
 
 def test_env_and_cache_lists_keep_a_long_path_on_one_line(
@@ -2351,7 +2401,7 @@ def test_logs_for_an_unknown_job_is_a_configuration_error(runner: CliRunner, hom
     (home / "data" / "logs").mkdir(parents=True)
     result = invoke(runner, home, ["logs", "nope"])
     assert result.exit_code == int(ExitCode.REGISTRY)
-    assert "yonga logs" in result.stderr
+    assert f"{_root(home)} logs" in " ".join(result.stderr.split())
 
 
 def test_logs_bundle_writes_an_archive_and_reports_it_as_json(
@@ -2386,7 +2436,7 @@ def test_logs_bundle_needs_a_job(runner: CliRunner, home: Path) -> None:
     (home / "data" / "logs").mkdir(parents=True)
     result = invoke(runner, home, ["logs", "--bundle"])
     assert result.exit_code == int(ExitCode.REGISTRY)
-    assert "yonga logs JOB_ID --bundle" in result.stderr
+    assert f"{_root(home)} logs JOB_ID --bundle" in " ".join(result.stderr.split())
 
 
 class SearchingHub:
@@ -3376,6 +3426,9 @@ def test_registry_profiles_keeps_each_id_on_one_line_when_narrow(
     starts = [line.split(" ", 1)[0] for line in result.stdout.splitlines()]
     for rule in load_builtin_registry().profiles:
         assert rule.id in starts
+        # The summary wraps between words, never inside one ("Uncompresse" / "d").
+        for word in rule.summary.split():
+            assert word in result.stdout, (word, result.stdout)
 
 
 def test_registry_paths_inside_an_appimage_names_the_appimage(
@@ -3449,6 +3502,54 @@ def test_eval_prints_the_comparison_and_saves_it(
     assert "Mean KL" in result.stdout
     assert "not to the original weights" in result.stdout
     assert list((home / "data" / "evaluations").glob("*.json"))
+
+
+@pytest.mark.parametrize(
+    ("args", "unknown"),
+    [
+        (["eval", "acme/not-here", "--reference", "ref"], "acme/not-here"),
+        (["eval", "cand", "--reference", "acme/not-here"], "acme/not-here"),
+    ],
+    ids=["unknown-candidate", "unknown-reference"],
+)
+def test_eval_of_an_unprepared_model_repeats_the_whole_command(
+    runner: CliRunner, home: Path, tmp_path: Path, args: list[str], unknown: str
+) -> None:
+    """'Then run it again: yonga eval X' dropped --reference and could swap the two."""
+    result = invoke(
+        runner,
+        home,
+        [*args, "--json"],
+        factory=lambda settings: EvaluatingWiring(settings, tmp_path),
+    )
+
+    assert result.exit_code == int(ExitCode.REGISTRY)
+    steps = _remediation(result)
+    assert f"Prepare it first: {_root(home)} prepare {unknown}" in steps
+    assert f"Then run the same command again: {_root(home)} {shlex.join(args)} --json" in steps
+    assert not any("RERUN_COMMAND" in step for step in steps)
+
+
+def test_publish_of_an_unprepared_model_keeps_the_repo_option(
+    runner: CliRunner, home: Path
+) -> None:
+    result = invoke(runner, home, ["publish", "acme/not-here", "--repo", "me/m", "--json"])
+
+    assert result.exit_code == int(ExitCode.REGISTRY), result.output
+    expected = f"{_root(home)} publish acme/not-here --repo me/m --json"
+    assert f"Then run the same command again: {expected}" in _remediation(result)
+
+
+def test_offline_advice_prints_the_command_without_the_offline_flag(
+    runner: CliRunner, home: Path
+) -> None:
+    """'unset YONGA_OFFLINE' did not help a user who had typed --offline."""
+    result = invoke(runner, home, ["--offline", "publish", "abc", "--repo", "me/m", "--json"])
+
+    assert result.exit_code == int(ExitCode.REGISTRY), result.output
+    expected = f"{_root(home)} publish abc --repo me/m --json"
+    assert any(step.endswith(f": {expected}") for step in _remediation(result))
+    assert not any("--offline publish" in step for step in _remediation(result))
 
 
 def test_eval_json_is_one_document(runner: CliRunner, home: Path, tmp_path: Path) -> None:

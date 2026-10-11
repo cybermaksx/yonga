@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -444,7 +445,11 @@ def test_list_says_when_stale_working_directories_hold_real_space(tmp_path: Path
     result = run_cli(home, "list")
 
     assert result.exit_code == 0
-    assert "in 1 stale working directory can be reclaimed: yonga list --clean" in result.stdout
+    root = shlex.join(
+        ["yonga", "--data-dir", str(home / "data"), "--cache-dir", str(home / "cache")]
+    )
+    expected = f"in 1 stale working directory can be reclaimed: {root} list --clean"
+    assert expected in " ".join(result.stdout.split())
     assert stale.is_dir()
 
 

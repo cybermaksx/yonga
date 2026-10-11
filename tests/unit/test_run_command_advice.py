@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import io
 import json
+import shlex
 from collections.abc import Iterator, Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -35,6 +36,7 @@ from tests.unit.test_cli import (
     FakeWiring,
     RefusingRuntimeFactory,
     _chat_wiring,
+    _root,
     _staged_artifact,
     invoke,
 )
@@ -55,7 +57,7 @@ from yonga.application.artifacts import ArtifactStore
 from yonga.application.benchmark import BenchmarkService
 from yonga.application.chat import ChatOptions
 from yonga.application.evaluation import EvaluationService
-from yonga.application.jobs import JobContext
+from yonga.application.jobs import JobContext, JobStateStore
 from yonga.application.probe import LocalArtifactStore, resolve_artifact
 from yonga.application.progress import CollectingSink
 from yonga.config.settings import Settings
@@ -68,6 +70,7 @@ from yonga.domain.artifacts import (
     manifest_path,
 )
 from yonga.domain.diagnostics import (
+    RERUN_PLACEHOLDER,
     CompileError,
     ConfigurationError,
     Diagnostic,
@@ -76,9 +79,10 @@ from yonga.domain.diagnostics import (
     YongaError,
     diagnostic,
     for_artifact_run,
+    with_rerun,
     without_job,
 )
-from yonga.domain.plans import ExportRequest, ExportResult, JobStatus
+from yonga.domain.plans import ExportRequest, ExportResult, JobStage, JobStatus
 from yonga.registry.loader import load_builtin_registry
 from yonga.registry.resolver import RegistryResolver
 from yonga.ui.chat_tui import render_answer
@@ -255,8 +259,8 @@ def test_chat_prints_no_job_placeholder_for_an_npu_refusal(
     err = " ".join(result.stderr.split())
     assert result.exit_code == int(ExitCode.COMPILE), result.output
     assert "JOB_ID" not in err
-    assert f"Run: yonga chat {ARTIFACT_ID} --device gpu" in err
-    assert "yonga prepare" not in err
+    assert f"Run: {_root(home)} chat {ARTIFACT_ID} --device gpu" in err
+    assert " prepare " not in err
 
 
 def test_a_registry_step_needing_a_job_is_dropped_for_a_command_without_one(
@@ -347,8 +351,8 @@ def test_probe_advice_names_the_probe_of_the_artifact(
     )
 
     err = " ".join(result.stderr.split())
-    assert f"Run: yonga probe {ARTIFACT_ID} --device gpu" in err, result.output
-    assert "yonga prepare" not in err
+    assert f"Run: {_root(home)} probe {ARTIFACT_ID} --device gpu" in err, result.output
+    assert " prepare " not in err
 
 
 # --- an unknown reference ------------------------------------------------------------
@@ -364,7 +368,11 @@ def test_probe_and_bench_tell_a_model_id_to_prepare_it_first(tmp_path: Path) -> 
         found = caught.value.diagnostic
         assert found.code == "artifact.not_prepared"
         assert "Prepare it first: yonga prepare acme/not-here" in found.remediation
-        assert f"Then run it again: yonga {command} acme/not-here" in found.remediation
+        # The command to repeat is the user's own, which only the CLI knows; it
+        # is never rebuilt from the reference, and never shown as a placeholder.
+        assert f"Then run the same command again: {RERUN_PLACEHOLDER}" in found.remediation
+        assert f"yonga {command} acme/not-here" not in " ".join(found.remediation)
+        assert "Then run the same command again." in with_rerun(found, None).remediation
         assert not any("MODEL" in step for step in found.remediation)
 
 
@@ -379,6 +387,9 @@ def test_an_artifact_id_that_is_gone_is_pointed_at_yonga_list(tmp_path: Path) ->
     assert found.title == "No prepared artifact has that id"
     assert found.remediation[0] == "See what is already prepared: yonga list"
     assert not any("yonga prepare cc24636a2f49356a" in step for step in found.remediation)
+    # Nor a placeholder: pasted, OWNER/NAME is looked up on the Hub as a model.
+    assert not any("yonga prepare" in step for step in found.remediation)
+    assert not any("OWNER" in step for step in found.remediation)
 
 
 def test_eval_keeps_its_code_and_gains_the_prepare_advice(tmp_path: Path) -> None:
@@ -399,7 +410,8 @@ def test_eval_keeps_its_code_and_gains_the_prepare_advice(tmp_path: Path) -> Non
 def test_publish_keeps_its_code_and_gains_the_prepare_advice() -> None:
     found = artifact_not_found("acme/x", command="publish", code="publish.artifact_not_found")
     assert found.code == "publish.artifact_not_found"
-    assert "Then run it again: yonga publish acme/x" in found.remediation
+    typed = "yonga publish acme/x --repo me/x --yes"
+    assert f"Then run the same command again: {typed}" in with_rerun(found, typed).remediation
 
 
 # --- several ready artifacts ---------------------------------------------------------
@@ -553,6 +565,9 @@ class CancelledExporter(FakeExporter):
                 FailureCategory.USER_CANCELLED,
                 "Conversion cancelled",
                 "The conversion was cancelled before it finished. No artifact was produced.",
+                remediation=[
+                    f"Run the same command to start the conversion again: {RERUN_PLACEHOLDER}"
+                ],
             ),
         )
 
@@ -579,6 +594,48 @@ def test_a_cancelled_export_is_recorded_as_cancelled_not_failed(tmp_path: Path) 
     assert ("warning", "export.cancelled") in events
     assert ("warning", "job.cancelled") in events
     assert not any(level == "error" for level, _ in events), events
+
+
+def test_a_cancelled_job_records_the_profile_its_plan_chose(tmp_path: Path) -> None:
+    """The state document said ``profile_id: null`` for a conversion cancelled half way."""
+    settings = settings_for(tmp_path)
+    hub = FakeHub(
+        repos={SAFETENSORS_REPO: safetensors_metadata()},
+        snapshots={SAFETENSORS_REPO: make_snapshot(tmp_path, "snapshot-safetensors")},
+    )
+    service = build_service(settings=settings, hub=hub, exporter=CancelledExporter())
+    plan = service.plan(SAFETENSORS_REPO, device="cpu")
+
+    with pytest.raises(YongaError):
+        run_prepare(service, plan, settings)
+
+    state = JobStateStore.load(settings.paths.job_state_path(plan.job_id)).state
+    assert state.stage is JobStage.CANCELLED
+    assert state.profile_id == plan.profile.id
+    assert state.target_device == plan.target_device
+
+
+def test_the_cancelled_conversion_advice_prints_the_users_command(
+    runner: CliRunner, home: Path, tmp_path: Path
+) -> None:
+    hub = FakeHub(
+        repos={SAFETENSORS_REPO: safetensors_metadata()},
+        snapshots={SAFETENSORS_REPO: make_snapshot(tmp_path, "snapshot-safetensors")},
+    )
+    args = ["prepare", SAFETENSORS_REPO, "--device", "cpu", "--profile", "cpu-int8-asym-ref"]
+
+    result = invoke(
+        runner,
+        home,
+        [*args, "--yes"],
+        factory=lambda settings: FakeWiring(settings, hub=hub, exporter=CancelledExporter()),
+    )
+
+    assert result.exit_code == int(ExitCode.CANCELLED), result.output
+    err = " ".join(result.stderr.split())
+    expected = f"{_root(home)} {shlex.join(args)} --yes"
+    assert f"Run the same command to start the conversion again: {expected}" in err
+    assert RERUN_PLACEHOLDER not in err
 
 
 class InterruptingRuntimeProbe(FakeRuntimeProbe):

@@ -316,6 +316,37 @@ def test_the_override_step_repeats_the_users_whole_command(
     )
 
 
+def test_prepare_json_reports_the_refusal_as_its_failure_document(
+    hub: FakeHub, tmp_path: Path
+) -> None:
+    """``docs/REGISTRY_SPEC.md`` promised an ``export_blocked`` key no document carried."""
+    from typer.testing import CliRunner
+
+    from tests.unit.test_cli import FakeWiring, invoke, one_document
+
+    home = tmp_path / "home"
+    (home / "config").mkdir(parents=True)
+    result = invoke(
+        CliRunner(),
+        home,
+        ["prepare", PHI_REPO, "--device", "cpu", "--yes", "--json"],
+        factory=lambda settings: FakeWiring(settings, hub=hub, resolver=resolver(PY314)),
+    )
+
+    document = one_document(result)
+    assert set(document) == {"ok", "exit_code", "diagnostic"}
+    assert document["exit_code"] == int(ExitCode.ENVIRONMENT_UNUSABLE)
+    found = document["diagnostic"]
+    assert isinstance(found, dict)
+    assert found["code"] == CODE
+    assert str(found["remediation"][-1]).endswith("--ignore-exporter-requirements")
+    assert hub.downloaded == []
+    spec = (Path(__file__).resolve().parents[2] / "docs" / "REGISTRY_SPEC.md").read_text(
+        encoding="utf-8"
+    )
+    assert "`export_blocked`" not in spec
+
+
 def test_the_plan_panel_says_the_export_is_blocked(settings: Settings, hub: FakeHub) -> None:
     plan = phi_service(settings, hub, PY314).plan(PHI_REPO, device="cpu")
     text = render(plan)

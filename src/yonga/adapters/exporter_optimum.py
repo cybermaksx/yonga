@@ -45,6 +45,7 @@ from yonga.adapters.subprocess import (
 )
 from yonga.application.progress import ProgressKind
 from yonga.domain.diagnostics import (
+    RERUN_PLACEHOLDER,
     ConfigurationError,
     Diagnostic,
     FailureCategory,
@@ -715,7 +716,9 @@ class OptimumExporter:
             FailureCategory.USER_CANCELLED,
             "Conversion cancelled",
             "The conversion was cancelled before it finished. No artifact was produced.",
-            remediation=["Re-run the same `yonga prepare` command to start the conversion again."],
+            remediation=[
+                f"Run the same command to start the conversion again: {RERUN_PLACEHOLDER}"
+            ],
             log_path=ctx.logger.path,
             job_id=ctx.job_id,
             context={"profile": request.profile.id},
@@ -899,7 +902,7 @@ def _prepare_output_dir(output_path: Path, ctx: JobContext) -> Diagnostic | None
                     FailureCategory.CONFIGURATION_ERROR,
                     "Conversion output path is not a directory",
                     f"{output} already exists and is not a directory.",
-                    remediation=[f"Remove {output} and run the command again."],
+                    remediation=[f"Remove {output} and run the command again: {RERUN_PLACEHOLDER}"],
                     log_path=ctx.logger.path,
                     job_id=ctx.job_id,
                 )

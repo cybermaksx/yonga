@@ -1267,6 +1267,10 @@ def _managed_toolchain_check(
     )
 
 
+#: The command that checks the exporter's import again, privately.
+_RECHECK_IMPORT = "yonga doctor --full"
+
+
 def _exporter_import_failure(
     failure: str, classified: Diagnostic | None, *, recorded: bool
 ) -> HealthCheck:
@@ -1286,11 +1290,15 @@ def _exporter_import_failure(
     else:
         title = "optimum.exporters.openvino does not import"
         remediation = [
-            'Reproduce it: python -c "import optimum.exporters.openvino"',
+            "Fix the Python environment yonga runs in: the import fails with the error above.",
             NEVER_INSTALLS_NOTE,
         ]
     if recorded:
         remediation.append("This is what the last check found; `yonga doctor --full` checks again.")
+    elif not any(_RECHECK_IMPORT in step for step in remediation):
+        # The check imports with OpenVINO's usage reporting off; a plain
+        # ``python -c "import ..."`` would not, so that is never the advice.
+        remediation.append(f"Once it is fixed, `{_RECHECK_IMPORT}` checks the import again.")
     return _check(
         "openvino.exporter_import",
         "exporter import",

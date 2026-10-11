@@ -9,6 +9,13 @@ path, its arguments and its options -- and :meth:`CommandLine.rerun` prints it
 again with an option added, removed or given another value, shell-quoted so it
 can be pasted as it stands.
 
+Advice that names *another* command keeps the root options too:
+:meth:`CommandLine.follow_up` builds one from words, and
+:meth:`CommandLine.carry_root` adds them to the ``yonga`` commands a line of
+advice already names. After ``yonga --data-dir X prepare M`` the next step is
+``yonga --data-dir X chat ID``; without ``--data-dir`` it would look for the
+artifact in the default store and not find it.
+
 An option whose name says it carries a secret is never kept, so no remediation
 can print one. The CLI masks secret-shaped values of the other options before
 it builds the command line.
@@ -18,11 +25,11 @@ from __future__ import annotations
 
 import re
 import shlex
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 
 from pydantic import BaseModel, ConfigDict, field_validator
 
-__all__ = ["CommandLine", "Option", "is_secret_option"]
+__all__ = ["OUTPUT_ROOT_OPTIONS", "CommandLine", "Option", "is_secret_option"]
 
 #: One option as typed: the flag alone (``("--yes",)``) or with its value.
 Option = tuple[str, ...]
@@ -32,6 +39,16 @@ Option = tuple[str, ...]
 _SECRET_OPTION = re.compile(
     r"(?:^|-)(?:token|password|passwd|secret|api-key|apikey|credentials?|auth)$", re.IGNORECASE
 )
+
+
+#: Root options that only change how this one invocation prints. A different
+#: command suggested afterwards does not inherit them: they say nothing about
+#: where the data is or whether the network may be used.
+OUTPUT_ROOT_OPTIONS: frozenset[str] = frozenset({"--json", "--debug", "--verbose", "-v"})
+
+#: ``yonga`` where a command starts: at the start of the text, after ``: ``, or
+#: after an opening quote or backtick -- never in prose such as "yonga never".
+_COMMAND_START = re.compile(r"(?:^|(?<=:\s)|(?<=['`\"(]))yonga\s+(?P<word>[a-z][a-z-]*)\b")
 
 
 def is_secret_option(flag: str) -> bool:
@@ -75,13 +92,15 @@ class CommandLine(BaseModel):
         drop: Sequence[str] = (),
         replace: Mapping[str, str] | None = None,
         add_root: Sequence[str] = (),
+        drop_root: Sequence[str] = (),
     ) -> str:
         """The same command, changed as asked, as one shell-quoted line.
 
         ``add`` appends flags the command does not already carry; ``drop``
         removes options by name, with their values; ``replace`` gives an option
         another value, where it stands or at the end. ``add_root`` adds a root
-        option such as ``--debug``, which only works before the command.
+        option such as ``--debug``, which only works before the command, and
+        ``drop_root`` removes one, such as ``--offline``.
         """
         changes = dict(replace or {})
         removed = set(drop)
@@ -97,10 +116,48 @@ class CommandLine(BaseModel):
         options.extend((flag, value) for flag, value in changes.items())
         present = {option[0] for option in options}
         options.extend((flag,) for flag in dict.fromkeys(add) if flag not in present)
-        root = list(self.root_options)
+        dropped_root = set(drop_root)
+        root = [option for option in self.root_options if option[0] not in dropped_root]
         present_root = {option[0] for option in root}
         root.extend((flag,) for flag in dict.fromkeys(add_root) if flag not in present_root)
         return self._render(_public(root), _public(options))
+
+    @property
+    def carried_root_options(self) -> tuple[Option, ...]:
+        """The root options another suggested command needs: all but the output ones."""
+        return tuple(option for option in self.root_options if option[0] not in OUTPUT_ROOT_OPTIONS)
+
+    def follow_up(self, *words: str) -> str:
+        """Another ``yonga`` command, ``words``, with this one's root options, shell-quoted.
+
+        ``follow_up("chat", artifact_id)`` after ``yonga --data-dir X prepare M``
+        is ``yonga --data-dir X chat ID``: the artifact is in X, and the plain
+        ``yonga chat ID`` would not find it.
+        """
+        root = [word for option in self.carried_root_options for word in option]
+        return shlex.join([self.program, *root, *words])
+
+    def carry_root(self, text: str, *, commands: Collection[str] | None = None) -> str:
+        """``text`` with this invocation's root options added to each ``yonga`` command in it.
+
+        A command is ``yonga`` followed by a command name -- one of ``commands``
+        when given -- where a command starts: at the start of the text, after
+        ``": "``, or after an opening quote or backtick, so prose such as
+        "yonga never installs" is left alone. A command that already starts
+        with an option (one this class printed whole) is left as it is too.
+        """
+        root = [word for option in self.carried_root_options for word in option]
+        if not root:
+            return text
+        prefix = shlex.join([self.program, *root])
+
+        def insert(match: re.Match[str]) -> str:
+            word = match.group("word")
+            if commands is not None and word not in commands:
+                return match.group(0)
+            return f"{prefix} {word}"
+
+        return _COMMAND_START.sub(insert, text)
 
     def _render(self, root: Sequence[Option], options: Sequence[Option]) -> str:
         """Join the parts in the order the parser expects them."""

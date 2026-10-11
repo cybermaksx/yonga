@@ -36,7 +36,7 @@ from pydantic import BaseModel
 from rich.console import Console, Group, RenderableType
 from rich.text import Text
 
-from yonga.domain.diagnostics import Diagnostic, Severity, fill_placeholders
+from yonga.domain.diagnostics import Diagnostic, Severity, fill_placeholders, with_rerun
 from yonga.util.redaction import redact_mapping, redact_text
 
 __all__ = [
@@ -46,6 +46,7 @@ __all__ = [
     "YongaConsole",
     "build_console",
     "diagnostic_lines",
+    "fallback_command",
     "human_bytes",
     "human_duration",
     "json_ready",
@@ -190,7 +191,7 @@ def json_ready(value: object) -> object:
     return str(value)
 
 
-def _fallback_command(item: Diagnostic) -> str | None:
+def fallback_command(item: Diagnostic) -> str | None:
     """Return the command the user should run next, when one can be derived."""
     explicit = item.context.get("fallback_command")
     if explicit:
@@ -219,7 +220,8 @@ def diagnostic_lines(
     the hint about the raw error prints: ``--debug`` is a root option, so
     appending it to the command is a usage error.
     """
-    item = fill_placeholders(item)
+    # A command the CLI did not fill in is never shown as its placeholder.
+    item = with_rerun(fill_placeholders(item), None)
     lines: list[str] = [item.title.strip() or item.code]
     message = item.message.strip()
     if message:
@@ -233,7 +235,7 @@ def diagnostic_lines(
     fallback_devices = [name for name in item.fallback_devices if name]
     if fallback_devices:
         lines.extend(("", f"Recommended fallback: {', '.join(fallback_devices)}"))
-    command = _fallback_command(item)
+    command = fallback_command(item)
     if command:
         if not fallback_devices:
             lines.append("")

@@ -9,6 +9,7 @@ repository reports ``qwen3_5`` but cannot be converted.
 from __future__ import annotations
 
 import io
+import re
 from dataclasses import dataclass, field
 from typing import Any, cast
 
@@ -241,6 +242,47 @@ def test_the_table_marks_hinted_identity_and_derivatives() -> None:
     assert "converts from nDimensional/Qwen3.5-9B-Uncensored-Safetensors" in flat
     assert "9.8M" in text
     assert "yonga inspect MODEL" in flat
+
+
+#: Real ``yonga search qwen3`` hits whose ids are long enough to break an 80-column table.
+LONG_HITS = [
+    ("Qwen/Qwen3-0.6B", 30_812_345, ["safetensors"]),
+    ("Qwen/Qwen3-VL-8B-Instruct", 9_812_345, ["safetensors"]),
+    ("unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF", 5_212_345, ["gguf"]),
+    ("lmstudio-community/Qwen3.8-27B-MLX-4bit", 4_112_345, ["safetensors", "mlx"]),
+    ("ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF", 3_312_345, ["gguf"]),
+]
+
+
+def render_at(renderable: object, width: int) -> str:
+    console = Console(file=io.StringIO(), width=width, force_terminal=False)
+    console.print(renderable)
+    return cast(io.StringIO, console.file).getvalue()
+
+
+@pytest.mark.parametrize("width", [60, 80, 100, 140])
+def test_repository_ids_stay_whole_and_counts_readable_at_any_width(width: int) -> None:
+    """At 80 columns ids wrapped mid-name and 30.8M came out as '30.' with no header."""
+    search, _ = service(
+        [
+            meta(repo_id, model_type="qwen3", downloads=downloads, tags=tags)
+            for repo_id, downloads, tags in LONG_HITS
+        ]
+    )
+    text = render_at(search_results(search.search("qwen3")), width)
+
+    lines = text.splitlines()
+    assert max(len(line) for line in lines) <= width
+    for repo_id, _, _ in LONG_HITS:
+        assert any(line.startswith(f"{repo_id} ") for line in lines), text
+    header = lines[0]
+    if "DL" in header.split():
+        for count in ("30.8M", "9.8M", "5.2M"):
+            assert count in text, text
+    else:
+        assert not any(re.search(r"\b\d+\.\s*$", line) for line in lines), text
+    if width >= 140:
+        assert "Format" in header and "DL" in header
 
 
 def test_a_device_filter_shows_only_that_column() -> None:

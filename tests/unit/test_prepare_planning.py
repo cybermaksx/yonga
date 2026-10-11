@@ -51,6 +51,7 @@ from yonga.domain.artifacts import (
 )
 from yonga.domain.diagnostics import (
     CancelledError,
+    DeviceUnsupportedError,
     ExitCode,
     ExportError,
     PreflightError,
@@ -1062,6 +1063,91 @@ def test_ready_artifact_is_reused_and_force_overrides_it(settings: Settings, hub
     assert forced.reused is False
     assert len(exporter.requests) == 2
     assert forced.artifact_dir == first.artifact_dir
+
+
+@dataclass
+class OnDiskRuntimeProbe(FakeRuntimeProbe):
+    """A runtime probe that, like OpenVINO, can only compile a file that exists."""
+
+    def compile(
+        self,
+        path: Path,
+        device: str,
+        properties: Mapping[str, str] | None = None,
+    ) -> ProbeResult:
+        """Refuse a path that names no file, as ``Core.compile_model`` does."""
+        assert path.is_file(), f"Could not open the file: {path}"
+        return super().compile(path, device, properties)
+
+
+def test_an_explicit_device_is_checked_before_a_reused_artifact_is_returned(
+    settings: Settings, hub: FakeHub
+) -> None:
+    """The CPU build of a profile answered ``--device gpu`` with "Device CPU", unprobed."""
+    runtime = OnDiskRuntimeProbe()
+    service = build_service(settings=settings, hub=hub, runtime=runtime)
+    first = run_prepare(service, service.plan(SAFETENSORS_REPO, device="cpu"), settings)
+    profile = first.manifest.export.profile
+    assert first.manifest.supported_devices == ["CPU"]
+    runtime.compiled.clear()
+
+    plan = service.plan(SAFETENSORS_REPO, device="gpu", profile_id=profile)
+    assert plan.reuse_existing_artifact == first.artifact_dir
+    assert plan.reuse_check_device == "GPU"
+    outcome = run_prepare(service, plan, settings)
+
+    assert outcome.reused is True
+    assert outcome.device == "GPU"
+    assert any(device == "GPU" for _, device in runtime.compiled)
+    assert any("checked on GPU" in note for note in outcome.notes)
+    recorded = ArtifactStore(settings.paths, settings).manifest_for(first.artifact_dir)
+    assert recorded is not None
+    assert recorded.supported_devices == ["CPU", "GPU"]
+    # Recorded the way the preparation's own probes are: relative to the artifact.
+    gpu_paths = [result.path for result in recorded.device_probes["GPU"].submodels if result.path]
+    assert gpu_paths and not any(path.is_absolute() for path in gpu_paths)
+
+    # Once recorded, the same request reuses it without probing again.
+    runtime.compiled.clear()
+    again = service.plan(SAFETENSORS_REPO, device="gpu", profile_id=profile)
+    assert again.reuse_check_device is None
+    assert run_prepare(service, again, settings).device == "GPU"
+    assert runtime.compiled == []
+
+
+def test_a_reused_artifact_that_fails_on_the_explicit_device_does_not_fall_back(
+    settings: Settings, hub: FakeHub
+) -> None:
+    runtime = FakeRuntimeProbe()
+    service = build_service(settings=settings, hub=hub, runtime=runtime)
+    first = run_prepare(service, service.plan(SAFETENSORS_REPO, device="cpu"), settings)
+    runtime.compile_failures["GPU"] = "Exception from src/plugins/intel_gpu: out of resources"
+
+    plan = service.plan(SAFETENSORS_REPO, device="gpu", profile_id=first.manifest.export.profile)
+    with pytest.raises(DeviceUnsupportedError) as caught:
+        run_prepare(service, plan, settings)
+
+    assert "will not silently prepare for another device" in caught.value.diagnostic.message
+    recorded = ArtifactStore(settings.paths, settings).manifest_for(first.artifact_dir)
+    assert recorded is not None
+    assert recorded.supported_devices == ["CPU"], "the CPU artifact is still ready and intact"
+    assert recorded.device_probes["GPU"].ok is False
+
+
+def test_an_explicit_device_already_probed_is_reused_and_reported_as_asked(
+    settings: Settings, hub: FakeHub
+) -> None:
+    runtime = FakeRuntimeProbe()
+    service = build_service(settings=settings, hub=hub, runtime=runtime)
+    run_prepare(service, service.plan(SAFETENSORS_REPO, device="cpu"), settings)
+    runtime.compiled.clear()
+
+    plan = service.plan(SAFETENSORS_REPO, device="cpu")
+    assert plan.reuse_check_device is None
+    outcome = run_prepare(service, plan, settings)
+
+    assert (outcome.reused, outcome.device) == (True, "CPU")
+    assert runtime.compiled == []
 
 
 def test_artifact_directory_layout_matches_architecture_spec(

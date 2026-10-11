@@ -24,6 +24,7 @@ from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 
+from yonga.config.paths import STAGING_DIRNAME, STAGING_MODEL_DIRNAME
 from yonga.domain.artifacts import ArtifactSummary, DeviceProbeReport, ProbeResult, ProbeStatus
 from yonga.domain.benchmarks import BenchmarkResult
 from yonga.domain.compatibility import (
@@ -481,12 +482,17 @@ def preparation_plan(plan: PreparationPlan) -> RenderableType:
     if plan.reuses_artifact:
         # Nothing is fetched, converted or written: download, temp space and
         # export environment would all describe work that does not happen.
+        reuse_note = "  ready at this revision and profile; --force to prepare again"
+        if plan.reuse_check_device is not None:
+            # Reuse is keyed by revision and profile, not device: say that the
+            # explicit device is checked before the artifact is handed back.
+            reuse_note = (
+                f"  ready at this revision and profile, not yet probed on "
+                f"{plan.reuse_check_device}: checked there before reuse; --force to prepare again"
+            )
         body.add_row(
             Text("Reusing artifact"),
-            Text.assemble(
-                (str(plan.reuse_existing_artifact), "bold"),
-                ("  ready at this revision and profile; --force to prepare again", "dim"),
-            ),
+            Text.assemble((str(plan.reuse_existing_artifact), "bold"), (reuse_note, "dim")),
         )
     else:
         _work_rows(body, plan)
@@ -1016,17 +1022,49 @@ def _release(version: str | None) -> str | None:
     return version.split("-", 1)[0].strip() or version
 
 
+def _staging_job(path: Path | None) -> str | None:
+    """The job whose staging directory ``path`` is (``.staging/<job>/model``), if it is one."""
+    if (
+        path is None
+        or path.name != STAGING_MODEL_DIRNAME
+        or path.parent.parent.name != STAGING_DIRNAME
+    ):
+        return None
+    return path.parent.name or None
+
+
+def _owner_directory_label(path: Path | None) -> str | None:
+    """How an owner known only by its directory is named in the Owner column.
+
+    A ``prepare`` smoke test compiles in the job's staging directory, whose
+    last component is always ``model``: as a label it said nothing. It is named
+    after its job instead, by the prefix ``yonga logs`` accepts.
+    """
+    if path is None:
+        return None
+    job = _staging_job(path)
+    if job is not None:
+        return f"staging (job {job[:_JOB_ID_PREFIX]})"
+    return path.name
+
+
 def _cache_owner(entry: CompileCacheEntry, *, width: int | None = None) -> Text:
     """The owning artifact; ``*`` marks one that lives outside the artifact store.
 
-    An artifact id is always shown whole. An owner known only by its directory
-    name (a copy outside the store, a staging directory) may be cut to
-    ``width`` cells when the terminal is narrow.
+    An artifact id, and a staging directory's job, are always shown whole.
+    An owner known only by its directory name (a copy outside the store) may
+    be cut to ``width`` cells when the terminal is narrow.
     """
-    label = entry.artifact_id or (entry.artifact_path.name if entry.artifact_path else None)
+    label = entry.artifact_id or _owner_directory_label(entry.artifact_path)
     if label is None:
         return Text(_DASH, style="dim")
-    if width is not None and entry.artifact_id is None and Text(label).cell_len > width:
+    staging = _staging_job(entry.artifact_path) is not None
+    if (
+        width is not None
+        and entry.artifact_id is None
+        and not staging
+        and Text(label).cell_len > width
+    ):
         label = label[: max(width - 1, 0)] + "…"
     owner = Text(label, style="" if entry.owner_exists else "dim")
     if entry.owner_exists and not entry.owner_in_store:
@@ -1114,7 +1152,11 @@ class _CacheTable:
         # The ``*`` marker is not part of the label, so the cut that fits is
         # found by measuring rather than by subtraction alone.
         widest = max(_cache_owner(entry).cell_len for entry in self._entries)
-        ids = [len(entry.artifact_id) for entry in self._entries if entry.artifact_id]
+        ids = [
+            _cache_owner(entry).cell_len
+            for entry in self._entries
+            if entry.artifact_id or _staging_job(entry.artifact_path) is not None
+        ]
         floor = max([_CACHE_OWNER_MIN_WIDTH, *ids])
         for width in range(widest - excess, floor - 1, -1):
             candidate = self._table(frozenset(dropped), owner_width=width)
@@ -1159,6 +1201,105 @@ def compile_cache_entries(
 # ----------------------------------------------------------------------
 # search
 # ----------------------------------------------------------------------
+#: Optional ``yonga search`` columns, in the order they are given up when the
+#: terminal is too narrow. The formats go first (``inspect`` lists them), then
+#: the download count, then the architecture. The repository id and the device
+#: verdicts always stay, and a repository id is never wrapped or cut: it is
+#: what the user copies into ``inspect`` or ``prepare``.
+_SEARCH_DROP_ORDER: tuple[str, ...] = ("Format", "DL", "Arch")
+
+
+class _SearchTable:
+    """The ``yonga search`` hits, laid out for the terminal they are printed on.
+
+    Rich squeezed every column of a too-wide table alike: at 80 columns the
+    download counts lost their header and their unit (``30.``) and repository
+    ids wrapped mid-name. Like ``yonga list``, whole columns are dropped instead,
+    in a fixed order, until the rest fit at their natural width; only on a
+    terminal too narrow for the repository ids alone do they fold.
+    """
+
+    def __init__(self, report: SearchReport, devices: Sequence[str]) -> None:
+        """Render every cell once; the layout is chosen at render time."""
+        self._devices = tuple(devices)
+        self._rows: list[dict[str, Text]] = []
+        self.hinted = False
+        self.derivatives: list[str] = []
+        for hit in report.hits:
+            arch = Text(hit.architecture or _DASH, style="" if hit.architecture else "dim")
+            if hit.identified_from:
+                arch.append("*", style="yellow")
+                self.hinted = True
+            row = {"Model": Text(hit.repo_id), "Arch": arch}
+            for name in self._devices:
+                entry = hit.compatibility_for(name)
+                if entry is None or entry.status is DeviceStatus.UNKNOWN:
+                    row[name] = Text("?", style="dim")
+                    continue
+                severity = _DEVICE_STATUS_SEVERITY[entry.status]
+                row[name] = Text(status_icon(severity), style=status_style(severity))
+            formats = Text(",".join(hit.formats) or _DASH, style="" if hit.formats else "dim")
+            if hit.derivative:
+                formats.append("+", style="cyan")
+                self.derivatives.append(
+                    f"+ {hit.repo_id} converts from {hit.derivative} (needs approval)"
+                )
+            row["Format"] = formats
+            row["DL"] = Text(_compact_count(hit.downloads))
+            self._rows.append(row)
+
+    def _table(
+        self, dropped: frozenset[str], *, compact: bool = False, fold: bool = False
+    ) -> Table:
+        # Compact: one space between columns instead of two, the last thing
+        # given up before a repository id would have to fold.
+        table = Table(
+            box=SIMPLE, show_edge=False, pad_edge=False, padding=(0, 1, 0, 0) if compact else (0, 1)
+        )
+        headers = ["Model", "Arch", *self._devices, "Format", "DL"]
+        shown = [header for header in headers if header not in dropped]
+        for header in shown:
+            folds = fold and header == "Model"
+            table.add_column(
+                header,
+                no_wrap=not folds,
+                overflow="fold" if folds else "ellipsis",
+                justify="center"
+                if header in self._devices
+                else ("right" if header == "DL" else "left"),
+            )
+        for row in self._rows:
+            table.add_row(*(row[header] for header in shown))
+        return table
+
+    def layout_for(self, console: Console, options: ConsoleOptions) -> tuple[frozenset[str], Table]:
+        """Return the widest layout whose natural width fits ``options``, and what it drops."""
+        dropped: set[str] = set()
+        for header in (None, *_SEARCH_DROP_ORDER):
+            if header is not None:
+                dropped.add(header)
+            candidate = self._table(frozenset(dropped))
+            if _natural_width(console, options, candidate) <= options.max_width:
+                return frozenset(dropped), candidate
+        candidate = self._table(frozenset(dropped), compact=True)
+        if _natural_width(console, options, candidate) <= options.max_width:
+            return frozenset(dropped), candidate
+        return frozenset(dropped), self._table(frozenset(dropped), compact=True, fold=True)
+
+    def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
+        """Render the chosen layout and the footnotes its markers need."""
+        dropped, table = self.layout_for(console, options)
+        yield table
+        if self.hinted and "Arch" not in dropped:
+            yield Text("* architecture identified from GGUF metadata; no config.json.", style="dim")
+        for line in self.derivatives:
+            yield Text(line, style="dim")
+
+    def __rich_measure__(self, console: Console, options: ConsoleOptions) -> Measurement:
+        """Measure the layout that would be chosen for ``options``."""
+        return Measurement.get(console, options, self.layout_for(console, options)[1])
+
+
 def search_results(report: SearchReport, *, device: str | None = None) -> RenderableType:
     """Render ``yonga search`` (``docs/CLI_SPEC.md`` section 5).
 
@@ -1166,51 +1307,18 @@ def search_results(report: SearchReport, *, device: str | None = None) -> Render
     identified from a GGUF header is marked ``*`` and footnoted, the same
     disclosure ``inspect`` makes, because every device claim on that row rests
     on the identification. A declared derivative is marked ``+`` and named in a
-    footnote, so long repository ids keep the width they need.
+    footnote, so long repository ids keep the width they need. A narrow
+    terminal gives up whole columns (:data:`_SEARCH_DROP_ORDER`), never part of
+    a repository id or a download count.
     """
     if not report.hits:
         return Text(f"No models on the Hub match {report.query!r}.", style="dim")
     devices = [device.upper()] if device and device.lower() != "auto" else ["CPU", "GPU", "NPU"]
-    table = Table(box=SIMPLE, show_edge=False, pad_edge=False)
-    table.add_column("Model", overflow="fold", min_width=24)
-    table.add_column("Arch", no_wrap=True)
-    for name in devices:
-        table.add_column(name, no_wrap=True, justify="center")
-    table.add_column("Format", no_wrap=True)
-    table.add_column("DL", no_wrap=True, justify="right")
-    hinted = False
-    derivatives: list[str] = []
-    for hit in report.hits:
-        arch = Text(hit.architecture or _DASH, style="" if hit.architecture else "dim")
-        if hit.identified_from:
-            arch.append("*", style="yellow")
-            hinted = True
-        cells: list[RenderableType] = [Text(hit.repo_id), arch]
-        for name in devices:
-            entry = hit.compatibility_for(name)
-            if entry is None or entry.status is DeviceStatus.UNKNOWN:
-                cells.append(Text("?", style="dim"))
-                continue
-            severity = _DEVICE_STATUS_SEVERITY[entry.status]
-            cells.append(Text(status_icon(severity), style=status_style(severity)))
-        formats = Text(",".join(hit.formats) or _DASH, style="" if hit.formats else "dim")
-        if hit.derivative:
-            formats.append("+", style="cyan")
-            derivatives.append(f"+ {hit.repo_id} converts from {hit.derivative} (needs approval)")
-        cells.append(formats)
-        cells.append(Text(_compact_count(hit.downloads)))
-        table.add_row(*cells)
-    footer: list[RenderableType] = []
-    if hinted:
-        footer.append(
-            Text("* architecture identified from GGUF metadata; no config.json.", style="dim")
-        )
-    footer.extend(Text(line, style="dim") for line in derivatives)
-    footer.append(
+    footer: list[RenderableType] = [
         Text("✓ supported   ✗ unsupported   ! experimental   ? no registry claim", style="dim")
-    )
+    ]
     footer.extend(Text(note, style="dim") for note in report.notes)
-    return Group(table, *footer)
+    return Group(_SearchTable(report, devices), *footer)
 
 
 def _compact_count(value: int | None) -> str:
@@ -1511,7 +1619,7 @@ class _ProfileTable:
     The profile id, the device and the priority never wrap and are never cut
     short; the summary is the column that wraps. When that would leave it
     fewer than :data:`_PROFILE_SUMMARY_MIN_WIDTH` cells, the weights column,
-    which the id repeats, makes room for it.
+    which the id repeats, makes room for it, and then the size band.
     """
 
     def __init__(self, rows: Sequence[Mapping[str, object]]) -> None:
@@ -1559,7 +1667,9 @@ class _ProfileTable:
             (row["summary"].cell_len for row in self._rows), default=_PROFILE_SUMMARY_MIN_WIDTH
         )
         wanted = min(summary, _PROFILE_SUMMARY_MIN_WIDTH)
-        for dropped in ((), ("weights",)):
+        # The size band goes after the weights: a summary squeezed below the
+        # minimum breaks its words in the middle ("Uncompresse" / "d").
+        for dropped in ((), ("weights",), ("weights", "band")):
             shown = [key for key in keys if key not in dropped]
             others = _natural_width(console, options, self._table(shown[:-1]))
             # Two cells separate the summary from the column before it.

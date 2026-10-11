@@ -105,7 +105,7 @@ set. The Exit column is the category's code, which is what `probe`, `chat` and `
 | `export.transformers.out_of_range` | `exporter-transformers-version-range` | `package_abi_mismatch` | 10 | optimum-intel's export config for this architecture declares a Transformers range the installed release is outside. `prepare` normally reads that range first and builds a managed environment; you see this only when that was turned off. | Drop `--no-managed-env`, or install a release in the range the message names. |
 | `export.optimum.normalized_config` | `optimum-normalized-config-allow-new` | `package_abi_mismatch` | 10 | optimum failed building the export configuration (`got multiple values for argument 'allow_new'`), before conversion began. An exporter defect on Python 3.14, seen for phi3 and mistral. For the model types the rule lists (phi3, mistral, mixtral, gpt2, bloom and others), `prepare` refuses before the download when the export would run on Python 3.14 with optimum 2.3.0 or older, in a managed environment or in yonga's own; `--ignore-exporter-requirements` overrides that for an optimum already patched. | Run yonga on Python 3.11-3.13. The AppImage bundles 3.14, so that means a pip install into a virtual environment on an older Python (`docs/INSTALL.md` section 2). |
 | `export.transformers.symbol_missing` | `exporter-transformers-symbol-mismatch` | `package_abi_mismatch` | 10 | Generic form of the above: `optimum/exporters/openvino/model_patcher.py` looked for something the installed Transformers does not provide, for any architecture. | Install the Transformers release the architecture requires; the failing import is in `yonga logs JOB_ID --raw`. |
-| `export.torchvision.build_mismatch` | `torchvision-torch-build-mismatch` | `package_abi_mismatch` | 10 | `operator torchvision::nms does not exist`: torchvision and torch come from different builds (PyPI's torchvision next to a CPU torch), so nothing that imports torchvision loads and no model converts. `prepare` finds this before the download (section 5.7). | `pip uninstall -y torchvision && pip install torchvision --index-url https://download.pytorch.org/whl/cpu` |
+| `export.torchvision.build_mismatch` | `torchvision-torch-build-mismatch` | `package_abi_mismatch` | 10 | `operator torchvision::nms does not exist`: torchvision and torch come from different builds (PyPI's torchvision next to a CPU torch), so nothing that imports torchvision loads and no model converts. `prepare` finds this before the download (section 5.7). | `pip uninstall -y torchvision && pip install torchvision --index-url https://download.pytorch.org/whl/cpu`, then `yonga doctor --full` to check the import. |
 
 The last two are a backstop, not the usual path. When the registry declares the architecture's
 Transformers pin, `prepare` exports in a managed environment that satisfies it, or with
@@ -518,8 +518,10 @@ pip uninstall -y torchvision
 pip install torchvision --index-url https://download.pytorch.org/whl/cpu
 ```
 
-`pip list` then shows the same `+cpu` suffix on `torch` and `torchvision`, and
-`python -c "import optimum.exporters.openvino"` imports cleanly.
+`pip list` then shows the same `+cpu` suffix on `torch` and `torchvision`, and `yonga doctor --full`
+reports `exporter import` as `imports`. Check it with yonga rather than with a plain
+`python -c "import ..."`: yonga imports the exporter with OpenVINO's usage reporting switched off
+(section 8), and a plain interpreter reports the import.
 
 ### 5.8 A GGUF repository cannot be imported
 
@@ -712,8 +714,9 @@ API in `~/intel/stats` and, without a consent file in `~/intel`, reports it to G
 through the `openvino_telemetry` package. yonga keeps that package from loading in every Python
 process it starts, including `optimum-cli` in a managed export environment, so nothing is sent and
 the file is not touched; it does not write the opt-out file into your home directory either. A
-count that still grows comes from another program that imports OpenVINO, such as a plain
-`python -c "import openvino"`.
+count that still grows comes from another program that imports OpenVINO, such as a plain Python
+session that runs `import openvino`. That is why yonga's advice never asks you to check an import
+that way: `yonga doctor --full` checks the exporter's import with the reporting switched off.
 
 ## 9. When nothing matches
 

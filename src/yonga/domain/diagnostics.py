@@ -9,7 +9,7 @@ single source of truth for ``docs/CLI_SPEC.md`` section 15.
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from enum import Enum, IntEnum
 from pathlib import Path
 from types import MappingProxyType
@@ -271,6 +271,60 @@ def fill_placeholders(item: Diagnostic) -> Diagnostic:
         steps.append(filled)
         if key is not None:
             commands.add(key)
+    if steps == item.remediation:
+        return item
+    return item.model_copy(update={"remediation": steps})
+
+
+#: Where a remediation step repeats the user's own command: "Then run it again:
+#: RERUN_COMMAND". Only the CLI knows that command, so a service writes this and
+#: :func:`with_rerun` puts the command in, or the step ends without one.
+RERUN_PLACEHOLDER = "RERUN_COMMAND"
+
+#: The same, for the user's command with ``--offline`` taken out: the advice
+#: after a failure that only the network can fix.
+ONLINE_RERUN_PLACEHOLDER = "RERUN_ONLINE_COMMAND"
+
+
+def _placeholder(name: str) -> re.Pattern[str]:
+    return re.compile(rf"(?<![\w-]){name}(?![\w-])")
+
+
+def _placeholder_tail(name: str) -> re.Pattern[str]:
+    return re.compile(rf":?\s*(?<![\w-]){name}(?![\w-])\.?\s*$")
+
+
+_RERUN_PLACEHOLDERS = {
+    name: (_placeholder(name), _placeholder_tail(name))
+    for name in (RERUN_PLACEHOLDER, ONLINE_RERUN_PLACEHOLDER)
+}
+
+
+def _literal(text: str) -> Callable[[re.Match[str]], str]:
+    """A :func:`re.sub` replacement that inserts ``text`` as it stands."""
+    return lambda _match: text
+
+
+def with_rerun(item: Diagnostic, command: str | None, *, online: str | None = None) -> Diagnostic:
+    """Put the command the user ran into each step that asks to repeat it.
+
+    ``command`` is that command, ready to paste, from the CLI, and ``online``
+    the same command without ``--offline``. With ``None`` (no command line is
+    known) the step ends after its own words, "Then run the same command
+    again.", rather than show the placeholder or a command rebuilt from the
+    reference alone -- which dropped required options such as ``eval
+    --reference`` and could put the reference where the candidate goes.
+    """
+    values = {RERUN_PLACEHOLDER: command, ONLINE_RERUN_PLACEHOLDER: online}
+    steps: list[str] = []
+    for step in item.remediation:
+        for name, (anywhere, tail) in _RERUN_PLACEHOLDERS.items():
+            if not anywhere.search(step):
+                continue
+            value = values[name]
+            # A function, so a backslash in the command is not read as a group.
+            step = anywhere.sub(_literal(value), step) if value else tail.sub(".", step)
+        steps.append(step)
     if steps == item.remediation:
         return item
     return item.model_copy(update={"remediation": steps})

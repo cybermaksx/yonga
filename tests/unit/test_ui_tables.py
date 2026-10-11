@@ -798,6 +798,11 @@ def test_registry_profiles_never_wraps_or_cuts_a_profile_id(width: int) -> None:
         assert "int4 asym g128 ratio 0.8" in text
     if width >= 200:
         assert "the CPU default below 5B parameters" in text
+    # The summary wraps between words, never inside one ("Uncompresse" / "d"):
+    # the size band is given up before the summary gets that narrow.
+    for row in profile_rows():
+        for word in str(row["summary"]).split():
+            assert word in text, (word, text)
 
 
 # ----------------------------------------------------------------------

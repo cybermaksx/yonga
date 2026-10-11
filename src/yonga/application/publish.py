@@ -41,6 +41,7 @@ from yonga.domain.artifacts import (
     ProbeStatus,
 )
 from yonga.domain.diagnostics import (
+    ONLINE_RERUN_PLACEHOLDER,
     ConfigurationError,
     FailureCategory,
     YongaError,
@@ -132,7 +133,7 @@ class PublishService:
                 "publish.offline",
                 "Publishing needs the network",
                 "yonga is in offline mode, and a publication is an upload.",
-                "Drop --offline (or YONGA_OFFLINE) to publish.",
+                f"Drop --offline (or YONGA_OFFLINE) to publish: {ONLINE_RERUN_PLACEHOLDER}",
             )
         artifact_dir, manifest = self._ready_artifact(reference)
         warnings: list[str] = []

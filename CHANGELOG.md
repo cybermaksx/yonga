@@ -80,7 +80,9 @@ manifest may change in any minor release.
 - An explicit `--profile` whose group size cannot divide the model's `config.json` channel widths
   is refused at the plan, before any download (exit 70, `export.quantization.group_size_mismatch`).
   The message names the profiles that fit, as your command with `--profile` changed, and never
-  swaps the profile itself.
+  swaps the profile itself. When no profile for that device fits (SmolLM2-360M with
+  `--device gpu --profile gpu-int4-asym-g128-r08`), it offers the fitting profiles of the other
+  devices, as your command with `--device` and `--profile` changed.
 - The `context_length_exceeded` message no longer repeats "The prompt". It names the offered tools
   and images when they count toward the limit, and says what to do: shorten the conversation, offer
   fewer tools or send fewer images, or use a GPU or CPU artifact, whose prompt length is not fixed.
@@ -161,7 +163,7 @@ manifest may change in any minor release.
   before the answer, and only the answer is kept in the conversation. `/reasoning on` advises
   restarting with `--show-reasoning` instead of the nonexistent `--thinking` option.
 - An unknown or removed artifact id no longer suggests running `yonga prepare` on that id; it
-  points to `yonga list`.
+  points to `yonga list`. No step prints a literal `yonga prepare OWNER/NAME` placeholder.
 - `yonga probe` without the OpenVINO runtime stops up front with `runtime.openvino.missing` and
   exit 10 (`pip install 'yonga[openvino]'`), as `bench` does, instead of an "Unrecognised failure"
   and exit 51.
@@ -277,6 +279,8 @@ manifest may change in any minor release.
   literal placeholder; they open no job, and `--debug` still shows the raw error.
 - `probe`, `bench`, `eval` and `publish` explain an unknown reference as `chat` does: a model id
   that is not prepared gets its `yonga prepare` command, and anything else points at `yonga list`.
+  The "run it again" step prints your whole command; rebuilt from the reference it dropped
+  `eval --reference` and `publish --repo`, and put an unknown reference in the candidate's place.
 - `chat` no longer draws an empty reply panel for an answer such as `361.` that Markdown reads as an
   empty numbered list.
 - `bench` prints where it saved the result once.
@@ -306,12 +310,32 @@ manifest may change in any minor release.
   nncf's bound and left `pip check` failing.
 - `yonga registry profiles` no longer breaks profile ids across lines in non-TTY or 80-column
   output. The summary wraps instead, and on a narrow terminal the weights column (which the id
-  spells out) gives way.
+  spells out) and then the size band give way, so the summary is not broken mid-word.
 - `yonga cache list` and `cache prune` plans no longer squeeze cache keys beside a long
   directory-name owner or the Why column: optional columns are dropped first, then the owner is cut
-  or dropped. The logs index shortens a repository id from its organisation.
+  or dropped. The logs index shortens a repository id from its organisation. An owner that is a
+  `prepare` job's staging directory reads `staging (job PREFIX)` instead of `model`.
 - Paths on `Saved:` (`bench`, `eval`), `env list`, `cache list` and `logs` lines are no longer
-  folded mid-path on narrow terminals, so they can be copied whole.
+  folded mid-path on narrow terminals, so they can be copied whole. A long `env list` pin line
+  wraps under its indent instead of at column 0.
+- `yonga search` keeps repository ids whole and download counts readable at 80 columns and in
+  piped output (it printed `30.` for 30.8M with no header, and wrapped ids mid-name): the format,
+  download and architecture columns are dropped, in that order, when the terminal is narrow.
+- Next-step hints and remediation commands repeat the root options you gave (`--data-dir`,
+  `--cache-dir`, `--config`, `--offline`): after `prepare --data-dir X`, "Chat with it: yonga chat
+  ID" looked in the default store and failed with exit 70. The same holds for `yonga list`, `cache
+  prune`, `logs` and registry steps.
+- Offline advice ("Not available offline", "Search needs the network", the export environment and
+  `publish`) prints your command without `--offline` instead of only naming `YONGA_OFFLINE` and
+  `HF_HUB_OFFLINE`.
+- A cancelled conversion's advice prints your command, like other re-run advice, and the cancelled
+  job's state records the profile and device its plan chose instead of `profile_id: null`.
+- `prepare --device D` reusing an artifact of the same revision and profile that was prepared on
+  another device probes it on D first (the compile and smoke test of a fresh preparation, recorded
+  in the manifest) and reports D; a failure stops the job without a fallback. It used to return the
+  CPU artifact as "Device CPU" without probing the requested GPU.
+- `docs/REGISTRY_SPEC.md` no longer says `prepare --json` carries an `export_blocked` key: the
+  refusal is the usual failure document, with the rule's diagnostic under `diagnostic`.
 
 ### Security
 
@@ -319,6 +343,11 @@ manifest may change in any minor release.
   to Google Analytics and counted it in `~/intel/stats`. yonga keeps it from loading in every Python
   process it runs, including `optimum-cli` in managed export environments, without writing to
   `~/intel`.
+- **yonga's advice no longer asks for a raw vendor import.** The `export.torchvision.build_mismatch`
+  remedy, and the advice for an exporter import no rule recognises (`prepare` and `doctor`), check
+  the import with `yonga doctor --full`, which imports with that reporting off, instead of a plain
+  `python -c "import optimum.exporters.openvino"`, which reported to Google Analytics and counted in
+  `~/intel/stats`. The registry and the user guides no longer advise such a command.
 
 ## [0.4.0] - 2026-10-09
 

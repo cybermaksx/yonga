@@ -78,3 +78,46 @@ def test_only_names_that_end_in_a_credential_word_are_secret() -> None:
     assert not is_secret_option("--max-new-tokens")
     assert not is_secret_option("--top-k")
     assert not is_secret_option("--license-reviewed")
+
+
+def test_a_root_option_can_be_dropped() -> None:
+    assert TYPED.rerun(drop_root=("--offline",)) == TYPED_TEXT.replace(" --offline", "")
+
+
+def test_a_follow_up_command_keeps_the_root_options_that_say_where_and_how() -> None:
+    """``yonga chat ID`` after ``prepare --data-dir X`` looked in the default store."""
+    noisy = TYPED.model_copy(
+        update={"root_options": (*TYPED.root_options, ("--json",), ("--debug",), ("-v",))}
+    )
+    assert noisy.follow_up("chat", "d8a6bf6fea1b4356") == (
+        "yonga --data-dir '/srv/my models' --offline chat d8a6bf6fea1b4356"
+    )
+    assert CommandLine(command=("prepare",)).follow_up("list") == "yonga list"
+
+
+COMMANDS = frozenset({"chat", "list", "doctor", "prepare", "cache"})
+
+
+def test_root_options_are_carried_into_the_commands_advice_names() -> None:
+    carried = "yonga --data-dir '/srv/my models' --offline"
+    assert TYPED.carry_root("See what is already prepared: yonga list", commands=COMMANDS) == (
+        f"See what is already prepared: {carried} list"
+    )
+    assert TYPED.carry_root("Run 'yonga doctor' to check.", commands=COMMANDS) == (
+        f"Run '{carried} doctor' to check."
+    )
+    assert TYPED.carry_root("yonga cache prune --all", commands=COMMANDS) == (
+        f"{carried} cache prune --all"
+    )
+
+
+def test_prose_and_whole_commands_are_left_alone() -> None:
+    for text in (
+        "yonga never installs packages; that choice stays yours.",
+        "yonga does not change your environment for you.",
+        "an artifact deleted with yonga remove no longer has one",
+        f"Re-run with --yes: {TYPED_TEXT} --yes",
+    ):
+        assert TYPED.carry_root(text, commands=COMMANDS) == text
+    bare = CommandLine(command=("chat",), arguments=("x",))
+    assert bare.carry_root("Then: yonga list", commands=COMMANDS) == "Then: yonga list"

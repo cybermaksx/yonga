@@ -28,6 +28,7 @@ re-imports ``__main__`` cannot re-execute the CLI.
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import sys
@@ -39,6 +40,7 @@ from pathlib import Path
 from typing import Any
 
 import typer
+from rich.padding import Padding
 from rich.text import Text
 from typer.core import TyperGroup
 
@@ -80,6 +82,7 @@ from yonga.domain.diagnostics import (
     YongaError,
     diagnostic,
     fill_placeholders,
+    with_rerun,
     without_job,
 )
 from yonga.domain.hardware import normalise_device
@@ -90,7 +93,7 @@ from yonga.registry.resolver import installed_registry_versions
 from yonga.repairs import known_implementations
 from yonga.ui import tables
 from yonga.ui.chat_tui import ChatCommandKind, ChatSessionInfo, ChatView, parse_command
-from yonga.ui.console import YongaConsole, human_bytes
+from yonga.ui.console import YongaConsole, fallback_command, human_bytes
 from yonga.ui.progress import RichProgressSink
 from yonga.util.redaction import redact_text
 
@@ -187,6 +190,40 @@ class CliState:
         """The command the user ran, with ``flags`` added, ready to paste."""
         return self.command_line.rerun(add=flags)
 
+    def follow_up(self, *words: str) -> str:
+        """Another ``yonga`` command to run next, with the root options the user gave."""
+        return self.command_line.follow_up(*words)
+
+    def hint(self, text: str) -> str:
+        """``text`` with the user's root options added to each ``yonga`` command it names.
+
+        A next step after ``yonga --data-dir X ...`` must look in X too: the
+        bare ``yonga chat ID`` it used to print failed with "No prepared
+        artifact has that id".
+        """
+        return self.command_line.carry_root(text, commands=command_names())
+
+    def with_root_options(self, item: Diagnostic) -> Diagnostic:
+        """``item`` with the user's command where it asks for it, and root options everywhere.
+
+        A step that repeats the command gets it whole (:func:`with_rerun`); every
+        other ``yonga`` command a step names gets the root options the user gave.
+        """
+        typed = self.command_line
+        item = with_rerun(
+            item,
+            typed.rerun() if typed.command else None,
+            online=typed.rerun(drop_root=("--offline",)) if typed.command else None,
+        )
+        steps = [self.hint(step) for step in item.remediation]
+        context = dict(item.context)
+        fallback = fallback_command(item)
+        if fallback:
+            context["fallback_command"] = self.hint(fallback)
+        if steps == item.remediation and context == item.context:
+            return item
+        return item.model_copy(update={"remediation": steps, "context": context})
+
     def report(self, item: Diagnostic, *, exit_code: ExitCode) -> ExitCode:
         """Render one diagnostic the way the current output mode requires."""
         # The job id is often only known here, so placeholders are filled last.
@@ -197,6 +234,7 @@ class CliState:
         enriched = fill_placeholders(self.attach_job(item))
         if self.job is None and enriched.matched_rule_id is not None:
             enriched = without_job(enriched)
+        enriched = self.with_root_options(enriched)
         self.console.diagnostic(
             enriched, debug_command=self.command_line.rerun(add_root=("--debug",))
         )
@@ -251,6 +289,18 @@ def cli_state(ctx: typer.Context, *, json_output: bool = False) -> CliState:
         state.enable_json()
     state.command_line = command_line(ctx)
     return state
+
+
+@functools.cache
+def command_names() -> frozenset[str]:
+    """The top-level command names, so advice is told apart from prose about yonga."""
+    names = {
+        command.name or (command.callback.__name__.replace("_", "-") if command.callback else "")
+        for command in app.registered_commands
+    }
+    names.update(group.name for group in app.registered_groups if group.name)
+    names.discard("")
+    return frozenset(names)
 
 
 def command_line(ctx: typer.Context) -> CommandLine:
@@ -1026,11 +1076,15 @@ def _prepare(
         if outcome.reused:
             console.print("  Reused    an existing artifact at this revision and profile")
         for note in outcome.notes:
-            console.print(f"  note: {note}", style="dim")
+            console.print(f"  note: {state.hint(note)}", style="dim")
         for warning in warnings:
-            console.print_error(f"  warning: {warning}", style="yellow")
+            console.print_error(f"  warning: {state.hint(warning)}", style="yellow")
         console.print("")
-        console.print(f"Chat with it: yonga chat {outcome.manifest.artifact_id}")
+        # One line, however long the root options make it: a command broken
+        # across lines does not paste back as one.
+        console.print(
+            f"Chat with it: {state.follow_up('chat', outcome.manifest.artifact_id)}", soft_wrap=True
+        )
     return ExitCode.WARNINGS if warnings else ExitCode.SUCCESS
 
 
@@ -1080,7 +1134,8 @@ def _stale_note(state: CliState, sweep: WorkspaceSweep | None, *, clean: bool) -
         return
     state.console.print(
         f"{human_bytes(sweep.freed_bytes)} in {sweep.removed_count} {directories} can be "
-        "reclaimed: yonga list --clean"
+        f"reclaimed: {state.follow_up('list', '--clean')}",
+        soft_wrap=True,
     )
 
 
@@ -1108,7 +1163,7 @@ def _list(state: CliState, *, clean: bool = False) -> ExitCode:
         return ExitCode.SUCCESS
     if not summaries:
         state.console.print("No prepared artifacts yet.")
-        state.console.print("Prepare one with: yonga prepare MODEL")
+        state.console.print(state.hint("Prepare one with: yonga prepare MODEL"), soft_wrap=True)
     else:
         state.console.print(tables.artifact_list(summaries))
     _stale_note(state, sweep, clean=clean)
@@ -1295,7 +1350,7 @@ def _probe(
         # failure first, an inconclusive device only when nothing failed.
         for report in _probe_verdict_order(outcome):
             if report.diagnostic is not None:
-                state.console.diagnostic(report.diagnostic)
+                state.console.diagnostic(state.with_root_options(report.diagnostic))
                 break
     return _probe_exit(outcome)
 
@@ -1919,7 +1974,7 @@ def _chat_loop(state: CliState, session: ChatSession, view: ChatView) -> ExitCod
             continue
         if not turn.ok:
             if turn.diagnostic is not None:
-                console.diagnostic(turn.diagnostic)
+                console.diagnostic(state.with_root_options(turn.diagnostic))
                 failure = turn.diagnostic
             continue
         failure = None
@@ -2112,7 +2167,9 @@ def _env_list(state: CliState) -> ExitCode:
             f"{environment.created_at:%Y-%m-%d}  {environment.path}",
             soft_wrap=True,
         )
-        state.console.print(f"    {pins}", style="dim")
+        # Padded rather than prefixed: a pin list that wraps continues under
+        # its own indent instead of at column 0, where it read as another row.
+        state.console.print(Padding(Text(pins, style="dim"), (0, 0, 0, 4)))
     for interpreter in interpreters:
         role = "the environments' base" if interpreter.in_use else "unused"
         state.console.print(
@@ -2216,12 +2273,13 @@ def _cache_list(state: CliState) -> ExitCode:
     if inventory.reclaimable_bytes:
         console.print(
             f"{human_bytes(inventory.reclaimable_bytes)} is orphaned or built by another "
-            "OpenVINO release: yonga cache prune"
+            f"OpenVINO release: {state.follow_up('cache', 'prune')}",
+            soft_wrap=True,
         )
     if counts[CacheEntryStatus.UNATTRIBUTED.value]:
         console.print(
             "Unattributed entries carry no ownership record and match no known artifact; "
-            "'yonga cache prune --unattributed' removes them too.",
+            f"'{state.follow_up('cache', 'prune', '--unattributed')}' removes them too.",
             style="dim",
         )
     for name in inventory.ignored:
@@ -2448,7 +2506,7 @@ def _render_path_report(state: CliState, report: PathReport) -> None:
     """Say whether 'yonga' now works, or exactly what to do so it does."""
     console = state.console
     if report.command_is_target:
-        console.print("Run 'yonga doctor' to check this host.", style="dim")
+        console.print(state.hint("Run 'yonga doctor' to check this host."), style="dim")
         return
     for line in report.advice:
         console.print_error(line, style="yellow")
@@ -2536,9 +2594,11 @@ def _render_kept_data(state: CliState, locations: Mapping[str, Path], *, from_py
         else "run them from the downloaded AppImage if 'yonga' is gone now"
     )
     console.print(
-        "To free space: 'yonga remove ARTIFACT' deletes a model and 'yonga cache prune --all' "
-        f"empties the compile cache ({where}). Deleting those directories yourself removes "
-        "everything.",
+        state.hint(
+            "To free space: 'yonga remove ARTIFACT' deletes a model and 'yonga cache prune --all' "
+            f"empties the compile cache ({where}). Deleting those directories yourself removes "
+            "everything."
+        ),
         style="dim",
     )
 
@@ -2589,7 +2649,10 @@ def _registry_validate(state: CliState) -> ExitCode:
                 state.console.print(f"  - {problem}")
         elif registry.ignored:
             state.console.print(
-                "The loaded layers are valid; 'yonga registry status' says why one is not in use."
+                state.hint(
+                    "The loaded layers are valid; 'yonga registry status' says why one is not "
+                    "in use."
+                )
             )
         else:
             state.console.print("Registry is valid.")
@@ -3107,7 +3170,9 @@ def _log_index(state: CliState, logs_dir: Path) -> ExitCode:
     state.console.print(f"Job logs in {logs_dir}", soft_wrap=True)
     state.console.print(tables.job_list(jobs))
     state.console.print("")
-    state.console.print("Show one with: yonga logs JOB_ID (a unique prefix is enough)")
+    state.console.print(
+        state.hint("Show one with: yonga logs JOB_ID (a unique prefix is enough)"), soft_wrap=True
+    )
     return ExitCode.SUCCESS
 
 

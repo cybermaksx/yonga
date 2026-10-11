@@ -530,6 +530,24 @@ def _relocated_validation(report: ValidationReport, staging: Path) -> Validation
     return moved
 
 
+def _anchored_validation(report: ValidationReport, artifact_dir: Path) -> ValidationReport:
+    """The inverse of :func:`_relocated_validation`: a manifest's IR paths under ``artifact_dir``.
+
+    A manifest records its IR files relative to the artifact directory; a probe
+    of a published artifact needs them where they are on disk.
+    """
+
+    def anchored(path: Path) -> Path:
+        return path if path.is_absolute() else artifact_dir / path
+
+    moved = report.model_copy(deep=True)
+    for ir in moved.irs:
+        ir.path = anchored(ir.path)
+        if ir.bin_path is not None:
+            ir.bin_path = anchored(ir.bin_path)
+    return moved
+
+
 def _relocated_device_probe(report: DeviceProbeReport, staging: Path) -> DeviceProbeReport:
     """Copy a device probe report so its submodel paths outlive staging."""
     moved = report.model_copy(deep=True)
@@ -901,6 +919,7 @@ class PrepareService:
             known_limitations=known_limitations,
             confirmations=confirmations,
             reuse_existing_artifact=reuse,
+            reuse_check_device=self._reuse_check_device(reuse, target_device, compatibility),
             force=force,
             export_environment=export_environment,
             export_environment_ready=environment_ready,
@@ -1544,6 +1563,26 @@ class PrepareService:
             return None
         return artifact_dir
 
+    def _reuse_check_device(
+        self,
+        reuse: Path | None,
+        target_device: str,
+        compatibility: CompatibilityDecision,
+    ) -> str | None:
+        """The explicit device a reused artifact must be probed on before it is reused.
+
+        ``None`` when nothing is reused, the device was chosen automatically (the
+        artifact's own recommendation is then the answer), or the manifest
+        already records a passing probe on the requested device.
+        """
+        if reuse is None or not compatibility.explicit_request:
+            return None
+        manifest = self._artifacts.manifest_for(reuse)
+        if manifest is None:
+            return None
+        device = normalise_device(target_device)
+        return None if device in manifest.supported_devices else device
+
     def _confirmations(
         self,
         *,
@@ -1723,7 +1762,11 @@ class PrepareService:
 
         self._stage(ctx, 1)
         tracker.stage = JobStage.INSPECTED
-        ctx.advance(JobStage.INSPECTED)
+        # Recorded now, not only at ``ready``: a job cancelled or failed half way
+        # still says which profile it was building (it used to say null).
+        ctx.advance(
+            JobStage.INSPECTED, profile_id=plan.profile.id, target_device=plan.target_device
+        )
 
         self._stage(ctx, 2)
         tracker.stage = JobStage.SOURCE_RESOLVED
@@ -1989,7 +2032,9 @@ class PrepareService:
                         f"The plan reused {plan.reuse_existing_artifact}, which is no longer a "
                         "ready artifact. Nothing was downloaded or exported."
                     ),
-                    remediation=["Re-run the command to plan the preparation again."],
+                    remediation=[
+                        f"Run the command again to plan the preparation again: {_rerun(plan)}"
+                    ],
                     context={"artifact_dir": str(plan.reuse_existing_artifact)},
                 )
             )
@@ -2151,6 +2196,14 @@ class PrepareService:
             if manifest.recommended_runtime is not None
             else plan.target_device
         )
+        notes: list[str] = []
+        if plan.compatibility.explicit_request:
+            # An explicit device is what the user asked for, and what the
+            # result reports: never the device the artifact was first made on.
+            device = normalise_device(plan.target_device)
+            if device not in manifest.supported_devices:
+                manifest, note = self._check_reused_on(plan, existing, manifest, device, ctx)
+                notes.append(note)
         message = (
             f"An artifact for {plan.resolved_source.source.repo_id} at this revision and "
             f"profile {plan.profile.id} is already ready; reusing {existing}."
@@ -2164,8 +2217,66 @@ class PrepareService:
             manifest=manifest,
             device=device,
             reused=True,
+            notes=notes,
             validation=manifest.validation,
             duration_seconds=time.perf_counter() - started,
+        )
+
+    def _check_reused_on(
+        self,
+        plan: PreparationPlan,
+        existing: Path,
+        manifest: ArtifactManifest,
+        device: str,
+        ctx: JobContext,
+    ) -> tuple[ArtifactManifest, str]:
+        """Probe a reused artifact on an explicit device it was never probed on.
+
+        Reuse is keyed by revision and profile (``docs/MODEL_PIPELINE.md``
+        section 15), so the CPU build of a profile answers ``--device gpu`` as
+        well. Returning it as "ready" without running it on the GPU reported
+        ``Device CPU`` for a GPU request and checked nothing. The same compile
+        and smoke test a fresh preparation runs decide instead; the result is
+        recorded in the manifest either way, and a failure stops the job with
+        no fallback, exactly as it would after a fresh conversion.
+        """
+        prepared_on = ", ".join(manifest.supported_devices) or "another device"
+        validation = manifest.validation
+        if validation is None:  # pragma: no cover - a ready manifest always has one
+            raise DeviceUnsupportedError(self._unclassified(device))
+        self._stage(ctx, 7)
+        ctx.emit(
+            ProgressKind.PROBE,
+            f"The ready artifact was probed on {prepared_on}, not on {device}; checking it there",
+            device=device,
+            status="started",
+        )
+        report = self._probe_device(
+            plan,
+            existing,
+            device,
+            _anchored_validation(validation, existing),
+            ctx,
+            plan.resolved_source.metadata,
+        )
+        # Recorded artifact-relative, like the probes the preparation recorded.
+        report = _relocated_device_probe(report, existing)
+        manifest = self._artifacts.record_device_probe(existing, report)
+        if not report.ok:
+            failure = report.diagnostic or self._unclassified(device)
+            failure = failure.model_copy(
+                update={
+                    "message": (
+                        f"{failure.message} The artifact at this revision and profile was "
+                        f"prepared on {prepared_on} and checked on {device} before reuse."
+                    )
+                }
+            )
+            raise DeviceUnsupportedError(self._explicit_failure(plan, failure, device))
+        ctx.advance(JobStage.PROBED)
+        return manifest, (
+            f"Reused the artifact prepared on {prepared_on}; it was checked on {device} "
+            "first and passed, and its manifest now records that probe."
         )
 
     # --- preflight --------------------------------------------------------
@@ -2279,8 +2390,11 @@ class PrepareService:
                 "runs in, so no conversion can start here. Nothing has been downloaded."
             ),
             remediation=[
-                'Reproduce it: python -c "import optimum.exporters.openvino"',
                 "The full error is in the job log: yonga logs JOB_ID --raw",
+                (
+                    "Once the environment is fixed, check the import again: yonga doctor --full "
+                    "(it imports the exporter with OpenVINO's usage reporting switched off)"
+                ),
             ],
             environment_broken=True,
             raw_excerpt=failure,

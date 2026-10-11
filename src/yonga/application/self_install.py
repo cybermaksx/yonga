@@ -59,6 +59,7 @@ from pathlib import Path
 from yonga import __version__
 from yonga.config.paths import Paths
 from yonga.domain.diagnostics import (
+    RERUN_PLACEHOLDER,
     ConfigurationError,
     FailureCategory,
     PreflightError,
@@ -1041,7 +1042,7 @@ def _recheck(target: Target) -> None:
             FailureCategory.CONFIGURATION_ERROR,
             "The target changed",
             f"{target.path} changed while yonga was working on it; nothing was replaced.",
-            remediation=["Run the command again."],
+            remediation=[f"Run the command again: {RERUN_PLACEHOLDER}"],
         )
     )
 

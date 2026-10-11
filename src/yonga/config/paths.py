@@ -23,6 +23,10 @@ DEFAULT_DATA_HOME: str = ".local/share"
 
 CONFIG_FILENAME: str = "config.toml"
 REGISTRY_OVERRIDES_DIRNAME: str = "registry-overrides"
+#: The hidden directory under the artifact root where jobs build their artifacts.
+STAGING_DIRNAME: str = ".staging"
+#: The directory inside a job's staging directory that the export writes.
+STAGING_MODEL_DIRNAME: str = "model"
 
 _JOB_ID_FORBIDDEN: frozenset[str] = frozenset({"", ".", ".."})
 
@@ -123,7 +127,7 @@ class Paths:
     @property
     def staging_dir(self) -> Path:
         """Hidden staging root; incomplete builds live here until validated."""
-        return self.artifacts_dir / ".staging"
+        return self.artifacts_dir / STAGING_DIRNAME
 
     @property
     def benchmarks_dir(self) -> Path:

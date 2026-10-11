@@ -1449,6 +1449,9 @@ def test_a_freshly_checked_failure_does_not_call_itself_recorded(tmp_path):
     assert check.status is Severity.WARNING
     assert "does not import: ImportError: something else entirely" in (check.detail or "")
     assert not any("checks again" in step for step in check.remediation)
+    # The way to check again is yonga's private import, never a plain interpreter's.
+    assert not any("python -c" in step for step in check.remediation)
+    assert any("yonga doctor --full" in step for step in check.remediation)
 
 
 def test_no_exporter_to_check_adds_no_line(tmp_path):

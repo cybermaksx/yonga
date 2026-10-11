@@ -50,6 +50,7 @@ from yonga.domain.diagnostics import (
     HubAuthError,
     SourceResolutionError,
     YongaError,
+    with_rerun,
 )
 from yonga.domain.models import ModelFormat, ModelIdentity, PipelineKind, RepoFile
 from yonga.util.jsonlog import null_logger
@@ -1211,6 +1212,13 @@ def test_offline_miss_is_reported_as_hub_offline_missing(tmp_path):
 
     assert excinfo.value.diagnostic.code == CODE_OFFLINE_MISSING
     assert excinfo.value.exit_code() is ExitCode.SOURCE_RESOLUTION
+    # The advice names the flag too, and ends in the user's command without it.
+    found = excinfo.value.diagnostic
+    online = "yonga prepare acme/x --device cpu"
+    step = next(step for step in found.remediation if "offline mode" in step)
+    assert "--offline" in step
+    filled = with_rerun(found, None, online=online).remediation
+    assert any(step.endswith(f": {online}") for step in filled)
 
 
 def test_download_honours_a_configured_hf_home(tmp_path):

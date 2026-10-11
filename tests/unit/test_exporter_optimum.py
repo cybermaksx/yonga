@@ -31,7 +31,7 @@ from yonga.adapters.filesystem import INCOMPLETE_MARKER_NAME, mark_incomplete
 from yonga.application.jobs import JobContext, open_job
 from yonga.application.progress import CollectingSink, ProgressKind
 from yonga.config.settings import load_settings
-from yonga.domain.diagnostics import ConfigurationError, FailureCategory
+from yonga.domain.diagnostics import RERUN_PLACEHOLDER, ConfigurationError, FailureCategory
 from yonga.domain.plans import (
     ConversionProfile,
     ExporterRequirements,
@@ -654,6 +654,10 @@ def test_cancellation_is_reported_as_user_cancelled(job: JobContext) -> None:
     assert result.diagnostic is not None
     assert result.diagnostic.code == "export.cancelled"
     assert result.diagnostic.category is FailureCategory.USER_CANCELLED
+    # The advice repeats the user's own command, which the CLI fills in.
+    steps = result.diagnostic.remediation
+    assert any(step.endswith(f": {RERUN_PLACEHOLDER}") for step in steps)
+    assert not any("`yonga prepare`" in step for step in steps)
 
 
 def test_a_cancelled_conversion_is_not_announced_as_failed(job: JobContext) -> None:

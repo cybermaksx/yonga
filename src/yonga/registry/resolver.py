@@ -983,7 +983,10 @@ class RegistryResolver:
 
         The way out is a profile that fits, for the device being prepared and,
         when the profile was made for another one, for that device too; the
-        automatic choice comes first. Nothing is chosen on the user's behalf.
+        automatic choice comes first. When no profile for those devices fits,
+        the other devices' fitting profiles are offered instead, each as a whole
+        command, so the refusal always ends in something to run. Nothing is
+        chosen on the user's behalf.
         """
 
         def prepare_with(device: str, profile_id: str) -> str:
@@ -991,8 +994,7 @@ class RegistryResolver:
                 return command(device, profile_id)
             return f"yonga prepare MODEL --device {device.lower()} --profile {profile_id}"
 
-        remediation: list[str] = []
-        for device in dict.fromkeys((target, profile.device)):
+        def fitting_steps(device: str, *, instead: bool) -> list[str]:
             fitting = [
                 rule
                 for rule in self.registry.profiles
@@ -1013,17 +1015,31 @@ class RegistryResolver:
                 fitting.remove(chosen)
                 fitting.insert(0, chosen)
             if not fitting:
-                remediation.append(f"No {device} profile can quantize this model.")
-                continue
+                return []
             first = fitting[0]
             why = "the one yonga chooses for this model" if first is chosen else "which fits"
-            remediation.append(
-                f"Prepare it for the {device} with {first.id}, {why}: "
-                f"{prepare_with(device, first.id)}"
-            )
+            where = f"the {device} instead" if instead else f"the {device}"
+            steps = [
+                f"Prepare it for {where} with {first.id}, {why}: {prepare_with(device, first.id)}"
+            ]
             if len(fitting) > 1:
                 others = ", ".join(rule.id for rule in fitting[1:])
-                remediation.append(f"Other {device} profiles that fit this model: {others}.")
+                steps.append(f"Other {device} profiles that fit this model: {others}.")
+            return steps
+
+        remediation: list[str] = []
+        considered = list(dict.fromkeys((target, profile.device)))
+        offered = False
+        for device in considered:
+            steps = fitting_steps(device, instead=False)
+            offered = offered or bool(steps)
+            remediation.extend(steps or [f"No {device} profile can quantize this model."])
+        if not offered:
+            # No profile for the requested device fits at all: the only ways out
+            # are other devices, which are named, never chosen.
+            others = sorted({rule.device for rule in self.registry.profiles} - set(considered))
+            for device in others:
+                remediation.extend(fitting_steps(device, instead=True))
         remediation.append(
             "'yonga registry profiles' lists every profile with its device, weights and size band."
         )

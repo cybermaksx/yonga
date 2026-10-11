@@ -17,7 +17,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from yonga.domain.artifacts import ArtifactSummary
-from yonga.domain.diagnostics import Diagnostic, FailureCategory, diagnostic
+from yonga.domain.diagnostics import RERUN_PLACEHOLDER, Diagnostic, FailureCategory, diagnostic
 
 __all__ = [
     "artifact_not_found",
@@ -53,7 +53,6 @@ def artifact_not_found(
     a command without one of its own reports a model id that is not prepared
     as ``artifact.not_prepared``, as ``chat`` always has.
     """
-    quoted = shlex.quote(reference)
     if is_model_id(reference):
         return diagnostic(
             "artifact.not_prepared" if code == "artifact.not_found" else code,
@@ -65,36 +64,41 @@ def artifact_not_found(
                 "many gigabytes."
             ),
             remediation=[
-                f"Prepare it first: yonga prepare {reference}",
-                f"Then run it again: yonga {command} {quoted}",
+                f"Prepare it first: yonga prepare {shlex.quote(reference)}",
+                # The user's own command, options and all, filled in by the CLI:
+                # rebuilt from the reference alone it dropped eval's --reference
+                # and publish's --repo, and could swap candidate and reference.
+                f"Then run the same command again: {RERUN_PLACEHOLDER}",
                 "See what is already prepared: yonga list",
             ],
             context={"reference": reference, "command": "prepare", "model": reference},
         )
+    # No step prints a placeholder such as OWNER/NAME: pasted, it is sent to the
+    # Hub as a model id. An artifact id is pointed at 'yonga list' alone, which
+    # shows every artifact id and the model each came from.
+    remediation = ["See what is already prepared: yonga list"]
     if _ARTIFACT_ID.fullmatch(reference):
         title = "No prepared artifact has that id"
         message = (
             f"No artifact on this host has the id {reference}. Artifact ids are the ones "
             "yonga list shows; an artifact deleted with yonga remove no longer has one."
         )
-        prepare = "Prepare the model it came from again: yonga prepare OWNER/NAME"
     else:
         title = "No prepared artifact matches that reference"
         message = (
             f"{reference!r} is not the id or directory of a prepared artifact, nor a "
             "Hugging Face model id (owner/name)."
         )
-        prepare = "Prepare a model first: yonga prepare OWNER/NAME"
+        remediation.append(
+            "To prepare a model, give 'yonga prepare' its Hugging Face id (owner/name)."
+        )
+    remediation.append("Or pass the artifact directory directly.")
     return diagnostic(
         code,
         FailureCategory.CONFIGURATION_ERROR,
         title,
         message,
-        remediation=[
-            "See what is already prepared: yonga list",
-            prepare,
-            "Or pass the artifact directory directly.",
-        ],
+        remediation=remediation,
         context={"reference": reference},
     )
 

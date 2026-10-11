@@ -17,6 +17,7 @@ Each case here came from a real run on the reference host (``build/e2e``):
 
 from __future__ import annotations
 
+import re
 import sys
 from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
@@ -257,6 +258,39 @@ def test_the_torchvision_build_mismatch_is_an_environment_failure() -> None:
     assert "--force-reinstall" not in joined
 
 
+#: A command that imports OpenVINO's conversion API in a plain interpreter, where
+#: ``openvino_telemetry`` reports the import (``docs/TROUBLESHOOTING.md`` section 8).
+RAW_VENDOR_IMPORT = re.compile(
+    r"python3?\s+-c\s+[\"']?\s*(?:import|from)\s+(?:openvino|optimum|nncf)|optimum-cli\s+export"
+)
+
+
+def test_no_registry_remedy_advises_a_raw_vendor_import() -> None:
+    """Following yonga's advice must stay as private as yonga itself."""
+    offending = [
+        f"{rule.id}: {step}"
+        for rule in load_builtin_registry().issues
+        for step in rule.recommendation.remediation
+        if RAW_VENDOR_IMPORT.search(step)
+    ]
+    assert offending == []
+
+
+def test_the_torchvision_remedy_checks_the_import_through_yonga() -> None:
+    rule = next(
+        rule
+        for rule in load_builtin_registry().issues
+        if rule.id == "torchvision-torch-build-mismatch"
+    )
+    assert any("yonga doctor --full" in step for step in rule.recommendation.remediation)
+
+
+@pytest.mark.parametrize("document", ["README.md", "docs/INSTALL.md", "docs/TROUBLESHOOTING.md"])
+def test_the_user_guides_never_advise_a_raw_vendor_import(document: str) -> None:
+    text = (Path(__file__).resolve().parents[2] / document).read_text(encoding="utf-8")
+    assert RAW_VENDOR_IMPORT.findall(text) == []
+
+
 def test_the_installation_guide_installs_torchvision_from_the_cpu_index_too() -> None:
     """The documented pip path is how the mismatch was produced on the reference host."""
     text = (Path(__file__).resolve().parents[2] / "docs" / "INSTALL.md").read_text(encoding="utf-8")
@@ -410,6 +444,9 @@ def test_an_unrecognised_import_failure_still_stops_before_the_download(
     assert caught.value.diagnostic.category is FailureCategory.PACKAGE_ABI_MISMATCH
     assert caught.value.exit_code() is ExitCode.ENVIRONMENT_UNUSABLE
     assert hub.downloaded == []
+    remedy = caught.value.diagnostic.remediation
+    assert not any(RAW_VENDOR_IMPORT.search(step) for step in remedy)
+    assert any("yonga doctor --full" in step for step in remedy)
 
 
 def test_a_working_import_lets_the_preparation_through(settings: Settings, tmp_path: Path) -> None:
@@ -562,6 +599,40 @@ def test_an_unfit_profile_for_another_device_also_names_what_fits_there() -> Non
     assert steps[1].endswith(
         f"yonga prepare {SMOLLM2_REPO} --device cpu --profile cpu-int8-asym-ref"
     )
+
+
+def test_an_unfit_profile_with_no_fitting_profile_on_its_device_offers_other_devices(
+    settings: Settings, tmp_path: Path
+) -> None:
+    """``--device gpu --profile gpu-int4-asym-g128-r08`` ended with nothing to run."""
+    hub = smollm2_hub(tmp_path)
+    service = build_service(settings=settings, hub=hub)
+    command = CommandLine(
+        command=("prepare",),
+        arguments=(SMOLLM2_REPO,),
+        options=(("--device", "gpu"), ("--profile", "gpu-int4-asym-g128-r08"), ("--yes",)),
+        root_options=(("--data-dir", "/srv/models"),),
+    )
+
+    with pytest.raises(RegistryError) as caught:
+        service.plan(
+            SMOLLM2_REPO, device="gpu", profile_id="gpu-int4-asym-g128-r08", command_line=command
+        )
+
+    steps = caught.value.diagnostic.remediation
+    assert steps[0] == "No GPU profile can quantize this model."
+    prefix = f"yonga --data-dir /srv/models prepare {SMOLLM2_REPO}"
+    assert any(
+        "for the CPU instead with cpu-int8-asym-ref" in step
+        and step.endswith(f"{prefix} --device cpu --profile cpu-int8-asym-ref --yes")
+        for step in steps
+    ), steps
+    assert any(
+        "for the NPU instead with npu-int4-sym-cw" in step
+        and step.endswith(f"{prefix} --device npu --profile npu-int4-sym-cw --yes")
+        for step in steps
+    ), steps
+    assert hub.downloaded == []
 
 
 def test_an_explicit_profile_that_fits_is_used() -> None:
