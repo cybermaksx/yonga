@@ -36,9 +36,11 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import typer
 from rich.markup import escape
+from typer.core import TyperGroup
 
 from yonga import APP_NAME, __version__
 from yonga.application.artifacts import ArtifactStore
@@ -447,11 +449,63 @@ def _suite(value: str) -> str:
 # ======================================================================
 # application
 # ======================================================================
+def _usage_error_class() -> type[Exception]:
+    """Click's ``UsageError``, as the installed typer raises it.
+
+    typer 0.27 vendors click, so ``import click`` would name a different class
+    from the one a parse failure raises there. ``typer.BadParameter`` is a
+    subclass of the right one under every typer release.
+    """
+    for klass in typer.BadParameter.__mro__:
+        if klass.__name__ == "UsageError" and issubclass(klass, Exception):
+            return klass
+    return typer.BadParameter  # pragma: no cover - click's BadParameter is a UsageError
+
+
+_USAGE_ERROR: type[Exception] = _usage_error_class()
+
+
+@contextmanager
+def _usage_errors_exit_70() -> Iterator[None]:
+    """Give a command line that cannot be parsed exit 70 instead of Click's 2.
+
+    Click exits 2 for an unknown command or option, a missing argument or a
+    value of the wrong type (``--timeout abc``). In yonga 2 means success with
+    warnings or an inconclusive probe (``docs/CLI_SPEC.md`` section 15), and a
+    script must be able to tell those from a typo; an invalid value that does
+    parse (``--timeout nan``) is already a configuration error, exit 70. Only
+    the code changes: Click still renders the message.
+    """
+    try:
+        yield
+    except _USAGE_ERROR as error:
+        error.exit_code = int(ExitCode.REGISTRY)  # type: ignore[attr-defined]
+        raise
+
+
+class _YongaGroup(TyperGroup):
+    """The root command group; see :func:`_usage_errors_exit_70`.
+
+    Parsing the root's own options happens in ``make_context``; every
+    subcommand, including the ``registry``, ``env``, ``cache`` and ``self``
+    groups and their commands, is resolved and parsed inside ``invoke``.
+    """
+
+    def make_context(self, *args: Any, **kwargs: Any) -> Any:
+        with _usage_errors_exit_70():
+            return super().make_context(*args, **kwargs)
+
+    def invoke(self, *args: Any, **kwargs: Any) -> Any:
+        with _usage_errors_exit_70():
+            return super().invoke(*args, **kwargs)
+
+
 app = typer.Typer(
     name=APP_NAME,
     help="Local AI model manager for Intel AI PCs (OpenVINO, Optimum Intel, Hugging Face).",
     no_args_is_help=True,
     add_completion=False,
+    cls=_YongaGroup,
 )
 registry_app = typer.Typer(
     name="registry",

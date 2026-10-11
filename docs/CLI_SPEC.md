@@ -994,6 +994,12 @@ Reserve stable classes:
 99  unexpected internal error
 ```
 
+A command line that cannot be parsed exits 70, like an option value that parses but is invalid:
+an unknown command or option, a missing argument, a value of the wrong type (`--timeout abc`), and
+`yonga` with no command, which prints the command list. Click's own code for these is 2, which
+here means warnings or an inconclusive probe, so the root command group remaps it; Click still
+renders the message. `--help` exits 0.
+
 A failure exits with its category's code (`CATEGORY_EXIT_CODES` in
 `src/yonga/domain/diagnostics.py`). Codes 40, 42 and 52 are no category's code: they name the stage
 a job died in (conversion, repair, generation) and appear only when the category is
