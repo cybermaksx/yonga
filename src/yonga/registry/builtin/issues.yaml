@@ -3,7 +3,10 @@
 # Prefer exact strings over regexes. A rule that names a model family beats a
 # rule that only names a device, so a family-specific diagnosis wins where it
 # applies and the generic one still covers everything else.
-schema_version: 1
+#
+# Schema 4 only for `blocks_export` (optimum-normalized-config-allow-new); every
+# other rule here still declares the version it needs.
+schema_version: 4
 
 issues:
   - id: qwen35-npu-fp16-bufferize
@@ -604,7 +607,7 @@ issues:
           unsloth/gemma-3-1b-it ("Maximum required is 5.0").
 
   - id: optimum-normalized-config-allow-new
-    schema_version: 1
+    schema_version: 4
     status: active
     priority: 60
     summary: optimum cannot build this architecture's export config on Python 3.14
@@ -612,6 +615,40 @@ issues:
     # method descriptor; on 3.11-3.13 the same optimum works.
     constraints:
       python: ">=3.14"
+    # The failure is certain before anything runs, so prepare refuses these
+    # model types before the download when the interpreter that will export
+    # (a managed environment's, or yonga's own) is 3.14 and optimum is a release
+    # without the fix. Measured on the reference host, 2026-10-11: building the
+    # OpenVINO text-generation-with-past export config with optimum 2.3.0 on
+    # Python 3.14.4 raises this error for exactly these decoder model types,
+    # while it built for 65 others, llama, qwen2, qwen3, gemma, granite, olmo2,
+    # lfm2, smollm3 and phi among them. The bound stays at 2.3.0 until a
+    # release is shown to carry the fix; a later one still gets classified.
+    blocks_export:
+      model_types:
+        - bloom
+        - codegen
+        - dbrx
+        - gpt2
+        - gpt_bigcode
+        - gpt_neo
+        - gptj
+        - mistral
+        - mixtral
+        - mpt
+        - phi3
+        - phimoe
+        - xglm
+      constraints:
+        optimum: "<=2.3.0"
+      message: >-
+        optimum 2.3.0 and earlier cannot build the export configuration of this
+        architecture on Python 3.14: functools.partial became a method
+        descriptor there, and optimum binds NormalizedConfig.with_args through
+        one, so the export would stop with "NormalizedConfig.__init__() got
+        multiple values for argument 'allow_new'" before any conversion. The
+        defect is in optimum, not in yonga, the model or the device; optimum
+        fixed it in pull request 2496, which no release carries yet.
     match:
       case_sensitive: true
       exception_contains:
@@ -648,6 +685,14 @@ issues:
           Transformers 5.5.4, Python 3.14.4, on the reference host. Building
           the export config for mistral and phi3 fails the same way there, and
           for llama it succeeds (2026-10-09).
+      - kind: tested
+        note: >-
+          blocks_export: every model type optimum-intel 2.2.0 registers for
+          OpenVINO text generation and Transformers 5.5.4 has a config for,
+          export config built from that default config with optimum 2.3.0 on
+          Python 3.14.4, reference host, 2026-10-11. The thirteen listed raised
+          the allow_new TypeError; the encoder-decoder types that also raise it
+          are left out, since yonga prepares decoder models.
       - kind: community
         url: https://github.com/huggingface/optimum/pull/2496
 
@@ -743,8 +788,8 @@ issues:
       fallback_devices: []
       remediation:
         - >-
-          Install torch and torchvision together from one index, in the
-          environment yonga runs in: pip install --force-reinstall torch
+          Replace torchvision with the build from torch's CPU index, in the
+          environment yonga runs in: pip uninstall -y torchvision && pip install
           torchvision --index-url https://download.pytorch.org/whl/cpu
         - "Then check that the exporter imports: python -c \"import optimum.exporters.openvino\""
         - yonga does not change your environment for you; that choice stays yours.
@@ -759,3 +804,12 @@ issues:
           pair is what the managed export environment verification caught
           before it installed both from the CPU index (docs/TROUBLESHOOTING.md
           section 5.7).
+      - kind: tested
+        note: >-
+          The repair, in a scratch venv on the reference host (2026-10-11):
+          torch 2.14.1+cpu, numpy 2.4.6 and PyPI's torchvision 0.29.1. Uninstalling
+          torchvision and installing it from the CPU index replaced only
+          torchvision (0.29.1+cpu), the import worked and pip check was clean.
+          The earlier advice, pip install --force-reinstall torch torchvision
+          from the CPU index, reinstalled every dependency from that index too
+          and upgraded numpy to 2.5.2, past nncf 3.4.0's numpy<2.5.0.

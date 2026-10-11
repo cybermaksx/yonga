@@ -97,20 +97,24 @@ from yonga.domain.plans import (
 #:
 #: Version 2 added :attr:`RuleMatch.parameter_count` (a profile's model-size
 #: band) and :attr:`ProfileRule.evidence`. Version 3 added
-#: :attr:`ChatProfileRule.tool_calling`. Older files still load unchanged:
-#: every new field defaults to "no constraint" or "not declared".
-SCHEMA_VERSION: int = 3
+#: :attr:`ChatProfileRule.tool_calling`, and version 4
+#: :attr:`IssueRule.blocks_export`. Older files still load unchanged: every new
+#: field defaults to "no constraint" or "not declared".
+SCHEMA_VERSION: int = 4
 
 #: Oldest yonga release that understands each registry schema version, written
 #: into a remote bundle as ``min_tool_version`` so an older yonga refuses the
 #: bundle at ``registry update`` instead of failing to parse it.
-SCHEMA_MIN_TOOL_VERSION: dict[int, str] = {2: "0.3.0", 3: "0.4.0"}
+SCHEMA_MIN_TOOL_VERSION: dict[int, str] = {2: "0.3.0", 3: "0.4.0", 4: "0.5.0"}
 
 #: The schema version a rule must declare to use a parameter-count band.
 PARAMETER_BAND_SCHEMA_VERSION: int = 2
 
 #: The schema version a chat profile must declare to carry ``tool_calling``.
 TOOL_CALLING_SCHEMA_VERSION: int = 3
+
+#: The schema version an issue rule must declare to carry ``blocks_export``.
+EXPORT_BLOCK_SCHEMA_VERSION: int = 4
 
 #: Specificity of a rule that names an exact repository id.
 SPECIFICITY_REPO_ID: int = 100
@@ -1149,6 +1153,44 @@ class IssueRecommendation(BaseModel):
         return names
 
 
+class ExportBlock(BaseModel):
+    """The model types an issue rule's failure is certain for, before anything runs.
+
+    An issue rule recognises a failure after it happened. Some failures are
+    known in advance: optimum 2.3.0 cannot build the phi3 export config on
+    Python 3.14, whatever the model. With this block, ``prepare`` refuses such
+    an export before the download, with the rule's own diagnostic, when the
+    source's ``model_type`` is listed and the rule's ``constraints`` and these
+    ``constraints`` all hold for the interpreter that will run the export (a
+    managed export environment's, or yonga's own). A version that is not known
+    never blocks: the rule still classifies the failure afterwards.
+    """
+
+    model_config = _STRICT
+
+    model_types: list[str] = Field(min_length=1)
+    """``config.json`` ``model_type`` values the export fails for, matched case-insensitively."""
+    constraints: dict[str, str] = Field(default_factory=dict)
+    """Further version bounds for the block only, such as the last release
+    without the fix: the rule keeps classifying the failure outside them."""
+    message: str | None = None
+    """What the refusal says instead of the rule's own message, which describes
+    a failure that has happened."""
+
+    @field_validator("model_types")
+    @classmethod
+    def _normalise_model_types(cls, value: list[str]) -> list[str]:
+        cleaned = _casefold_all(value)
+        if not cleaned:
+            raise ValueError("must name at least one model type")
+        return cleaned
+
+    @field_validator("constraints")
+    @classmethod
+    def _normalise_constraints(cls, value: dict[str, str]) -> dict[str, str]:
+        return {_normalise_key(key): str(spec).strip() for key, spec in value.items()}
+
+
 class IssueRule(BaseRule):
     """A known failure signature and its classification."""
 
@@ -1157,6 +1199,17 @@ class IssueRule(BaseRule):
     match: IssueMatch = Field(default_factory=IssueMatch)
     classification: IssueClassification
     recommendation: IssueRecommendation = Field(default_factory=IssueRecommendation)
+    blocks_export: ExportBlock | None = None
+
+    @model_validator(mode="after")
+    def _export_block_needs_schema_four(self) -> IssueRule:
+        """An older reader rejects the unknown key, so an older rule must not carry it."""
+        if self.blocks_export is not None and self.schema_version < EXPORT_BLOCK_SCHEMA_VERSION:
+            raise ValueError(
+                f"issue rule {self.id}: blocks_export needs schema_version "
+                f"{EXPORT_BLOCK_SCHEMA_VERSION}"
+            )
+        return self
 
     @property
     def match_block(self) -> RuleMatch:

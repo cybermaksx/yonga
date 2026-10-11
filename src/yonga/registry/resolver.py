@@ -1379,6 +1379,61 @@ class RegistryResolver:
             explanation,
         )
 
+    def export_blocker(
+        self,
+        meta: ModelMetadata | None,
+        *,
+        versions: Mapping[str, str | None] | None = None,
+    ) -> Diagnostic | None:
+        """The known failure exporting ``meta`` is certain to hit, or ``None``.
+
+        An issue rule's ``blocks_export`` (schema 4) applies when it lists the
+        model's ``model_type`` and every constraint of the rule and of the block
+        holds for ``versions``: the interpreter and packages that will run the
+        export, by default the ones this resolver is bound to. Unlike matching
+        elsewhere, a version that is not known does not pass. Refusing an export
+        that would have worked costs more than a failure the rule still
+        classifies once it happens.
+
+        The diagnostic is the rule's own, with the block's ``message`` when it
+        has one, and the versions that decided it in ``context["versions"]``.
+        """
+        model_type = (meta.model_type or "").strip().casefold() if meta is not None else ""
+        if not model_type:
+            return None
+        bound = self.versions if versions is None else versions
+        rules = sorted(
+            (rule for rule in self.registry.issues if rule.status.is_usable),
+            key=lambda rule: (-rule.priority, rule.id),
+        )
+        for rule in rules:
+            block = rule.blocks_export
+            if block is None or model_type not in block.model_types:
+                continue
+            if not (_verified(rule.constraints, bound) and _verified(block.constraints, bound)):
+                continue
+            keys = sorted({*rule.constraints, *block.constraints})
+            found = self._diagnostic_from_issue(
+                rule,
+                text="",
+                device=None,
+                stage="export",
+                meta=meta,
+                job_id=None,
+                log_path=None,
+            )
+            return found.model_copy(
+                update={
+                    "message": block.message or found.message,
+                    "raw_excerpt": None,
+                    "context": {
+                        **found.context,
+                        "versions": ", ".join(f"{key} {bound[key]}" for key in keys),
+                    },
+                }
+            )
+        return None
+
     @staticmethod
     def _pick_issue(
         scored: Sequence[tuple[IssueRule, RuleCandidate, int]],
@@ -1806,6 +1861,15 @@ def _contents_match(
     if needle is None or contents_probe is None:
         return True
     return any(contents_probe(name, needle) for name in candidates)
+
+
+def _verified(constraints: Mapping[str, str], versions: Mapping[str, str | None]) -> bool:
+    """True when every constraint names a known version that satisfies it."""
+    for key, specifier in constraints.items():
+        version = versions.get(key)
+        if version is None or not satisfies(version, specifier):
+            return False
+    return True
 
 
 def _context(

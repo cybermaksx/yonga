@@ -190,6 +190,17 @@ def make_profile() -> ConversionProfile:
     )
 
 
+def test_profile_runtime_properties_apply_only_on_its_own_device() -> None:
+    profile = make_profile()
+    assert profile.runtime_properties_on("GPU.0") == {"ATTENTION_BACKEND": "SDPA"}
+    assert profile.runtime_properties_on("gpu") == {"ATTENTION_BACKEND": "SDPA"}
+    assert profile.runtime_properties_on("CPU") == {}
+    assert profile.runtime_properties_on("NPU") == {}
+    # A copy: the caller may extend it without changing the profile.
+    profile.runtime_properties_on("GPU")["CACHE_DIR"] = "/x"
+    assert profile.runtime_properties == {"ATTENTION_BACKEND": "SDPA"}
+
+
 def make_plan(**overrides: object) -> PreparationPlan:
     requested = ModelIdentity(repo_id="HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive")
     source = ModelIdentity(

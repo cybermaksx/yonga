@@ -196,7 +196,10 @@ Default `--device auto`.
 `--ignore-exporter-requirements` converts in the current environment even though a declared exporter
 package version is unmet. Otherwise such a job runs its export in a managed export environment, or,
 under `--no-managed-env`, stops in preflight. Like `--trust-remote-code` it is its own deliberate flag
-and `--yes` does not imply it.
+and `--yes` does not imply it. It also overrides a known exporter failure: an issue rule's
+`blocks_export` (`REGISTRY_SPEC.md` section 6.1) that refuses the export before any question and
+before the download, for example phi3 or mistral on Python 3.14 with optimum 2.3.0 (exit 10). The
+plan shows that refusal as a `BLOCKED` section, and the manifest records an override.
 
 `--no-managed-env` refuses to build a managed export environment, so an exporter requirement the
 installed packages cannot meet stops preparation at preflight instead. `--ignore-exporter-requirements`

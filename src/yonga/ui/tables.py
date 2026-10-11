@@ -534,6 +534,7 @@ def preparation_plan(plan: PreparationPlan) -> RenderableType:
 
     blocks.extend(_refusal_block(plan))
     blocks.extend(_exporter_block(plan))
+    blocks.extend(_known_export_failure_block(plan))
 
     return Panel(
         Group(*blocks),
@@ -688,6 +689,37 @@ def _exporter_block(plan: PreparationPlan) -> list[RenderableType]:
         Text(
             "Preparation stops at preflight, before the download and the conversion. "
             f"Override with {_IGNORE_EXPORTER_REQUIREMENTS_FLAG} if you know the pin is stale; "
+            "--yes does not.",
+            style="dim",
+        ),
+    ]
+
+
+def _known_export_failure_block(plan: PreparationPlan) -> list[RenderableType]:
+    """Render an export the registry knows will fail as a *blocking* section.
+
+    Keyed on :attr:`PreparationPlan.export_blocked`, the field the service
+    refuses on, and overridden by the same flag as an unmet exporter pin.
+    """
+    blocked = plan.export_blocked
+    if blocked is None:
+        return []
+    versions = blocked.context.get("versions", "")
+    problems = Table.grid(padding=(0, 2))
+    problems.add_column(no_wrap=True, width=1)
+    problems.add_column(overflow="fold")
+    problems.add_row(
+        Text("x", style="bold red"),
+        Text(f"{blocked.title} ({versions})", style="red"),
+    )
+    return [
+        Text(""),
+        Rule(style="red"),
+        Text("BLOCKED — this export is known to fail here", style="bold red"),
+        problems,
+        Text(
+            "Preparation stops before the download and before any question. Override with "
+            f"{_IGNORE_EXPORTER_REQUIREMENTS_FLAG} only if the exporter already carries the fix; "
             "--yes does not.",
             style="dim",
         ),

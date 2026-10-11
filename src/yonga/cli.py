@@ -875,7 +875,8 @@ def prepare(
         False,
         "--ignore-exporter-requirements",
         help=(
-            "Convert even though a declared exporter package version is unmet. "
+            "Convert even though a declared exporter package version is unmet, or the "
+            "registry knows this export fails with the installed versions. "
             "Deliberate and separate: --yes never enables it."
         ),
     ),

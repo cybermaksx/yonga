@@ -850,6 +850,17 @@ class PrepareService:
                 f"Exporter requirement could not be checked: {note}"
                 for note in exporter_unverifiable
             )
+        # Only a job that runs the exporter can hit an exporter defect: a reused
+        # artifact, a GGUF import and an OpenVINO copy never do.
+        export_blocked = None
+        if (
+            reuse is None
+            and resolved_source.gguf_file is None
+            and not resolved_source.already_openvino
+        ):
+            export_blocked = self._registry.export_blocker(
+                source_meta, versions=self._export_versions(export_environment)
+            )
 
         if reuse is None and profile_selection is not None and profile_selection.applies:
             known_limitations.extend(
@@ -897,6 +908,7 @@ class PrepareService:
             download_ignore_patterns=ignore_patterns,
             auth_missing=auth_missing,
             command_line=command_line,
+            export_blocked=export_blocked,
         )
         if plan.reuses_artifact or plan.refused_before_work:
             # Nothing the confirmations describe will happen: a reused artifact is
@@ -937,6 +949,23 @@ class PrepareService:
         if not allowed or not self._settings.managed_export_envs or self._environments is None:
             return None
         return self._environments.spec_for(requirements, reason="; ".join(requirements.problems))
+
+    def _export_versions(self, environment: EnvironmentSpec | None) -> dict[str, str | None]:
+        """The interpreter and package versions the export will run with.
+
+        Without a managed environment that is yonga's own, as the registry
+        resolver sees it. A managed environment is created from
+        ``environment.python`` with its pinned packages; only an exact pin
+        (``==2.3.0``) names a version, and anything looser stays unknown.
+        """
+        if environment is None:
+            return dict(self._registry.versions)
+        versions: dict[str, str | None] = {"python": environment.python}
+        for package, specifier in environment.packages.items():
+            pinned = specifier.strip().removeprefix("==")
+            exact = specifier.strip().startswith("==") and "*" not in pinned
+            versions[package.replace("-", "_")] = pinned if exact else None
+        return versions
 
     def _pin_from_hub(self, identity: ModelIdentity) -> ModelIdentity:
         """Resolve a branch or tag to a commit SHA when ``inspect`` did not.
@@ -1709,6 +1738,9 @@ class PrepareService:
         if reused is not None:
             return reused
         self._refuse_impossible(plan)
+        overridden = self._refuse_known_export_failure(
+            plan, ctx, ignored=ignore_exporter_requirements
+        )
         self._approve(plan, confirm, unattended=unattended)
 
         self._stage(ctx, 3)
@@ -1716,6 +1748,7 @@ class PrepareService:
         warnings, preflight_notes = self._preflight(
             plan, ctx, ignore_exporter_requirements=ignore_exporter_requirements
         )
+        warnings = overridden + warnings
         staging = self._staging_dir(plan, ctx)
         adopted = self._adopt_export(plan, staging, ctx)
         # Built at preflight, before the model download: a failed build then costs
@@ -1985,6 +2018,61 @@ class PrepareService:
                     context={"repo_id": source},
                 )
             )
+
+    def _refuse_known_export_failure(
+        self,
+        plan: PreparationPlan,
+        ctx: JobContext,
+        *,
+        ignored: bool,
+    ) -> list[str]:
+        """Stop, before any question, an export the registry knows will fail.
+
+        The registry decided this at planning time against the interpreter and
+        packages that will run the export (:attr:`PreparationPlan.export_blocked`).
+        ``--ignore-exporter-requirements`` overrides it as it overrides an unmet
+        pin, for an exporter patched in place under the same version; the
+        override is returned as a warning so the manifest records it.
+        """
+        blocked = plan.export_blocked
+        if blocked is None:
+            return []
+        versions = blocked.context.get("versions", "")
+        if ignored:
+            note = (
+                f"Known exporter failure overridden with {IGNORE_EXPORTER_REQUIREMENTS_FLAG}: "
+                f"{blocked.title} ({versions}, rule {blocked.matched_rule_id})"
+            )
+            ctx.emit(ProgressKind.LOG, note, severity=Severity.WARNING)
+            ctx.logger.warning("preflight.export_block_overridden", note)
+            return [note]
+        where = (
+            f"managed export environment {plan.export_environment.name}"
+            if plan.export_environment is not None
+            else "the Python environment yonga runs in"
+        )
+        message = (
+            f"{blocked.message} The export would run in {where}, with {versions}. yonga "
+            f"stops here, before the {format_bytes(plan.disk.expected_download_bytes)} "
+            "download. Nothing has been downloaded."
+        )
+        raise PreflightError(
+            blocked.model_copy(
+                update={
+                    "message": message,
+                    "remediation": [
+                        *blocked.remediation,
+                        (
+                            "If the exporter installed there already carries the fix under the "
+                            "same version, re-run with "
+                            f"{IGNORE_EXPORTER_REQUIREMENTS_FLAG} (--yes does not override "
+                            f"this): {_rerun(plan, add=(IGNORE_EXPORTER_REQUIREMENTS_FLAG,))}"
+                        ),
+                    ],
+                    "job_id": ctx.job_id,
+                }
+            )
+        )
 
     @staticmethod
     def _runtime_missing(plan: PreparationPlan) -> Diagnostic:
@@ -3178,7 +3266,7 @@ class PrepareService:
         successful smoke test the device is reported failed.
         """
         attempted_at = _now()
-        properties = self._compile_properties(plan.profile)
+        properties = self._compile_properties(plan.profile, device)
         results: list[ProbeResult] = []
         failure: Diagnostic | None = None
         deferred: Diagnostic | None = None
@@ -3319,11 +3407,11 @@ class PrepareService:
         )
 
     @staticmethod
-    def _compile_properties(profile: ConversionProfile) -> dict[str, str]:
-        """Profile runtime properties minus the ones only a GenAI pipeline understands."""
+    def _compile_properties(profile: ConversionProfile, device: str) -> dict[str, str]:
+        """The profile's properties for ``device``, minus the GenAI-only ones."""
         return {
             name: value
-            for name, value in profile.runtime_properties.items()
+            for name, value in profile.runtime_properties_on(device).items()
             if name.upper() not in GENAI_ONLY_PROPERTIES
         }
 
@@ -3338,7 +3426,9 @@ class PrepareService:
 
         The profile's full runtime properties are applied here — including the
         GenAI-only ones such as ``ATTENTION_BACKEND=SDPA`` — because this is the
-        first point at which a real pipeline exists to accept them.
+        first point at which a real pipeline exists to accept them. They are
+        applied only on the profile's own device, though: an NPU profile probed
+        on the GPU after a fallback must not hand it ``MAX_PROMPT_LEN``.
         """
         if self._smoke is None:
             return ProbeResult(
@@ -3357,7 +3447,7 @@ class PrepareService:
                 staging,
                 device=device,
                 pipeline=plan.pipeline,
-                properties=dict(plan.profile.runtime_properties),
+                properties=plan.profile.runtime_properties_on(device),
                 prompt=SMOKE_PROMPT,
                 max_new_tokens=SMOKE_MAX_NEW_TOKENS,
             )
@@ -3583,7 +3673,7 @@ class PrepareService:
             recommended_runtime=RecommendedRuntime(
                 device=device,
                 pipeline=plan.pipeline,
-                properties=dict(plan.profile.runtime_properties),
+                properties=plan.profile.runtime_properties_on(device),
                 max_new_tokens=int(self._settings.max_new_tokens),
                 generation_defaults={},
                 chat=self._chat_snapshot(chat_rule),

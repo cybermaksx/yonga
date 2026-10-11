@@ -77,7 +77,7 @@ def tool_calling(**overrides: object) -> ToolCallingRule:
 
 
 def test_schema_three_introduces_tool_calling_and_names_a_tool_floor() -> None:
-    assert SCHEMA_VERSION == TOOL_CALLING_SCHEMA_VERSION == 3
+    assert SCHEMA_VERSION >= TOOL_CALLING_SCHEMA_VERSION == 3
     assert SCHEMA_MIN_TOOL_VERSION[3] == "0.4.0"
     assert {"tagged_json", "json_list"} <= KNOWN_TOOL_CALL_FORMATS
 
