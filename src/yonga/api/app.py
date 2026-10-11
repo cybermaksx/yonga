@@ -6,7 +6,9 @@ assistant role, one chunk per released piece of text, one chunk per tool call
 an optional usage chunk, and ``data: [DONE]``. Generation
 runs on a worker thread; a client that disconnects makes the next chunk ask
 the pipeline to stop, so an abandoned request does not hold the accelerator
-for the rest of its token budget.
+for the rest of its token budget. The status waits until the pipeline has
+accepted the prompt, so a request it refuses before generating (a prompt over
+an NPU's compiled length) gets the same 400 with ``stream`` as without it.
 
 Security posture: the server binds to loopback unless told otherwise (the CLI
 decides that), keeps no request content anywhere, and when an API key is
@@ -165,21 +167,19 @@ def create_app(
         except YongaError as error:
             return _diagnostic_error(error.diagnostic)
         if body.stream:
-            return StreamingResponse(
-                _stream(server, completion, limit=limit, include_usage=body.include_usage),
-                media_type="text/event-stream",
-                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            generation = _Generation(server, completion)
+            return _EventStream(
+                generation,
+                _stream(server, generation, limit=limit, include_usage=body.include_usage),
             )
         try:
             turn = await asyncio.to_thread(server.complete, completion)
-        except ParameterError as error:
-            # An image whose header was fine but whose pixels are not, found
-            # only when it is decoded for the pipeline.
-            return _error(400, str(error), error.code, param=error.param)
-        except YongaError as error:
-            return _diagnostic_error(error.diagnostic)
+        except (ParameterError, YongaError) as error:
+            # A ParameterError is an image whose header was fine but whose
+            # pixels are not, found only when it is decoded for the pipeline.
+            return _failure_response(error)
         if turn.diagnostic is not None:
-            return _diagnostic_error(turn.diagnostic)
+            return _failure_response(turn)
         return JSONResponse(_completion(server, turn, limit=limit))
 
     return app
@@ -261,43 +261,167 @@ def _chunk(
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
+class _Generation:
+    """One streamed generation, run on a worker thread and relayed through a queue.
+
+    The worker reports ``started`` the first time the pipeline hands back a
+    chunk, which is once it has accepted the prompt. What a pipeline refuses
+    before that -- a prompt longer than an NPU's compiled length, an image whose
+    pixels do not decode, a model that does not load -- ends the work without
+    it, and :class:`_EventStream` can still answer with a status.
+    """
+
+    def __init__(self, server: ModelServer, completion: CompletionRequest) -> None:
+        self._server = server
+        self._completion = completion
+        self._queue: asyncio.Queue[tuple[str, object]] = asyncio.Queue()
+        self._abandoned = threading.Event()
+        self._held: tuple[str, object] | None = None
+
+    def start(self) -> None:
+        """Start generating on a worker thread; call from the event loop."""
+        loop = asyncio.get_running_loop()
+        abandoned, started = self._abandoned, threading.Event()
+
+        def deliver(kind: str, value: object) -> None:
+            # The event loop is gone once the client has disconnected and the
+            # response was torn down; there is then nobody left to deliver to.
+            with suppress(RuntimeError):
+                loop.call_soon_threadsafe(self._queue.put_nowait, (kind, value))
+
+        def should_stop() -> bool:
+            # Asked on every chunk the pipeline streams, before it is released.
+            if not started.is_set():
+                started.set()
+                deliver("started", None)
+            return abandoned.is_set()
+
+        def on_text(text: str) -> bool | None:
+            if abandoned.is_set():
+                return True  # ask the pipeline to stop
+            deliver("text", text)
+            return None
+
+        def work() -> None:
+            try:
+                turn = self._server.complete(
+                    self._completion, on_text=on_text, should_stop=should_stop
+                )
+                deliver("done", turn)
+            except BaseException as error:
+                deliver("error", error)
+
+        threading.Thread(target=work, name="yonga-generate", daemon=True).start()
+
+    async def first(self) -> tuple[str, object]:
+        """Wait for the first event; :meth:`next` returns it again, unless it is ``started``."""
+        event = await self._queue.get()
+        if event[0] != "started":
+            self._held = event
+        return event
+
+    async def next(self) -> tuple[str, object]:
+        """The next event: ``started``, ``text``, ``done`` (a turn) or ``error``."""
+        if self._held is not None:
+            event, self._held = self._held, None
+            return event
+        return await self._queue.get()
+
+    def abandon(self) -> None:
+        """Ask the pipeline to stop at its next chunk: nobody is reading any more."""
+        self._abandoned.set()
+
+
+class _EventStream(StreamingResponse):
+    """Server-sent events whose status waits until generation has started.
+
+    A request refused before the pipeline produces anything gets the status
+    and body the same request gets without ``stream``, so a client sees a 400
+    it can act on (and does not retry) rather than a 200 whose only event is
+    an error. Once generation has started the status is sent, and a failure
+    can only be reported as an event (see :func:`_stream`). The role chunk
+    that opens the stream waits with the status; it carries nothing a client
+    needs before the answer follows it.
+    """
+
+    def __init__(self, generation: _Generation, events: AsyncIterator[str]) -> None:
+        super().__init__(
+            events,
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+        self._generation = generation
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        generation = self._generation
+        generation.start()
+        try:
+            opening = await _opening(generation, receive)
+        except BaseException:
+            generation.abandon()
+            raise
+        if opening is None:
+            # The client went away while the request waited for the pipeline.
+            # Nobody reads this answer, but an application must give one, or
+            # the middleware reports a request that got no response.
+            generation.abandon()
+            gone = _error(499, "The client closed the request.", "client_closed_request")
+            await gone(scope, receive, send)
+            return
+        kind, value = opening
+        if kind == "error" or (kind == "done" and _failed(value)):
+            await _failure_response(value)(scope, receive, send)
+            return
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            # Also when the client left before the first event was read.
+            generation.abandon()
+
+
+async def _opening(generation: _Generation, receive: Receive) -> tuple[str, object] | None:
+    """The first event of ``generation``, or ``None`` if the client disconnects first."""
+    first = asyncio.create_task(generation.first())
+    gone = asyncio.create_task(_disconnect(receive))
+    try:
+        await asyncio.wait({first, gone}, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        first.cancel()
+        gone.cancel()
+        await asyncio.gather(first, gone, return_exceptions=True)
+    return first.result() if first.done() and not first.cancelled() else None
+
+
+async def _disconnect(receive: Receive) -> None:
+    """Return once the client has disconnected; the body has been read already."""
+    while (await receive())["type"] != "http.disconnect":
+        pass
+
+
+def _failed(value: object) -> bool:
+    """Whether a finished generation's turn carries a failure instead of an answer."""
+    return not isinstance(value, ChatTurn) or value.diagnostic is not None
+
+
 async def _stream(
     server: ModelServer,
-    completion: CompletionRequest,
+    generation: _Generation,
     *,
     limit: int,
     include_usage: bool,
 ) -> AsyncIterator[str]:
-    """Run one generation on a worker thread and relay it as server-sent events."""
-    loop = asyncio.get_running_loop()
-    queue: asyncio.Queue[tuple[str, object]] = asyncio.Queue()
-    abandoned = threading.Event()
+    """Relay a started ``generation`` as server-sent events.
 
-    def deliver(kind: str, value: object) -> None:
-        # The event loop is gone once the client has disconnected and the
-        # response was torn down; there is then nobody left to deliver to.
-        with suppress(RuntimeError):
-            loop.call_soon_threadsafe(queue.put_nowait, (kind, value))
-
-    def on_text(text: str) -> bool | None:
-        if abandoned.is_set():
-            return True  # ask the pipeline to stop
-        deliver("text", text)
-        return None
-
-    def work() -> None:
-        try:
-            turn = server.complete(completion, on_text=on_text, should_stop=abandoned.is_set)
-            deliver("done", turn)
-        except BaseException as error:
-            deliver("error", error)
-
+    The status is already sent, so a failure from here on is an ``error``
+    event carrying the body a request refused without ``stream`` gets.
+    """
     identifier, created, model = completion_id(), int(time.time()), server.model.id
-    threading.Thread(target=work, name="yonga-generate", daemon=True).start()
     try:
         yield _chunk(identifier, created, model, {"role": "assistant", "content": ""})
         while True:
-            kind, value = await queue.get()
+            kind, value = await generation.next()
+            if kind == "started":
+                continue
             if kind == "text":
                 yield _chunk(identifier, created, model, {"content": str(value)})
                 continue
@@ -319,31 +443,12 @@ async def _stream(
                     }
                     yield f"data: {json.dumps(payload)}\n\n"
             else:
-                report = (
-                    value.diagnostic
-                    if isinstance(value, ChatTurn) and value.diagnostic is not None
-                    else value.diagnostic
-                    if isinstance(value, YongaError)
-                    else None
-                )
-                if isinstance(value, ParameterError):
-                    # An image that only failed once decoded; the stream had already begun.
-                    error: dict[str, object] = {
-                        "message": str(value),
-                        "code": value.code,
-                        "param": value.param,
-                    }
-                elif report is not None:
-                    _status, body = _diagnostic_body(report)
-                    # The stream has begun: no status, and only what the event shape carries.
-                    error = {key: body[key] for key in ("message", "code", "param") if body[key]}
-                else:
-                    error = {"message": "Generation failed.", "code": "internal_error"}
-                yield f"data: {json.dumps({'error': error})}\n\n"
+                _status, body = _failure(value)
+                yield f"data: {json.dumps({'error': body})}\n\n"
             yield "data: [DONE]\n\n"
             return
     finally:
-        abandoned.set()
+        generation.abandon()
 
 
 # --- request limits -------------------------------------------------------------------
@@ -426,6 +531,30 @@ def _model_not_found(name: str) -> JSONResponse:
 def _diagnostic_error(report: Diagnostic) -> JSONResponse:
     status, body = _diagnostic_body(report)
     return JSONResponse({"error": body}, status_code=status)
+
+
+def _failure_response(outcome: object) -> JSONResponse:
+    status, body = _failure(outcome)
+    return JSONResponse({"error": body}, status_code=status)
+
+
+def _failure(outcome: object) -> tuple[int, dict[str, object]]:
+    """The status and OpenAI-shaped error body for a generation that gave no answer.
+
+    ``outcome`` is what it ended with: a :class:`ParameterError` (an image
+    whose pixels do not decode), a typed error, a turn carrying a diagnostic,
+    or anything else, which is the server's own failure and says no more.
+    The same body is a response's, or a stream's ``error`` event once the
+    stream has begun.
+    """
+    error: dict[str, object]
+    if isinstance(outcome, ParameterError):
+        error = {"message": str(outcome), "type": "invalid_request_error", "param": outcome.param}
+        return 400, {**error, "code": outcome.code}
+    if isinstance(outcome, YongaError | ChatTurn) and outcome.diagnostic is not None:
+        return _diagnostic_body(outcome.diagnostic)
+    error = {"message": "Generation failed.", "type": "server_error", "param": None}
+    return 500, {**error, "code": "internal_error"}
 
 
 def _diagnostic_body(report: Diagnostic) -> tuple[int, dict[str, object]]:

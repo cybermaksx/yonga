@@ -7,9 +7,12 @@ model naming is what the shipped chat profile produces.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import threading
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -54,6 +57,20 @@ class StreamingRuntime(FakeRuntime):
         return result
 
 
+class BreakingRuntime(StreamingRuntime):
+    """Streams the start of an answer, then fails: the device went away mid-answer."""
+
+    def __init__(self, failure: BaseException) -> None:
+        super().__init__(["The answer is"])
+        self.failure = failure
+
+    def generate_stream(
+        self, history: ChatHistory, config: GenerationSettings, on_text: TextCallback
+    ) -> GenerationResult:
+        super().generate_stream(history, config, on_text)
+        raise self.failure
+
+
 def make_server(
     tmp_path: Path,
     answers: list[str | BaseException],
@@ -61,9 +78,11 @@ def make_server(
     streaming: bool = True,
     chunk: int = 3,
     show_reasoning: bool = False,
+    runtime: FakeRuntime | None = None,
 ) -> tuple[ModelServer, FakeRuntime]:
     service, factory, _ = build_service(tmp_path)
-    runtime = StreamingRuntime(answers, chunk) if streaming else FakeRuntime(answers)
+    if runtime is None:
+        runtime = StreamingRuntime(answers, chunk) if streaming else FakeRuntime(answers)
     factory.runtime = runtime
     artifact = write_artifact(tmp_path, make_manifest())
     session = service.open_artifact(artifact)
@@ -404,7 +423,7 @@ def test_a_generation_setting_out_of_range_names_the_parameter(
         error = response.json()["error"]
         assert error["param"] == param
         assert error["type"] == "invalid_request_error"
-        assert error["code"].startswith("serve.request.")
+        assert error["code"] == f"serve.request.{param}"
         assert f"{param} must be" in error["message"]
     assert runtime.histories == []
 
@@ -454,12 +473,29 @@ def test_a_server_error_does_not_echo_openvinos_source_locations(tmp_path: Path)
     client = client_for(server)
 
     plain = client.post("/v1/chat/completions", json=ask()).json()["error"]
-    parsed = events(client.post("/v1/chat/completions", json=ask(stream=True)).text)
-    (streamed,) = [e["error"] for e in parsed if isinstance(e, dict) and "error" in e]
+    streamed = client.post("/v1/chat/completions", json=ask(stream=True))
 
     assert plain["message"] == "Generation failed on NPU: The device returned no logits."
-    assert streamed["message"] == plain["message"]
     assert plain["type"] == "server_error"
+    assert streamed.status_code == 500, "it failed before generating, so the status says so"
+    assert streamed.json()["error"] == plain
+
+
+def test_an_error_event_does_not_echo_openvinos_source_locations(tmp_path: Path) -> None:
+    raw = "Check 'ok' failed at /home/jenkins/src/pipeline.cpp:120:\nThe device was lost.\n"
+    failure = GenerationError(
+        diagnostic(
+            "runtime.genai.generation_failed",
+            FailureCategory.UNKNOWN_RUNTIME_ERROR,
+            "Generation failed on NPU",
+            raw,
+        )
+    )
+    server, _ = make_server(tmp_path, [], runtime=BreakingRuntime(failure))
+    parsed = events(client_for(server).post("/v1/chat/completions", json=ask(stream=True)).text)
+
+    (error,) = [e["error"] for e in parsed if isinstance(e, dict) and "error" in e]
+    assert error["message"] == "Generation failed on NPU: The device was lost."
 
 
 def prompt_too_long() -> GenerationError:
@@ -469,7 +505,7 @@ def prompt_too_long() -> GenerationError:
             PROMPT_TOO_LONG,
             FailureCategory.CONFIGURATION_ERROR,
             "The prompt is too long for this model",
-            "The prompt is 6423 tokens, and this model on NPU takes at most 1024.",
+            "It has 6423 tokens, and this model on NPU takes at most 1024.",
             context={"device": "NPU", "prompt_tokens": "6423", "max_prompt_tokens": "1024"},
         )
     )
@@ -485,7 +521,7 @@ def test_a_prompt_over_the_npu_length_is_openais_context_length_error(tmp_path: 
     assert response.status_code == 400
     error = response.json()["error"]
     assert error == {
-        "message": "The prompt is too long for this model: The prompt is 6423 tokens, and this "
+        "message": "The prompt is too long for this model: It has 6423 tokens, and this "
         "model on NPU takes at most 1024.",
         "type": "invalid_request_error",
         "param": "messages",
@@ -494,18 +530,19 @@ def test_a_prompt_over_the_npu_length_is_openais_context_length_error(tmp_path: 
     assert client.post("/v1/chat/completions", json=ask()).status_code == 200
 
 
-def test_a_streamed_prompt_over_the_npu_length_names_it_in_the_error_event(
-    tmp_path: Path,
-) -> None:
-    server, _ = make_server(tmp_path, [prompt_too_long()])
-    response = client_for(server).post("/v1/chat/completions", json=ask(stream=True))
+def test_a_streamed_prompt_over_the_npu_length_is_the_same_400(tmp_path: Path) -> None:
+    """The pipeline refuses it before generating, so the stream never opens."""
+    server, _ = make_server(tmp_path, [prompt_too_long(), prompt_too_long(), "Hi."])
+    client = client_for(server)
 
-    parsed = events(response.text)
-    (error,) = [e["error"] for e in parsed if isinstance(e, dict) and "error" in e]
-    assert error["code"] == "context_length_exceeded"
-    assert error["param"] == "messages"
-    assert "6423" in error["message"]
-    assert parsed[-1] == "[DONE]"
+    plain = client.post("/v1/chat/completions", json=ask())
+    streamed = client.post("/v1/chat/completions", json=ask(stream=True))
+
+    assert streamed.status_code == plain.status_code == 400
+    assert streamed.headers["content-type"] == "application/json"
+    assert streamed.json() == plain.json()
+    assert streamed.json()["error"]["code"] == "context_length_exceeded"
+    assert client.post("/v1/chat/completions", json=ask(stream=True)).status_code == 200
 
 
 # --- streaming ------------------------------------------------------------------------
@@ -547,6 +584,7 @@ def test_a_runtime_that_cannot_stream_still_answers_a_streaming_request(
 
 
 def test_a_failure_while_streaming_ends_with_an_error_event(tmp_path: Path) -> None:
+    """Once text has gone out the status is sent; the event carries the body a 500 would."""
     failure = GenerationError(
         diagnostic(
             "runtime.genai.generation_failed",
@@ -555,13 +593,108 @@ def test_a_failure_while_streaming_ends_with_an_error_event(tmp_path: Path) -> N
             "device lost",
         )
     )
-    server, _ = make_server(tmp_path, [failure])
+    server, _ = make_server(tmp_path, [], runtime=BreakingRuntime(failure))
     response = client_for(server).post("/v1/chat/completions", json=ask(stream=True))
 
+    assert response.status_code == 200
     parsed = events(response.text)
+    assert content_of(response.text) == "The answer is"
     errors = [e for e in parsed if isinstance(e, dict) and "error" in e]
-    assert errors[0]["error"]["code"] == "runtime.genai.generation_failed"
+    assert errors == [
+        {
+            "error": {
+                "message": "Generation failed on GPU: device lost",
+                "type": "server_error",
+                "param": None,
+                "code": "runtime.genai.generation_failed",
+            }
+        }
+    ]
     assert parsed[-1] == "[DONE]"
+
+
+def test_a_failure_before_the_first_chunk_is_a_status_not_an_event(tmp_path: Path) -> None:
+    failure = GenerationError(
+        diagnostic(
+            "runtime.genai.generation_failed",
+            FailureCategory.UNKNOWN_RUNTIME_ERROR,
+            "Generation failed on GPU",
+            "device lost",
+        )
+    )
+    server, _ = make_server(tmp_path, [failure, failure])
+    client = client_for(server)
+
+    plain = client.post("/v1/chat/completions", json=ask())
+    streamed = client.post("/v1/chat/completions", json=ask(stream=True))
+
+    assert streamed.status_code == plain.status_code == 500
+    assert streamed.json() == plain.json()
+
+
+def test_a_client_gone_before_generation_starts_stops_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No status is sent while the request waits, yet a client that leaves is noticed."""
+    server, runtime = make_server(tmp_path, ["One. Two. Three."], chunk=1)
+    waiting, release, finished = threading.Event(), threading.Event(), threading.Event()
+    complete = server.complete
+
+    def queued(completion: Any, **kwargs: Any) -> Any:
+        waiting.set()
+        release.wait(5)  # another request still holds the pipeline
+        try:
+            return complete(completion, **kwargs)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(server, "complete", queued)
+    sent = asyncio.run(leave_while_waiting(create_app(server), waiting))
+    release.set()
+
+    assert finished.wait(5)
+    assert isinstance(runtime, StreamingRuntime) and runtime.stopped_early, "stopped at once"
+    # Nobody reads it; it only ends the exchange, which the middleware insists on.
+    assert sent[0]["type"] == "http.response.start"
+    assert sent[0]["status"] == 499
+
+
+async def leave_while_waiting(app: Any, waiting: threading.Event) -> list[dict[str, Any]]:
+    """Drive ``app`` over ASGI with a client that disconnects once ``waiting`` is set."""
+    body = json.dumps(ask(stream=True)).encode()
+    pending = [{"type": "http.request", "body": body, "more_body": False}]
+    gone = asyncio.Event()
+    sent: list[dict[str, Any]] = []
+
+    async def receive() -> dict[str, Any]:
+        if pending:
+            return pending.pop()
+        await gone.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(message: dict[str, Any]) -> None:
+        sent.append(message)
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/chat/completions",
+        "raw_path": b"/v1/chat/completions",
+        "query_string": b"",
+        "root_path": "",
+        "headers": [(b"content-type", b"application/json")],
+        "client": ("127.0.0.1", 50000),
+        "server": ("127.0.0.1", 8000),
+    }
+    served = asyncio.create_task(app(scope, receive, send))
+    assert await asyncio.to_thread(waiting.wait, 5)
+    assert sent == [], "no status before the pipeline has accepted the prompt"
+    gone.set()
+    await asyncio.wait_for(served, 5)
+    return sent
 
 
 # --- authentication -------------------------------------------------------------------

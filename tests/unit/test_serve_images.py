@@ -24,7 +24,7 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 from tests.unit.test_chat_service import build_service, make_manifest, write_artifact
-from tests.unit.test_serve_api import StreamingRuntime, content_of, events
+from tests.unit.test_serve_api import StreamingRuntime, content_of
 from yonga.adapters.runtime_genai import ChatHistory, ChatImage, ChatMessage, GenerationResult
 from yonga.api.app import create_app
 from yonga.api.images import decode_data_url
@@ -404,24 +404,22 @@ def test_pixels_that_fail_to_decode_are_a_400_naming_the_image(tmp_path: Path) -
     assert runtime.seen == []
 
 
-def test_pixels_that_fail_to_decode_end_a_stream_with_an_error(tmp_path: Path) -> None:
+def test_pixels_that_fail_to_decode_are_the_same_400_when_streamed(tmp_path: Path) -> None:
+    """Found before generation starts, so the stream never opens."""
     server, runtime = make_server(tmp_path, ["Hi."])
     response = client_for(server).post(
         "/v1/chat/completions", json=ask(user(image_part(truncated_png())), stream=True)
     )
 
-    errors = [
-        event for event in events(response.text) if isinstance(event, dict) and "error" in event
-    ]
-    assert errors == [
-        {
-            "error": {
-                "message": "The image could not be decoded as PNG, JPEG, WebP or GIF.",
-                "code": "invalid_request",
-                "param": "messages[0].content[0].image_url.url",
-            }
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": {
+            "message": "The image could not be decoded as PNG, JPEG, WebP or GIF.",
+            "type": "invalid_request_error",
+            "param": "messages[0].content[0].image_url.url",
+            "code": "invalid_request",
         }
-    ]
+    }
     assert runtime.seen == []
 
 
