@@ -10,7 +10,8 @@ import io
 from typing import Any
 
 from yonga.application.progress import ProgressEvent, ProgressKind
-from yonga.ui.console import YongaConsole, build_console
+from yonga.domain.diagnostics import Severity
+from yonga.ui.console import YongaConsole, build_console, status_icon
 from yonga.ui.progress import RichProgressSink
 
 
@@ -195,3 +196,99 @@ def test_a_validate_event_without_a_role_is_left_alone() -> None:
         )
 
     assert "Applying registry repairs" in err.getvalue()
+
+
+# ----------------------------------------------------------------------
+# a finished download stays finished
+# ----------------------------------------------------------------------
+GIB = 1024**3
+
+
+def download(status: str, current: int | None = None, total: int | None = None) -> ProgressEvent:
+    """One download event as the Hub adapter emits it."""
+    return ProgressEvent(
+        kind=ProgressKind.DOWNLOAD,
+        message="Downloading acme/model",
+        current=current,
+        total=total,
+        status=status,
+    )
+
+
+def stage(number: int, label: str) -> ProgressEvent:
+    """One ``N/7`` stage event."""
+    return ProgressEvent(kind=ProgressKind.STAGE, message=label, current=number, total=7)
+
+
+def test_a_late_byte_report_after_completion_prints_nothing() -> None:
+    """``Downloading ... (1.4 GiB / 1.6 GiB)`` used to appear after ``7/7 Probing``."""
+    console, err = make_console()
+
+    with RichProgressSink(console) as sink:
+        sink.emit(stage(4, "Downloading"))
+        sink.emit(download("started"))
+        sink.emit(download("downloading", GIB, 2 * GIB))
+        sink.emit(download("completed", 2 * GIB, 2 * GIB))
+        sink.emit(stage(7, "Probing runtime"))
+        sink.emit(download("downloading", GIB, 2 * GIB))
+
+    after = err.getvalue().split("7/7 Probing runtime", 1)[1]
+    assert "Downloading" not in after
+
+
+def test_a_new_download_after_a_finished_one_is_shown() -> None:
+    console, err = make_console()
+
+    with RichProgressSink(console) as sink:
+        sink.emit(download("started"))
+        sink.emit(download("completed"))
+        sink.emit(stage(5, "Fallback"))
+        sink.emit(download("started"))
+
+    assert "Downloading acme/model" in err.getvalue().split("5/7 Fallback", 1)[1]
+
+
+def live_console() -> YongaConsole:
+    """A console that animates, as on a terminal."""
+    return YongaConsole(
+        out=build_console(file=io.StringIO(), width=100, force_terminal=True),
+        err=build_console(file=io.StringIO(), width=100, force_terminal=True),
+        env={},
+    )
+
+
+def test_a_completed_download_fills_its_bar_and_is_not_redrawn_later() -> None:
+    """On a terminal the 100% bar kept being redrawn through stages 5 to 7."""
+    sink = RichProgressSink(live_console())
+    try:
+        sink.emit(download("downloading", GIB, 2 * GIB))
+        sink.emit(download("completed"))
+        progress = sink._progress
+        assert progress is not None
+        [task] = progress.tasks
+        assert task.total == 2 * GIB
+        assert task.completed == task.total
+
+        sink.emit(stage(5, "Converting"))
+        sink.emit(download("downloading", GIB, 2 * GIB))
+        assert progress.tasks == []
+    finally:
+        sink.close()
+
+
+def test_a_cancelled_outcome_is_not_drawn_as_an_error() -> None:
+    """The user stopping a step is not the step failing."""
+    console, err = make_console()
+
+    with RichProgressSink(console) as sink:
+        sink.emit(
+            ProgressEvent(
+                kind=ProgressKind.PROBE,
+                device="CPU",
+                status="cancelled",
+                severity=Severity.ERROR,
+            )
+        )
+
+    assert status_icon(Severity.ERROR) not in err.getvalue()
+    assert status_icon(Severity.WARNING) in err.getvalue()

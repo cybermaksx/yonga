@@ -2734,10 +2734,11 @@ class PrepareService:
             environment_versions={} if environment is None else dict(environment.installed),
         )
         result = self._exporter.export(request, ctx)
-        # The exporter empties its output directory before it starts, which takes the
-        # marker with it. Re-mark whatever it left behind — on success so an
-        # interrupted validation is still recognisable, and on failure so the debris
-        # of a failed run is recognisably this job's and not a user directory.
+        # The exporter keeps the marker when it empties its output directory, but
+        # the tool it runs owns that directory meanwhile. Re-mark whatever it left
+        # behind — on success so an interrupted validation is still recognisable,
+        # and on failure so the debris of a failed run is recognisably this job's
+        # and not a user directory.
         if staging.is_dir():
             mark_incomplete(staging, job_id=ctx.job_id)
         record = ExportRecord(

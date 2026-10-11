@@ -443,6 +443,42 @@ def test_default_line_selector_classification():
     assert default_line_selector("Loading weights:  40%|####      | 8/21") is None
 
 
+#: What nncf printed during a real INT4 export (managed environment, piped).
+NNCF_OUTPUT = [
+    "Mixed-Precision assignment ━━━━━━━━━━━━━━━━━━━━ 100% 196/196 • 0:00:00 • 0:00:00",
+    "INFO:nncf:Statistics of the bitwidth distribution:",
+    "┍━━━━━━━━━━━━━━━━━━━━━━━━━━━┯━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┑",
+    "│ Weight compression mode   │ % all parameters (layers)   │",
+    "┝━━━━━━━━━━━━━━━━━━━━━━━━━━━┿━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┥",
+    "│ int4_asym, group size 128 │ 59% (139 / 198)             │",
+    "┕━━━━━━━━━━━━━━━━━━━━━━━━━━━┷━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┙",
+    "Applying Weight Compression ━━━━━━━━━━━━━━━━━━━━━━━━━━━ 100% • 0:00:05 • 0:00:00",
+]
+
+
+def test_a_table_row_is_not_a_milestone():
+    """nncf's bit-width table used to become the live "Converting" description."""
+    assert default_line_selector("│ Weight compression mode   │ % all parameters │") is None
+    assert default_line_selector("┍━━━━━━━━━━━━━━━━━━┯━━━━━━━━━━━━━━━━━━┑") is None
+
+
+def test_rich_progress_bars_are_reported_by_their_label(job):
+    ctx, sink, log = job
+    SubprocessRunner().run(
+        python(f"for line in {NNCF_OUTPUT!r}:\n    print(line)"),
+        ctx=ctx,
+    )
+    messages = [event.message for event in sink.of_kind(ProgressKind.EXPORT)]
+    assert messages == [
+        "Mixed-Precision assignment",
+        "INFO:nncf:Statistics of the bitwidth distribution:",
+        "Applying Weight Compression",
+    ]
+    # Nothing is lost: the job log keeps every line verbatim.
+    logged = [entry["message"] for entry in read_log(log) if entry["event"] == "subprocess.output"]
+    assert logged == NNCF_OUTPUT
+
+
 def test_progress_uses_the_last_segment_of_a_carriage_return_redraw(job):
     ctx, sink, _log = job
     SubprocessRunner().run(

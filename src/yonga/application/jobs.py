@@ -56,6 +56,7 @@ from yonga.domain.diagnostics import (
 )
 from yonga.domain.plans import JobStage, JobState, JobStatus, JobSummary
 from yonga.util.jsonlog import LEVEL_ERROR, LEVEL_WARNING, JobLogger, null_logger
+from yonga.util.library_logs import library_logs_to
 from yonga.util.redaction import environment_secrets
 
 __all__ = [
@@ -907,7 +908,9 @@ def open_job(
 
     succeeded = False
     try:
-        yield ctx
+        # Library records (the Hub's advisory warnings) belong in this job's log.
+        with library_logs_to(logger):
+            yield ctx
         succeeded = True
     except BaseException as error:
         ctx.fail_unfinished(error)

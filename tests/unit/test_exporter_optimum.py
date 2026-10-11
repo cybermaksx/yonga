@@ -8,6 +8,7 @@ is covered by ``tests/integration/test_exporter_fake.py``.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -25,7 +26,9 @@ from yonga.adapters.exporter_optimum import (
     quantization_flags,
     resolve_launcher,
 )
+from yonga.adapters.filesystem import INCOMPLETE_MARKER_NAME, mark_incomplete
 from yonga.application.jobs import JobContext, open_job
+from yonga.application.progress import CollectingSink, ProgressKind
 from yonga.config.settings import load_settings
 from yonga.domain.diagnostics import ConfigurationError, FailureCategory
 from yonga.domain.plans import (
@@ -538,6 +541,39 @@ def test_export_clears_only_tool_owned_staging_leftovers(job: JobContext) -> Non
     assert sibling.read_text(encoding="utf-8") == "sibling"
 
 
+def job_events(job: JobContext, event: str) -> list[dict[str, object]]:
+    """The records of ``event`` in this job's log so far."""
+    lines = job.logger.path.read_text(encoding="utf-8").splitlines()
+    return [entry for entry in map(json.loads, lines) if entry["event"] == event]
+
+
+def test_a_fresh_staging_directory_is_not_reported_as_leftovers(job: JobContext) -> None:
+    """The caller's incomplete marker is not output from an earlier attempt."""
+    output = job.staging_dir / "model"
+    mark_incomplete(output, job_id=job.job_id)
+
+    OptimumExporter(FakeRunner(), launcher=LAUNCHER).export(
+        make_request(job, output_path=output), job
+    )
+
+    assert job_events(job, "export.output_reset") == []
+    assert (output / INCOMPLETE_MARKER_NAME).exists()
+
+
+def test_real_leftovers_are_reported_and_cleared_but_the_marker_stays(job: JobContext) -> None:
+    output = job.staging_dir / "model"
+    mark_incomplete(output, job_id=job.job_id)
+    (output / "stale.xml").write_text("partial", encoding="utf-8")
+
+    OptimumExporter(FakeRunner(), launcher=LAUNCHER).export(
+        make_request(job, output_path=output), job
+    )
+
+    [reset] = job_events(job, "export.output_reset")
+    assert reset["entries"] == 1
+    assert [path.name for path in output.iterdir()] == [INCOMPLETE_MARKER_NAME]
+
+
 def test_export_refuses_when_the_output_path_is_a_file(job: JobContext) -> None:
     job.staging_dir.mkdir(parents=True, exist_ok=True)
     target = job.staging_dir / "model"
@@ -601,6 +637,29 @@ def test_cancellation_is_reported_as_user_cancelled(job: JobContext) -> None:
     assert result.diagnostic is not None
     assert result.diagnostic.code == "export.cancelled"
     assert result.diagnostic.category is FailureCategory.USER_CANCELLED
+
+
+def test_a_cancelled_conversion_is_not_announced_as_failed(job: JobContext) -> None:
+    """The live line read "Conversion failed" above a "Conversion cancelled" result."""
+    sink = CollectingSink()
+    job.progress = sink
+    runner = FakeRunner(returncode=-2, cancelled=True)
+
+    OptimumExporter(runner, launcher=LAUNCHER).export(make_request(job), job)
+
+    last = sink.of_kind(ProgressKind.EXPORT)[-1]
+    assert last.message == "Conversion cancelled"
+    assert last.status == "cancelled"
+
+
+def test_a_failed_conversion_is_still_announced_as_failed(job: JobContext) -> None:
+    sink = CollectingSink()
+    job.progress = sink
+
+    OptimumExporter(FakeRunner(returncode=1), launcher=LAUNCHER).export(make_request(job), job)
+
+    last = sink.of_kind(ProgressKind.EXPORT)[-1]
+    assert (last.message, last.status) == ("Conversion failed", "failed")
 
 
 def test_an_already_cancelled_job_never_starts_the_exporter(job: JobContext) -> None:

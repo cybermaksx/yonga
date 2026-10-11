@@ -35,6 +35,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from yonga.adapters.filesystem import INCOMPLETE_MARKER_NAME
 from yonga.application.progress import ProgressKind
 from yonga.domain.diagnostics import (
     ConfigurationError,
@@ -578,11 +579,17 @@ class OptimumExporter:
                 stderr_tail=stderr_tail,
             )
 
+        if success:
+            outcome, status, severity = "Conversion finished", "ok", Severity.INFO
+        elif cancelled:
+            outcome, status, severity = "Conversion cancelled", "cancelled", Severity.WARNING
+        else:
+            outcome, status, severity = "Conversion failed", "failed", Severity.ERROR
         ctx.emit(
             ProgressKind.EXPORT,
-            "Conversion finished" if success else "Conversion failed",
-            status="ok" if success else "failed",
-            severity=Severity.INFO if success else Severity.ERROR,
+            outcome,
+            status=status,
+            severity=severity,
             diagnostic=failure,
             profile=request.profile.id,
         )
@@ -633,11 +640,12 @@ class OptimumExporter:
     ) -> ExportResult:
         """Build the result for an export that never started."""
         ctx.logger.error("export.refused", failure.message, code=failure.code)
+        cancelled = failure.category is FailureCategory.USER_CANCELLED
         ctx.emit(
             ProgressKind.EXPORT,
             failure.title,
-            status="failed",
-            severity=Severity.ERROR,
+            status="cancelled" if cancelled else "failed",
+            severity=Severity.WARNING if cancelled else Severity.ERROR,
             diagnostic=failure,
         )
         return ExportResult(
@@ -866,8 +874,13 @@ def _clear_directory(directory: Path, ctx: JobContext) -> None:
     Only reached for paths inside ``ctx.staging_dir``, which means the content can
     only be the remains of an interrupted run of *this* job. Nothing outside the
     staging area is ever deleted (``SPEC.md`` section 11).
+
+    The incomplete-build marker is not output: the caller writes it before the
+    export so the directory is recognisably tool-owned, and it stays. A fresh
+    staging directory holding only the marker has nothing to clear and is not
+    reported as leftovers from an earlier attempt.
     """
-    children = list(directory.iterdir())
+    children = [child for child in directory.iterdir() if child.name != INCOMPLETE_MARKER_NAME]
     if not children:
         return
     ctx.logger.info(

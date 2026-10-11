@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
@@ -33,6 +34,7 @@ from yonga.adapters.hf import (
     CODE_REVISION_UNRESOLVED,
     CODE_UNKNOWN,
     HuggingFaceAdapter,
+    _progress_tqdm_class,
     detect_formats,
     detect_remote_code,
     is_commit_sha,
@@ -1241,6 +1243,120 @@ def test_download_emits_progress_events(tmp_path):
     assert byte_events[-1].current == 4096
     assert byte_events[-1].total == 4096
     assert byte_events[-1].data["unit"] == "bytes"
+
+
+class LeakyBarApi(FakeApi):
+    """Drives ``tqdm_class`` the way ``huggingface_hub.snapshot_download`` does.
+
+    The real function builds a "Fetching N files" bar for its thread pool and a
+    shared byte bar it never closes: the byte bar is only closed by the garbage
+    collector, at an arbitrary later moment. Xet transfers can also report fewer
+    bytes than the files' declared sizes.
+    """
+
+    def __init__(self, *, reported: int, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.reported = reported
+        self.byte_bar: Any = None
+
+    def snapshot_download(self, repo_id, *, tqdm_class=None, **kwargs):
+        assert tqdm_class is not None, "a job context always supplies a progress class"
+        self.snapshot_calls.append({"repo_id": repo_id, "tqdm_class": tqdm_class})
+        # The byte bar: TTY auto-detection (disable=None), never closed upstream.
+        self.byte_bar = tqdm_class(
+            disable=None,
+            name="huggingface_hub.snapshot_download",
+            desc="Downloading (incomplete total...)",
+            total=0,
+            initial=0,
+            unit="B",
+            unit_scale=True,
+        )
+        self.byte_bar.total += 4096
+        self.byte_bar.refresh()
+        # The file-count bar thread_map builds: no ``disable`` at all.
+        files = tqdm_class(["config.json", "model.safetensors"], desc="Fetching 2 files")
+        for _name in files:
+            self.byte_bar.update(self.reported // 2)
+        self.byte_bar.set_description("Download complete")
+        assert self.snapshot is not None
+        return str(self.snapshot)
+
+
+def test_download_bars_draw_nothing_of_their_own(tmp_path, capsys):
+    """The sink is the display: Hub tqdm bars must not write to the terminal too."""
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    api = LeakyBarApi(snapshot=snapshot, reported=4096)
+    ctx = make_job_context(tmp_path)
+
+    adapter_for(api).download(ModelIdentity(repo_id="acme/x", revision=SAFETENSORS_SHA), ctx=ctx)
+    api.byte_bar.close()
+
+    captured = capsys.readouterr()
+    assert "Fetching 2 files" not in captured.err
+    assert "Download" not in captured.err
+    assert captured.out == ""
+
+
+def test_a_byte_bar_closed_after_the_download_reports_nothing(tmp_path):
+    """The garbage collector closing the Hub's byte bar later must not redraw it."""
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    api = LeakyBarApi(snapshot=snapshot, reported=4096)
+    ctx = make_job_context(tmp_path)
+    sink = ctx.progress
+    assert isinstance(sink, CollectingSink)
+
+    adapter_for(api).download(ModelIdentity(repo_id="acme/x", revision=SAFETENSORS_SHA), ctx=ctx)
+    finished = len(sink.events)
+    api.byte_bar.update(1)
+    api.byte_bar.close()
+
+    assert len(sink.events) == finished
+    assert sink.events[-1].status == "completed"
+
+
+def test_a_finished_download_is_reported_complete(tmp_path):
+    """A transfer that reported fewer bytes than declared still finished."""
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    api = LeakyBarApi(snapshot=snapshot, reported=3000)
+    ctx = make_job_context(tmp_path)
+    sink = ctx.progress
+    assert isinstance(sink, CollectingSink)
+
+    adapter_for(api).download(ModelIdentity(repo_id="acme/x", revision=SAFETENSORS_SHA), ctx=ctx)
+
+    done = sink.of_kind(ProgressKind.DOWNLOAD)[-1]
+    assert done.status == "completed"
+    assert done.current == 4096
+    assert done.total == 4096
+
+
+def test_byte_progress_from_many_threads_is_counted_and_monotonic(tmp_path):
+    """Hub worker threads share one byte bar; no update may be lost or reordered."""
+    workers, per_worker = 8, 2000
+    ctx = make_job_context(tmp_path)
+    sink = ctx.progress
+    assert isinstance(sink, CollectingSink)
+    progress = _progress_tqdm_class(ctx, repo_id="acme/x", revision=SAFETENSORS_SHA, min_interval=0)
+    bar = progress(total=workers * per_worker, unit="B")
+
+    def pump() -> None:
+        for _ in range(per_worker):
+            bar.update(1)
+
+    threads = [threading.Thread(target=pump) for _ in range(workers)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    bar.close()
+
+    counts = [event.current or 0 for event in sink.of_kind(ProgressKind.DOWNLOAD)]
+    assert counts == sorted(counts)
+    assert counts[-1] == workers * per_worker
 
 
 def test_download_without_a_context_passes_no_tqdm_class(tmp_path):

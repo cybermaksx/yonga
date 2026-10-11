@@ -542,7 +542,9 @@ Job 61926a20-16b1-45e4-8392-5089d9f8c25e  (~/.local/share/yonga/logs/61926a20-â€
 
 Useful events: `job.stage` (where the job got to), `export.command` (the exact argv, redacted),
 `subprocess.output` (every line the exporter printed), `export.failed` (the tail that was
-classified, in its `raw` field), `preflight.*` (disk and requirement decisions).
+classified, in its `raw` field), `preflight.*` (disk and requirement decisions), `library.log`
+(warnings `huggingface_hub` logged during the job, such as the Hub's advice to set `HF_TOKEN`,
+kept here instead of breaking into the progress display).
 
 Every job ends with one terminal event. `job.completed` is a job that ran to its end, `probe` and
 `bench` included. `job.failed` (an error) and `job.cancelled` (a warning: Ctrl-C is not a defect)
