@@ -25,6 +25,20 @@ manifest may change in any minor release.
   `pipx install 'yonga[openvino,export]'`. `self uninstall` removes only an AppImage, after a
   question, and keeps models, logs, caches and settings, saying where they are.
   `docs/CLI_SPEC.md` section 12c.
+- **`yonga registry profiles [--device DEVICE] [--json]`** lists the conversion profiles
+  `--profile` accepts, with device, weights, size band, priority and status. An unknown
+  `--profile` now names the profiles for the requested device and points to this command.
+- The preparation plan always shows an `Export environment` row: a managed environment, or this
+  environment with the interpreter path and the reason.
+- Issue rule `gguf-reader-open-failed` (`export.gguf.open_failed`, exit 10). GGUF import failures
+  are now classified by the registry like optimum export failures instead of always being
+  `unknown_runtime_error`.
+- Issue rule `torchvision-torch-build-mismatch` (`export.torchvision.build_mismatch`, exit 10) for
+  `operator torchvision::nms does not exist`. `prepare` also imports the exporter in its own
+  environment at preflight, so a broken torch/torchvision pair is reported before the download.
+- The probe job log records every probe result with its raw runtime text (`probe.result`), as the
+  diagnostics already said it did.
+- `yonga eval` prints `Saved: PATH`, and `--json` includes `result_path`, as `bench` does.
 
 ### Changed
 
@@ -33,6 +47,188 @@ manifest may change in any minor release.
   it is a warning with `self install` as the remedy when `yonga` is not on `PATH`, or when it is
   another installation (named with its path, for example an older AppImage). For a pip install it
   is information only. `doctor --json` carries it as `installation`. `docs/CLI_SPEC.md` section 3.
+- **A command line yonga cannot parse exits 70** instead of Click's 2: an unknown command or
+  option, a missing argument, a value of the wrong type (`--timeout abc`, `--older-than abc`) and
+  a bare `yonga`. Exit 2 is left meaning only warnings or an inconclusive probe; `--help` still
+  exits 0.
+- `prepare` downloads only the files the conversion reads. ONNX copies, `original/` checkpoints,
+  training runs and a second weight format are skipped (SmolLM2-360M: 693 MiB instead of
+  4.7 GiB), and the plan's expected download counts the same files.
+- Automatic profile selection skips a group-wise profile whose group size cannot divide the
+  model's `hidden_size` (or `intermediate_size` at ratio 1.0) from `config.json`, and says why
+  under "Chosen because". With no fitting profile for an explicit device, `prepare` stops before
+  the download (exit 70) and names the devices that fit; `--device auto` moves on to the next
+  device.
+- `yonga logs` lists each job's id prefix, local start time with its zone, command, model, device,
+  outcome (ok/failed/cancelled/running/unfinished), duration and log size; `--json` adds these
+  fields. One job's view shows the same facts and prints record times in local time instead of
+  unmarked UTC.
+- `yonga list` shows the source revision as 7 characters under a `Rev` header.
+- While a job runs, warnings logged by huggingface_hub (such as the Hub's "You are sending
+  unauthenticated requests" advice) go to the job log as `library.log` records instead of breaking
+  into the progress line.
+
+### Fixed
+
+- `--offline` (and `YONGA_OFFLINE` / `HF_HUB_OFFLINE`) no longer contacts the Hugging Face Hub for
+  `inspect`, `prepare` or revision resolution. A cached model is inspected and prepared from the
+  local cache alone, including one downloaded by commit SHA with no `refs/main`. An uncached
+  revision, or a snapshot with only metadata files, fails with `hub.offline.missing` without
+  making any request.
+- `yonga inspect` no longer says a model needs `--trust-remote-code` when the registry declares a
+  native Transformers implementation (Phi-4-mini, phi3). `inspect` and `prepare` now share one
+  remote-code decision.
+- `yonga --offline search` reports `hub.offline.search_unavailable` ("Search needs the network")
+  instead of a misleading cache-miss message.
+- Re-running `prepare` for a model that is already prepared reuses the artifact without asking
+  anything, so it works in scripts without `--yes`. The reuse plan no longer lists a download,
+  temp space, repairs or an export environment.
+- An explicit `--device` that the registry records as unsupported for the model (official or
+  tested evidence) is refused before the download with exit 50 and the recommended fallback,
+  instead of after a full download and conversion.
+- Without the OpenVINO runtime installed, `prepare` stops before the download with exit 10 and
+  names `pip install 'yonga[openvino]'`, instead of blaming the host for having no devices. It no
+  longer offers to build a managed export environment then.
+- A gated or private repository with no Hugging Face token is flagged in the plan and refused
+  before the download with exit 21.
+- In a session without a terminal and without `--yes`, `prepare` says the confirmation could not
+  be asked and suggests `--yes`, instead of saying the user declined it.
+- A `prepare` that adopts a retained export, or copies published OpenVINO IR, reports this as a
+  note and exits 0 instead of 2.
+- The plan's "Estimated artifact" is worked out from the profile's quantization and the model's
+  parameter count (Qwen3-0.6B INT4: about 516 MiB, previously 1.4 GiB).
+- The plan's device decision for `--device auto` states the actual reason, such as the registry's
+  recommendation.
+- NNCF's group-size refusal is classified (`export.quantization.group_size_mismatch`, exit 70) even
+  when its list of refused nodes pushes the exception line out of the exporter's output tail; it
+  used to end as a generic `export.failed`.
+- The group-size remediation no longer offers the NPU's channel-wise profile on the CPU or GPU,
+  where its `MAX_PROMPT_LEN` fails the probe; it suggests `cpu-int8-asym-ref` on the CPU instead.
+  The Python 3.14 optimum diagnostic now explains what AppImage users can do.
+- Remediation steps print the real repository and job id instead of `MODEL` and `JOB_ID` wherever
+  they are known (`prepare`, `probe`, `chat`, `bench`, `--json`), and a step that repeats an
+  earlier command is listed once.
+- "Chosen because" for a profile named by a model or architecture rule gives the parameter count
+  and the profile the rule overrode, such as the size-banded default (`automatic_profile_id` in the
+  manifest).
+- GGUF import no longer fails with "Failed to open ... with gguf_open" on a huggingface-hub 1.x
+  cache (read-only blobs). OpenVINO GenAI's reader opens the file read-write, so yonga imports
+  from a private writable copy in staging (a reflink where the filesystem supports one) instead of
+  a link into the cache, and the disk plan reserves room for it.
+- `prepare --gguf-file` naming a file the repository does not have exits 20
+  (`source.gguf_file_not_found`), as `docs/CLI_SPEC.md` section 6 says, instead of 70.
+- The generation smoke test no longer writes an entry to the compile cache. That entry could never
+  be reused, was left orphaned after every `prepare` and grew with each re-prepare.
+- `prepare` no longer redraws a finished download, or prints a stale "Downloading ... (1.4 GiB /
+  1.6 GiB)" line, after the probe stage: the Hub's byte bar, closed later by the garbage
+  collector, has its late reports ignored. A completed download is reported at its full size.
+- Download progress no longer jumps backwards or under-counts while the Hub downloads files in
+  parallel.
+- huggingface_hub's own progress bars ("Fetching N files: 0%|...") no longer appear in piped
+  output or compete with yonga's progress display on a terminal.
+- The live conversion line shows nncf's step labels ("Applying Weight Compression") instead of
+  rows of its bit-width table or the text of its progress bars.
+- A conversion cancelled with Ctrl+C is announced as "Conversion cancelled", not "Conversion
+  failed".
+- A preparation job no longer logs `export.output_reset` ("clearing leftover staging output from
+  an earlier attempt") when there were no leftovers.
+- `yonga chat` loads the model before showing the startup panel. A model that cannot load on the
+  chosen device ends the chat with its category's exit code (51 for an NPU compiler refusal, 10
+  when OpenVINO GenAI is missing), instead of failing every message and exiting 0.
+- `yonga chat` exits with the failure's code (52 when unclassified) when the user leaves right
+  after a message that got no answer.
+- Ctrl-C during a reply stops it at the next token and returns to the prompt with the conversation
+  intact, instead of waiting for the reply to finish and then exiting 60. A second Ctrl-C quits.
+- `--show-reasoning` and `/reasoning on` show the reasoning without `<think>` tags, in a dim panel
+  before the answer, and only the answer is kept in the conversation. `/reasoning on` advises
+  restarting with `--show-reasoning` instead of the nonexistent `--thinking` option.
+- An unknown or removed artifact id no longer suggests running `yonga prepare` on that id; it
+  points to `yonga list`.
+- `yonga probe` without the OpenVINO runtime stops up front with `runtime.openvino.missing` and
+  exit 10 (`pip install 'yonga[openvino]'`), as `bench` does, instead of an "Unrecognised failure"
+  and exit 51.
+- `yonga probe` shows each submodel in one line. A deferred raw compile reads "the GenAI pipeline
+  decides" instead of a 25-line compiler dump with padded empty rows, and a recognised failure is
+  named by its diagnostic. `--verbose` shows the raw text, and `--json` and the job log always
+  carry it.
+- `yonga probe --device auto` no longer prints a red refusal and a "prepare for GPU" suggestion for
+  a device that failed while another passed; the failure is information about an artifact that
+  runs.
+- `python -m yonga.application.probe` reports a missing artifact or missing OpenVINO on stderr with
+  its exit code instead of a traceback.
+- `yonga eval --device npu` is refused before anything loads (`eval.device.unsupported`, exit 70).
+  Native compiler output during an eval compile is captured instead of leaking onto stdout, and a
+  load failure gets a one-line message.
+- `yonga bench` numbers warmups and measured runs separately in progress and errors
+  (`warmup 1/1`, `run 1/3`), and the summary says "1 warmup" instead of "1 warmups".
+- `probe` and `bench` jobs end with `job.completed` and a terminal `completed` stage. A successful
+  run used to leave a log with only `job.created` and a state that looked live for 24 hours.
+- A failed job's raw error text (for example the NPU compiler's failing pass and shape) is written
+  to its job log as `job.error_detail`, so `yonga logs JOB_ID --raw` and bug-report bundles contain
+  what the remediation says they do.
+- A cancelled job is recorded as `job.cancelled` (a warning) with a terminal `cancelled` stage
+  instead of `job.failed`. The record names the last stage actually reached, plus `failed_before`
+  for the step that was running.
+- A job you cancel no longer keeps its managed temporary directory (often over a gigabyte) for
+  diagnosis; it is removed and logged as `job.temp_discarded`.
+- A prompt longer than the NPU's fixed prompt length (`MAX_PROMPT_LEN`), including one made too
+  long by the offered tools, gets OpenAI's 400 `context_length_exceeded` (`param` `messages`) with
+  the prompt's token count and the limit, instead of a 500 that the openai client retried;
+  `yonga chat` reports the same case as `runtime.genai.prompt_too_long`.
+- Error messages no longer include OpenVINO's source location ("Check '...' failed at
+  /path/file.cpp:LINE"), which named the vendor's build machine.
+- A generation setting refused as out of range names its field in `error.param` (`temperature`,
+  `top_p`, `top_k`, `repetition_penalty`, `max_tokens` or `max_completion_tokens`, whichever was
+  sent); it used to be null.
+- A refused API key gets OpenAI's error type `invalid_request_error` instead of `auth`.
+- A request body that is not valid JSON, or is not sent as JSON, gets `param` null instead of the
+  decode error's character offset or an empty string, and the message says what was wrong.
+- `yonga env remove` always asks before deleting, including when the environment is named
+  `export-KEY`. With `--json` or in a non-interactive session and no `--yes`, it removes nothing,
+  exits 60 and says to re-run with `--yes`.
+- Inside the AppImage, the copy of the bundled Python that export environments are made from is
+  shown by `yonga env list` and is deleted with the last environment that uses it or after a
+  failed build.
+- `yonga cache prune --older-than` with a very large number of days no longer crashes with an
+  internal error; such an age selects nothing.
+- `cache list`, `cache prune`, `doctor` and `env list` say "1 entry" and "1 environment" for a
+  single item.
+- `yonga doctor` run from the AppImage no longer warns about optimum-intel, nncf and transformers,
+  which the image never carries by design; one `export toolchain` line says that `prepare`
+  converts in a managed export environment, so an AppImage host can reach exit 0.
+- When `yonga doctor` exits 10, its last line names the cause: the OpenVINO runtime is not
+  installed (with `pip install 'yonga[openvino]'`), it is installed but cannot be imported, or no
+  device was found.
+- `yonga self uninstall --help` describes `--bin-dir` as the directory to remove the command from,
+  not to install it in. Run from a pip or pipx install, `self uninstall` says that it removes only
+  the AppImage, and no longer tells you to run the cleanup commands from the downloaded AppImage
+  while your pip `yonga` is still there.
+- `registry update` with a malformed bundle (`registry.remote.invalid`) names each field that is
+  wrong, such as a timestamp without a UTC offset, instead of only counting the problems.
+- An installed remote bundle that no longer verifies is no longer ignored silently: `doctor
+  --full` warns (`registry.ignored`), `registry validate` lists it under "Ignored" and exits 2,
+  and `registry explain` warns that it explained without it.
+- The remediation for an expired registry bundle names an update command that works as written:
+  `--url`/`--file` when `registry_url` is unset, plus `registry reset`.
+- `registry update` refuses `--url` together with `--file`, and `--signature` without `--file`
+  (exit 70), instead of silently ignoring one of them.
+- `registry paths` inside an AppImage names the AppImage file for the built-in registry instead of
+  a mount path that disappears when the command exits (`builtin_appimage` in `--json`).
+- `tools/registry_bundle.py` prints an expected refusal, such as an already expired bundle, as one
+  line instead of a traceback, and documents every option in `--help`.
+- `yonga remove` no longer deletes the newest of several artifacts when a repository id, id prefix
+  or copied artifact id matches more than one; it refuses with exit 70 (even under `--yes`) and
+  lists each candidate's artifact id, profile and device.
+- `yonga list` on an 80-column terminal keeps the model and its revision, dropping the creation and
+  benchmark times first; long repository ids are shortened instead of the column being dropped,
+  and if the Ready column has to go, unready artifacts are named under the table.
+- The pip install instructions take torchvision from PyTorch's CPU index together with torch.
+  With torch alone from there, pip installed PyPI's torchvision, which cannot load against a CPU
+  torch, and every conversion failed. `docs/TROUBLESHOOTING.md` section 5.7 gives a repair that
+  actually replaces the PyPI build.
+- The README command overview lists `self` (seventeen commands). `docs/TROUBLESHOOTING.md`
+  documents every `self install`/`self uninstall` diagnostic code and its exit code.
+  `docs/INSTALL.md`'s quoted doctor line and its Qwen3-0.6B artifact size (430 MiB) match reality.
 
 ## [0.4.0] - 2026-10-09
 
