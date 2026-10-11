@@ -10,6 +10,7 @@ duplicate id inside a single layer is an authoring mistake and raises
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable, Mapping, Sequence
 from importlib.resources import files
 from pathlib import Path
@@ -69,6 +70,7 @@ __all__ = [
     "KNOWN_REPAIR_IMPLEMENTATIONS",
     "REGISTRY_SUFFIXES",
     "REMOTE_LAYER",
+    "builtin_registry_appimage",
     "builtin_registry_dir",
     "load_builtin_documents",
     "load_builtin_registry",
@@ -194,6 +196,27 @@ def builtin_registry_dir() -> Path | None:
     except (TypeError, ValueError):  # pragma: no cover - zip-imported distribution
         return None
     return candidate if candidate.is_dir() else None
+
+
+def builtin_registry_appimage(directory: Path | None = None) -> Path | None:
+    """The AppImage the built-in registry is read from, or ``None`` outside one.
+
+    An AppImage mounts itself under a new temporary directory on every run and
+    unmounts it on exit, so a path inside the mount is useless once the
+    command that printed it has finished. ``APPDIR`` is that mount and
+    ``APPIMAGE`` the file the user actually has; both are set by the AppImage
+    runtime.
+    """
+    appdir = os.environ.get("APPDIR")
+    appimage = os.environ.get("APPIMAGE")
+    directory = directory if directory is not None else builtin_registry_dir()
+    if not appdir or not appimage or directory is None:
+        return None
+    try:
+        inside = directory.resolve().is_relative_to(Path(appdir).resolve())
+    except OSError:
+        return None
+    return Path(appimage) if inside else None
 
 
 def load_builtin_documents() -> list[RegistryDocument]:
@@ -364,6 +387,7 @@ def load_registry(
     extra_dirs: Sequence[Path] = (),
     *,
     remote_documents: Sequence[RegistryDocument] = (),
+    ignored: Sequence[str] = (),
 ) -> Registry:
     """Load the built-in registry, then a verified remote layer, then user overrides.
 
@@ -371,7 +395,9 @@ def load_registry(
     passed :func:`yonga.registry.remote.verify_bundle`; this function trusts its
     caller for that. They form one layer after the built-in rules, so a bundle
     can update shipped knowledge, and before every user override, so the user's
-    own rules always win.
+    own rules always win. ``ignored`` names layers the caller left out and why
+    (an installed bundle that no longer verifies); they are recorded on
+    :attr:`Registry.ignored` so a report can say so.
 
     ``paths`` supplies ``Paths.registry_overrides_dir``; ``extra_dirs`` adds
     further directories after it (later layers win). Each directory is one merge
@@ -386,7 +412,9 @@ def load_registry(
         documents = override_documents(directory)
         if documents:
             merger.add_layer(_Layer(str(directory), documents))
-    return merger.build()
+    registry = merger.build()
+    registry.ignored = list(ignored)
+    return registry
 
 
 def load_registry_from_documents(documents: Iterable[RegistryDocument]) -> Registry:

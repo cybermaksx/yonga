@@ -10,7 +10,7 @@ functions decides anything — the layouts follow ``docs/CLI_SPEC.md`` sections 
 from __future__ import annotations
 
 import sys
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
@@ -1314,6 +1314,36 @@ def registry_explanation(explanation: RegistryExplanation) -> RenderableType:
     if explanation.notes:
         blocks.extend(_bullet_block("Notes", explanation.notes, style="yellow"))
     return Group(*blocks)
+
+
+def registry_profiles(rows: Sequence[Mapping[str, object]]) -> RenderableType:
+    """Render ``yonga registry profiles``: one line per profile ``--profile`` accepts.
+
+    ``rows`` are the command's JSON entries. The size band and the priority
+    decide the automatic choice, so both are shown; a profile that is not
+    active has its status in front of its summary.
+    """
+    table = Table(box=SIMPLE, show_edge=False, pad_edge=False, header_style="bold")
+    table.add_column("Profile", overflow="fold")
+    table.add_column("Device", no_wrap=True)
+    table.add_column("Weights", overflow="fold")
+    table.add_column("Size band", overflow="fold")
+    table.add_column("Prio", justify="right", no_wrap=True)
+    table.add_column("Summary", overflow="fold")
+    for row in rows:
+        status = str(row.get("status") or "")
+        summary = _text(row.get("summary"), style="dim")
+        if status and status != "active":
+            summary = Text.assemble((status, "yellow"), ("  ", ""), summary)
+        table.add_row(
+            Text(str(row["id"]), style="bold"),
+            str(row["device"]),
+            str(row["weights"]),
+            _text(row.get("band")),
+            str(row["priority"]),
+            summary,
+        )
+    return table
 
 
 def _resolution_table(resolution: ResolutionExplanation, winner_id: str | None) -> RenderableType:

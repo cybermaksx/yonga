@@ -521,25 +521,33 @@ class Wiring:
     def registry(self) -> Registry:
         """Load the builtin registry merged with the user's override layers."""
         if self._registry is None:
-            self._registry = load_registry(
-                self.paths, remote_documents=self.remote_registry_documents()
-            )
+            documents, ignored = self.remote_registry_layer()
+            self._registry = load_registry(self.paths, remote_documents=documents, ignored=ignored)
         return self._registry
 
-    def remote_registry_documents(self) -> list[RegistryDocument]:
-        """The installed remote bundle's documents, verified again; empty when unusable.
+    def remote_registry_layer(self) -> tuple[list[RegistryDocument], list[str]]:
+        """The installed remote bundle's documents, verified again, and why it was left out.
 
         A bundle that no longer verifies (expired, edited on disk, its key
         removed) is left out rather than failing every command: the built-in
-        registry is always a safe answer. ``yonga registry status`` says why.
+        registry is always a safe answer. It is not left out silently, though:
+        the second item says why, and ends up on :attr:`Registry.ignored` for
+        ``doctor --full``, ``registry validate`` and ``registry explain``. The
+        policy ``never`` is a choice, not a fault, so it reports nothing.
         """
         if self._settings.registry_update_policy == "never":
-            return []
+            return [], []
+        store = RemoteRegistryStore(self.paths, registry_url=self._settings.registry_url)
         try:
-            verified = RemoteRegistryStore(self.paths).load()
-        except RegistryError:
-            return []
-        return [] if verified is None else list(verified.documents)
+            verified = store.load()
+        except RegistryError as error:
+            state = store.state()
+            which = (
+                f"version {state.version}" if state is not None else "in " + str(store.directory)
+            )
+            reason = f"{error.diagnostic.code}: {error.diagnostic.message}"
+            return [], [f"installed remote bundle {which} is not in use ({reason})"]
+        return ([] if verified is None else list(verified.documents)), []
 
     def registry_resolver(self) -> RegistryResolver:
         """Return a resolver bound to the loaded registry and the host's tags."""

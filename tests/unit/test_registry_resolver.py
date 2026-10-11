@@ -433,6 +433,33 @@ def test_unknown_explicit_profile_id_raises():
     assert excinfo.value.diagnostic.code == "registry.profile_unknown"
 
 
+def test_unknown_explicit_profile_lists_the_profiles_for_the_device():
+    """The remediation names the valid ids, and a command that lists them all."""
+    resolver = builtin_resolver()
+    with pytest.raises(RegistryError) as excinfo:
+        resolver.resolve_profile(device="cpu", explicit_profile_id="cpu-int3-bogus")
+    available, listing = excinfo.value.diagnostic.remediation
+    cpu = [rule.id for rule in resolver.registry.profiles if rule.device == "CPU"]
+    assert cpu and available == f"Profiles for CPU: {', '.join(cpu)}."
+    assert not any(
+        rule.id in available for rule in resolver.registry.profiles if rule.device != "CPU"
+    )
+    assert "yonga registry profiles" in listing
+
+
+def test_unknown_explicit_profile_on_a_device_without_profiles():
+    resolver = resolver_for(
+        """
+        profiles:
+          - id: cpu-only
+            device: cpu
+        """
+    )
+    with pytest.raises(RegistryError) as excinfo:
+        resolver.resolve_profile(device="npu", explicit_profile_id="npu-nothing")
+    assert excinfo.value.diagnostic.remediation[0] == "No registry profile targets NPU."
+
+
 def test_missing_profile_for_a_device_raises():
     resolver = resolver_for(
         """

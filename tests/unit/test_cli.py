@@ -2958,7 +2958,7 @@ def test_publish_requires_a_destination(runner: CliRunner, home: Path) -> None:
 # ======================================================================
 # registry update / status / reset
 # ======================================================================
-def _signed_bundle(tmp_path: Path, home: Path) -> Path:
+def _signed_bundle(tmp_path: Path, home: Path, payload: bytes | None = None) -> Path:
     """A signed bundle on disk, its key trusted in ``home``'s config directory."""
     import base64
 
@@ -2972,7 +2972,7 @@ def _signed_bundle(tmp_path: Path, home: Path) -> Path:
     keys.mkdir(parents=True, exist_ok=True)
     raw = key.public_key().public_bytes_raw()
     (keys / "publisher.pub").write_text(base64.b64encode(raw).decode(), encoding="utf-8")
-    payload = bundle()
+    payload = payload if payload is not None else bundle()
     target = tmp_path / "bundle.json"
     target.write_bytes(payload)
     (tmp_path / "bundle.json.sig").write_bytes(sign_bundle(payload, key))
@@ -3039,6 +3039,192 @@ def test_registry_status_reports_a_bundle_that_stopped_verifying(
     assert "Not in use" in result.stdout
     reset = invoke(runner, home, ["registry", "reset"])
     assert "Removed the remote registry bundle." in reset.stdout
+
+
+def _tampered_install(runner: CliRunner, home: Path, tmp_path: Path) -> None:
+    """Install a bundle, then change one byte of it on disk so it no longer verifies."""
+    target = _signed_bundle(tmp_path, home)
+    installed = invoke(runner, home, ["registry", "update", "--file", str(target), "--yes"])
+    assert installed.exit_code == int(ExitCode.SUCCESS), installed.stderr
+    bundle_path = home / "data" / "registry-remote" / "bundle.json"
+    bundle_path.write_bytes(bundle_path.read_bytes().replace(b"remote_test", b"remote_tesT"))
+
+
+def test_registry_validate_warns_about_a_bundle_that_stopped_verifying(
+    runner: CliRunner, home: Path, tmp_path: Path
+) -> None:
+    """'Registry is valid.' with exit 0 would hide that the installed bundle is not used."""
+    _tampered_install(runner, home, tmp_path)
+
+    result = invoke(runner, home, ["registry", "validate"])
+
+    assert result.exit_code == int(ExitCode.WARNINGS)
+    assert "Ignored" in result.stdout
+    assert "registry.remote.bad_signature" in result.stdout
+    assert "Registry is valid." not in result.stdout
+    payload = one_document(invoke(runner, home, ["registry", "validate", "--json"]))
+    ignored = payload["ignored"]
+    assert isinstance(ignored, list) and len(ignored) == 1
+    assert "bad_signature" in ignored[0]
+
+
+def test_registry_validate_reports_nothing_ignored_for_a_bundle_in_use(
+    runner: CliRunner, home: Path, tmp_path: Path
+) -> None:
+    target = _signed_bundle(tmp_path, home)
+    invoke(runner, home, ["registry", "update", "--file", str(target), "--yes"])
+
+    result = invoke(runner, home, ["registry", "validate", "--json"])
+
+    assert result.exit_code == int(ExitCode.SUCCESS)
+    assert one_document(result)["ignored"] == []
+
+
+def test_doctor_full_warns_about_a_bundle_that_stopped_verifying(
+    runner: CliRunner, home: Path, tmp_path: Path
+) -> None:
+    _tampered_install(runner, home, tmp_path)
+
+    payload = one_document(invoke(runner, home, ["doctor", "--full", "--json"]))
+
+    sections = payload["sections"]
+    assert isinstance(sections, list)
+    (registry,) = [section for section in sections if section["id"] == "registry"]
+    ignored = [check for check in registry["checks"] if check["id"] == "registry.ignored"]
+    assert ignored and ignored[0]["status"] == "warning"
+
+
+def test_registry_explain_warns_about_a_bundle_that_stopped_verifying(
+    runner: CliRunner, home: Path, tmp_path: Path
+) -> None:
+    _tampered_install(runner, home, tmp_path)
+    wiring_for = lambda settings: FakeWiring(  # noqa: E731 - one-line factory
+        settings, hub=hub_with(tmp_path=tmp_path)
+    )
+
+    human = invoke(
+        runner,
+        home,
+        ["registry", "explain", SAFETENSORS_REPO, "--device", "cpu"],
+        factory=wiring_for,
+    )
+    machine = invoke(
+        runner,
+        home,
+        ["registry", "explain", SAFETENSORS_REPO, "--device", "cpu", "--json"],
+        factory=wiring_for,
+    )
+
+    assert human.exit_code == int(ExitCode.SUCCESS)
+    assert "warning:" in human.stderr and "bad_signature" in plain_text(human.stderr)
+    assert len(one_document(machine)["ignored"]) == 1  # type: ignore[arg-type]
+
+
+def test_registry_update_names_what_is_wrong_with_a_malformed_bundle(
+    runner: CliRunner, home: Path, tmp_path: Path
+) -> None:
+    from tests.unit.test_remote_registry import bundle
+
+    document = json.loads(bundle())
+    document["created_at"] = "2026-09-01T00:00:00"
+    target = _signed_bundle(tmp_path, home, json.dumps(document).encode())
+
+    result = invoke(runner, home, ["registry", "update", "--file", str(target), "--yes", "--json"])
+
+    assert result.exit_code == int(ExitCode.REGISTRY)
+    diagnostic_payload = one_document(result)["diagnostic"]
+    assert isinstance(diagnostic_payload, dict)
+    assert diagnostic_payload["code"] == "registry.remote.invalid"
+    assert "created_at: Input should have timezone info" in diagnostic_payload["message"]
+
+
+def test_registry_update_refuses_url_and_file_together(
+    runner: CliRunner, home: Path, tmp_path: Path
+) -> None:
+    """CLI_SPEC section 12 gives them as alternatives; one must not be silently dropped."""
+    target = _signed_bundle(tmp_path, home)
+
+    both = ["--url", "https://127.0.0.1:9/b.json", "--file", str(target)]
+    result = invoke(runner, home, ["registry", "update", *both, "--yes"])
+
+    assert result.exit_code == int(ExitCode.REGISTRY)
+    assert "--url" in result.stderr and "--file" in result.stderr
+    assert not (home / "data" / "registry-remote" / "bundle.json").exists()
+
+
+def test_registry_update_refuses_a_signature_without_a_file(
+    runner: CliRunner, home: Path, tmp_path: Path
+) -> None:
+    target = _signed_bundle(tmp_path, home)
+
+    result = invoke(
+        runner,
+        home,
+        ["registry", "update", "--signature", str(target) + ".sig", "--yes"],
+    )
+
+    assert result.exit_code == int(ExitCode.REGISTRY)
+    assert "--signature" in result.stderr
+
+
+def test_registry_profiles_lists_what_profile_accepts(runner: CliRunner, home: Path) -> None:
+    """The ids an unknown --profile points the user to, with device, weights and band."""
+    from yonga.registry import load_builtin_registry
+
+    builtin = load_builtin_registry()
+    cpu = sorted(rule.id for rule in builtin.profiles if rule.device == "CPU")
+
+    result = invoke(runner, home, ["registry", "profiles"])
+    machine = one_document(invoke(runner, home, ["registry", "profiles", "--json"]))
+    only_cpu = one_document(
+        invoke(runner, home, ["registry", "profiles", "--device", "cpu", "--json"])
+    )
+
+    assert result.exit_code == int(ExitCode.SUCCESS)
+    for rule in builtin.profiles:
+        assert rule.id in result.stdout
+    assert "below 5B" in result.stdout
+    rows = machine["profiles"]
+    assert isinstance(rows, list)
+    assert {row["id"] for row in rows} == {rule.id for rule in builtin.profiles}
+    assert all({"device", "weights", "band", "priority", "status"} <= set(row) for row in rows)
+    cpu_rows = only_cpu["profiles"]
+    assert isinstance(cpu_rows, list)
+    assert sorted(row["id"] for row in cpu_rows) == cpu
+    # Highest priority first within a device: the order the automatic choice weighs them.
+    priorities = [row["priority"] for row in cpu_rows]
+    assert priorities == sorted(priorities, reverse=True)
+
+
+def test_registry_paths_inside_an_appimage_names_the_appimage(
+    runner: CliRunner, home: Path, tmp_path: Path
+) -> None:
+    """The mount path is gone once the command exits, so the AppImage itself is shown."""
+    from yonga.registry.loader import builtin_registry_dir
+
+    builtin = builtin_registry_dir()
+    assert builtin is not None
+    appimage = tmp_path / "yonga-x86_64.AppImage"
+    env = {"APPDIR": str(builtin.parent.parent), "APPIMAGE": str(appimage)}
+
+    result = invoke(runner, home, ["registry", "paths"], env=env)
+    machine = one_document(invoke(runner, home, ["registry", "paths", "--json"], env=env))
+
+    assert result.exit_code == int(ExitCode.SUCCESS)
+    assert f"inside {appimage}" in plain_text(result.stdout)
+    assert str(builtin) not in result.stdout
+    assert machine["builtin_appimage"] == str(appimage)
+
+
+def test_registry_paths_outside_an_appimage_shows_the_directory(
+    runner: CliRunner, home: Path
+) -> None:
+    machine = one_document(
+        invoke(runner, home, ["registry", "paths", "--json"], env={"APPDIR": "", "APPIMAGE": ""})
+    )
+
+    assert machine["builtin_appimage"] is None
+    assert machine["builtin"]
 
 
 # ======================================================================

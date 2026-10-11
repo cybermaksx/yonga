@@ -391,3 +391,107 @@ def test_reset_removes_the_bundle(settings: Settings, key: Ed25519PrivateKey) ->
     assert store.reset() is True
     assert store.state() is None
     assert store.reset() is False
+
+
+# --- saying what is wrong -------------------------------------------------------------
+
+
+def test_a_malformed_bundle_names_each_problem(paths: Paths, key: Ed25519PrivateKey) -> None:
+    """``N problem(s)`` alone gives the user nothing to act on; each field is named."""
+    trust(paths, key)
+    document = json.loads(bundle())
+    document["created_at"] = "2026-09-01T00:00:00"
+    document["expires_at"] = "2030-01-01T00:00:00"
+    payload = json.dumps(document).encode()
+
+    with pytest.raises(RegistryError) as caught:
+        verify_bundle(payload, sign_bundle(payload, key), trusted_keys(paths), now=NOW)
+
+    message = caught.value.diagnostic.message
+    assert "created_at: Input should have timezone info" in message
+    assert "expires_at: Input should have timezone info" in message
+    # The offending values are not echoed back.
+    assert "2030-01-01" not in message
+    assert caught.value.diagnostic.remediation
+
+
+def test_a_bundle_with_many_problems_names_the_first_and_counts_the_rest(
+    paths: Paths, key: Ed25519PrivateKey
+) -> None:
+    trust(paths, key)
+    document = {f"unexpected_{index}": index for index in range(9)}
+    payload = json.dumps(document).encode()
+
+    with pytest.raises(RegistryError) as caught:
+        verify_bundle(payload, sign_bundle(payload, key), trusted_keys(paths), now=NOW)
+
+    assert code_of(caught) == "registry.remote.invalid"
+    message = caught.value.diagnostic.message
+    assert message.endswith("more.")
+    assert "unexpected_0: Extra inputs are not permitted" in message
+    assert "unexpected_8" not in message
+
+
+@pytest.mark.parametrize(
+    ("registry_url", "command"),
+    [
+        (None, "yonga registry update --url https://…/bundle.json (or --file BUNDLE)"),
+        ("https://example.org/bundle.json", "yonga registry update"),
+    ],
+)
+def test_an_expired_bundle_suggests_an_update_that_works_as_written(
+    paths: Paths, key: Ed25519PrivateKey, registry_url: str | None, command: str
+) -> None:
+    """A bare ``registry update`` fails without registry_url, so it is suggested only with one."""
+    trust(paths, key)
+    payload, signature = signed(key, expires=NOW - timedelta(seconds=1))
+
+    with pytest.raises(RegistryError) as caught:
+        RemoteRegistryStore(paths, registry_url=registry_url).verify(payload, signature, now=NOW)
+
+    assert caught.value.diagnostic.remediation == [
+        f"Install a current one: {command}",
+        "Or go back to the built-in registry: yonga registry reset",
+    ]
+
+
+# --- an installed bundle that stopped verifying is reported, not hidden ----------------
+
+
+def test_a_bundle_that_stopped_verifying_is_recorded_as_ignored(
+    settings: Settings, key: Ed25519PrivateKey
+) -> None:
+    trust(settings.paths, key)
+    install(settings.paths, key)
+    target = settings.paths.remote_registry_dir / "bundle.json"
+    target.write_bytes(target.read_bytes().replace(b"gpu.remote_test", b"gpu.remote_tesT"))
+
+    registry = Wiring(settings).registry()
+
+    (reason,) = registry.ignored
+    assert reason.startswith("installed remote bundle version 1 is not in use")
+    assert "registry.remote.bad_signature" in reason
+    assert "remote" not in registry.layers
+
+
+def test_a_bundle_in_use_is_not_ignored(settings: Settings, key: Ed25519PrivateKey) -> None:
+    trust(settings.paths, key)
+    install(settings.paths, key)
+
+    assert Wiring(settings).registry().ignored == []
+
+
+def test_the_policy_never_is_a_choice_not_an_ignored_layer(
+    tmp_path: Path, key: Ed25519PrivateKey
+) -> None:
+    settings = Settings(
+        config_dir=tmp_path / "config",
+        cache_dir=tmp_path / "cache",
+        data_dir=tmp_path / "data",
+        registry_update_policy="never",
+    )
+    trust(settings.paths, key)
+    install(settings.paths, key)
+    (settings.paths.registry_keys_dir / "publisher.pub").unlink()
+
+    assert Wiring(settings).registry().ignored == []

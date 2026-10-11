@@ -38,6 +38,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import typer
+from rich.markup import escape
 
 from yonga import APP_NAME, __version__
 from yonga.application.artifacts import ArtifactStore
@@ -2349,6 +2350,7 @@ def _registry_validate(state: CliState) -> ExitCode:
                 "layers": list(registry.layers),
                 "counts": dict(counts),
                 "problems": problems,
+                "ignored": list(registry.ignored),
             },
             ok=not problems,
         )
@@ -2357,6 +2359,12 @@ def _registry_validate(state: CliState) -> ExitCode:
         for name, count in counts.items():
             state.console.print(f"  {name:<14} {count}")
         state.console.print(f"  layers         {len(registry.layers)}")
+        if registry.ignored:
+            # Validation covers what loaded; a layer that did not load would
+            # otherwise pass unseen under "Registry is valid."
+            state.console.section("Ignored")
+            for reason in registry.ignored:
+                state.console.print(f"  - {escape(reason)}")
         if problems:
             # The problem list is the command's result, not a side note, so it
             # belongs on stdout next to the counts; the summary diagnostic that
@@ -2364,6 +2372,10 @@ def _registry_validate(state: CliState) -> ExitCode:
             state.console.section("Problems")
             for problem in problems:
                 state.console.print(f"  - {problem}")
+        elif registry.ignored:
+            state.console.print(
+                "The loaded layers are valid; 'yonga registry status' says why one is not in use."
+            )
         else:
             state.console.print("Registry is valid.")
     if problems:
@@ -2379,6 +2391,53 @@ def _registry_validate(state: CliState) -> ExitCode:
                 ],
             )
         )
+    return ExitCode.WARNINGS if registry.ignored else ExitCode.SUCCESS
+
+
+@registry_app.command("profiles")
+def registry_profiles(
+    ctx: typer.Context,
+    device: str | None = typer.Option(None, "--device", help="Only profiles for this device."),
+    json_output: bool = typer.Option(False, "--json", help="Emit the profiles as JSON."),
+) -> None:
+    """List the conversion profiles '--profile' accepts."""
+    state = cli_state(ctx, json_output=json_output)
+    _dispatch(state, lambda: _registry_profiles(state, device=device))
+
+
+def _registry_profiles(state: CliState, *, device: str | None) -> ExitCode:
+    """Every profile of the merged registry, by device and then by priority."""
+    target = _device(device)
+    registry = state.graph.registry()
+    chosen = [
+        rule for rule in registry.profiles if target in (None, "auto") or rule.device == target
+    ]
+    chosen.sort(key=lambda rule: (rule.device, -rule.priority, rule.id))
+    rows: list[dict[str, object]] = [
+        {
+            "id": rule.id,
+            "device": rule.device,
+            "weights": rule.weights_label(),
+            "band": (
+                rule.applies_to.parameter_count.describe()
+                if rule.applies_to.parameter_count is not None
+                else None
+            ),
+            "priority": rule.priority,
+            "status": rule.status.value,
+            "evidence": rule.evidence.value,
+            "summary": rule.summary,
+            "origin": registry.origins.get(rule.id),
+        }
+        for rule in chosen
+    ]
+    if state.json_mode:
+        state.emit({"profiles": rows, "ignored": list(registry.ignored)})
+        return ExitCode.SUCCESS
+    if not rows:
+        state.console.print(f"No registry profile targets {target}.")
+        return ExitCode.SUCCESS
+    state.console.print(tables.registry_profiles(rows))
     return ExitCode.SUCCESS
 
 
@@ -2412,10 +2471,13 @@ def _registry_explain(state: CliState, model: str, *, device: str | None) -> Exi
         inventory=inventory,
         device=None if target in (None, "auto") else target,
     )
+    ignored = list(graph.registry().ignored)
     if state.json_mode:
-        state.emit(explanation.model_dump(mode="json"))
+        state.emit({**explanation.model_dump(mode="json"), "ignored": ignored})
         return ExitCode.SUCCESS
     state.console.print(tables.registry_explanation(explanation))
+    for reason in ignored:
+        state.console.print_error(f"[yellow]warning:[/] {escape(reason)}; explained without it.")
     return ExitCode.SUCCESS
 
 
@@ -2431,12 +2493,16 @@ def registry_paths(
 
 def _registry_paths(state: CliState) -> ExitCode:
     """Print the configuration and registry layer locations (section 12)."""
-    from yonga.registry.loader import builtin_registry_dir
+    from yonga.registry.loader import builtin_registry_appimage, builtin_registry_dir
 
     paths = state.settings.paths
     overrides = registry_override_dirs(paths)
+    builtin = builtin_registry_dir()
+    appimage = builtin_registry_appimage(builtin)
     payload: dict[str, object] = {
-        "builtin": str(builtin_registry_dir()) if builtin_registry_dir() is not None else None,
+        "builtin": str(builtin) if builtin is not None else None,
+        # The builtin path above is on the AppImage's per-run mount; this is the file to keep.
+        "builtin_appimage": str(appimage) if appimage is not None else None,
         "overrides": [str(directory) for directory in overrides],
         "config_file": str(state.settings.config_file) if state.settings.config_file else None,
         "versions": installed_registry_versions(),
@@ -2445,8 +2511,14 @@ def _registry_paths(state: CliState) -> ExitCode:
     if state.json_mode:
         state.emit(payload)
         return ExitCode.SUCCESS
-    state.console.print(f"Builtin registry   {payload['builtin']}")
-    state.console.print(f"Override layers    {', '.join(str(d) for d in overrides) or 'none'}")
+    if appimage is not None:
+        state.console.print(
+            f"Builtin registry   inside {appimage} (read-only; its mount exists only while "
+            "yonga runs, so 'yonga registry explain' and 'registry profiles' show the rules)"
+        )
+    else:
+        state.console.print(f"Builtin registry   {payload['builtin']}")
+    state.console.print(f"Override layers   {', '.join(str(d) for d in overrides) or 'none'}")
     state.console.print(f"Configuration file {payload['config_file'] or 'none'}")
     state.console.section("Managed directories")
     for name, value in paths.as_dict().items():
@@ -2497,6 +2569,26 @@ def _registry_update(
                 remediation=['Set registry_update_policy = "manual" to allow updates.'],
             )
         )
+    if url is not None and file is not None:
+        raise ConfigurationError(
+            diagnostic(
+                "registry.remote.conflicting_sources",
+                FailureCategory.CONFIGURATION_ERROR,
+                "Choose one bundle to update from",
+                "--url and --file each name a bundle; only one can be installed.",
+                remediation=["Pass either --url URL or --file BUNDLE, not both."],
+            )
+        )
+    if signature is not None and file is None:
+        raise ConfigurationError(
+            diagnostic(
+                "registry.remote.signature_without_file",
+                FailureCategory.CONFIGURATION_ERROR,
+                "--signature goes with --file",
+                "A downloaded bundle's signature is always fetched from URL.sig.",
+                remediation=["Pass --signature together with --file BUNDLE."],
+            )
+        )
     if file is not None:
         source = str(file)
         try:
@@ -2537,7 +2629,7 @@ def _registry_update(
         bundle_bytes = fetch(target)
         signature_bytes = fetch(target + ".sig", limit=64 * 1024)
 
-    store = RemoteRegistryStore(settings.paths)
+    store = RemoteRegistryStore(settings.paths, registry_url=settings.registry_url)
     verified = store.verify(bundle_bytes, signature_bytes)
     current = state.graph.registry()
     incoming = [rule for document in verified.documents for rule in document.rules()]
@@ -2602,7 +2694,7 @@ def _registry_status(state: CliState) -> ExitCode:
     from yonga.registry.remote import RemoteRegistryStore, trusted_keys
 
     settings = state.settings
-    store = RemoteRegistryStore(settings.paths)
+    store = RemoteRegistryStore(settings.paths, registry_url=settings.registry_url)
     installed = store.state()
     keys = trusted_keys(settings.paths)
     problem: str | None = None
