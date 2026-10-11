@@ -263,7 +263,10 @@ def inspect_report(
             # Said here because nothing else will: a size band would quietly not apply.
             parameters.append(f"  not used to choose a profile: {basis}", style="dim")
         else:
-            parameters.append("  Hub count; includes embeddings and any vision tower", style="dim")
+            parameters.append(
+                f"  {metadata.parameter_count_origin}; includes embeddings and any vision tower",
+                style="dim",
+            )
         facts.add_row(Text("Parameters"), parameters)
     if metadata.gated or metadata.private:
         flags = ", ".join(

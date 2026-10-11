@@ -19,14 +19,17 @@ import _thread
 import json
 import os
 import re
+import shlex
 import shutil
 import time
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import pytest
+import typer
 
 # ``Result`` comes from typer, not click: typer 0.27 vendored click and returns
 # its own ``typer.testing.Result`` from ``CliRunner.invoke``, while typer 0.25
@@ -908,7 +911,9 @@ def test_a_permission_denied_npu_in_prepare_exits_ten(
     )
     assert result.exit_code == int(ExitCode.ENVIRONMENT_UNUSABLE)
     assert "No permission to use the NPU device node" in result.stderr
-    assert "--device auto" not in result.stderr
+    # Only the hint that repeats the user's own command with --debug may say it.
+    advice = [line for line in result.stderr.splitlines() if "--debug" not in line]
+    assert not any("--device auto" in line for line in advice)
     assert {device for _name, device in runtime.compiled} == {"NPU"}
 
 
@@ -3484,3 +3489,240 @@ def test_probe_of_one_failing_device_still_explains_the_failure_once(
 
     assert result.exit_code != int(ExitCode.SUCCESS)
     assert plain_text(result.stderr).count("Re-run with --debug") == 1
+
+
+# ======================================================================
+# advice to run the command again repeats the whole command
+# ======================================================================
+def _root(home: Path) -> str:
+    """The root options :func:`invoke` passes, as the re-run advice prints them."""
+    return shlex.join(
+        ["yonga", "--data-dir", str(home / "data"), "--cache-dir", str(home / "cache")]
+    )
+
+
+def _remediation(result: Result) -> list[str]:
+    """The remediation steps of the one ``--json`` error document."""
+    item = one_document(result)["diagnostic"]
+    assert isinstance(item, dict)
+    steps = item["remediation"]
+    assert isinstance(steps, list)
+    return [str(step) for step in steps]
+
+
+def test_the_yes_advice_keeps_every_option_the_user_gave(
+    runner: CliRunner, home: Path, tmp_path: Path
+) -> None:
+    """``prepare X --device cpu`` must not come back as ``prepare X --yes``: that auto-selects."""
+    hub = hub_with(tmp_path=tmp_path)
+    result = invoke(
+        runner,
+        home,
+        [
+            "prepare",
+            SAFETENSORS_REPO,
+            "--device",
+            "cpu",
+            "--profile",
+            "cpu-int8-asym-ref",
+            "--json",
+        ],
+        factory=lambda settings: FakeWiring(settings, hub=hub),
+    )
+
+    assert result.exit_code == int(ExitCode.CANCELLED)
+    expected = (
+        f"{_root(home)} prepare {SAFETENSORS_REPO} --device cpu --profile cpu-int8-asym-ref "
+        "--json --yes"
+    )
+    assert any(step.endswith(f": {expected}") for step in _remediation(result))
+    assert hub.downloaded == []
+
+
+def test_the_remote_code_advice_keeps_every_option_the_user_gave(
+    runner: CliRunner, home: Path, tmp_path: Path
+) -> None:
+    result = invoke(
+        runner,
+        home,
+        ["prepare", SAFETENSORS_REPO, "--device", "cpu", "--yes", "--json"],
+        factory=lambda settings: FakeWiring(
+            settings, hub=hub_with(remote_code=True, tmp_path=tmp_path)
+        ),
+    )
+
+    assert result.exit_code == int(ExitCode.REMOTE_CODE_REQUIRED)
+    expected = f"{_root(home)} prepare {SAFETENSORS_REPO} --device cpu --yes --json"
+    assert any(step.endswith(f": {expected} --trust-remote-code") for step in _remediation(result))
+
+
+def test_the_debug_advice_puts_the_root_option_where_it_parses(
+    runner: CliRunner, home: Path
+) -> None:
+    """``yonga list --debug`` is a usage error: ``--debug`` belongs before the command."""
+
+    def factory(settings: Settings) -> Wiring:
+        return FakeWiring(settings, store=ExplodingArtifactStore(settings.paths, settings))
+
+    as_json = invoke(runner, home, ["list", "--json"], factory=factory)
+    human = invoke(runner, home, ["list"], factory=factory)
+
+    expected = f"{_root(home)} --debug list"
+    assert any(step.endswith(f": {expected} --json") for step in _remediation(as_json))
+    assert f"Re-run with --debug to see the raw error: {expected}" in plain_text(human.stderr)
+
+
+def test_the_remove_advice_repeats_the_command(
+    runner: CliRunner, home: Path, tmp_path: Path
+) -> None:
+    artifact_id = _prepared_artifact_id(runner, home, tmp_path)
+
+    result = invoke(runner, home, ["remove", artifact_id, "--json"])
+
+    assert result.exit_code == int(ExitCode.CANCELLED)
+    assert _remediation(result) == [
+        "Re-run with --yes to remove it without a prompt: "
+        f"{_root(home)} remove {artifact_id} --json --yes"
+    ]
+
+
+def test_the_env_remove_advice_repeats_the_command(runner: CliRunner, home: Path) -> None:
+    path = make_export_env(home)
+
+    result = invoke(runner, home, ["env", "remove", path.name, "--json"])
+
+    assert result.exit_code == int(ExitCode.CANCELLED)
+    assert _remediation(result) == [
+        "Re-run with --yes to remove it without a prompt: "
+        f"{_root(home)} env remove {path.name} --json --yes"
+    ]
+
+
+def test_the_cache_prune_advice_repeats_the_command(
+    runner: CliRunner, home: Path, tmp_path: Path
+) -> None:
+    populated_cache(home, tmp_path)
+
+    result = invoke(runner, home, ["cache", "prune", "--older-than", "30", "--json"])
+
+    assert result.exit_code == int(ExitCode.CANCELLED)
+    assert _remediation(result) == [
+        "Re-run with --yes to prune without a prompt: "
+        f"{_root(home)} cache prune --older-than 30 --json --yes"
+    ]
+
+
+def test_the_publish_advice_repeats_the_command(
+    runner: CliRunner, home: Path, tmp_path: Path
+) -> None:
+    from tests.unit.test_publish import FakePublisher, someone
+
+    artifact_id = _prepared_artifact_id(runner, home, tmp_path)
+    result = _publish(
+        runner,
+        home,
+        tmp_path,
+        [artifact_id, "--repo", "someone/m", "--json"],
+        FakePublisher(someone()),
+    )
+
+    assert result.exit_code == int(ExitCode.CANCELLED)
+    assert _remediation(result) == [
+        "Re-run with --yes to upload without a prompt: "
+        f"{_root(home)} publish {artifact_id} --repo someone/m --json --yes"
+    ]
+
+
+def test_the_registry_update_advice_repeats_the_command(
+    runner: CliRunner, home: Path, tmp_path: Path
+) -> None:
+    target = _signed_bundle(tmp_path, home)
+
+    result = invoke(runner, home, ["registry", "update", "--file", str(target), "--json"])
+
+    assert result.exit_code == int(ExitCode.CANCELLED)
+    assert _remediation(result) == [
+        "Re-run with --yes to install it without a prompt: "
+        f"{_root(home)} registry update --file {shlex.quote(str(target))} --json --yes"
+    ]
+
+
+class _Colour(str, Enum):
+    RED = "red"
+
+
+#: A small app with the kinds of parameter the real commands have.
+_PROBE_APP = typer.Typer(add_completion=False)
+_PROBE_SEEN: list[str] = []
+
+
+@_PROBE_APP.callback()
+def _probe_root(
+    data_dir: Path | None = typer.Option(None, "--data-dir"),
+    offline: bool = typer.Option(False, "--offline"),
+) -> None:
+    """Root options."""
+
+
+@_PROBE_APP.command()
+def run(
+    ctx: typer.Context,
+    model: str = typer.Argument(...),
+    yes: bool = typer.Option(False, "--yes", "-y"),
+    token: str | None = typer.Option(None, "--token"),
+    url: str | None = typer.Option(None, "--url"),
+    colour: _Colour = typer.Option(_Colour.RED, "--colour"),
+    max_new_tokens: int | None = typer.Option(None, "--max-new-tokens"),
+    repair: bool = typer.Option(True, "--repair/--no-repair"),
+) -> None:
+    """One command."""
+    _PROBE_SEEN.append(cli_module.command_line(ctx).rerun(add=("--force",)))
+
+
+def _parsed(args: Sequence[str]) -> str:
+    """Run ``args`` through the small app and render what :func:`command_line` saw."""
+    _PROBE_SEEN.clear()
+    result = CliRunner().invoke(_PROBE_APP, list(args))
+    assert result.exit_code == 0, result.output
+    return _PROBE_SEEN[0]
+
+
+def test_the_command_line_is_rebuilt_from_what_was_typed() -> None:
+    line = _parsed(
+        [
+            "--offline",
+            "--data-dir",
+            "/srv/my models",
+            "run",
+            "acme/m",
+            "-y",
+            "--colour",
+            "red",
+            "--max-new-tokens",
+            "8",
+            "--no-repair",
+        ]
+    )
+
+    # Long spellings, values as typed, defaults left out, root options first.
+    assert line == (
+        "yonga --data-dir '/srv/my models' --offline run acme/m --yes --colour red "
+        "--max-new-tokens 8 --no-repair --force"
+    )
+
+
+def test_the_command_line_never_repeats_a_secret() -> None:
+    line = _parsed(
+        [
+            "run",
+            "acme/m",
+            "--token",
+            FAKE_TOKEN,
+            "--url",
+            f"https://user:{FAKE_TOKEN}@example.com/b.json",
+        ]
+    )
+
+    assert FAKE_TOKEN not in line
+    assert "--token" not in line
+    assert "--url" in line

@@ -131,6 +131,7 @@ from yonga.domain.environments import (
     ExportEnvironment,
 )
 from yonga.domain.hardware import HardwareInventory, normalise_device
+from yonga.domain.invocation import CommandLine
 from yonga.domain.models import (
     ModelFormat,
     ModelIdentity,
@@ -434,6 +435,18 @@ def _as_identity(value: ModelIdentity | str) -> ModelIdentity:
     return ModelIdentity.parse(value)
 
 
+def _command_line(command_line: CommandLine | None, repo_id: str) -> CommandLine:
+    """The command that asked for the preparation, or ``yonga prepare REPO`` if unknown."""
+    if command_line is not None:
+        return command_line
+    return CommandLine(command=("prepare",), arguments=(repo_id,))
+
+
+def _rerun(plan: PreparationPlan, *, add: Sequence[str] = (), drop: Sequence[str] = ()) -> str:
+    """The user's own command with ``add`` added and ``drop`` removed, ready to paste."""
+    return _command_line(plan.command_line, plan.requested.repo_id).rerun(add=add, drop=drop)
+
+
 def _pinned(identity: ModelIdentity, metadata: ModelMetadata) -> ModelIdentity:
     """Return ``identity`` pinned to the revision the Hub resolved, when known."""
     resolved = metadata.resolved_revision
@@ -597,12 +610,15 @@ class PrepareService:
         managed_env: bool = True,
         reuse_export: bool = True,
         gguf_file: str | None = None,
+        command_line: CommandLine | None = None,
     ) -> PreparationPlan:
         """Decide everything, change nothing.
 
         ``reuse_export`` lets the plan adopt a completed export that a failed job
         with identical inputs left behind (see :mod:`yonga.application.export_reuse`);
-        the CLI turns it off for ``--fresh-export``.
+        the CLI turns it off for ``--fresh-export``. ``command_line`` is the
+        command the user typed; a remediation that says to run it again with a
+        flag added repeats it whole, instead of just ``yonga prepare REPO``.
 
         Metadata lookups are the only I/O: no download, no conversion, no
         directory is created. The returned plan is what the CLI prints before
@@ -645,6 +661,13 @@ class PrepareService:
         # is copied as published, so the model's size must not pick a profile
         # whose quantization would never be applied.
         size_applies = resolved_source.gguf_file is None and not resolved_source.already_openvino
+        user_command = _command_line(command_line, requested.repo_id)
+
+        def with_profile(device_name: str, other_profile: str) -> str:
+            return user_command.rerun(
+                replace={"--device": device_name.lower(), "--profile": other_profile}
+            )
+
         while True:
             try:
                 profile, profile_explanation = self._registry.resolve_profile(
@@ -654,14 +677,18 @@ class PrepareService:
                     model_rule=model_rule,
                     explicit_profile_id=profile_id,
                     size_applies=size_applies,
+                    profile_command=with_profile,
                 )
                 break
             except RegistryError as error:
                 # Auto mode moves on when no profile for its first choice can
-                # quantize the model; an explicit device is an instruction.
+                # quantize the model; an explicit device is an instruction, and
+                # so is an explicit profile, which no other device would fit
+                # any better.
                 remaining = compatibility.fallback_candidates
                 if (
                     compatibility.explicit_request
+                    or profile_id is not None
                     or error.diagnostic.code != GROUP_SIZE_MISMATCH_CODE
                     or not remaining
                 ):
@@ -863,6 +890,7 @@ class PrepareService:
             profile_selection=profile_selection,
             download_ignore_patterns=ignore_patterns,
             auth_missing=auth_missing,
+            command_line=command_line,
         )
         if plan.reuses_artifact or plan.refused_before_work:
             # Nothing the confirmations describe will happen: a reused artifact is
@@ -1679,7 +1707,7 @@ class PrepareService:
 
         self._stage(ctx, 3)
         tracker.stage = JobStage.PREFLIGHT_OK
-        warnings = self._preflight(
+        warnings, preflight_notes = self._preflight(
             plan, ctx, ignore_exporter_requirements=ignore_exporter_requirements
         )
         staging = self._staging_dir(plan, ctx)
@@ -1713,7 +1741,7 @@ class PrepareService:
             export = self._convert(plan, snapshot, staging, ctx, environment=environment)
         # How the IR was obtained (an adopted export, a copied OpenVINO repository)
         # is recorded, not warned about: the artifact is exactly as good.
-        notes = list(export.notes)
+        notes = [*preflight_notes, *export.notes]
         ctx.advance(JobStage.EXPORTED)
 
         self._stage(ctx, 6)
@@ -1839,7 +1867,7 @@ class PrepareService:
                     "Review the repository's custom modelling code first.",
                     (
                         "Then re-run with the explicit flag: "
-                        f"yonga prepare {plan.requested.repo_id} --trust-remote-code"
+                        f"{_rerun(plan, add=('--trust-remote-code',))}"
                     ),
                     "--yes does not and will not enable remote code.",
                 ],
@@ -1883,7 +1911,7 @@ class PrepareService:
         else:
             remediation = [
                 "Re-run the same command with --yes to approve it without a prompt: "
-                f"yonga prepare {plan.requested.repo_id} --yes",
+                f"{_rerun(plan, add=('--yes',))}",
                 "Or run it in a terminal to be asked.",
             ]
         return diagnostic(
@@ -2052,10 +2080,11 @@ class PrepareService:
         ctx: JobContext,
         *,
         ignore_exporter_requirements: bool = False,
-    ) -> list[str]:
+    ) -> tuple[list[str], list[str]]:
         """Point every temp variable at managed storage and refuse to start if tight.
 
-        Returns non-fatal warnings worth recording in the manifest. Raises
+        Returns the non-fatal warnings and the notes worth recording in the
+        manifest; only a warning makes the run exit 2. Raises
         :class:`~yonga.domain.diagnostics.PreflightError` when the managed temp
         or the artifact filesystem clearly cannot hold the job (exit code 30),
         and when the exporter's declared package pins are unmet (exit code 10).
@@ -2063,6 +2092,7 @@ class PrepareService:
         :meth:`_refuse_impossible`, before any confirmation was asked.
         """
         warnings: list[str] = []
+        notes: list[str] = []
         temp_dir = ctx.temp_dir
         system_temp = system_temp_dir()
         try:
@@ -2099,14 +2129,18 @@ class PrepareService:
         for note in plan.disk.temp.notes:
             ctx.emit(ProgressKind.LOG, note)
         if plan.disk.temp.system_temp_would_fail:
-            warnings.append(
+            # A note, not a warning: TMPDIR, TMP and TEMP point at the managed
+            # directory for every child, so the small /tmp put nothing at risk.
+            # A warning here made every prepare on such a host exit 2.
+            notes.append(
                 f"The system temporary directory {system_temp} is too small for this "
                 "conversion; the managed directory was used instead."
             )
         if plan.disk.temp.temp_filesystem.is_ram_backed:
             # Not fatal on its own: the space check below is what actually decides.
-            # Saying so is still worth a note, because a RAM-backed cache directory is
-            # almost always a misconfiguration rather than a choice.
+            # It stays a warning, unlike a small /tmp: the managed directory is the
+            # one in use, and its files compete with the conversion for memory. A
+            # RAM-backed cache directory is almost always a misconfiguration.
             warnings.append(
                 f"The managed temporary directory sits on a RAM-backed "
                 f"{plan.disk.temp.temp_filesystem.fstype} filesystem; consider pointing "
@@ -2118,7 +2152,7 @@ class PrepareService:
             self._require_exporter_requirements(plan, ctx, ignored=ignore_exporter_requirements)
         )
         self._require_exporter_imports(plan, ctx)
-        return warnings
+        return warnings, notes
 
     def _require_exporter_imports(self, plan: PreparationPlan, ctx: JobContext) -> None:
         """Refuse before the download when the exporter cannot even be imported here.
@@ -2224,7 +2258,7 @@ class PrepareService:
             ),
             (
                 f"If you know this pin is stale, re-run with {IGNORE_EXPORTER_REQUIREMENTS_FLAG}: "
-                f"yonga prepare {plan.requested.repo_id} {IGNORE_EXPORTER_REQUIREMENTS_FLAG}"
+                f"{_rerun(plan, add=(IGNORE_EXPORTER_REQUIREMENTS_FLAG,))}"
             ),
             (
                 "--yes does not and will not bypass this check, only "
@@ -2850,7 +2884,8 @@ class PrepareService:
                         "but repairs were disabled with --no-repair."
                     ),
                     remediation=[
-                        "Re-run without --no-repair to apply the repair.",
+                        "Re-run without --no-repair to apply the repair: "
+                        f"{_rerun(plan, drop=('--no-repair',))}",
                         "Or inspect the staged artifact and fix it by hand.",
                     ],
                     context={"rules": names, "staging": str(staging)},
@@ -3028,7 +3063,10 @@ class PrepareService:
                 detail or "The exported artifact did not pass validation.",
                 remediation=[
                     "Inspect the job log for the raw conversion output.",
-                    "Re-run with --force to redo the conversion from scratch.",
+                    # Not --force: that replaces an artifact, while a re-run
+                    # would still adopt the export this job leaves behind.
+                    "Re-run with --fresh-export to redo the conversion from scratch: "
+                    f"{_rerun(plan, add=('--fresh-export',))}",
                 ],
             ),
         )

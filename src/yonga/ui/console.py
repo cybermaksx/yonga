@@ -201,7 +201,9 @@ def _fallback_command(item: Diagnostic) -> str | None:
     return f"yonga {command} {model} --device {device}"
 
 
-def diagnostic_lines(item: Diagnostic, *, debug: bool = False) -> list[str]:
+def diagnostic_lines(
+    item: Diagnostic, *, debug: bool = False, debug_command: str | None = None
+) -> list[str]:
     """Render ``item`` as plain text lines, in the order a reader needs them.
 
     This is the pure core shared by the coloured renderer and by the undecorated
@@ -209,6 +211,9 @@ def diagnostic_lines(item: Diagnostic, *, debug: bool = False) -> list[str]:
     The raw exception excerpt is included only when ``debug`` is true; in normal
     mode a traceback is never shown. Remediation placeholders are filled in
     here as well, so every surface prints the same copy-pasteable commands.
+    ``debug_command`` is the user's own command with ``--debug`` added, which
+    the hint about the raw error prints: ``--debug`` is a root option, so
+    appending it to the command is a usage error.
     """
     item = fill_placeholders(item)
     lines: list[str] = [item.title.strip() or item.code]
@@ -238,12 +243,16 @@ def diagnostic_lines(item: Diagnostic, *, debug: bool = False) -> list[str]:
     if debug and item.raw_excerpt:
         lines.extend(("", "Raw error (--debug):"))
         lines.extend(f"  {line}" for line in redact_text(item.raw_excerpt).splitlines())
+    elif item.raw_excerpt and debug_command:
+        lines.extend(("", f"Re-run with --debug to see the raw error: {debug_command}"))
     elif item.raw_excerpt:
         lines.extend(("", "Re-run with --debug to see the raw error."))
     return lines
 
 
-def render_diagnostic(item: Diagnostic, *, debug: bool = False) -> RenderableType:
+def render_diagnostic(
+    item: Diagnostic, *, debug: bool = False, debug_command: str | None = None
+) -> RenderableType:
     """Return a styled renderable for ``item`` (see :func:`diagnostic_lines`)."""
     severity = item.severity
     header = Text()
@@ -251,7 +260,7 @@ def render_diagnostic(item: Diagnostic, *, debug: bool = False) -> RenderableTyp
     header.append(item.title.strip() or item.code, style=f"bold {status_style(severity)}")
 
     body = Text()
-    for line in diagnostic_lines(item, debug=debug)[1:]:
+    for line in diagnostic_lines(item, debug=debug, debug_command=debug_command)[1:]:
         style = "dim" if line.startswith(("Job log:", "Job id:", "Re-run with")) else ""
         body.append(line, style=style)
         body.append("\n")
@@ -419,7 +428,9 @@ class YongaConsole:
     # ------------------------------------------------------------------
     # diagnostics
     # ------------------------------------------------------------------
-    def diagnostic(self, d: Diagnostic, *, debug: bool | None = None) -> None:
+    def diagnostic(
+        self, d: Diagnostic, *, debug: bool | None = None, debug_command: str | None = None
+    ) -> None:
         """Render a failure the way a human wants to read it.
 
         A short title, a plain-English explanation, the remediation steps, the
@@ -427,16 +438,19 @@ class YongaConsole:
         printed only when ``debug`` is true; a traceback is never printed. In
         ``--json`` mode the same text is written to stderr without any
         decoration, so stdout still holds exactly one JSON document.
+        ``debug_command`` is the command that would show the raw exception.
         """
         show_raw = self.debug if debug is None else debug
         if not self.show_decoration:
-            for line in diagnostic_lines(d, debug=show_raw):
+            for line in diagnostic_lines(d, debug=show_raw, debug_command=debug_command):
                 self.err.file.write(line + "\n")
             with suppress(OSError, ValueError):
                 self.err.file.flush()
             return
         self.err.line()
-        self.err.print(render_diagnostic(d, debug=show_raw), highlight=False)
+        self.err.print(
+            render_diagnostic(d, debug=show_raw, debug_command=debug_command), highlight=False
+        )
 
     # ------------------------------------------------------------------
     # confirmation

@@ -197,9 +197,16 @@ profile whose refusal is certain and says so in "Chosen because":
 A named profile (`profiles:` in an architecture or model rule) is passed over the same way. When
 no profile for the device is left, `prepare` stops before the download with
 `export.quantization.group_size_mismatch` (exit 70), unless the device was chosen automatically:
-then the next device in the ranking is tried. A profile requested with `--profile` is used anyway,
-and the plan says it will fail. Example: SmolLM2-360M has a hidden size of 960, so the CPU gets
-`cpu-int8-asym-ref`, the NPU `npu-int4-sym-cw`, and no GPU profile fits.
+then the next device in the ranking is tried. A profile requested with `--profile` is refused the
+same way, before the download and with the same code, naming the profiles that fit, for the device
+being prepared and for the profile's own device (the automatic choice first, as the user's own
+command with `--profile` and `--device` changed); it is never swapped for one of them. Example:
+SmolLM2-360M has a hidden size of 960, so the CPU gets `cpu-int8-asym-ref`, the NPU
+`npu-int4-sym-cw`, and no GPU profile fits.
+
+Only the widths `config.json` declares are checked. A refusal on another layer is not predicted:
+Qwen3.5 0.8B-4B fail `cpu-int4-asym-g128` on a one-channel `rotary_emb` weight while the 9B of the
+same architecture prepares with it, so that is recorded as a known limitation, not a refusal.
 
 ## 6. Issue/signature rule
 

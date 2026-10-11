@@ -32,6 +32,8 @@ from yonga.adapters.subprocess import CompletedCommand
 from yonga.application.jobs import JobContext
 from yonga.application.prepare import _runtime_task
 from yonga.config.settings import Settings
+from yonga.domain.diagnostics import PreflightError
+from yonga.domain.invocation import CommandLine
 from yonga.domain.plans import DeclaredRequirement
 
 REPO = "acme/gemma-like"
@@ -97,6 +99,26 @@ def test_without_managed_environments_the_declared_range_blocks_at_preflight(
     plan = service.plan(REPO, device="gpu", managed_env=False)
 
     assert plan.exporter_requirements_block, "refused before the download, not after the export"
+
+
+def test_the_override_advice_repeats_the_whole_command(settings: Settings, tmp_path: Path) -> None:
+    """The flag that overrides the pin is offered on the user's own command, not a bare one."""
+    exporter = DeclaringExporter(">=4.57,<=5.0")
+    service = build_service(settings=settings, hub=hub_for(tmp_path), exporter=exporter)
+    typed = CommandLine(
+        command=("prepare",),
+        arguments=(REPO,),
+        options=(("--device", "gpu"), ("--no-managed-env",), ("--yes",)),
+    )
+    plan = service.plan(REPO, device="gpu", managed_env=False, command_line=typed)
+
+    with pytest.raises(PreflightError) as caught:
+        run_prepare(service, plan, settings)
+
+    expected = (
+        f"yonga prepare {REPO} --device gpu --no-managed-env --yes --ignore-exporter-requirements"
+    )
+    assert any(step.endswith(f": {expected}") for step in caught.value.diagnostic.remediation)
 
 
 def test_a_range_the_installed_version_meets_changes_nothing(

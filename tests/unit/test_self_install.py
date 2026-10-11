@@ -20,6 +20,7 @@ import pytest
 from typer.main import get_command
 from typer.testing import CliRunner
 
+from tests.support import plain_text
 from tests.unit.test_cli import invoke, one_document
 from yonga.application.doctor import _installation_check
 from yonga.application.self_install import (
@@ -430,6 +431,7 @@ def test_cli_install_twice_then_uninstall(cli_host: Host) -> None:
     declined = invoke(runner, home, ["self", "uninstall"], env=env)
     assert declined.exit_code == int(ExitCode.CANCELLED)
     assert (cli_host.default_bin / "yonga").exists()
+    assert f"--cache-dir {home / 'cache'} self uninstall --yes" in plain_text(declined.stderr)
 
     removed = invoke(runner, home, ["self", "uninstall", "--yes"], env=env)
     assert removed.exit_code == int(ExitCode.SUCCESS)
@@ -451,6 +453,8 @@ def test_cli_replacing_needs_yes_when_nobody_can_answer(cli_host: Host) -> None:
     assert refused.exit_code == int(ExitCode.CANCELLED)
     assert old.read_bytes().endswith(b"older")
     assert "version unknown" in refused.stdout
+    # The advice repeats --bin-dir: without it, --yes would install somewhere else.
+    assert f"self install --bin-dir {bin_dir} --yes" in plain_text(refused.stderr)
 
     replaced = invoke(
         runner, home, ["self", "install", "--bin-dir", str(bin_dir), "--yes", "--json"], env=env

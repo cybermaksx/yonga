@@ -147,6 +147,15 @@ def test_inspect_parameters_row_names_the_hub_count():
     assert "not used to choose a profile" not in text
 
 
+def test_inspect_parameters_row_offline_does_not_claim_a_hub_count():
+    """Offline the number is counted here from the cached headers; the Hub was not asked."""
+    local = small_model().model_copy(update={"parameter_count_local": True})
+    text = render(inspect_report(local), width=240)
+    assert "600,000,000" in text
+    assert "counted locally from the cached safetensors headers; includes embeddings" in text
+    assert "Hub count" not in text
+
+
 def test_inspect_parameters_row_flags_a_packed_checkpoint():
     """GPTQ-style I32 packing makes the Hub count understate the model."""
     packed = small_model(
