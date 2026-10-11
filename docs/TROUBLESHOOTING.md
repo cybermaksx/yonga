@@ -476,7 +476,10 @@ each export after the download. `prepare` now imports `optimum.exporters.openvin
 preflight, as the managed environments are verified, and stops before the download with
 `export.torchvision.build_mismatch` (exit 10), or `export.toolchain_import_failed` for an import
 failure no rule recognises. A successful import is remembered per interpreter and package
-versions, so it costs a few seconds once.
+versions, so it costs a few seconds once. `yonga doctor` reports the same check as
+`exporter import` in its OpenVINO section: it imports once when nothing is recorded for the
+installed versions, then shows what the last check found, a failure with this remedy as a
+warning; `yonga doctor --full` checks a recorded failure again.
 
 Installing torchvision again from the CPU index is not enough: pip sees the PyPI build already
 satisfies the requirement and keeps it. Replace it explicitly:
@@ -674,6 +677,14 @@ device names and weight formats are upstream vocabulary, so an override targetin
 OpenVINO release adds needs no change to this code. The price is that "valid" here means "this file
 is well-formed and self-consistent", never "these values will work on your machine". The thing that
 finds out whether they work is `yonga prepare`, which asks OpenVINO.
+
+**`~/intel/stats` and OpenVINO's usage reporting.** OpenVINO counts each import of its conversion
+API in `~/intel/stats` and, without a consent file in `~/intel`, reports it to Google Analytics
+through the `openvino_telemetry` package. yonga keeps that package from loading in every Python
+process it starts, including `optimum-cli` in a managed export environment, so nothing is sent and
+the file is not touched; it does not write the opt-out file into your home directory either. A
+count that still grows comes from another program that imports OpenVINO, such as a plain
+`python -c "import openvino"`.
 
 ## 9. When nothing matches
 

@@ -71,7 +71,7 @@ Seventeen commands; `registry` has seven subcommands, `env`, `cache` and `self` 
 
 | Command | What it does |
 |---|---|
-| `yonga doctor` | Host report: OS, CPU, RAM, package versions, OpenVINO ABI family, devices, NPU node/driver/compiler, storage, Hugging Face auth. Exits 0/2/10. |
+| `yonga doctor` | Host report: OS, CPU, RAM, package versions, whether the exporter imports, OpenVINO ABI family, devices, NPU node/driver/compiler, storage, Hugging Face auth. Exits 0/2/10. |
 | `yonga search QUERY` | Searches the Hub in one request and shows what the registry knows about each result's architecture, with a format hint and any declared derivative. Compatibility is per architecture; `inspect` answers whether a repository can actually be prepared. |
 | `yonga inspect MODEL` | Reads Hub metadata (no weights), identifies the architecture, shows per-device compatibility with its evidence level, the source that would be converted, and known limitations. |
 | `yonga prepare MODEL` | Plans, confirms, downloads, converts with an explicit quantization profile, validates the IR, applies known repairs, probes the runtime, and publishes an artifact with a manifest. |
@@ -141,22 +141,41 @@ Full prerequisites, the Intel NPU driver situation on Linux, and the version rul
 
 ```console
 $ yonga doctor
-✓ Host
+· Host
 ✓ OpenVINO
 ✓ Devices
 ✓ NPU
 ! Storage
 · Hugging Face
 ...
+OpenVINO
+✓  Runtime          2026.4.1
+✓  GenAI            2026.4.1.0
+✓  Tokenizers       2026.4.1.0
+✓  optimum-intel    2.2.0
+✓  nncf             3.4.0
+✓  transformers     5.5.4
+✓  exporter import  imports  optimum.exporters.openvino imports in this environment.
+✓  huggingface-hub  1.21.0
+✓  ABI family       aligned (2026.4)  openvino 2026.4.1, openvino-genai 2026.4.1.0,
+                    openvino-tokenizers 2026.4.1.0
+
 Devices
 ✓  CPU  Intel(R) Core(TM) Ultra 7 268V  intel64
 ✓  GPU  Intel(R) Arc(TM) Graphics (iGPU)  GPU: vendor=0x8086 arch=v20.4.4
 ✓  NPU  Intel(R) AI Boost  4000
 ...
+Storage
+...
+!  system temp          15.4 GiB tmpfs  7.5 GiB free at /tmp
+                        → yonga runs conversions in a managed, disk-backed temporary directory
+                        instead of the system temp filesystem, so a small tmpfs is a warning and
+                        never fatal.
+...
 Usable, with warnings above.
 ```
 
-`doctor` exits 2 here because `/tmp` is a 15 GiB tmpfs. That is a warning on purpose: `yonga` converts in its own disk-backed temporary directory and never needs `/tmp` enlarged.
+`doctor` exits 2 here, and only because `/tmp` is a 15 GiB tmpfs (`!` under Storage). That is a warning on purpose: `yonga` converts in its own disk-backed temporary directory and never needs `/tmp` enlarged. A `·` line is information, not a warning: on this machine the Host section shows one because the development install runs from a Python environment while `yonga` on `PATH` is the AppImage, and the Hugging Face section because no token is configured, which public models do not need. The first `doctor` also imports the conversion toolchain once (a few seconds) to check that it loads; later runs reuse that answer until the installed versions change.
 
 Prepare a model, then use it. `prepare` prints the plan (source, revision, device, profile, quantization, disk estimate, expected repairs) and asks before doing anything expensive:
 
@@ -309,3 +328,4 @@ The MVP also does not aim to support every Hugging Face task. Focus first on tex
 6. **Graceful fallback:** distinguish unsupported model/device combinations from broken installations.
 7. **Useful diagnostics:** collapse known failures into actionable messages while preserving raw logs.
 8. **Upstream-friendly:** model repairs and compatibility rules should be narrow, traceable, and suitable for turning into upstream bug reports.
+9. **Private:** no telemetry. yonga reports nothing about its use, and keeps OpenVINO's own usage reporting (`openvino_telemetry`, which otherwise sends each import to Google Analytics and counts it in `~/intel/stats`) from loading in every Python process it starts, without writing anything to your home directory.

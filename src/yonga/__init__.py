@@ -2,12 +2,19 @@
 
 This module intentionally imports nothing heavy: it is imported by every other
 module in the package (including the CLI entry point) and must stay cheap.
+
+Being first is also why it switches vendor telemetry off (:mod:`yonga.privacy`):
+OpenVINO reports every import of itself unless that is done before it loads.
 """
 
 from __future__ import annotations
 
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _distribution_version
+
+from yonga.privacy import block_vendor_telemetry
+
+block_vendor_telemetry()
 
 APP_NAME: str = "yonga"
 """Human-facing product name, used in help text, panels and manifests."""

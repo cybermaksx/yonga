@@ -50,6 +50,7 @@ from yonga.domain.hardware import (
 )
 from yonga.domain.models import ModelIdentity, ModelMetadata
 from yonga.registry import load_builtin_registry
+from yonga.registry.resolver import RegistryResolver
 
 GIB = 1024**3
 
@@ -693,6 +694,50 @@ def test_an_appimage_names_the_export_environments_already_built(tmp_path):
     assert "1.5 GiB" in (toolchain.detail or "")
 
 
+def test_environment_disk_counts_the_base_python_like_env_list(tmp_path):
+    """doctor and ``yonga env list`` total the same bytes: environments plus the base copy."""
+    settings = make_settings(tmp_path)
+    inventory = healthy_inventory(settings, packages=packages(NO_TOOLCHAIN))
+    environment = built_environment(settings, int(1.42 * GIB))
+    base = 98 * 1024**2
+    service = DoctorService(
+        FakeHardwareProbe(inventory),
+        FakeRuntimeProbe(("CPU", "GPU", "NPU")),
+        FakeHubClient(None),
+        None,
+        settings,
+        export_environments=lambda: [environment],
+        base_interpreter_bytes=lambda: base,
+        installation=lambda: installation(InstallKind.APPIMAGE),
+    )
+
+    report = service.run()
+
+    storage = require(report, "storage.export_environments")
+    assert storage.value == "1 built, 1.5 GiB"
+    assert "including a 98.0 MiB copy of the bundled Python" in (storage.detail or "")
+    assert "(1.5 GiB now)" in (require(report, "openvino.export_toolchain").detail or "")
+
+
+def test_a_base_python_alone_is_still_disk_in_use(tmp_path):
+    """An unused base copy is what ``env list`` shows with no environment; doctor too."""
+    settings = make_settings(tmp_path)
+    inventory = healthy_inventory(settings)
+    service = DoctorService(
+        FakeHardwareProbe(inventory),
+        FakeRuntimeProbe(("CPU", "GPU", "NPU")),
+        FakeHubClient(None),
+        None,
+        settings,
+        export_environments=list,
+        base_interpreter_bytes=lambda: 98 * 1024**2,
+    )
+
+    storage = require(service.run(), "storage.export_environments")
+
+    assert storage.value == "none built, 98.0 MiB"
+
+
 def test_an_appimage_reports_a_bundled_export_package_as_usual(tmp_path):
     settings = make_settings(tmp_path)
     inventory = healthy_inventory(
@@ -1305,3 +1350,107 @@ def test_a_compile_cache_that_cannot_be_measured_never_fails_doctor(tmp_path):
 
     assert report.check("storage.compile_cache") is None
     assert report.compile_cache is None
+
+
+# --- the exporter import ---------------------------------------------------------
+
+#: What importing the exporter prints with a CPU torch next to PyPI's torchvision.
+TORCHVISION_FAILURE = (
+    "Traceback (most recent call last):\n"
+    "  ...\n"
+    "RuntimeError: operator torchvision::nms does not exist"
+)
+
+
+def import_doctor(
+    tmp_path: Path, recorded: bool | str | None, checked: bool | str | None = None
+) -> tuple[DoctorService, list[bool]]:
+    """A doctor whose exporter recorded ``recorded`` and finds ``checked`` when asked to import.
+
+    Also returns each ``run`` it was asked with: ``False`` reads the record,
+    ``True`` imports.
+    """
+    settings = make_settings(tmp_path)
+    asked: list[bool] = []
+    resolver = RegistryResolver(load_builtin_registry())
+
+    def exporter_import(run: bool) -> bool | str | None:
+        asked.append(run)
+        return checked if run else recorded
+
+    service = DoctorService(
+        FakeHardwareProbe(healthy_inventory(settings)),
+        FakeRuntimeProbe(("CPU", "GPU", "NPU")),
+        FakeHubClient(None),
+        None,
+        settings,
+        exporter_import=exporter_import,
+        classify_failure=lambda failure: resolver.classify(raw_error=failure, stage="export"),
+    )
+    return service, asked
+
+
+def test_a_recorded_working_import_is_one_ok_line_after_the_packages(tmp_path):
+    service, asked = import_doctor(tmp_path, True)
+
+    report = service.run(full=True)
+
+    check = require(report, "openvino.exporter_import")
+    assert (check.status, check.value) == (Severity.OK, "imports")
+    labels = [item.id for item in require_section(report, "openvino").checks]
+    assert labels.index("openvino.exporter_import") == labels.index("openvino.transformers") + 1
+    # A recorded success is trusted, even by --full: the seconds-long import is not repeated.
+    assert asked == [False]
+
+
+def test_the_first_doctor_imports_once_when_nothing_is_recorded(tmp_path):
+    service, asked = import_doctor(tmp_path, False, True)
+
+    check = require(service.run(), "openvino.exporter_import")
+
+    assert check.status is Severity.OK
+    assert asked == [False, True]
+
+
+def test_a_broken_exporter_import_is_reported_with_the_registry_remedy(tmp_path):
+    """CPU torch + PyPI torchvision: versions look fine, the import does not."""
+    service, asked = import_doctor(tmp_path, TORCHVISION_FAILURE)
+
+    report = service.run()
+
+    check = require(report, "openvino.exporter_import")
+    assert check.status is Severity.WARNING
+    assert check.value == "fails"
+    assert "torchvision cannot load against the installed torch" in (check.detail or "")
+    assert "operator torchvision::nms does not exist" in (check.detail or "")
+    remedy = " ".join(check.remediation)
+    assert "--index-url https://download.pytorch.org/whl/cpu" in remedy
+    assert "`yonga doctor --full` checks again" in remedy
+    assert report.exit_code() is ExitCode.WARNINGS
+    assert require(report, "openvino.optimum_intel").status is Severity.OK
+    # Plain doctor reports the recorded failure without importing again.
+    assert asked == [False]
+
+
+def test_full_checks_a_recorded_failure_again(tmp_path):
+    service, asked = import_doctor(tmp_path, TORCHVISION_FAILURE, True)
+
+    check = require(service.run(full=True), "openvino.exporter_import")
+
+    assert check.status is Severity.OK
+    assert asked == [False, True]
+
+
+def test_a_freshly_checked_failure_does_not_call_itself_recorded(tmp_path):
+    service, _ = import_doctor(tmp_path, False, "ImportError: something else entirely")
+
+    check = require(service.run(), "openvino.exporter_import")
+
+    assert check.status is Severity.WARNING
+    assert "does not import: ImportError: something else entirely" in (check.detail or "")
+    assert not any("checks again" in step for step in check.remediation)
+
+
+def test_no_exporter_to_check_adds_no_line(tmp_path):
+    service, _ = import_doctor(tmp_path, None)
+    assert service.run().check("openvino.exporter_import") is None

@@ -705,6 +705,59 @@ def test_doctor_exits_ten_without_a_usable_runtime(runner: CliRunner, home: Path
     )
     result = invoke(runner, home, ["doctor"], factory=wiring_for)
     assert result.exit_code == int(ExitCode.ENVIRONMENT_UNUSABLE)
+    # The closing line is the advice a user acts on; Rich must not read
+    # "[openvino]" as a style tag and leave "pip install 'yonga'".
+    last = result.stderr.strip().splitlines()[-1]
+    assert last.endswith("pip install 'yonga[openvino]'"), last
+
+
+def test_doctor_reports_an_exporter_that_does_not_import(
+    runner: CliRunner, home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CPU torch next to PyPI's torchvision: every version is fine, the import is not.
+
+    Plain doctor shows what the last check recorded -- here the failure a
+    'prepare' preflight met -- and never runs the seconds-long import itself.
+    """
+    from tests.unit.test_exporter_optimum import FakeRunner
+    from yonga.adapters import exporter_optimum
+
+    monkeypatch.setattr(exporter_optimum, "_module_importable", lambda name: True)
+    failing = FakeRunner(
+        returncode=1,
+        stderr=[
+            "Traceback (most recent call last):",
+            "RuntimeError: operator torchvision::nms does not exist",
+        ],
+    )
+    cache = home / "cache" / "metadata"
+    exporter_optimum.OptimumExporter(failing, cache_dir=cache).toolchain_import_failure()
+    doctor_runner = FakeRunner(returncode=0)
+    exporter = exporter_optimum.OptimumExporter(doctor_runner, cache_dir=cache)
+    wiring_for = lambda settings: FakeWiring(  # noqa: E731 - one-line factory
+        settings,
+        hardware=FakeHardwareProbe(healthy_inventory()),
+        exporter=exporter,
+    )
+
+    result = invoke(runner, home, ["doctor"], factory=wiring_for)
+
+    assert result.exit_code == int(ExitCode.WARNINGS)
+    text = plain_text(result.stdout)
+    assert "exporter import" in text
+    assert "torchvision cannot load against the installed torch" in text
+    assert doctor_runner.calls == []
+
+    result = invoke(runner, home, ["doctor", "--full", "--json"], factory=wiring_for)
+    payload = one_document(result)
+    assert len(doctor_runner.calls) == 1
+    checks = [
+        check
+        for section in payload["sections"]  # type: ignore[attr-defined]
+        for check in section["checks"]
+        if check["id"] == "openvino.exporter_import"
+    ]
+    assert checks[0]["status"] == "ok"
 
 
 def test_doctor_json_is_one_document_without_a_token(runner: CliRunner, home: Path) -> None:

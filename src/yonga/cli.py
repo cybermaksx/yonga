@@ -39,7 +39,7 @@ from pathlib import Path
 from typing import Any
 
 import typer
-from rich.markup import escape
+from rich.text import Text
 from typer.core import TyperGroup
 
 from yonga import APP_NAME, __version__
@@ -1406,7 +1406,7 @@ def _serve(
         warning = f"Binding {host} makes the model reachable from other machines."
         if api_key is None:
             warning += f" No {API_KEY_ENV} is set, so anyone who can reach it can use it."
-        console.print_error(f"[yellow]warning:[/] {warning}")
+        console.print_error(Text.assemble(("warning:", "yellow"), f" {warning}"))
 
     service: ChatService = state.graph.chat_service(progress=state.sink())
     from yonga.application.serve import ModelServer
@@ -1421,15 +1421,23 @@ def _serve(
         server.load()
         url = f"http://{_url_host(host)}:{port}/v1"
         console.print(
-            f"Serving [bold]{server.model.id}[/] on {server.model.device} at [cyan]{url}[/]"
-            + ("  (API key required)" if api_key else "")
+            Text.assemble(
+                "Serving ",
+                (server.model.id, "bold"),
+                f" on {server.model.device} at ",
+                (url, "cyan"),
+                "  (API key required)" if api_key else "",
+            )
         )
         if server.image_policy.accepted and not _pillow_available():
             console.print_error(
-                "[yellow]warning:[/] Pillow is not installed, so requests with images will "
-                "fail; text works. pip install 'yonga\\[serve]' to accept images."
+                Text.assemble(
+                    ("warning:", "yellow"),
+                    " Pillow is not installed, so requests with images will fail; text "
+                    "works. pip install 'yonga[serve]' to accept images.",
+                )
             )
-        console.print("[dim]Press Ctrl+C to stop.[/]")
+        console.print("Press Ctrl+C to stop.", style="dim")
         app_instance = create_app(server, api_key=api_key, max_body_bytes=limits.max_body_bytes)
         _run_http(app_instance, host=host, port=port, verbose=state.settings.verbose)
     finally:
@@ -1655,7 +1663,7 @@ def _publish(
         )
     console.print(f"Uploading to {plan.url} ...")
     url = service.publish(plan)
-    console.print(f"[green]Published[/] {plan.artifact_id}: {url}")
+    console.print(Text.assemble(("Published", "green"), f" {plan.artifact_id}: {url}"))
     payload["url"] = url
     state.emit(payload)
     return ExitCode.WARNINGS if plan.warnings else ExitCode.SUCCESS
@@ -2436,7 +2444,7 @@ def _registry_validate(state: CliState) -> ExitCode:
             # otherwise pass unseen under "Registry is valid."
             state.console.section("Ignored")
             for reason in registry.ignored:
-                state.console.print(f"  - {escape(reason)}")
+                state.console.print(f"  - {reason}")
         if problems:
             # The problem list is the command's result, not a side note, so it
             # belongs on stdout next to the counts; the summary diagnostic that
@@ -2549,7 +2557,9 @@ def _registry_explain(state: CliState, model: str, *, device: str | None) -> Exi
         return ExitCode.SUCCESS
     state.console.print(tables.registry_explanation(explanation))
     for reason in ignored:
-        state.console.print_error(f"[yellow]warning:[/] {escape(reason)}; explained without it.")
+        state.console.print_error(
+            Text.assemble(("warning:", "yellow"), f" {reason}; explained without it.")
+        )
     return ExitCode.SUCCESS
 
 
@@ -2746,7 +2756,9 @@ def _registry_update(
         )
     store.install(verified, bundle_bytes, signature_bytes, source=source)
     payload["installed"] = True
-    console.print(f"[green]Installed[/] registry bundle version {bundle.version}.")
+    console.print(
+        Text.assemble(("Installed", "green"), f" registry bundle version {bundle.version}.")
+    )
     state.emit(payload)
     return ExitCode.SUCCESS
 
@@ -2800,7 +2812,7 @@ def _registry_status(state: CliState) -> ExitCode:
         f"expires {installed.expires_at:%Y-%m-%d}, from {installed.source}"
     )
     if problem:
-        console.print(f"[yellow]Not in use:[/] {problem}")
+        console.print(Text.assemble(("Not in use:", "yellow"), f" {problem}"))
         return ExitCode.WARNINGS
     console.print("In use          " + ("yes" if in_use else "no (policy is 'never')"))
     return ExitCode.SUCCESS

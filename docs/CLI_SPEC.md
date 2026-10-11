@@ -96,6 +96,17 @@ never carries them and nothing can be installed into it, so there the missing on
 environment, with how many are built or that the first conversion builds one. An AppImage on a
 disk-backed temp directory can therefore exit 0.
 
+Where the toolchain is installed, versions alone do not prove it loads (a CPU torch next to PyPI's
+torchvision passes every version check), so an `exporter import` line (`openvino.exporter_import`)
+follows the packages. It is the import of `optimum.exporters.openvino` that `prepare` runs in
+preflight, sharing its record: doctor imports once (a few seconds) when nothing is recorded for the
+installed package versions and otherwise reports the record, so it stays fast. A success is ok; a
+failure is a warning with the registry's diagnostic title and remedy (for example
+`export.torchvision.build_mismatch`) and a note that `--full` checks again, which `--full` does.
+
+The `export environments` line totals the disk under the environments directory exactly as
+`yonga env list` does: the environments and the copy of the bundled Python they are made from.
+
 The `compile cache` line reports the size of the OpenVINO compile cache and how much of it is
 reclaimable: orphaned plus stale-runtime entries, as `yonga cache list` classifies them (section
 12b). It is a warning, with `yonga cache prune` as the remediation, when the reclaimable bytes are
@@ -111,6 +122,9 @@ Exit codes:
 
 The last line names the cause of a 10: the OpenVINO runtime is not installed (with
 `pip install 'yonga[openvino]'`), is installed but cannot be imported, or no device was found.
+
+Every line is printed as plain text: square brackets in a command, a path, a model id or a message
+from a library are never read as terminal styling.
 
 Do not make warnings such as small `/tmp` fatal if managed temp solves them.
 

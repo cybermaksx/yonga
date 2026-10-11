@@ -8,7 +8,11 @@ wraps :class:`rich.console.Console` and adds the project's output rules:
   JSON document to stdout;
 * failures are rendered as short, plain-English explanations — never tracebacks —
   with the raw exception text shown only under ``--debug``;
-* ``--yes`` may never auto-approve a security-sensitive question.
+* ``--yes`` may never auto-approve a security-sensitive question;
+* a ``str`` is always plain text. Rich console markup is switched off, so a
+  bracketed word in a message, a remediation command (``pip install
+  'yonga[openvino]'``), a model id or a path is printed as written instead of
+  being read as a style tag. Styling is applied with :class:`rich.text.Text`.
 
 The UI renders; it never decides. Nothing here imports adapters, OpenVINO or the
 Hugging Face Hub.
@@ -283,8 +287,13 @@ def build_console(
     When ``no_color`` is set the colour system is switched off entirely rather
     than merely desaturated, so ``NO_COLOR`` also removes bold and dim
     attributes: a terminal that asked for no escape sequences gets none.
+
+    Markup is off: every string this console renders -- a printed line, a table
+    cell, a column header -- is literal text, because most of them carry text
+    yonga did not write (diagnostics, model ids, paths, upstream errors).
     """
     return Console(
+        markup=False,
         file=file,
         stderr=stderr,
         no_color=no_color,
@@ -361,16 +370,16 @@ class YongaConsole:
     # plain output
     # ------------------------------------------------------------------
     def print(self, renderable: RenderableType = "", *, style: str | None = None) -> None:
-        """Write a renderable to stdout; silent in ``--json`` mode."""
+        """Write a renderable to stdout; silent in ``--json`` mode. A ``str`` is plain text."""
         if not self.show_decoration:
             return
-        self.out.print(renderable, style=style, highlight=False)
+        self.out.print(_plain(renderable), style=style, highlight=False)
 
     def print_error(self, renderable: RenderableType = "", *, style: str | None = None) -> None:
-        """Write a renderable to stderr; silent in ``--json`` mode."""
+        """Write a renderable to stderr; silent in ``--json`` mode. A ``str`` is plain text."""
         if not self.show_decoration:
             return
-        self.err.print(renderable, style=style, highlight=False)
+        self.err.print(_plain(renderable), style=style, highlight=False)
 
     def detail(self, message: str) -> None:
         """Write a dim line to stderr, but only under ``--verbose``."""
@@ -477,10 +486,22 @@ class YongaConsole:
         from rich.prompt import Confirm
 
         try:
-            return bool(Confirm.ask(question, console=self.err, default=default))
+            # A ``str`` prompt would be parsed as markup; the question can name a model.
+            prompt = Text(question, style="prompt")
+            return bool(Confirm.ask(prompt, console=self.err, default=default))
         except (EOFError, KeyboardInterrupt):
             self.err.line()
             return False
+
+
+def _plain(renderable: RenderableType) -> RenderableType:
+    """Return ``renderable`` with a ``str`` turned into literal :class:`Text`.
+
+    The consoles from :func:`build_console` already ignore markup; this keeps
+    the rule when a caller (a test, an embedding application) hands
+    :class:`YongaConsole` a Rich console of its own.
+    """
+    return Text(renderable) if isinstance(renderable, str) else renderable
 
 
 def _stdin_is_tty() -> bool:

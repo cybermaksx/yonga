@@ -20,10 +20,12 @@ mechanical part:
   environment at once; the second waits and then reuses the first's result.
 
 Environments are addressed only through the interpreter at ``bin/python``
-(``python -m pip``, ``python -m optimum.commands.optimum_cli``), never through
+(``python -m pip``, ``optimum.commands.optimum_cli`` run as a module), never through
 console scripts, whose shebangs would pin an absolute build path. Every such
 interpreter runs with ``-P``, so the directory yonga was started from is not put
 first on ``sys.path``: a stray ``json.py`` or ``pip/`` there cannot run in its place.
+Whatever imports OpenVINO there starts with its telemetry switched off
+(:mod:`yonga.privacy`); yonga itself is not installed in these environments.
 """
 
 from __future__ import annotations
@@ -59,6 +61,7 @@ from yonga.domain.environments import (
     EnvironmentSpec,
     ExportEnvironment,
 )
+from yonga.privacy import python_code_argv
 from yonga.util.versions import installed_version, satisfies
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -505,7 +508,7 @@ class ExportEnvironmentManager:
         """Import the export entry point inside the environment and check every pin."""
         ctx.emit(ProgressKind.LOG, "Export environment: verifying", status="env")
         script = _VERIFY_SCRIPT % (list(ENVIRONMENT_PACKAGES),)
-        result = self._runner.run([str(python), "-P", "-c", script], ctx=ctx)
+        result = self._runner.run(python_code_argv(python, script), ctx=ctx)
         self._check(result, spec, "verifying the environment")
         versions = _parse_versions(result.stdout_lines)
         problems = (

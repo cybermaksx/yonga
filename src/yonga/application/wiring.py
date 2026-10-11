@@ -35,6 +35,7 @@ from yonga.adapters import (
     HubClient,
     HubPublisher,
     HubSearch,
+    RecordsToolchainImport,
 )
 from yonga.adapters import RuntimeProbe as RuntimeProbePort
 from yonga.adapters.export_env import ExportEnvironmentManager
@@ -601,9 +602,27 @@ class Wiring:
             self._settings,
             progress=progress,
             export_environments=self.export_environments().environments,
+            base_interpreter_bytes=self._base_interpreter_bytes,
+            exporter_import=self._exporter_import_state,
+            classify_failure=self._classify_export_failure,
             compile_cache=self.compile_cache_service().inventory,
             installation=self.self_install_service().status,
         )
+
+    def _exporter_import_state(self, run: bool) -> bool | str | None:
+        """The exporter's import check for doctor; with ``run`` false, only what was recorded."""
+        exporter = self.exporter()
+        if not isinstance(exporter, RecordsToolchainImport):
+            return None
+        return exporter.toolchain_import_state(run=run)
+
+    def _classify_export_failure(self, failure: str) -> Diagnostic:
+        """Read an export failure through the registry, as 'prepare' does."""
+        return self.registry_resolver().classify(raw_error=failure, stage="export")
+
+    def _base_interpreter_bytes(self) -> int:
+        """Disk held by the bundled-Python copies environments are made from."""
+        return sum(copy.size_bytes for copy in self.export_environments().base_interpreters())
 
     def self_install_service(self) -> SelfInstallService:
         """Build the ``yonga self`` service over this process's environment."""
