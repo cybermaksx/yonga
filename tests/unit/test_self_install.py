@@ -15,7 +15,9 @@ import sys
 from collections.abc import Mapping
 from pathlib import Path
 
+import click
 import pytest
+from typer.main import get_command
 from typer.testing import CliRunner
 
 from tests.unit.test_cli import invoke, one_document
@@ -32,6 +34,7 @@ from yonga.application.self_install import (
     is_appimage,
     on_path,
 )
+from yonga.cli import app
 from yonga.config.paths import Paths
 from yonga.domain.diagnostics import ConfigurationError, ExitCode, Severity, YongaError
 
@@ -497,3 +500,60 @@ def test_cli_doctor_reports_the_install_check(cli_host: Host) -> None:
     assert installation["kind"] == "appimage"
     assert installation["path_command_relation"] == "missing"
     assert result.exit_code == int(ExitCode.WARNINGS)
+
+
+def _bin_dir_help(command: str) -> str:
+    group = get_command(app)
+    assert isinstance(group, click.Group)
+    self_group = group.commands["self"]
+    assert isinstance(self_group, click.Group)
+    option = next(p for p in self_group.commands[command].params if p.name == "bin_dir")
+    assert isinstance(option, click.Option)
+    return option.help or ""
+
+
+def test_cli_uninstall_help_says_remove_not_install() -> None:
+    assert "remove the 'yonga' command from" in _bin_dir_help("uninstall")
+    assert "install the 'yonga' command in" in _bin_dir_help("install")
+
+
+def test_cli_uninstall_from_a_python_environment_says_what_stays(cli_host: Host) -> None:
+    """Run from pip, the AppImage goes and this installation's yonga stays."""
+    runner = CliRunner()
+    home = cli_host.root / "yonga-home"
+    (home / "config").mkdir(parents=True)
+    bin_dir = cli_host.root / "fakebin"
+    copy = fake_appimage(bin_dir / "yonga", b"an AppImage copy")
+    env = {"HOME": str(cli_host.home), "PATH": "/usr/bin", "APPIMAGE": "", "APPDIR": ""}
+
+    removed = invoke(
+        runner, home, ["self", "uninstall", "--bin-dir", str(bin_dir), "--yes"], env=env
+    )
+
+    assert removed.exit_code == int(ExitCode.SUCCESS), removed.output
+    assert not copy.exists()
+    text = " ".join(removed.stdout.split())
+    assert "runs from a Python environment" in text
+    assert "removes only the AppImage" in text
+    assert "downloaded AppImage" not in text
+    assert "this Python environment's yonga still runs them" in text
+
+
+def test_cli_uninstall_from_an_appimage_points_at_the_download(cli_host: Host) -> None:
+    runner = CliRunner()
+    home = cli_host.root / "yonga-home"
+    (home / "config").mkdir(parents=True)
+    bin_dir = cli_host.root / "fakebin"
+    fake_appimage(bin_dir / "yonga", b"an AppImage copy")
+
+    removed = invoke(
+        runner,
+        home,
+        ["self", "uninstall", "--bin-dir", str(bin_dir), "--yes"],
+        env=cli_env(cli_host),
+    )
+
+    assert removed.exit_code == int(ExitCode.SUCCESS), removed.output
+    text = " ".join(removed.stdout.split())
+    assert "Python environment" not in text
+    assert "run them from the downloaded AppImage" in text

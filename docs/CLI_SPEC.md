@@ -89,6 +89,13 @@ environment the line is information only. The `--json` document carries it under
 (`kind`, `version`, `appimage`, `prefix`, `path_command`, `path_command_relation`: `this`,
 `other_appimage`, `other` or `missing`, and `path_command_version`).
 
+A missing `optimum-intel`, `nncf` or `transformers` is a warning in a Python environment, with
+`pip install 'yonga[export]'` and the managed export environment as the alternatives. An AppImage
+never carries them and nothing can be installed into it, so there the missing ones are a single
+`export toolchain` line (`openvino.export_toolchain`, ok): `prepare` converts in a managed export
+environment, with how many are built or that the first conversion builds one. An AppImage on a
+disk-backed temp directory can therefore exit 0.
+
 The `compile cache` line reports the size of the OpenVINO compile cache and how much of it is
 reclaimable: orphaned plus stale-runtime entries, as `yonga cache list` classifies them (section
 12b). It is a warning, with `yonga cache prune` as the remediation, when the reclaimable bytes are
@@ -101,6 +108,9 @@ Exit codes:
 - 0: usable runtime exists;
 - 2: runtime usable but warnings;
 - 10: no usable OpenVINO device/runtime;
+
+The last line names the cause of a 10: the OpenVINO runtime is not installed (with
+`pip install 'yonga[openvino]'`), is installed but cannot be imported, or no device was found.
 
 Do not make warnings such as small `/tmp` fatal if managed temp solves them.
 
@@ -617,7 +627,9 @@ how a later `install` (and `doctor`) can name the version it would replace witho
 
 `uninstall` removes only the file at `DIR/yonga`. Prepared models, logs, caches and settings are
 kept; it prints their directories and that `yonga remove`, `yonga cache prune --all` or deleting
-the directories frees the space.
+the directories frees the space. Run from a Python environment (pip or pipx), it says first that
+it removes only the AppImage, not the installation running it, which still runs those commands
+afterwards.
 
 `--json` documents: `install` carries `action` (`installed`, `replaced`, `already_installed`),
 `source`, `target`, `bin_dir`, `version`, `size`, `sha256`, `created_bin_dir`, `previous`

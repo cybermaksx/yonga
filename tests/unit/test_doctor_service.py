@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -25,10 +26,17 @@ from yonga.application.doctor import (
     DoctorService,
     group_membership_remediation,
 )
+from yonga.application.self_install import (
+    CommandRelation,
+    InstallationStatus,
+    InstallKind,
+    RunningInstallation,
+)
 from yonga.config.settings import Settings
 from yonga.domain.artifacts import IRDescription, ProbeResult, assert_no_secrets
 from yonga.domain.compile_cache import CacheEntryStatus, CompileCacheEntry, CompileCacheInventory
-from yonga.domain.diagnostics import ExitCode, HealthCheck, Severity
+from yonga.domain.diagnostics import ExitCode, HealthCheck, HealthSection, Severity
+from yonga.domain.environments import EnvironmentSpec, ExportEnvironment
 from yonga.domain.hardware import (
     DeviceKind,
     FilesystemInfo,
@@ -358,6 +366,13 @@ def require(report: DoctorReport, check_id: str) -> HealthCheck:
     return check
 
 
+def require_section(report: DoctorReport, section_id: str) -> HealthSection:
+    """Return a section that must exist, failing the test loudly otherwise."""
+    section = report.section(section_id)
+    assert section is not None, f"missing section {section_id!r}"
+    return section
+
+
 def remediation_text(report: DoctorReport, check_id: str) -> str:
     """Join one check's value, detail and remediation into a searchable string."""
     check = require(report, check_id)
@@ -583,17 +598,183 @@ def test_a_missing_export_package_names_the_managed_environment(tmp_path, monkey
     assert "yonga[export]" in remediation
 
 
-def test_inside_an_appimage_no_pip_install_is_suggested_for_export(tmp_path, monkeypatch):
-    """Nothing can be installed into the image; the managed environment is the answer."""
-    monkeypatch.setenv("APPIMAGE", "/home/user/yonga.AppImage")
+#: What an AppImage build bundles: the runtime, never the conversion toolchain.
+NO_TOOLCHAIN: dict[str, str | None] = {"optimum-intel": None, "nncf": None, "transformers": None}
+
+
+def installation(kind: InstallKind) -> InstallationStatus:
+    """yonga running as ``kind``, with 'yonga' on PATH being this installation."""
+    if kind is InstallKind.APPIMAGE:
+        image = Path("/home/user/.local/bin/yonga")
+        running = RunningInstallation(
+            kind, "0.4.0", Path("/tmp/.mount_yonga/usr/python"), appimage=image
+        )
+        return InstallationStatus(running, image, CommandRelation.THIS)
+    running = RunningInstallation(kind, "0.4.0", Path("/home/user/venv"))
+    return InstallationStatus(running, Path("/home/user/venv/bin/yonga"), CommandRelation.THIS)
+
+
+def built_environment(settings: Settings, size_bytes: int) -> ExportEnvironment:
+    """One managed export environment on disk, as ``yonga env list`` reports it."""
+    spec = EnvironmentSpec(python="3.14", packages={"transformers": "==5.5.4"})
+    return ExportEnvironment(
+        spec=spec,
+        path=settings.paths.envs_dir / spec.name,
+        created_at=datetime(2026, 10, 1, tzinfo=UTC),
+        size_bytes=size_bytes,
+    )
+
+
+def build_install(
+    settings: Settings,
+    inventory: HardwareInventory,
+    kind: InstallKind,
+    environments: Sequence[ExportEnvironment] = (),
+) -> DoctorService:
+    """A doctor that knows how yonga runs and which export environments exist."""
+    status = installation(kind)
+    return DoctorService(
+        FakeHardwareProbe(inventory),
+        FakeRuntimeProbe(("CPU", "GPU", "NPU")),
+        FakeHubClient(None),
+        None,
+        settings,
+        export_environments=lambda: list(environments),
+        installation=lambda: status,
+    )
+
+
+def test_an_appimage_without_the_toolchain_is_one_ok_line_and_exits_zero(tmp_path):
+    """The AppImage never carries the toolchain; by design, so never a warning."""
     settings = make_settings(tmp_path)
-    inventory = healthy_inventory(settings, packages=packages({"optimum-intel": None}))
+    # A disk-backed system temp, as in the E2E run, so nothing else is flagged.
+    measured = filesystems(settings, system_temp_fstype="ext4", system_temp_bytes=900 * GIB)
+    inventory = healthy_inventory(
+        settings,
+        packages=packages(NO_TOOLCHAIN),
+        filesystems=measured,
+        system_temp=measured[0],
+        managed_temp=measured[1],
+    )
+    service = build_install(settings, inventory, InstallKind.APPIMAGE)
+
+    report = service.run()
+
+    assert report.problems == []
+    for dist_name in ("optimum_intel", "nncf", "transformers"):
+        assert report.check(f"openvino.{dist_name}") is None
+    toolchain = require(report, "openvino.export_toolchain")
+    assert toolchain.status is Severity.OK
+    assert "built on first prepare" in (toolchain.value or "")
+    assert "optimum-intel, nncf and transformers are not in the AppImage" in (
+        toolchain.detail or ""
+    )
+    assert str(settings.paths.envs_dir) in (toolchain.detail or "")
+    assert "pip install" not in json.dumps(report.to_json())
+    labels = [check.id for check in require_section(report, "openvino").checks]
+    assert (
+        labels.index("openvino.export_toolchain")
+        == labels.index("openvino.openvino_tokenizers") + 1
+    )
+    assert require_section(report, "openvino").status is Severity.OK
+    assert report.exit_code() is ExitCode.SUCCESS
+    assert report.summary() is None
+
+
+def test_an_appimage_names_the_export_environments_already_built(tmp_path):
+    settings = make_settings(tmp_path)
+    inventory = healthy_inventory(settings, packages=packages(NO_TOOLCHAIN))
+    environment = built_environment(settings, 3 * GIB // 2)
+    service = build_install(settings, inventory, InstallKind.APPIMAGE, [environment])
+
+    toolchain = require(service.run(), "openvino.export_toolchain")
+
+    assert toolchain.value == "managed environment, 1 built"
+    assert "1.5 GiB" in (toolchain.detail or "")
+
+
+def test_an_appimage_reports_a_bundled_export_package_as_usual(tmp_path):
+    settings = make_settings(tmp_path)
+    inventory = healthy_inventory(
+        settings, packages=packages({"optimum-intel": None, "nncf": None})
+    )
+    service = build_install(settings, inventory, InstallKind.APPIMAGE)
+
+    report = service.run()
+
+    assert require(report, "openvino.transformers").status is Severity.OK
+    toolchain = require(report, "openvino.export_toolchain")
+    assert (toolchain.detail or "").startswith("optimum-intel and nncf are not in the AppImage")
+
+
+def test_a_python_environment_still_warns_with_the_export_extra(tmp_path, monkeypatch):
+    """An inherited APPIMAGE variable does not make a venv an AppImage."""
+    monkeypatch.setenv("APPIMAGE", "/home/user/other.AppImage")
+    settings = make_settings(tmp_path)
+    inventory = healthy_inventory(settings, packages=packages(NO_TOOLCHAIN))
+    service = build_install(settings, inventory, InstallKind.PYTHON)
+
+    report = service.run()
+
+    assert report.check("openvino.export_toolchain") is None
+    nncf = require(report, "openvino.nncf")
+    assert nncf.status is Severity.WARNING
+    assert "yonga[export]" in " ".join(nncf.remediation)
+    assert report.exit_code() is ExitCode.WARNINGS
+
+
+# --- the closing line -----------------------------------------------------------------
+
+
+def test_a_missing_runtime_is_named_as_the_cause_with_its_install_command(tmp_path):
+    settings = make_settings(tmp_path)
+    inventory = healthy_inventory(
+        settings,
+        devices=[],
+        openvino_available=False,
+        openvino_import_error="No module named 'openvino'",
+        packages=packages({"openvino": None, "openvino-genai": None, "openvino-tokenizers": None}),
+    )
+    service, _, _, _ = build(settings, inventory, device_names=())
+
+    summary = service.run().summary()
+
+    assert summary == "The OpenVINO runtime is not installed: pip install 'yonga[openvino]'"
+
+
+def test_a_runtime_that_does_not_import_is_not_called_missing(tmp_path):
+    settings = make_settings(tmp_path)
+    inventory = healthy_inventory(
+        settings,
+        devices=[],
+        openvino_available=False,
+        openvino_import_error="ImportError: libopenvino.so.2026: cannot open shared object",
+    )
+    service, _, _, _ = build(settings, inventory, device_names=())
+
+    summary = service.run().summary() or ""
+
+    assert "installed but could not be imported" in summary
+    assert "pip install" not in summary
+
+
+def test_a_runtime_without_devices_points_at_the_host(tmp_path):
+    settings = make_settings(tmp_path)
+    inventory = healthy_inventory(settings, devices=[])
+    service, _, _, _ = build(settings, inventory, device_names=())
+
+    report = service.run()
+
+    assert report.exit_code() is ExitCode.ENVIRONMENT_UNUSABLE
+    assert report.summary() == "No usable OpenVINO device was found on this host."
+
+
+def test_warnings_get_the_usable_with_warnings_line(tmp_path):
+    settings = make_settings(tmp_path)
+    inventory = healthy_inventory(settings, packages=packages({"nncf": None}))
     service, _, _, _ = build(settings, inventory)
 
-    remediation = " ".join(require(service.run(), "openvino.optimum_intel").remediation)
-
-    assert "managed export environment" in remediation
-    assert "pip install" not in remediation
+    assert service.run().summary() == "Usable, with warnings above."
 
 
 # --- NPU permissions ------------------------------------------------------------------

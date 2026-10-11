@@ -51,7 +51,7 @@ from yonga.domain.diagnostics import (
     Severity,
     worst_severity,
 )
-from yonga.domain.environments import ExportEnvironment
+from yonga.domain.environments import ESTIMATED_ENVIRONMENT_BYTES, ExportEnvironment
 from yonga.domain.hardware import (
     FilesystemInfo,
     HardwareInventory,
@@ -73,6 +73,7 @@ __all__ = [
     "COMPILE_CACHE_WARN_BYTES",
     "COMPILE_CACHE_WARN_FLOOR_BYTES",
     "COMPILE_CACHE_WARN_FREE_FRACTION",
+    "EXPORT_PACKAGES",
     "MANAGED_TEMP_NOTE",
     "OPENVINO_INSTALL_HINT",
     "REPORTED_PACKAGES",
@@ -97,14 +98,21 @@ REPORTED_PACKAGES: tuple[tuple[str, str, Severity], ...] = (
     ("huggingface-hub", "huggingface-hub", Severity.ERROR),
 )
 
+#: The conversion toolchain: optional, because 'prepare' can convert without it
+#: in a managed export environment. An AppImage never carries it.
+EXPORT_PACKAGES: tuple[str, ...] = ("optimum-intel", "nncf", "transformers")
+
 #: The single sentence that keeps a small ``/tmp`` from ever being fatal.
 MANAGED_TEMP_NOTE: str = (
     "yonga runs conversions in a managed, disk-backed temporary directory instead of the "
     "system temp filesystem, so a small tmpfs is a warning and never fatal."
 )
 
+#: The command that installs the OpenVINO runtime. Printed, never executed.
+OPENVINO_RUNTIME_COMMAND: str = "pip install 'yonga[openvino]'"
+
 #: How to obtain the OpenVINO runtime. Printed, never executed.
-OPENVINO_INSTALL_HINT: str = "Install the runtime extras: pip install 'yonga[openvino]'"
+OPENVINO_INSTALL_HINT: str = f"Install the runtime extras: {OPENVINO_RUNTIME_COMMAND}"
 
 #: How to obtain the conversion toolchain. Printed, never executed.
 EXPORT_INSTALL_HINT: str = "Install the conversion extras: pip install 'yonga[export]'"
@@ -221,6 +229,28 @@ class DoctorReport(BaseModel):
             return ExitCode.SUCCESS
         return ExitCode.WARNINGS
 
+    def summary(self) -> str | None:
+        """The closing line under the report, naming the cause; ``None`` when all is well.
+
+        An unusable runtime is told apart from an unusable host: a missing
+        ``openvino`` package is an install command away, while an empty device
+        list points at drivers.
+        """
+        code = self.exit_code()
+        if code is ExitCode.SUCCESS:
+            return None
+        if code is ExitCode.WARNINGS:
+            return "Usable, with warnings above."
+        if self.check("devices.runtime") is not None:
+            runtime = self.hardware.package("openvino")
+            if runtime is None or runtime.version is None:
+                return f"The OpenVINO runtime is not installed: {OPENVINO_RUNTIME_COMMAND}"
+            return (
+                "The OpenVINO runtime is installed but could not be imported; "
+                "see the Devices section above."
+            )
+        return "No usable OpenVINO device was found on this host."
+
     def to_json(self) -> dict[str, object]:
         """Return a JSON-safe dictionary (enums as values, paths as strings).
 
@@ -300,13 +330,21 @@ class DoctorService:
         devices_section, runtime_usable = self._devices_section(
             inventory, runtime_names, runtime_error
         )
+        installation = self._installation_status()
+        environments = self._list_export_environments()
+        appimage = (
+            isinstance(installation, InstallationStatus)
+            and installation.running.kind is InstallKind.APPIMAGE
+        )
 
         sections = [
-            self._emit(self._host_section(inventory)),
-            self._emit(self._openvino_section(inventory)),
+            self._emit(self._host_section(inventory, installation)),
+            self._emit(
+                self._openvino_section(inventory, appimage=appimage, environments=environments)
+            ),
             self._emit(devices_section),
             self._emit(self._npu_section(inventory)),
-            self._emit(self._storage_section(inventory, full=full)),
+            self._emit(self._storage_section(inventory, environments, full=full)),
             self._emit(self._huggingface_section(inventory, auth)),
         ]
         if full:
@@ -358,6 +396,25 @@ class DoctorService:
             return [], message
         return names, None
 
+    def _installation_status(self) -> InstallationStatus | Exception | None:
+        """How yonga runs, the error that hid it, or ``None`` when not wired."""
+        if self._installation is None:
+            return None
+        try:
+            return self._installation()
+        except Exception as exc:
+            return exc
+
+    def _list_export_environments(self) -> list[ExportEnvironment] | None:
+        """The managed export environments, or ``None`` when they cannot be listed."""
+        if self._export_environments is None:
+            return None
+        try:
+            return list(self._export_environments())
+        except Exception:
+            # Reporting disk use must never make doctor fail.
+            return None
+
     def _emit(self, section: HealthSection) -> HealthSection:
         """Publish one finished section on the progress sink and return it."""
         self._progress.emit(
@@ -373,8 +430,12 @@ class DoctorService:
 
     # --- host ----------------------------------------------------------
 
-    def _host_section(self, inventory: HardwareInventory) -> HealthSection:
-        """OS, kernel, Python, CPU, RAM and swap."""
+    def _host_section(
+        self,
+        inventory: HardwareInventory,
+        installation: InstallationStatus | Exception | None,
+    ) -> HealthSection:
+        """OS, kernel, Python, install, CPU, RAM and swap."""
         host = inventory.host
         memory = inventory.memory
         checks = [
@@ -401,7 +462,7 @@ class DoctorService:
                 host.python_version,
                 unknown_remediation=["The running Python version could not be determined."],
             ),
-            *self._installation_checks(),
+            *self._installation_checks(installation),
             _fact(
                 "host.cpu",
                 "CPU",
@@ -441,24 +502,26 @@ class DoctorService:
             )
         return HealthSection(id="host", title="Host", checks=_finalise(checks))
 
-    def _installation_checks(self) -> list[HealthCheck]:
+    def _installation_checks(
+        self, installation: InstallationStatus | Exception | None
+    ) -> list[HealthCheck]:
         """How yonga runs, and whether ``yonga`` on PATH is this installation."""
-        if self._installation is None:
+        if installation is None:
             return []
-        try:
-            status = self._installation()
-        except Exception as exc:
+        if isinstance(installation, Exception):
             return [
                 _check(
                     "host.install",
                     "Install",
                     Severity.UNKNOWN,
                     value="unknown",
-                    remediation=[f"How yonga is installed could not be read: {_describe(exc)}"],
+                    remediation=[
+                        f"How yonga is installed could not be read: {_describe(installation)}"
+                    ],
                 )
             ]
-        self._installation_summary = status.to_json()
-        return [_installation_check(status)]
+        self._installation_summary = installation.to_json()
+        return [_installation_check(installation)]
 
     def _memory_check(self, inventory: HardwareInventory) -> HealthCheck:
         """RAM total and availability, warning on a host too small to convert on."""
@@ -495,12 +558,35 @@ class DoctorService:
 
     # --- openvino packages ---------------------------------------------
 
-    def _openvino_section(self, inventory: HardwareInventory) -> HealthSection:
-        """Package versions plus the OpenVINO/GenAI/Tokenizers ABI family check."""
-        checks = [
-            _package_check(inventory, dist_name, label, missing)
-            for dist_name, label, missing in REPORTED_PACKAGES
-        ]
+    def _openvino_section(
+        self,
+        inventory: HardwareInventory,
+        *,
+        appimage: bool,
+        environments: Sequence[ExportEnvironment] | None,
+    ) -> HealthSection:
+        """Package versions plus the OpenVINO/GenAI/Tokenizers ABI family check.
+
+        An AppImage never carries the conversion toolchain: 'prepare' converts
+        in a managed export environment instead, by design. There the missing
+        packages are one ``export toolchain`` line saying so, not a warning
+        per package that no one can act on.
+        """
+        checks: list[HealthCheck] = []
+        absent: list[str] = []
+        position = 0
+        for dist_name, label, missing in REPORTED_PACKAGES:
+            if appimage and dist_name in EXPORT_PACKAGES and not _installed(inventory, dist_name):
+                if not absent:
+                    position = len(checks)
+                absent.append(dist_name)
+                continue
+            checks.append(_package_check(inventory, dist_name, label, missing))
+        if absent:
+            checks.insert(
+                position,
+                _managed_toolchain_check(absent, environments, self._settings.paths.envs_dir),
+            )
         checks.append(_abi_family_check(inventory))
         return HealthSection(id="openvino", title="OpenVINO", checks=_finalise(checks))
 
@@ -603,7 +689,13 @@ class DoctorService:
 
     # --- storage ---------------------------------------------------------
 
-    def _storage_section(self, inventory: HardwareInventory, *, full: bool) -> HealthSection:
+    def _storage_section(
+        self,
+        inventory: HardwareInventory,
+        environments: Sequence[ExportEnvironment] | None,
+        *,
+        full: bool,
+    ) -> HealthSection:
         """Free space on the cache/artifact filesystems and the managed-temp note."""
         paths = self._settings.paths
         floor = max(self._settings.temp_min_bytes, CRITICAL_FREE_BYTES)
@@ -625,9 +717,8 @@ class DoctorService:
             _system_temp_check(inventory.system_temp, floor),
             _managed_temp_check(inventory.managed_temp, paths.tmp_dir),
         ]
-        environments = self._environment_check(paths.envs_dir)
         if environments is not None:
-            checks.append(environments)
+            checks.append(_environment_check(environments, paths.envs_dir))
         compile_cache = self._compile_cache_check(
             _filesystem_for(inventory, paths.compile_cache_dir) or inventory.managed_temp
         )
@@ -636,27 +727,6 @@ class DoctorService:
         if full:
             checks.extend(_extra_filesystem_checks(inventory, paths.artifacts_dir, paths.tmp_dir))
         return HealthSection(id="storage", title="Storage", checks=_finalise(checks))
-
-    def _environment_check(self, root: Path) -> HealthCheck | None:
-        """How many managed export environments exist and the disk they use."""
-        if self._export_environments is None:
-            return None
-        try:
-            environments = list(self._export_environments())
-        except Exception:
-            # Reporting disk use must never make doctor fail.
-            return None
-        total = sum(environment.size_bytes for environment in environments)
-        value = (
-            f"{len(environments)} built, {format_bytes(total)}" if environments else "none built"
-        )
-        return HealthCheck(
-            id="storage.export_environments",
-            label="export environments",
-            status=Severity.OK,
-            value=value,
-            detail=f"{root} — isolated environments exports run in; `yonga env list`",
-        )
 
     def _compile_cache_check(self, filesystem: FilesystemInfo | None) -> HealthCheck | None:
         """The compile cache's size, and a warning when much of it is dead weight.
@@ -1029,9 +1099,6 @@ def _package_check(
     if package is None or package.version is None:
         if dist_name in ABI_PACKAGES:
             remediation = [hint, NEVER_INSTALLS_NOTE]
-        elif os.environ.get("APPIMAGE"):
-            # Nothing can be installed into an AppImage; the managed environment is the way.
-            remediation = [MANAGED_EXPORT_NOTE]
         else:
             remediation = [MANAGED_EXPORT_NOTE, hint, NEVER_INSTALLS_NOTE]
         return _check(
@@ -1056,6 +1123,61 @@ def _package_check(
             ],
         )
     return _check(check_id, label, Severity.OK, value=package.version)
+
+
+def _installed(inventory: HardwareInventory, dist_name: str) -> bool:
+    """Whether a distribution is installed in yonga's own environment."""
+    package = inventory.package(dist_name)
+    return package is not None and package.version is not None
+
+
+def _managed_toolchain_check(
+    absent: Sequence[str],
+    environments: Sequence[ExportEnvironment] | None,
+    root: Path,
+) -> HealthCheck:
+    """The ``openvino.export_toolchain`` line of an AppImage.
+
+    The image carries no conversion toolchain on purpose, and nothing can be
+    installed into it: 'prepare' converts in a managed export environment. That
+    is how an AppImage is meant to work, so it is ``ok`` and never a warning.
+    """
+    names = _listing(absent)
+    verb = "is" if len(absent) == 1 else "are"
+    if environments:
+        total = sum(environment.size_bytes for environment in environments)
+        value = f"managed environment, {len(environments)} built"
+        detail = (
+            f"{names} {verb} not in the AppImage; 'prepare' converts in a managed export "
+            f"environment under {root} ({format_bytes(total)} now)."
+        )
+    else:
+        value = "managed environment, built on first prepare"
+        detail = (
+            f"{names} {verb} not in the AppImage; the first 'prepare' that converts builds "
+            f"a managed export environment under {root} "
+            f"(about {format_bytes(ESTIMATED_ENVIRONMENT_BYTES)}) and reuses it."
+        )
+    return _check(
+        "openvino.export_toolchain",
+        "export toolchain",
+        Severity.OK,
+        value=value,
+        detail=detail,
+    )
+
+
+def _environment_check(environments: Sequence[ExportEnvironment], root: Path) -> HealthCheck:
+    """How many managed export environments exist and the disk they use."""
+    total = sum(environment.size_bytes for environment in environments)
+    value = f"{len(environments)} built, {format_bytes(total)}" if environments else "none built"
+    return _check(
+        "storage.export_environments",
+        "export environments",
+        Severity.OK,
+        value=value,
+        detail=f"{root} — isolated environments exports run in; `yonga env list`",
+    )
 
 
 def _abi_family_check(inventory: HardwareInventory) -> HealthCheck:
@@ -1502,6 +1624,13 @@ def _filesystem_for(inventory: HardwareInventory, path: Path) -> FilesystemInfo 
 def _describe(error: BaseException) -> str:
     """Render an exception as one redacted line."""
     return redact_text(f"{type(error).__name__}: {error}")
+
+
+def _listing(names: Sequence[str]) -> str:
+    """``a``, ``a and b``, ``a, b and c``."""
+    if len(names) < 2:
+        return "".join(names)
+    return f"{', '.join(names[:-1])} and {names[-1]}"
 
 
 def _join(*parts: str | None) -> str | None:

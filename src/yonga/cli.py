@@ -55,7 +55,7 @@ from yonga.application.jobs import (
 )
 from yonga.application.probe import ProbeOutcome, check_probe_options
 from yonga.application.progress import ProgressEvent, ProgressKind, ProgressSink, null_sink
-from yonga.application.self_install import InstallAction, PathReport, TargetKind
+from yonga.application.self_install import InstallAction, InstallKind, PathReport, TargetKind
 from yonga.application.wiring import Wiring, WiringFactory
 from yonga.config.settings import Settings, load_settings
 from yonga.domain.artifacts import ArtifactSummary, DeviceProbeReport, ProbeStatus
@@ -566,10 +566,11 @@ def _doctor(state: CliState, *, full: bool) -> ExitCode:
     state.console.print(tables.doctor_report(report.sections))
     for note in report.notes:
         state.console.print_error(note, style="dim")
-    if code is ExitCode.ENVIRONMENT_UNUSABLE:
-        state.console.print_error("No usable OpenVINO device was found on this host.")
-    elif code is ExitCode.WARNINGS:
-        state.console.print_error("Usable, with warnings above.", style="dim")
+    summary = report.summary()
+    if summary is not None and code is ExitCode.ENVIRONMENT_UNUSABLE:
+        state.console.print_error(summary)
+    elif summary is not None:
+        state.console.print_error(summary, style="dim")
     return code
 
 
@@ -2188,6 +2189,7 @@ def _cache_prune(
 # self
 # ======================================================================
 _BIN_DIR_HELP = "Directory to install the 'yonga' command in (default: ~/.local/bin)."
+_UNINSTALL_BIN_DIR_HELP = "Directory to remove the 'yonga' command from (default: ~/.local/bin)."
 
 
 @self_app.command("install")
@@ -2260,7 +2262,9 @@ def _render_path_report(state: CliState, report: PathReport) -> None:
 @self_app.command("uninstall")
 def self_uninstall(
     ctx: typer.Context,
-    bin_dir: Path | None = typer.Option(None, "--bin-dir", metavar="DIR", help=_BIN_DIR_HELP),
+    bin_dir: Path | None = typer.Option(
+        None, "--bin-dir", metavar="DIR", help=_UNINSTALL_BIN_DIR_HELP
+    ),
     yes: bool = typer.Option(False, "--yes", "-y", help="Do not ask for confirmation."),
     json_output: bool = typer.Option(False, "--json", help="Emit the outcome as JSON."),
 ) -> None:
@@ -2292,6 +2296,13 @@ def _self_uninstall(state: CliState, *, bin_dir: Path | None, yes: bool) -> Exit
             console.print(f"Nothing to remove: there is no yonga AppImage at {target}.")
         return ExitCode.SUCCESS
 
+    from_python = service.running().kind is InstallKind.PYTHON
+    if from_python and not state.json_mode:
+        # Typed from a pip or pipx install, 'self uninstall' could read as removing that.
+        console.print(
+            f"This yonga runs from a Python environment; 'self uninstall' removes only the "
+            f"AppImage at {target}. To remove this installation, use pip or pipx yourself."
+        )
     version = f"yonga {plan.version}" if plan.version else "version unknown"
     question = f"Remove {target} ({version}, {human_bytes(plan.target.size or 0)})?"
     if not console.confirm(question, default=False, assume_yes=yes):
@@ -2309,21 +2320,28 @@ def _self_uninstall(state: CliState, *, bin_dir: Path | None, yes: bool) -> Exit
         state.emit(document(removed))
         return ExitCode.SUCCESS
     console.print(f"Removed {target}." if removed else f"{target} was already gone.")
-    _render_kept_data(state, locations)
+    _render_kept_data(state, locations, from_python=from_python)
     return ExitCode.SUCCESS
 
 
-def _render_kept_data(state: CliState, locations: Mapping[str, Path]) -> None:
+def _render_kept_data(state: CliState, locations: Mapping[str, Path], *, from_python: bool) -> None:
     """Say what was left in place and how to remove it, without doing it."""
     console = state.console
     console.print(
         f"Kept: prepared models and logs in {locations['data_dir']}, caches in "
         f"{locations['cache_dir']}, settings in {locations['config_dir']}."
     )
+    # A Python environment's yonga is still installed; only an AppImage user may have
+    # just removed the only 'yonga' command there was.
+    where = (
+        "this Python environment's yonga still runs them"
+        if from_python
+        else "run them from the downloaded AppImage if 'yonga' is gone now"
+    )
     console.print(
         "To free space: 'yonga remove ARTIFACT' deletes a model and 'yonga cache prune --all' "
-        "empties the compile cache (run them from the downloaded AppImage if 'yonga' is gone "
-        "now). Deleting those directories yourself removes everything.",
+        f"empties the compile cache ({where}). Deleting those directories yourself removes "
+        "everything.",
         style="dim",
     )
 
