@@ -88,6 +88,18 @@ def test_cpu_torchvision_repair_replaces_the_pypi_build() -> None:
     assert f"pip install torchvision --index-url https://{CPU_INDEX}" in text
 
 
+def test_no_torch_repair_force_reinstalls_from_the_cpu_index() -> None:
+    """``--force-reinstall`` also reinstalls every dependency, and took numpy past nncf's bound."""
+    documents = [README, *sorted(DOCS.glob("*.md"))]
+    offending = [
+        (document.name, line.strip())
+        for document in documents
+        for line in document.read_text(encoding="utf-8").splitlines()
+        if CPU_INDEX in line and "--force-reinstall" in line
+    ]
+    assert offending == []
+
+
 def test_troubleshooting_lists_every_self_install_code() -> None:
     """``self install`` is the first command an AppImage user runs; its refusals are documented."""
     source = (ROOT / "src" / "yonga" / "application" / "self_install.py").read_text(

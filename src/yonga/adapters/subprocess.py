@@ -44,15 +44,37 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from yonga.util.jsonlog import JobLogger
 
 __all__ = [
+    "DEFAULT_HEAD_LINES",
     "DEFAULT_TAIL_LINES",
+    "EXCEPTION_CONTEXT_LINES",
+    "EXCEPTION_HEADERS_KEPT",
+    "TRACEBACK_START",
     "CompletedCommand",
     "SubprocessRunner",
     "default_line_selector",
+    "elision_marker",
+    "is_elision_marker",
     "progress_text",
 ]
 
 #: Number of trailing output lines kept in memory for each stream.
-DEFAULT_TAIL_LINES: int = 200
+DEFAULT_TAIL_LINES: int = 300
+
+#: Number of leading output lines kept in memory for each stream, in front of
+#: the tail. An elision marker stands for what lies between the two.
+DEFAULT_HEAD_LINES: int = 50
+
+#: How many lines of each exception, its header and what follows it, are kept
+#: from output that falls between the head and the tail, and for at most how
+#: many exceptions. A long failure listing (NNCF prints one line per refused
+#: node) can push even the exception line out of a plain tail, and that line is
+#: what the registry's signatures are written against.
+EXCEPTION_CONTEXT_LINES: int = 3
+EXCEPTION_HEADERS_KEPT: int = 4
+
+#: The line that opens a Python traceback; its header is the first unindented
+#: line after it.
+TRACEBACK_START = "Traceback (most recent call last):"
 
 #: Exit code reported when the command could not be started at all.
 SPAWN_FAILURE_RETURNCODE: int = 127
@@ -110,6 +132,88 @@ def default_line_selector(line: str) -> ProgressKind | None:
     return None
 
 
+#: The line :func:`elision_marker` writes, so readers of an excerpt can skip it.
+_ELISION = re.compile(r"\[\.\.\. \d+ lines omitted \.\.\.\]")
+
+
+def elision_marker(count: int) -> str:
+    """The line that stands for ``count`` output lines left out of a kept excerpt."""
+    return f"[... {count} lines omitted ...]"
+
+
+def is_elision_marker(line: str) -> bool:
+    """``True`` for a line :func:`elision_marker` wrote rather than the command."""
+    return _ELISION.fullmatch(line.strip()) is not None
+
+
+class _OutputExcerpt:
+    """What is kept of one stream: its head, its tail, and the exceptions in between.
+
+    Lines leaving the tail are scanned in order the way a reader of the whole
+    stream would: the header of each traceback (the first unindented line after
+    :data:`TRACEBACK_START`) and the lines right after it are kept, for the last
+    :data:`EXCEPTION_HEADERS_KEPT` exceptions, together with the traceback's
+    opening line so a reader of the excerpt still recognises the header as one.
+    Everything else between the head and the tail is replaced by elision markers.
+    """
+
+    def __init__(self, head: int, tail: int) -> None:
+        self._head_limit = head
+        self._head: list[str] = []
+        self._tail: deque[str] = deque(maxlen=tail)
+        self._exceptions: deque[list[tuple[int, str]]] = deque(maxlen=EXCEPTION_HEADERS_KEPT)
+        self._seen = 0
+        self._traceback: tuple[int, str] | None = None
+        self._context_left = 0
+
+    def append(self, line: str) -> None:
+        index = self._seen
+        self._seen += 1
+        if len(self._head) < self._head_limit:
+            self._head.append(line)
+            if self._is_header(index, line):
+                self._traceback = None
+            return
+        if len(self._tail) == self._tail.maxlen:
+            self._evicted(index - len(self._tail), self._tail[0])
+        self._tail.append(line)
+
+    def _is_header(self, index: int, line: str) -> bool:
+        """Follow the traceback state through ``line``; ``True`` for an exception header."""
+        stripped = line.strip()
+        if stripped == TRACEBACK_START:
+            self._traceback = (index, line)
+        elif self._traceback is not None and stripped and not line[:1].isspace():
+            return True
+        return False
+
+    def _evicted(self, index: int, line: str) -> None:
+        if self._is_header(index, line) and self._traceback is not None:
+            self._exceptions.append([self._traceback, (index, line)])
+            self._traceback = None
+            self._context_left = EXCEPTION_CONTEXT_LINES - 1
+        elif self._context_left > 0:
+            self._exceptions[-1].append((index, line))
+            self._context_left -= 1
+
+    def lines(self) -> list[str]:
+        kept = list(self._head)
+        previous = len(self._head) - 1
+        for exception in self._exceptions:
+            for index, line in exception:
+                if index <= previous:  # a traceback opened in the head
+                    continue
+                if index != previous + 1:
+                    kept.append(elision_marker(index - previous - 1))
+                kept.append(line)
+                previous = index
+        tail_start = self._seen - len(self._tail)
+        if tail_start != previous + 1:
+            kept.append(elision_marker(tail_start - previous - 1))
+        kept.extend(self._tail)
+        return kept
+
+
 def _recorded_overrides(
     candidates: Mapping[str, str],
     *,
@@ -146,10 +250,15 @@ class CompletedCommand:
     returncode: int
     duration_seconds: float
     stdout_lines: Sequence[str] = field(default_factory=list)
-    """The last ``tail_lines`` redacted stdout lines."""
+    """The first ``head_lines`` and last ``tail_lines`` redacted stdout lines.
+
+    Between the two, the header lines of the last few Python exceptions are
+    kept, and an elision marker (:func:`elision_marker`) stands for every run
+    of lines left out.
+    """
 
     stderr_lines: Sequence[str] = field(default_factory=list)
-    """The last ``tail_lines`` redacted stderr lines."""
+    """The same excerpt of stderr."""
 
     cancelled: bool = False
     """``True`` when the run was stopped by Ctrl+C or a programmatic cancel."""
@@ -186,6 +295,7 @@ class SubprocessRunner:
         self,
         *,
         tail_lines: int = DEFAULT_TAIL_LINES,
+        head_lines: int = DEFAULT_HEAD_LINES,
         poll_interval: float = 0.1,
         sigint_grace_seconds: float = 5.0,
         sigterm_grace_seconds: float = 5.0,
@@ -195,12 +305,13 @@ class SubprocessRunner:
     ) -> None:
         """Create a runner.
 
-        ``tail_lines`` bounds the in-memory output tail; a conversion can emit
-        hundreds of megabytes of progress bars, so the full stream only ever
-        goes to the job log file. ``extra_secrets`` adds literal strings that
+        ``head_lines`` and ``tail_lines`` bound the in-memory output excerpt; a
+        conversion can emit hundreds of megabytes of progress bars, so the full
+        stream only ever goes to the job log file. ``extra_secrets`` adds literal strings that
         must be masked in captured output on top of the pattern-based rules.
         """
         self._tail_lines = max(1, int(tail_lines))
+        self._head_lines = max(0, int(head_lines))
         self._poll_interval = max(0.01, float(poll_interval))
         self._grace: tuple[tuple[int, float], ...] = (
             (int(signal.SIGINT), max(0.0, float(sigint_grace_seconds))),
@@ -265,8 +376,8 @@ class SubprocessRunner:
                 timeout=timeout,
             )
 
-        stdout_tail: deque[str] = deque(maxlen=self._tail_lines)
-        stderr_tail: deque[str] = deque(maxlen=self._tail_lines)
+        stdout_tail = _OutputExcerpt(self._head_lines, self._tail_lines)
+        stderr_tail = _OutputExcerpt(self._head_lines, self._tail_lines)
         started = time.monotonic()
 
         try:
@@ -350,8 +461,8 @@ class SubprocessRunner:
             returncode = -int(self._grace[-1][0])
 
         with lock:
-            stdout_lines = list(stdout_tail)
-            stderr_lines = list(stderr_tail)
+            stdout_lines = stdout_tail.lines()
+            stderr_lines = stderr_tail.lines()
 
         if logger is not None:
             logger.info(
@@ -381,7 +492,7 @@ class SubprocessRunner:
         self,
         stream: IO[str] | None,
         name: str,
-        tail: deque[str],
+        tail: _OutputExcerpt,
         lock: threading.Lock,
         ctx: JobContext | None,
     ) -> None:
@@ -401,7 +512,7 @@ class SubprocessRunner:
         self,
         raw: str,
         name: str,
-        tail: deque[str],
+        tail: _OutputExcerpt,
         lock: threading.Lock,
         ctx: JobContext | None,
     ) -> None:

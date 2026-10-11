@@ -36,6 +36,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from yonga.adapters.filesystem import INCOMPLETE_MARKER_NAME
+from yonga.adapters.subprocess import (
+    EXCEPTION_CONTEXT_LINES,
+    EXCEPTION_HEADERS_KEPT,
+    TRACEBACK_START,
+    elision_marker,
+    is_elision_marker,
+)
 from yonga.application.progress import ProgressKind
 from yonga.domain.diagnostics import (
     ConfigurationError,
@@ -110,13 +117,6 @@ DISK_EXHAUSTION_SIGNATURES: tuple[str, ...] = (
 
 #: How many trailing output lines are kept on an :class:`ExportResult`.
 TAIL_LINES: int = 40
-
-#: How many lines of each exception, its header and what follows it, a failed
-#: export keeps from above the tail, and for at most how many exceptions.
-EXCEPTION_CONTEXT_LINES: int = 3
-EXCEPTION_HEADERS_KEPT: int = 4
-
-_TRACEBACK_START = "Traceback (most recent call last):"
 
 #: Cache files under the exporter's cache directory: optimum-intel's declared
 #: Transformers ranges, and the interpreters whose export toolchain imported.
@@ -762,6 +762,8 @@ def _failure_tail(lines: Sequence[str], limit: int = TAIL_LINES) -> list[str]:
     ``Traceback (most recent call last):``) and the lines right after it are kept
     in front, so a chained cause such as ``operator torchvision::nms does not
     exist`` survives as well, and an elision marker says what was left out.
+    The runner's own marker, standing for lines it never kept, is not an
+    exception header even when it falls inside a traceback.
     """
     every = [str(line).rstrip("\n") for line in lines]
     start = max(len(every) - limit, 0) if limit > 0 else len(every)
@@ -770,8 +772,10 @@ def _failure_tail(lines: Sequence[str], limit: int = TAIL_LINES) -> list[str]:
     headers: list[int] = []
     in_traceback = False
     for index, line in enumerate(every[:start]):
-        if line.strip() == _TRACEBACK_START:
+        if line.strip() == TRACEBACK_START:
             in_traceback = True
+        elif is_elision_marker(line):
+            continue
         elif in_traceback and line.strip() and not line[:1].isspace():
             headers.append(index)
             in_traceback = False
@@ -788,11 +792,11 @@ def _failure_tail(lines: Sequence[str], limit: int = TAIL_LINES) -> list[str]:
     previous = -1
     for position in kept:
         if position != previous + 1:
-            selected.append(f"[... {position - previous - 1} lines omitted ...]")
+            selected.append(elision_marker(position - previous - 1))
         selected.append(every[position])
         previous = position
     if previous + 1 < start:
-        selected.append(f"[... {start - previous - 1} lines omitted ...]")
+        selected.append(elision_marker(start - previous - 1))
     return [redact_text(line) for line in selected] + _tail(every, limit)
 
 

@@ -17,6 +17,7 @@ Each case here came from a real run on the reference host (``build/e2e``):
 
 from __future__ import annotations
 
+import sys
 from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 
@@ -38,6 +39,7 @@ from tests.unit.test_prepare_planning import (
 from yonga.adapters import ChecksToolchainImport
 from yonga.adapters import exporter_optimum as exporter_module
 from yonga.adapters.exporter_optimum import TAIL_LINES, OptimumExporter
+from yonga.adapters.subprocess import SubprocessRunner
 from yonga.application.benchmark import BenchmarkService
 from yonga.application.jobs import JobContext, open_job
 from yonga.application.probe import LocalArtifactStore
@@ -181,6 +183,40 @@ def test_the_kept_exception_line_is_classified_as_the_group_size_mismatch(
     assert classified.exit_code() is ExitCode.REGISTRY
 
 
+def test_a_node_list_longer_than_the_runner_keeps_still_classifies(job: JobContext) -> None:
+    """The runner's excerpt, not only the exporter's, keeps the exception line.
+
+    82 lines of warnings came before the real SmolLM2 exception; with more
+    refused nodes than the runner's tail holds, that line used to be gone
+    before the exporter ever saw the output.
+    """
+    nodes = 1000
+    child = "\n".join(
+        [
+            "import sys",
+            "for index in range(82):",
+            "    print(f'UserWarning {index}', file=sys.stderr)",
+            f"lines = {SMOLLM2_STDERR[:6]!r}",
+            f"for index in range({nodes}):",
+            "    lines.append(f'\\t\"node.{index}/MatMul\" (channel size: 960)')",
+            "print('\\n'.join(lines), file=sys.stderr)",
+            "sys.exit(1)",
+        ]
+    )
+    captured = SubprocessRunner().run([sys.executable, "-c", child])
+    assert captured.returncode == 1
+    assert NNCF_HEADER in captured.stderr_lines
+
+    runner = FakeRunner(returncode=1, stderr=captured.stderr_lines)
+    result = OptimumExporter(runner, launcher=LAUNCHER).export(make_request(job), job)
+    classified = resolver().classify(
+        raw_error="\n".join([*result.stdout_tail, *result.stderr_tail]),
+        device="CPU",
+        stage="export",
+    )
+    assert classified.code == GROUP_SIZE_MISMATCH_CODE
+
+
 def test_a_chained_root_cause_above_the_tail_is_kept_too(job: JobContext) -> None:
     runner = FakeRunner(returncode=1, stderr=TORCHVISION_STDERR)
     result = OptimumExporter(runner, launcher=LAUNCHER).export(make_request(job), job)
@@ -212,8 +248,11 @@ def test_the_torchvision_build_mismatch_is_an_environment_failure() -> None:
     assert result.environment_broken is True
     assert result.fallback_devices == []
     joined = " ".join(result.remediation)
-    assert "torch torchvision" in joined
+    assert "pip uninstall -y torchvision && pip install torchvision --index-url" in joined
     assert "https://download.pytorch.org/whl/cpu" in joined
+    # --force-reinstall reinstalled every dependency from the CPU index and took
+    # numpy past nncf's bound; --force-reinstall of torch itself is never needed.
+    assert "--force-reinstall" not in joined
 
 
 def test_the_installation_guide_installs_torchvision_from_the_cpu_index_too() -> None:

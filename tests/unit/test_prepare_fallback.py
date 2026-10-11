@@ -352,6 +352,54 @@ def test_genai_only_properties_never_reach_a_compile_probe(
     assert 16 <= smoke.calls[0][2] <= 32
 
 
+def test_a_profile_for_another_device_brings_none_of_its_runtime_properties(
+    settings: Settings, hub: FakeHub
+) -> None:
+    """``--device gpu --profile npu-int4-sym-cw``: the GPU never sees ``MAX_PROMPT_LEN``.
+
+    The CPU and GPU plugins refuse the NPU's static-shape budget outright, so
+    passing it on made every cross-device profile fail its smoke test.
+    """
+    runtime = FakeRuntimeProbe()
+    smoke = FakeSmokeTester()
+    service = build_service(settings=settings, hub=hub, runtime=runtime, smoke=smoke)
+    plan = service.plan(SAFETENSORS_REPO, device="gpu", profile_id="npu-int4-sym-cw")
+    assert plan.profile.runtime_properties["MAX_PROMPT_LEN"] == "1024"
+
+    outcome = run_prepare(service, plan, settings)
+
+    assert [(device, properties) for device, properties, _ in smoke.calls] == [("GPU", {})]
+    for result in outcome.manifest.device_probes["GPU"].submodels:
+        assert result.properties.get("MAX_PROMPT_LEN") is None
+    assert outcome.manifest.recommended_runtime is not None
+    assert outcome.manifest.recommended_runtime.device == "GPU"
+    assert outcome.manifest.recommended_runtime.properties == {}
+
+
+def test_an_npu_profile_falling_back_leaves_its_runtime_properties_behind(
+    settings: Settings, hub: FakeHub
+) -> None:
+    """Auto mode keeps the NPU profile's weights on the GPU, not its NPU-only properties."""
+    smoke = FakeSmokeTester(failures={"NPU": "RuntimeError: generation produced no tokens"})
+    service = build_service(
+        settings=settings,
+        hub=hub,
+        smoke=smoke,
+        resolver=builtin_resolver([NPU_FIRST_REGISTRY]),
+    )
+    plan = service.plan(SAFETENSORS_REPO, device="auto")
+    assert plan.profile.device == "NPU"
+
+    outcome = run_prepare(service, plan, settings)
+
+    assert outcome.device == "GPU"
+    calls = {device: properties for device, properties, _ in smoke.calls}
+    assert calls["NPU"]["MAX_PROMPT_LEN"] == "1024"
+    assert calls["GPU"] == {}
+    assert outcome.manifest.recommended_runtime is not None
+    assert outcome.manifest.recommended_runtime.properties == {}
+
+
 # --- validation and repair -----------------------------------------------------------
 
 

@@ -15,10 +15,13 @@ from typing import Any
 import pytest
 
 from yonga.adapters.subprocess import (
+    DEFAULT_HEAD_LINES,
     DEFAULT_TAIL_LINES,
     CompletedCommand,
     SubprocessRunner,
     default_line_selector,
+    elision_marker,
+    is_elision_marker,
 )
 from yonga.application.jobs import JobContext
 from yonga.application.progress import CollectingSink, ProgressKind
@@ -267,7 +270,7 @@ def test_a_missing_executable_is_returned_not_raised(tmp_path):
 
 
 def test_output_tail_is_bounded(tmp_path):
-    runner = SubprocessRunner(tail_lines=10)
+    runner = SubprocessRunner(tail_lines=10, head_lines=0)
     result = runner.run(
         python(
             """
@@ -277,9 +280,77 @@ def test_output_tail_is_bounded(tmp_path):
         )
     )
     assert result.returncode == 0
-    assert len(result.stdout_lines) == 10
+    assert len(result.stdout_lines) == 1 + 10
     assert result.stdout_lines[-1] == "line 499"
-    assert result.stdout_lines[0] == "line 490"
+    assert result.stdout_lines[1] == "line 490"
+    assert result.stdout_lines[0] == elision_marker(490)
+
+
+def test_output_keeps_the_head_and_the_tail_with_a_marker_between(tmp_path):
+    result = SubprocessRunner(tail_lines=5, head_lines=3).run(
+        python(
+            """
+            for index in range(100):
+                print(f"line {index}")
+            """
+        )
+    )
+    assert result.stdout_lines == [
+        "line 0",
+        "line 1",
+        "line 2",
+        "[... 92 lines omitted ...]",
+        *(f"line {index}" for index in range(95, 100)),
+    ]
+    assert is_elision_marker(result.stdout_lines[3])
+    assert not is_elision_marker("line 3")
+
+
+def test_a_short_output_is_kept_whole_without_a_marker(tmp_path):
+    result = SubprocessRunner(tail_lines=5, head_lines=3).run(
+        python(
+            """
+            for index in range(8):
+                print(f"line {index}")
+            """
+        )
+    )
+    assert result.stdout_lines == [f"line {index}" for index in range(8)]
+
+
+def test_an_exception_pushed_out_of_the_tail_is_still_kept(tmp_path):
+    """NNCF prints one line per refused node after its exception line.
+
+    Hundreds of them used to push that line, the one the registry matches, out
+    of the excerpt before anything downstream could see it.
+    """
+    result = SubprocessRunner(tail_lines=20, head_lines=5).run(
+        python(
+            """
+            import sys
+            for index in range(100):
+                print(f"warning {index}", file=sys.stderr)
+            print("Traceback (most recent call last):", file=sys.stderr)
+            print('  File "algorithm.py", line 679, in validate_group_size', file=sys.stderr)
+            print("    raise nncf.InvalidGroupSizeError(msg)", file=sys.stderr)
+            print("nncf.errors.InvalidGroupSizeError: group size 128.", file=sys.stderr)
+            print("Failed nodes:", file=sys.stderr)
+            for index in range(500):
+                print(f"\tnode {index} (channel size: 960)", file=sys.stderr)
+            sys.exit(1)
+            """
+        )
+    )
+    lines = list(result.stderr_lines)
+    assert result.returncode == 1
+    assert lines[:5] == [f"warning {index}" for index in range(5)]
+    assert lines[-1] == "\tnode 499 (channel size: 960)"
+    assert len(lines) == 5 + 1 + 1 + 1 + 3 + 1 + 20
+    header = lines.index("nncf.errors.InvalidGroupSizeError: group size 128.")
+    assert lines[header - 2] == "Traceback (most recent call last):"
+    assert is_elision_marker(lines[header - 1])
+    assert lines[header + 1 : header + 3] == ["Failed nodes:", "\tnode 0 (channel size: 960)"]
+    assert is_elision_marker(lines[header + 3])
 
 
 def test_the_full_stream_still_reaches_the_job_log(job):
@@ -512,5 +583,6 @@ def test_completed_command_satisfies_the_command_result_shape():
     assert result.output_tail == []
 
 
-def test_default_tail_is_two_hundred():
-    assert DEFAULT_TAIL_LINES == 200
+def test_default_excerpt_is_a_head_of_fifty_and_a_tail_of_three_hundred():
+    assert DEFAULT_HEAD_LINES == 50
+    assert DEFAULT_TAIL_LINES == 300

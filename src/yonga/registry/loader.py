@@ -430,7 +430,7 @@ def _describe_rule(rule: AnyRule) -> str:
 
 
 def _validate_constraints(rule: AnyRule, problems: list[str]) -> None:
-    """Check the rule-level and device-level version constraints."""
+    """Check the rule-level, device-level and export-block version constraints."""
     for problem in constraint_problems(rule.constraints):
         problems.append(f"{_describe_rule(rule)}: {problem}")
     devices = getattr(rule, "devices", None)
@@ -438,6 +438,10 @@ def _validate_constraints(rule: AnyRule, problems: list[str]) -> None:
         for device, support in devices.items():
             for problem in constraint_problems(support.constraints):
                 problems.append(f"{_describe_rule(rule)} device {device}: {problem}")
+    block = getattr(rule, "blocks_export", None)
+    if block is not None:
+        for problem in constraint_problems(block.constraints):
+            problems.append(f"{_describe_rule(rule)} blocks_export: {problem}")
 
 
 def _validate_references(registry: Registry, problems: list[str]) -> None:

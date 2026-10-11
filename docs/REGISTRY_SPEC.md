@@ -40,8 +40,9 @@ All rules have:
 
 ```yaml
 id: unique-stable-id
-schema_version: 3        # 1 and 2 still load; 2 adds profile size bands (section 5.1),
-                         # 3 adds a chat profile's tool_calling (section 8b)
+schema_version: 4        # 1 to 3 still load; 2 adds profile size bands (section 5.1),
+                         # 3 adds a chat profile's tool_calling (section 8b),
+                         # 4 adds an issue rule's blocks_export (section 6.1)
 status: active           # active | deprecated | experimental
 summary: short text
 sources:
@@ -232,6 +233,47 @@ can be copied as it stands; an unknown value leaves the word, which still reads 
 Only the whole word is replaced (`MODEL_DIR` is left alone). A step that then repeats an earlier one,
 or ends in the same `yonga …` command, is dropped, so a rule's "run this model on the GPU instead:
 yonga prepare MODEL --device gpu" and `prepare`'s own "Prepare for GPU instead: …" print once.
+
+### 6.1 Refusing an export before the download (schema version 4)
+
+Some failures are certain before anything runs. An issue rule may say so with `blocks_export`:
+
+```yaml
+schema_version: 4
+issues:
+  - id: optimum-normalized-config-allow-new
+    schema_version: 4
+    constraints:
+      python: ">=3.14"
+    match:
+      exception_contains:
+        - "NormalizedConfig.__init__() got multiple values for argument 'allow_new'"
+    classification:
+      code: export.optimum.normalized_config
+      category: package_abi_mismatch
+    blocks_export:
+      model_types: [phi3, mistral]   # config.json model_type, case-insensitive
+      constraints:
+        optimum: "<=2.3.0"           # narrows the refusal only, never the classification
+      message: >-
+        optional; replaces the recommendation's message, which describes a failure
+        that has happened
+```
+
+`prepare` refuses the export at planning time, before any question and before the download, with
+the rule's own diagnostic (code, category, exit code and remediation), when the source's
+`model_type` is listed and the rule's `constraints` and the block's `constraints` all hold for the
+interpreter that will run the export: a managed export environment's Python and its exact
+(`==`) package pins, or yonga's own interpreter and installed packages. A version that is not
+known never blocks, and the rule keeps classifying the failure as before wherever the block does
+not apply. `--ignore-exporter-requirements` overrides the refusal, as it overrides an unmet
+exporter pin, and the artifact's manifest records that it did; `--yes` does not. The plan panel
+shows the refusal as a `BLOCKED` section, and `prepare --json` carries it as `export_blocked`.
+
+- **Version.** An issue rule with `blocks_export` needs `schema_version: 4`. A rule without its own
+  `schema_version` takes its document's, and no rule may declare a newer version than its document.
+- **Validation.** `model_types` must name at least one type, and the block's constraint keys are
+  checked like any other `constraints` block.
 
 ## 7. Repair rule
 
@@ -503,12 +545,13 @@ The bundle forms one layer after the built-in rules and before user overrides: i
 shipped rule by id, and a user override replaces either.
 
 `tools/registry_bundle.py build` sets `min_tool_version` from the newest `schema_version` in the
-bundle (schema 2 needs yonga 0.3.0, schema 3 needs 0.4.0), and refuses a lower
-`--min-tool-version`. An older yonga then refuses the bundle at `registry update` and keeps the one
-it has, instead of installing data it cannot parse. A schema-2 or schema-3 bundle therefore cuts
-older releases off from every remote update, including issue signatures; keep bundles at schema 1
-until a band or a tool-call format itself must change remotely. A file that declares no
-`schema_version` is read at the building yonga's own version, so declare one.
+bundle (schema 2 needs yonga 0.3.0, schema 3 needs 0.4.0, schema 4 needs 0.5.0), and refuses a
+lower `--min-tool-version`. An older yonga then refuses the bundle at `registry update` and keeps
+the one it has, instead of installing data it cannot parse. A bundle at schema 2 or later
+therefore cuts older releases off from every remote update, including issue signatures; keep
+bundles at schema 1 until a band, a tool-call format or an export block itself must change
+remotely. A file that declares no `schema_version` is read at the building yonga's own version, so
+declare one.
 
 ## 13. Registry tests
 

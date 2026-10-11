@@ -312,6 +312,19 @@ class ConversionProfile(BaseModel):
     def _normalise_device_name(cls, value: str) -> str:
         return normalise_device(value)
 
+    def runtime_properties_on(self, device: str) -> dict[str, str]:
+        """The runtime properties to apply on ``device``: this profile's own, or none.
+
+        They were chosen for the profile's own device and only that device's
+        plugin is known to accept them: the NPU's ``MAX_PROMPT_LEN`` makes the CPU
+        and GPU plugins refuse the pipeline. A profile used elsewhere -- an
+        explicit cross-device ``--profile``, or auto mode falling back from the
+        NPU -- runs with the device's own defaults.
+        """
+        if normalise_device(device) != self.device:
+            return {}
+        return dict(self.runtime_properties)
+
 
 class ConfirmationReason(BaseModel):
     """One thing the user must confirm before a preparation may proceed."""
@@ -507,6 +520,11 @@ class PreparationPlan(BaseModel):
     auth_missing: bool = False
     """The source repository is gated or private and no Hugging Face token was
     found, so its download is bound to be refused."""
+    export_blocked: Diagnostic | None = None
+    """A known exporter defect this export is certain to hit with the interpreter
+    and packages that will run it (an issue rule's ``blocks_export``). The job
+    stops before any question is asked unless ``--ignore-exporter-requirements``
+    overrides it, as it overrides an unmet exporter pin."""
 
     @field_validator("target_device")
     @classmethod
