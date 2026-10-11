@@ -1,5 +1,7 @@
 # yonga — Local Intel AI Model Manager
 
+**Website and user guide (English, Türkçe): <https://ooguz.github.io/yonga/>**
+
 `yonga` is a Linux-first local AI model manager for Intel AI PCs. Its primary goal is to make Hugging Face models usable on Intel NPU/GPU/CPU without requiring the user to manually understand model formats, OpenVINO conversion flags, NPU compiler limitations, tokenizer IR quirks, or device-specific quantization trade-offs.
 
 The product principle is:
