@@ -233,6 +233,14 @@ Only the whole word is replaced (`MODEL_DIR` is left alone). A step that then re
 or ends in the same `yonga …` command, is dropped, so a rule's "run this model on the GPU instead:
 yonga prepare MODEL --device gpu" and `prepare`'s own "Prepare for GPU instead: …" print once.
 
+The words are filled per command. `chat`, `bench` and `probe` run an artifact that already exists:
+a step ending in `yonga prepare MODEL --device D` for a device that artifact passed its probe on
+becomes "Run this artifact on the D instead: yonga chat ID --device d" (the command that failed,
+with the artifact id and the other device), and so does the `Run:` line under the fallback devices;
+a device the artifact was never probed on keeps the `prepare` advice. A command that opens no job
+(`chat`, `serve`, `eval`, `publish`) has no id for `JOB_ID`, so a rule's step naming it is not
+shown there; `--debug` shows the raw text the step points at.
+
 ## 7. Repair rule
 
 ```yaml

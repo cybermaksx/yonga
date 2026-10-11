@@ -21,7 +21,6 @@ Nothing here prints, asks a question or touches ``sys.argv``.
 
 from __future__ import annotations
 
-import re
 from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
@@ -38,6 +37,7 @@ from yonga.adapters import (
 )
 from yonga.adapters import RuntimeProbe as RuntimeProbePort
 from yonga.adapters.export_env import ExportEnvironmentManager
+from yonga.application.artifact_refs import artifact_not_found
 from yonga.application.artifacts import ArtifactStore
 from yonga.application.benchmark import BenchmarkService
 from yonga.application.benchmark import RuntimeFactory as BenchmarkRuntimeFactory
@@ -131,26 +131,19 @@ class AnyArtifactStore:
         return self._catalogue.manifest_for(artifact_dir)
 
 
-#: A Hugging Face model id, ``owner/name``: the only reference ``yonga prepare`` takes as given.
-_REPO_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}/[A-Za-z0-9][A-Za-z0-9._-]{0,95}")
-#: An artifact id as ``yonga list`` prints it (16 hex digits), or a prefix the store accepts.
-_ARTIFACT_ID = re.compile(r"[0-9a-f]{6,16}")
-
-
 class ArtifactResolver:
     """Adapts an artifact store to the chat service's one-method port.
 
     ``yonga chat`` must never start a multi-gigabyte conversion as a side effect
-    (``docs/CLI_SPEC.md`` section 9), so an unresolvable reference fails here.
-    A model id gets the exact ``yonga prepare`` command to run instead; anything
-    else (an artifact id that is gone, a mistyped name) is pointed at
-    ``yonga list``, because preparing an artifact id would only send it to the
-    Hub as if it were a model.
+    (``docs/CLI_SPEC.md`` section 9), so an unresolvable reference fails here,
+    explained by :func:`~yonga.application.artifact_refs.artifact_not_found`
+    for ``command`` (``chat`` or ``serve``), as every run command explains it.
     """
 
-    def __init__(self, store: AnyArtifactStore) -> None:
-        """Bind the resolver to a prepared-artifact store."""
+    def __init__(self, store: AnyArtifactStore, *, command: str = "chat") -> None:
+        """Bind the resolver to a prepared-artifact store and the command using it."""
         self._store = store
+        self._command = command
 
     def resolve(self, reference: str) -> Path:
         """Return the prepared artifact directory for ``reference``.
@@ -163,56 +156,7 @@ class ArtifactResolver:
         found = self._store.find(reference)
         if found is not None:
             return found
-        if not _REPO_ID.fullmatch(reference) or Path(reference).expanduser().exists():
-            raise ConfigurationError(_no_artifact_diagnostic(reference))
-        raise ConfigurationError(
-            diagnostic(
-                "artifact.not_prepared",
-                FailureCategory.CONFIGURATION_ERROR,
-                "No prepared artifact for that model",
-                (
-                    f"{reference} has not been prepared on this host. yonga does not convert a "
-                    "model as a side effect of starting a chat, because that can download and "
-                    "quantize many gigabytes."
-                ),
-                remediation=[
-                    f"Prepare it first: yonga prepare {reference}",
-                    f"Then start the chat: yonga chat {reference}",
-                    "See what is already prepared: yonga list",
-                ],
-                context={"reference": reference, "command": "prepare", "model": reference},
-            )
-        )
-
-
-def _no_artifact_diagnostic(reference: str) -> Diagnostic:
-    """Explain a reference that is not a model id and matches no prepared artifact."""
-    if _ARTIFACT_ID.fullmatch(reference):
-        title = "No prepared artifact has that id"
-        message = (
-            f"No artifact on this host has the id {reference}. Artifact ids are the ones "
-            "yonga list shows; an artifact deleted with yonga remove no longer has one."
-        )
-        prepare = "Prepare the model it came from again: yonga prepare OWNER/NAME"
-    else:
-        title = "No prepared artifact matches that reference"
-        message = (
-            f"{reference!r} is not the id or directory of a prepared artifact, nor a "
-            "Hugging Face model id (owner/name)."
-        )
-        prepare = "Prepare a model first: yonga prepare OWNER/NAME"
-    return diagnostic(
-        "artifact.not_found",
-        FailureCategory.CONFIGURATION_ERROR,
-        title,
-        message,
-        remediation=[
-            "See what is already prepared: yonga list",
-            prepare,
-            "Or pass the artifact directory directly.",
-        ],
-        context={"reference": reference},
-    )
+        raise ConfigurationError(artifact_not_found(reference, command=self._command))
 
 
 class GenAISmokeTester:
@@ -584,9 +528,9 @@ class Wiring:
             )
         return self._readable_artifacts
 
-    def artifact_resolver(self) -> ArtifactResolver:
-        """Return the chat service's reference resolver."""
-        return ArtifactResolver(self.readable_artifacts())
+    def artifact_resolver(self, *, command: str = "chat") -> ArtifactResolver:
+        """Return the chat service's reference resolver, for ``chat`` or ``serve``."""
+        return ArtifactResolver(self.readable_artifacts(), command=command)
 
     # ------------------------------------------------------------------
     # services
@@ -668,11 +612,13 @@ class Wiring:
             isolated_smoke_tester=self.isolated_smoke_tester(),
         )
 
-    def chat_service(self, *, progress: ProgressSink | None = None) -> ChatService:
-        """Build the ``yonga chat`` service."""
+    def chat_service(
+        self, *, progress: ProgressSink | None = None, command: str = "chat"
+    ) -> ChatService:
+        """Build the ``yonga chat`` service; ``serve`` builds it with ``command="serve"``."""
         return ChatService(
             self.chat_runtime_factory(),
-            self.artifact_resolver(),
+            self.artifact_resolver(command=command),
             self.registry_resolver(),
             self._settings,
             progress=progress,

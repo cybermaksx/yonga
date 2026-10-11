@@ -35,6 +35,7 @@ import numpy.typing as npt
 from pydantic import BaseModel, ConfigDict
 
 from yonga import __version__
+from yonga.application.artifact_refs import artifact_not_found
 from yonga.application.progress import ProgressEvent, ProgressKind, ProgressSink, null_sink
 from yonga.config.paths import Paths
 from yonga.config.settings import Settings
@@ -376,11 +377,8 @@ class EvaluationService:
         directory = self._store.find(reference)
         manifest = self._store.manifest_for(directory) if directory is not None else None
         if directory is None or manifest is None:
-            raise _refusal(
-                "eval.artifact_not_found",
-                "No prepared artifact by that name",
-                f"{reference!r} is not an artifact yonga prepared.",
-                "Run 'yonga list' to see the prepared artifacts.",
+            raise ConfigurationError(
+                artifact_not_found(reference, command="eval", code="eval.artifact_not_found")
             )
         weight = manifest.export.arguments.get("weight_format")
         return EvaluatedArtifact(

@@ -276,6 +276,83 @@ def fill_placeholders(item: Diagnostic) -> Diagnostic:
     return item.model_copy(update={"remediation": steps})
 
 
+def without_job(item: Diagnostic) -> Diagnostic:
+    """Drop the remediation steps that need a job id ``item`` does not have.
+
+    ``yonga chat`` and ``yonga serve`` open no job, so a registry step such as
+    "the failing pass is in the job log: yonga logs JOB_ID --raw" can never be
+    filled for them, and printing the placeholder would send the user looking
+    for a job that does not exist. The raw text such a step points at is still
+    shown with ``--debug``. A diagnostic that has a job id is returned as it is.
+    """
+    if item.job_id:
+        return item
+    steps = [step for step in item.remediation if not _JOB_PLACEHOLDER.search(step)]
+    if steps == item.remediation:
+        return item
+    return item.model_copy(update={"remediation": steps})
+
+
+def for_artifact_run(
+    item: Diagnostic,
+    *,
+    run_command: str,
+    devices: Iterable[str],
+    has_job: bool,
+) -> Diagnostic:
+    """Point ``item``'s advice at the prepared artifact a command was running.
+
+    Registry remediation is written for ``prepare``: "run this model on the GPU
+    instead: yonga prepare MODEL --device gpu". When ``chat``, ``bench`` or
+    ``probe`` fails on one device with an artifact that already passed on that
+    fallback device, preparing it again is the wrong advice: the same command
+    with another ``--device`` is the right one. ``run_command`` is that command
+    without its ``--device`` (``yonga chat e3014dda15c8a5be``), and ``devices``
+    are the ones the artifact passed its probe on.
+
+    A step that ends in ``yonga prepare <model> --device D`` for a device in
+    ``devices`` is replaced by one that runs ``run_command`` there, and the
+    "Run:" line under the fallback devices names it too. Steps for a device the
+    artifact was never probed on keep their ``prepare`` advice. Without a job
+    (``has_job`` false) the steps that need its id are dropped, see
+    :func:`without_job`.
+    """
+    runnable = {name for name in (normalise_device(device) for device in devices) if name}
+    steps: list[str] = []
+    for step in item.remediation:
+        device = _prepared_device(step)
+        if device is not None and device in runnable:
+            command = f"{run_command} --device {device.lower()}"
+            step = f"Run this artifact on the {device} instead: {command}"
+        steps.append(step)
+    context = dict(item.context)
+    first = item.fallback_devices[0] if item.fallback_devices else None
+    if first is not None and first in runnable:
+        context["fallback_command"] = f"{run_command} --device {first.lower()}"
+    updated = item.model_copy(update={"remediation": steps, "context": context})
+    if not has_job:
+        updated = without_job(updated)
+    return fill_placeholders(updated)
+
+
+#: A remediation step naming the job id it cannot know yet.
+_JOB_PLACEHOLDER = re.compile(r"(?<![\w-])JOB_ID(?![\w-])")
+
+#: ``yonga prepare <model> --device <device>`` and nothing more, once whitespace is collapsed.
+_PREPARE_FOR_DEVICE = re.compile(r"yonga prepare \S+ --device (\S+)")
+
+
+def _prepared_device(step: str) -> str | None:
+    """The device a step's trailing ``yonga prepare MODEL --device D`` prepares for."""
+    command = _TRAILING_COMMAND.search(step.strip())
+    if command is None:
+        return None
+    found = _PREPARE_FOR_DEVICE.fullmatch(" ".join(command.group(1).split()))
+    if found is None:
+        return None
+    return normalise_device(found.group(1)) or None
+
+
 class YongaError(Exception):
     """Base class for typed failures; always carries a :class:`Diagnostic`.
 

@@ -207,7 +207,8 @@ yonga prepare MODEL --ignore-exporter-requirements   # export in *your* environm
 Downloads resume through the Hugging Face cache. An export interrupted part-way restarts: the
 upstream exporter cannot continue from the middle. But an export that *finished* is kept when a
 later stage fails (a device probe, validation, Ctrl-C during the smoke test), and retrying the same
-command reuses it — the plan shows `Export  reused from failed job …` and stages 4–5 are skipped.
+command reuses it — the plan shows `Export  reused from cancelled job …` (or `failed job`) and
+stages 4–5 are skipped.
 
 ```bash
 yonga prepare MODEL --device cpu            # Ctrl-C during 7/7 Probing runtime

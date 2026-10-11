@@ -43,6 +43,7 @@ from rich.markup import escape
 from typer.core import TyperGroup
 
 from yonga import APP_NAME, __version__
+from yonga.application.artifact_refs import newest_choice_note
 from yonga.application.artifacts import ArtifactStore
 from yonga.application.benchmark import DEFAULT_SUITE, benchmark_result_path
 from yonga.application.chat import ChatOptions, ChatService, ChatSession, ChatTurn
@@ -79,6 +80,7 @@ from yonga.domain.diagnostics import (
     YongaError,
     diagnostic,
     fill_placeholders,
+    without_job,
 )
 from yonga.domain.hardware import normalise_device
 from yonga.domain.models import ModelIdentity
@@ -180,7 +182,13 @@ class CliState:
     def report(self, item: Diagnostic, *, exit_code: ExitCode) -> ExitCode:
         """Render one diagnostic the way the current output mode requires."""
         # The job id is often only known here, so placeholders are filled last.
+        # A registry rule's JOB_ID always means "the job that failed"; for a
+        # command that opened no job those steps are dropped rather than printed
+        # with the placeholder. (yonga's own usage hints, such as
+        # "yonga logs JOB_ID --bundle", ask the user for one and stay.)
         enriched = fill_placeholders(self.attach_job(item))
+        if self.job is None and enriched.matched_rule_id is not None:
+            enriched = without_job(enriched)
         self.console.diagnostic(enriched)
         if self.json_mode:
             self.console.print_json(error_document(enriched, exit_code=exit_code))
@@ -231,6 +239,28 @@ def cli_state(ctx: typer.Context, *, json_output: bool = False) -> CliState:
     if json_output:
         state.enable_json()
     return state
+
+
+def _note_artifact_choice(state: CliState, *references: str) -> None:
+    """Say which artifact a reference chose when several ready ones answered it.
+
+    ``chat``, ``bench``, ``probe``, ``eval`` and ``publish`` all take the newest
+    ready artifact a model id matches; this is the one place that says so, on
+    stderr, before the command runs (``docs/CLI_SPEC.md`` section 8). A path names
+    one directory and never needs the note. Advisory: a store that cannot be
+    read here is left for the command itself to report.
+    """
+    if state.json_mode:
+        return
+    for reference in references:
+        if Path(reference).expanduser().exists():
+            continue
+        try:
+            note = newest_choice_note(reference, state.graph.artifact_store().matches(reference))
+        except Exception:  # the note never decides whether the command runs
+            continue
+        if note is not None:
+            state.console.print_error(note, style="dim")
 
 
 def exit_code_for(error: YongaError) -> ExitCode:
@@ -1137,6 +1167,7 @@ def _probe(
     """Run the per-submodel probe (``docs/CLI_SPEC.md`` section 11)."""
     target = _device(device) or "auto"
     check_probe_options(quick=quick, timeout=timeout)
+    _note_artifact_choice(state, artifact)
     service = state.graph.probe_service()
     with open_job(
         settings=state.settings,
@@ -1266,6 +1297,7 @@ def chat(
         show_reasoning=True if show_reasoning else None,
         system_prompt=system,
         display_name=artifact,
+        command="chat",
     )
     _dispatch(state, lambda: _chat(state, artifact, options=options))
 
@@ -1285,6 +1317,7 @@ def _chat(state: CliState, artifact: str, *, options: ChatOptions) -> ExitCode:
                 ],
             )
         )
+    _note_artifact_choice(state, artifact)
     service: ChatService = state.graph.chat_service(progress=state.sink())
     session = service.open_session(artifact, options=options)
     try:
@@ -1360,6 +1393,7 @@ def serve(
         max_new_tokens=max_new_tokens,
         show_reasoning=True if show_reasoning else None,
         display_name=artifact,
+        command="serve",
     )
     limits = _ServeLimits(
         max_body_bytes=max_body_mb * 1024 * 1024, carry_images_forward=carry_images_forward
@@ -1408,7 +1442,7 @@ def _serve(
             warning += f" No {API_KEY_ENV} is set, so anyone who can reach it can use it."
         console.print_error(f"[yellow]warning:[/] {warning}")
 
-    service: ChatService = state.graph.chat_service(progress=state.sink())
+    service: ChatService = state.graph.chat_service(progress=state.sink(), command="serve")
     from yonga.application.serve import ModelServer
 
     limits = limits if limits is not None else _ServeLimits()
@@ -1482,6 +1516,7 @@ def eval_command(
                 )
             ) from error
 
+        _note_artifact_choice(state, candidate, reference)
         service = state.graph.evaluation_service(progress=state.sink())
         text = load_corpus(corpus) if corpus is not None else None
         result = service.evaluate(
@@ -1601,6 +1636,7 @@ def _publish(
     yes: bool,
 ) -> ExitCode:
     """Plan, show, confirm and upload (``docs/CLI_SPEC.md`` section 14a)."""
+    _note_artifact_choice(state, artifact)
     service = state.graph.publish_service()
     console = state.console
     plan = service.plan(
@@ -1886,6 +1922,7 @@ def _bench(
     """Run the benchmark suite (``docs/CLI_SPEC.md`` section 10)."""
     target = _device(device)
     chosen = _suite(suite)
+    _note_artifact_choice(state, artifact)
     service = state.graph.benchmark_service()
     with open_job(
         settings=state.settings,

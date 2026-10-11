@@ -750,6 +750,12 @@ def test_an_unresolvable_reference_raises_with_remediation(tmp_path: Path) -> No
 
     with pytest.raises(ConfigurationError) as excinfo:
         resolve_artifact(LocalArtifactStore(paths), "acme/nope")
+    # A model id that is not prepared is told how to prepare it, as chat tells it.
+    assert excinfo.value.diagnostic.code == "artifact.not_prepared"
+    assert "Prepare it first: yonga prepare acme/nope" in excinfo.value.diagnostic.remediation
+
+    with pytest.raises(ConfigurationError) as excinfo:
+        resolve_artifact(LocalArtifactStore(paths), "not a model")
     assert excinfo.value.diagnostic.code == "artifact.not_found"
     assert excinfo.value.diagnostic.remediation
 

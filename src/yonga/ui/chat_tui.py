@@ -13,12 +13,15 @@ session.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
+from markdown_it import MarkdownIt
+from markdown_it.token import Token
 from pydantic import BaseModel, ConfigDict, Field
 from rich.box import ROUNDED
 from rich.console import Group, RenderableType
@@ -489,7 +492,7 @@ def render_answer(answer: str | ChatAnswer) -> RenderableType:
     """
     body = _answer_text(answer).strip()
     if body:
-        return Panel(Markdown(body), border_style="green", box=ROUNDED, padding=(1, 2))
+        return Panel(_answer_body(body), border_style="green", box=ROUNDED, padding=(1, 2))
     if (
         not isinstance(answer, str)
         and not answer.reasoning_hidden
@@ -519,6 +522,73 @@ def render_answer(answer: str | ChatAnswer) -> RenderableType:
         box=ROUNDED,
         padding=(1, 2),
     )
+
+
+#: An ordered-list marker at the start of a line, after any blockquote markers.
+_LIST_NUMBER = re.compile(r"^((?:[ \t]*>)*[ \t]*)(\d{1,9})([.)])")
+
+#: Token types whose content Rich draws as text.
+_VISIBLE_TOKENS = frozenset({"text", "code_inline", "fence", "code_block"})
+
+
+def _answer_body(body: str) -> RenderableType:
+    """Render a non-empty answer as Markdown, unless Markdown would show nothing.
+
+    Markdown reads some short answers as structure with no text in it: a bare
+    ``391.`` -- what a model answers to "What is 17*23?" -- is an ordered list
+    whose single item is empty, so the panel came out blank. A list item like
+    that is written back as the number it is, and an answer that would still
+    draw no text at all (a lone ``#``, a fence with nothing in it) is shown
+    exactly as it was written.
+    """
+    source = _keep_lone_numbers(body)
+    if not _has_visible_text(source):
+        return Text(body)
+    return Markdown(source)
+
+
+def _markdown_tokens(text: str) -> list[Token]:
+    """Parse ``text`` the way :class:`rich.markdown.Markdown` does."""
+    return MarkdownIt().enable("strikethrough").enable("table").parse(text)
+
+
+def _keep_lone_numbers(body: str) -> str:
+    """Escape the marker of an ordered list whose only item has no text.
+
+    ``391.`` on a line of its own starts such a list. A real numbered list has
+    more than one item, and its markers are left alone.
+    """
+    tokens = _markdown_tokens(body)
+    lines = body.split("\n")
+    for index, token in enumerate(tokens):
+        if token.type != "ordered_list_open":
+            continue
+        items: list[int] = []
+        for position in range(index + 1, len(tokens)):
+            later = tokens[position]
+            if later.type == "ordered_list_close" and later.level == token.level:
+                break
+            if later.type == "list_item_open" and later.level == token.level + 1:
+                items.append(position)
+        if len(items) != 1:
+            continue
+        item = tokens[items[0]]
+        if item.map is None or tokens[items[0] + 1].type != "list_item_close":
+            continue
+        line = item.map[0]
+        lines[line] = _LIST_NUMBER.sub(r"\1\2\\\3", lines[line], count=1)
+    return "\n".join(lines)
+
+
+def _has_visible_text(source: str) -> bool:
+    """True when Markdown rendering of ``source`` draws at least one character."""
+    pending = list(_markdown_tokens(source))
+    while pending:
+        token = pending.pop()
+        if token.type in _VISIBLE_TOKENS and token.content.strip():
+            return True
+        pending.extend(token.children or ())
+    return False
 
 
 def render_reasoning(reasoning: str) -> RenderableType:
