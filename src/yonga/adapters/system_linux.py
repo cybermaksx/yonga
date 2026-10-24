@@ -20,6 +20,7 @@ a diagnostic tool that crashes while diagnosing is worthless.
 from __future__ import annotations
 
 import contextlib
+import fnmatch
 import importlib.util
 import os
 import platform
@@ -91,10 +92,12 @@ _INTEL_OPENCL_MARKER = "libigdrcl"
 LEVEL_ZERO_LOADER_PATTERNS: tuple[str, ...] = ("libze_loader.so*",)
 NPU_LEVEL_ZERO_PATTERNS: tuple[str, ...] = ("libze_intel_npu.so*", "libze_intel_vpu.so*")
 
-#: System directories searched for those libraries, in order.
+#: System directories searched for those libraries, in order. ``/usr/lib64`` is
+#: where Fedora installs them.
 _SYSTEM_LIBRARY_DIRS: tuple[str, ...] = (
     "/usr/lib/x86_64-linux-gnu",
     "/usr/lib",
+    "/usr/lib64",
     "/usr/local/lib",
 )
 
@@ -555,22 +558,36 @@ class LinuxSystemProbe:
 
     def _find_npu_libraries(self) -> list[str]:
         """Return the NPU compiler libraries found on this host."""
-        return self._find_libraries(NPU_LIBRARY_PATTERNS)
+        return self._find_libraries({"compiler": NPU_LIBRARY_PATTERNS})["compiler"]
 
-    def _find_libraries(self, patterns: Sequence[str]) -> list[str]:
-        """Return the files matching ``patterns`` in the library search directories."""
-        found: dict[str, None] = {}
+    def _find_libraries(self, groups: Mapping[str, Sequence[str]]) -> dict[str, list[str]]:
+        """Return, per group, the files matching its patterns in the library directories.
+
+        Each directory is listed once, however many patterns are matched in it,
+        and a directory that is a link to another one searched (Arch's
+        ``/usr/lib64`` -> ``/usr/lib``) is not listed again.
+        """
+        found: dict[str, dict[str, None]] = {key: {} for key in groups}
+        seen: set[Path] = set()
         for directory in self.library_search_dirs():
             if not _is_dir(directory):
                 continue
-            for pattern in patterns:
-                try:
-                    matches = sorted(directory.glob(pattern))
-                except OSError:  # pragma: no cover - unreadable directory
-                    continue
-                for match in matches:
-                    found.setdefault(str(match), None)
-        return list(found)
+            try:
+                real = directory.resolve()
+            except OSError:  # pragma: no cover - a loop of links
+                continue
+            if real in seen:
+                continue
+            seen.add(real)
+            try:
+                names = sorted(entry.name for entry in directory.iterdir())
+            except OSError:  # pragma: no cover - unreadable directory
+                continue
+            for key, patterns in groups.items():
+                for name in names:
+                    if any(fnmatch.fnmatchcase(name, pattern) for pattern in patterns):
+                        found[key].setdefault(str(directory / name), None)
+        return {key: list(paths) for key, paths in found.items()}
 
     # --- accelerators and their drivers ---------------------------------
     def pci_accelerators(self, notes: list[str] | None = None) -> list[PciAccelerator] | None:
@@ -625,10 +642,13 @@ class LinuxSystemProbe:
                 library = (self._read_text(icd) or "").strip()
                 if _INTEL_OPENCL_MARKER in library:
                     opencl.append(library)
+        found = self._find_libraries(
+            {"loader": LEVEL_ZERO_LOADER_PATTERNS, "npu": NPU_LEVEL_ZERO_PATTERNS}
+        )
         return DriverLibraries(
             gpu_opencl=opencl,
-            level_zero_loader=self._find_libraries(LEVEL_ZERO_LOADER_PATTERNS),
-            npu_level_zero=self._find_libraries(NPU_LEVEL_ZERO_PATTERNS),
+            level_zero_loader=found["loader"],
+            npu_level_zero=found["npu"],
         )
 
     # --- filesystems ---------------------------------------------------
@@ -758,8 +778,6 @@ class LinuxSystemProbe:
             else None
         )
         npu = self.npu_node(driver_version=driver_version, notes=notes)
-        accelerators = self.pci_accelerators(notes)
-        driver_libraries = self.driver_libraries()
 
         filesystems = self.filesystems(full=full)
         system_temp = filesystems[0] if filesystems else None
@@ -779,8 +797,6 @@ class LinuxSystemProbe:
             openvino_available=snapshot.available,
             openvino_import_error=snapshot.import_error,
             npu=npu,
-            accelerators=accelerators,
-            driver_libraries=driver_libraries,
             packages=packages,
             device_tags=tags,
             system_temp=system_temp,

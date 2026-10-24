@@ -22,7 +22,12 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from yonga.application.jobs import JobContext
     from yonga.domain.artifacts import IRDescription, ProbeResult
     from yonga.domain.environments import EnvironmentSpec, ExportEnvironment
-    from yonga.domain.hardware import HardwareInventory, HuggingFaceAuthInfo
+    from yonga.domain.hardware import (
+        DriverLibraries,
+        HardwareInventory,
+        HuggingFaceAuthInfo,
+        PciAccelerator,
+    )
     from yonga.domain.models import ModelIdentity, ModelMetadata
     from yonga.domain.plans import (
         DeclaredRequirement,
@@ -38,6 +43,7 @@ __all__ = [
     "CommandRunner",
     "DeclaresRequirements",
     "DeclaresRequirementsIn",
+    "DriverProbe",
     "ExportEnvironments",
     "Exporter",
     "FilesystemProbe",
@@ -59,6 +65,23 @@ class HardwareProbe(Protocol):
 
     def inventory(self, *, full: bool = False) -> HardwareInventory:
         """Return a snapshot of the host. Must be read-only and never need root."""
+        ...
+
+
+@runtime_checkable
+class DriverProbe(Protocol):
+    """Lists the accelerators on the bus and the system drivers present for them.
+
+    Only ``doctor`` asks, so these are kept out of :meth:`HardwareProbe.inventory`,
+    which every ``prepare`` runs.
+    """
+
+    def pci_accelerators(self, notes: list[str] | None = None) -> list[PciAccelerator] | None:
+        """The Intel GPUs and NPUs on the PCI bus, or ``None`` when it cannot be read."""
+        ...
+
+    def driver_libraries(self) -> DriverLibraries:
+        """The user-space GPU and NPU drivers found on this host."""
         ...
 
 

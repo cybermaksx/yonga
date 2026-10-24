@@ -329,6 +329,38 @@ def test_driver_libraries_finds_intels_opencl_icd_and_the_level_zero_libraries(t
     assert [Path(p).name for p in libraries.npu_level_zero] == ["libze_intel_npu.so.1"]
 
 
+def test_library_search_includes_fedoras_lib64(tmp_path):
+    root = build_root(tmp_path)
+    probe = LinuxSystemProbe(root=root, filesystem=StubFilesystem())
+    assert root / "usr" / "lib64" in probe.library_search_dirs()
+
+
+def test_driver_libraries_are_found_in_lib64(tmp_path):
+    root = build_root(tmp_path)
+    lib64 = root / "usr" / "lib64"
+    lib64.mkdir(parents=True)
+    (lib64 / "libze_loader.so.1").write_bytes(b"")
+    (lib64 / "libze_intel_npu.so.1").write_bytes(b"")
+    probe = LinuxSystemProbe(root=root, filesystem=StubFilesystem())
+
+    libraries = probe.driver_libraries()
+
+    assert str(lib64 / "libze_loader.so.1") in libraries.level_zero_loader
+    assert str(lib64 / "libze_intel_npu.so.1") in libraries.npu_level_zero
+
+
+def test_a_linked_library_directory_is_not_searched_twice(tmp_path):
+    """Arch's /usr/lib64 is a link to /usr/lib."""
+    root = build_root(tmp_path)
+    lib = root / "usr" / "lib"
+    lib.mkdir(parents=True)
+    (root / "usr" / "lib64").symlink_to(lib)
+    (lib / "libze_loader.so.1").write_bytes(b"")
+    probe = LinuxSystemProbe(root=root, filesystem=StubFilesystem())
+
+    assert len(probe.driver_libraries().level_zero_loader) == 1
+
+
 def test_driver_libraries_are_empty_on_a_host_without_them(tmp_path):
     probe = LinuxSystemProbe(
         root=build_root(tmp_path), filesystem=StubFilesystem(), library_dirs=[]
@@ -451,6 +483,9 @@ def test_inventory_with_injected_devices(tmp_path):
     assert len(inventory.packages) == 7
     # system temp, managed tmp, artifacts, root
     assert len(inventory.filesystems) == 4
+    # The PCI bus and the driver libraries are doctor's to ask for, not every prepare's.
+    assert inventory.accelerators is None
+    assert inventory.driver_libraries is None
 
 
 def test_inventory_full_adds_more_filesystems(tmp_path):

@@ -223,51 +223,58 @@ issues:
 
   # Below npu-compiler-pass-failed on purpose: a compiler that loaded and
   # refused the graph says so with "[NPU_VCL] Compiler returned msg:", and that
-  # diagnosis is the more precise one when both match.
-  - id: npu-driver-compiler-missing
+  # diagnosis is the more precise one when both match. Without it, the text
+  # alone cannot tell a missing compiler from one that cannot take this IR's
+  # opset (or a blob from a newer plugin), so the rule names both and keeps the
+  # fallback; `yonga doctor` tells them apart by NPU_COMPILER_VERSION.
+  - id: npu-unsupported-feature
     schema_version: 1
     status: active
     priority: 35
-    summary: The NPU driver has no compiler library to compile with
+    summary: The NPU driver refused the graph as an unsupported feature
     match:
       device: npu
       case_sensitive: true
       exception_contains:
         - "pfnCreate2 result: ZE_RESULT_ERROR_UNSUPPORTED_FEATURE"
     classification:
-      code: npu.compiler.driver_compiler_missing
-      category: compiler_missing
-      environment_broken: true
+      code: npu.compiler.unsupported_feature
+      category: compiler_unsupported_graph
+      environment_broken: false
       retry_same_device: false
     recommendation:
-      title: The NPU driver could not load its compiler
+      title: The NPU driver could not compile this graph
       message: >-
-        The NPU driver refused to create the graph as an unsupported feature.
-        With no compiler message attached, this means the driver found no
-        compiler library: its NPU_COMPILER_VERSION is 0 and no model can be
-        compiled for the NPU until one is installed. The model is not at fault,
-        so yonga will not move the job to another device for you.
+        The NPU driver refused to create the graph as an unsupported feature,
+        and no compiler message came with it. Either the driver has no
+        compiler library to compile with (yonga doctor then reads 'missing' on
+        the NPU compiler line, and no model compiles for the NPU), or the
+        compiler it has cannot take this model's IR or opset version.
+      fallback_devices:
+        - gpu
+        - cpu
       remediation:
-        - "Confirm with: yonga doctor (the NPU compiler line reads 'missing')"
+        - "Check the compiler: yonga doctor (the NPU section's compiler line)"
         - >-
-          Install the NPU compiler matching your NPU driver version:
-          intel-driver-compiler-npu on Ubuntu; where the driver package leaves
-          it out (Arch's intel-npu-driver), copy
+          If it reads 'missing', install the NPU compiler matching your NPU
+          driver version: doctor names the package for your distribution (on
+          Arch, whose intel-npu-driver leaves it out, copy
           libopenvino_intel_npu_compiler.so and
           libopenvino_intel_npu_compiler_loader.so from the same release's
-          intel-driver-compiler-npu .deb
-          (https://github.com/intel/linux-npu-driver/releases) into /usr/lib.
-        - "Or prepare for another device: yonga prepare MODEL --device gpu"
-      fallback_devices: []
+          intel-driver-compiler-npu .deb at
+          https://github.com/intel/linux-npu-driver/releases into /usr/lib).
+        - "Otherwise use another device: yonga prepare MODEL --device gpu"
     sources:
       - kind: tested
         note: >-
           Reproduced on CachyOS with Arch's intel-npu-driver 1.38.0 (no compiler
-          in the package), OpenVINO 2026.4.1 and an Arrow Lake Core Ultra 7
-          255U, preparing Qwen3-4B for the NPU: "Compilation failed. Level0
-          pfnCreate2 result: ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, code
+          in the package; NPU_COMPILER_TYPE CompilerType.DRIVER,
+          NPU_COMPILER_VERSION 0), OpenVINO 2026.4.1 and an Arrow Lake Core
+          Ultra 7 255U, preparing Qwen3-4B for the NPU: "Compilation failed.
+          Level0 pfnCreate2 result: ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, code
           0x78000003". The driver log showed it failing to dlopen
-          /usr/lib/libopenvino_intel_npu_compiler_loader.so.
+          /usr/lib/libopenvino_intel_npu_compiler_loader.so; with the compiler
+          installed the same artifact compiled and generated on the NPU.
 
   - id: tokenizer-string-precision-read
     schema_version: 1

@@ -60,7 +60,7 @@ NPU
                       → add your user to the 'render' group, then log out and back in for the new
                       membership to take effect
                       → Suggested command, to run yourself: sudo usermod -aG render $USER
-                      → yonga never runs sudo and never changes permissions or group membership.
+                      → yonga never runs sudo and never changes packages, kernel modules, permissions or group membership: run any command yourself.
 !  Group              render  the current user is not a member of 'render'
 ```
 

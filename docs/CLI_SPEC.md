@@ -100,8 +100,15 @@ whose remediation names the package for the host's distribution family, from `ID
 in `/etc/os-release`: Arch and its derivatives, Debian and Ubuntu, or Fedora; any other gets the
 upstream release page. With several GPUs the ids are `drivers.gpu0.*`, `drivers.gpu1.*`. A host
 with neither is one informational line; the section is left out when the PCI bus cannot be read.
+Whether OpenVINO lists a device is decided from its own names (`GPU.0`, `GPU.1`), not the folded
+list the Devices section shows. A device bound to another kernel driver (`vfio-pci` for
+passthrough) is told to be released, not to `modprobe`. A GPU before Gen12, which Intel's current
+compute runtime does not cover, is informational when OpenVINO does not list it. Only doctor reads
+the bus and the libraries (`DriverProbe`); `HardwareProbe.inventory`, which `prepare` runs, does not.
 In the `NPU` section, a driver that reports compiler version 0 (`npu.compiler_version`, `missing`)
-has no compiler library, and the group line is informational when the node is accessible anyway.
+has no compiler library, whatever `NPU_COMPILER_TYPE` says; `npu.compiler_libraries` needs both
+`libopenvino_intel_npu_compiler.so` and its loader unless a compiler answers anyway. The group line
+is informational when the node is accessible anyway.
 
 The `Install` line (`host.install`) says how yonga is running: an AppImage, with the image file's
 path, or a Python environment, with `sys.prefix`. It also says what the command `yonga` on `PATH`

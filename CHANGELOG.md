@@ -25,18 +25,20 @@ manifest may change in any minor release.
   and NPU driver for an NPU) and whether OpenVINO lists it. A missing driver comes with the
   install command for the host's distribution family: Arch and derivatives such as CachyOS,
   Debian and Ubuntu, or Fedora.
-- A known failure for an NPU driver without its compiler library
-  (`npu.compiler.driver_compiler_missing`), which Arch's `intel-npu-driver` package causes: every
-  NPU compile failed with `ZE_RESULT_ERROR_UNSUPPORTED_FEATURE`, reported as an unrecognised
-  failure.
+- A known failure for `ZE_RESULT_ERROR_UNSUPPORTED_FEATURE` from the NPU driver without a
+  compiler message (`npu.compiler.unsupported_feature`), which Arch's `intel-npu-driver` package
+  causes by leaving the compiler out: it was reported as an unrecognised failure. It names both
+  causes (no compiler library, or a compiler that cannot take the IR) and keeps the GPU/CPU
+  fallback; `doctor` tells them apart.
 
 ### Fixed
 
 - `doctor` reports an NPU driver that loaded no compiler (`NPU_COMPILER_VERSION` 0) as a warning
-  instead of a plain version line.
-- `doctor` no longer counts `libopenvino_intel_npu_plugin.so`, which every `openvino` wheel ships,
-  as an NPU compiler library, so the `compiler libraries` line can no longer pass without a
-  compiler.
+  instead of a plain version line, whatever `NPU_COMPILER_TYPE` says.
+- `doctor`'s `compiler libraries` line needs both `libopenvino_intel_npu_compiler.so` and
+  `libopenvino_intel_npu_compiler_loader.so`, and no longer counts
+  `libopenvino_intel_npu_plugin.so`, which every `openvino` wheel ships; it gives the same advice
+  as the compiler line. `/usr/lib64` is searched too, where Fedora installs the libraries.
 - `doctor` no longer tells the user to join the NPU node's group, with a `sudo usermod` command,
   when the node is accessible to them anyway.
 

@@ -215,16 +215,18 @@ NPU_DRIVER_COMPILER_MISSING_ERROR = (
 )
 
 
-def test_a_driver_without_its_compiler_is_named_and_not_blamed_on_the_model():
+def test_an_unsupported_feature_names_both_causes_and_keeps_the_fallback():
+    """The text alone cannot tell a missing compiler from an IR it cannot take."""
     result = resolver().classify(raw_error=NPU_DRIVER_COMPILER_MISSING_ERROR, device="npu")
-    assert result.code == "npu.compiler.driver_compiler_missing"
-    assert result.matched_rule_id == "npu-driver-compiler-missing"
-    assert result.category is FailureCategory.COMPILER_MISSING
-    assert result.environment_broken is True
-    assert result.fallback_devices == []
+    assert result.code == "npu.compiler.unsupported_feature"
+    assert result.matched_rule_id == "npu-unsupported-feature"
+    assert result.category is FailureCategory.COMPILER_UNSUPPORTED_GRAPH
+    assert result.environment_broken is False
+    assert result.fallback_devices == ["GPU", "CPU"]
     remediation = " ".join(result.remediation)
     assert "libopenvino_intel_npu_compiler_loader.so" in remediation
     assert "yonga doctor" in remediation
+    assert "--device gpu" in remediation
 
 
 def test_a_compiler_that_answered_still_wins_over_the_missing_compiler_rule():

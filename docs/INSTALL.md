@@ -208,7 +208,7 @@ If it is absent, `doctor` reports the node as missing and says:
 ```text
 Load the NPU kernel driver (the intel_vpu module) or install the intel-npu driver package for your
 distribution.
-yonga changes nothing about the kernel: run any module or package command yourself.
+yonga never runs sudo and never changes packages, kernel modules, permissions or group membership: run any command yourself.
 ```
 
 **b. The device node `/dev/accel/accel0` exists.** The kernel module creates it. `/sys/class/accel/accel0`
@@ -234,7 +234,7 @@ NPU
                       → add your user to the 'render' group, then log out and back in for the new
                       membership to take effect
                       → Suggested command, to run yourself: sudo usermod -aG render $USER
-                      → yonga never runs sudo and never changes permissions or group membership.
+                      → yonga never runs sudo and never changes packages, kernel modules, permissions or group membership: run any command yourself.
 !  Group              render  the current user is not a member of 'render'
 ```
 

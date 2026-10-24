@@ -22,12 +22,46 @@ __all__ = [
     "SYSTEM_CHANGES_NOTE",
     "DistroFamily",
     "DriverComponent",
+    "claimed_device_steps",
     "distro_family",
     "install_steps",
+    "is_legacy_gpu",
 ]
 
-#: yonga changes nothing about the system; said next to every install command.
-SYSTEM_CHANGES_NOTE = "yonga changes nothing about the system: run any package command yourself."
+#: The one sentence, next to every system command doctor suggests, that yonga
+#: runs none of them.
+SYSTEM_CHANGES_NOTE = (
+    "yonga never runs sudo and never changes packages, kernel modules, permissions or group "
+    "membership: run any command yourself."
+)
+
+#: PCI device-id prefixes of the Intel GPU generations up to Gen11 (Ice Lake,
+#: Elkhart/Jasper Lake) and their predecessors back to Sandy Bridge. Intel's
+#: current compute-runtime covers Gen12 (Tiger Lake) and newer; these older
+#: iGPUs are served by its legacy branch at most, so installing the current
+#: runtime cannot make OpenVINO list them.
+_LEGACY_GPU_ID_PREFIXES: tuple[str, ...] = (
+    "0x00",  # Ironlake
+    "0x01",  # Sandy Bridge, Ivy Bridge
+    "0x04",  # Haswell
+    "0x0a",  # Haswell ULT
+    "0x0c",  # Haswell
+    "0x0d",  # Haswell (Iris Pro)
+    "0x0f",  # Bay Trail
+    "0x16",  # Broadwell
+    "0x19",  # Skylake
+    "0x1a",  # Apollo Lake
+    "0x22",  # Cherry Trail
+    "0x31",  # Gemini Lake
+    "0x3e",  # Coffee Lake
+    "0x45",  # Elkhart Lake
+    "0x4e",  # Jasper Lake
+    "0x59",  # Kaby Lake
+    "0x5a",  # Apollo Lake, Cannon Lake
+    "0x87",  # Amber Lake
+    "0x8a",  # Ice Lake
+    "0x9b",  # Comet Lake
+)
 
 
 class DistroFamily(str, Enum):
@@ -133,3 +167,24 @@ def install_steps(component: DriverComponent, host: HostInfo) -> list[str]:
     family = distro_family(host)
     steps = _STEPS.get(component, {}).get(family) if family is not None else None
     return [*(steps or _GENERIC_STEPS[component]), SYSTEM_CHANGES_NOTE]
+
+
+def claimed_device_steps(kind: str, address: str, driver: str) -> list[str]:
+    """What to do about an accelerator another kernel driver has claimed.
+
+    A device bound to, say, ``vfio-pci`` for passthrough is not missing a
+    driver, and ``modprobe`` will not take it back.
+    """
+    return [
+        f"The {kind} at {address} is claimed by the '{driver}' kernel driver (vfio-pci, for "
+        "example, reserves it for a virtual machine), so this host cannot use it.",
+        f"To use it here, release it from '{driver}' (undo the passthrough configuration) "
+        "and reboot.",
+        SYSTEM_CHANGES_NOTE,
+    ]
+
+
+def is_legacy_gpu(device_id: str) -> bool:
+    """Whether a GPU's PCI device id belongs to a generation before Gen12."""
+    normalised = device_id.strip().lower()
+    return any(normalised.startswith(prefix) for prefix in _LEGACY_GPU_ID_PREFIXES)
