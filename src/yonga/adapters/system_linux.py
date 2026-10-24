@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING
 from yonga.adapters.filesystem import FilesystemAdapter, system_temp_dir
 from yonga.domain.hardware import (
     DeviceKind,
+    DriverLibraries,
     FilesystemInfo,
     HardwareInventory,
     HostInfo,
@@ -40,6 +41,7 @@ from yonga.domain.hardware import (
     NPUNodeInfo,
     OpenVINODevice,
     PackageInfo,
+    PciAccelerator,
 )
 from yonga.util.versions import installed_version
 
@@ -50,6 +52,9 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 __all__ = [
     "ACCEL_DIRNAME",
+    "INTEL_PCI_VENDOR",
+    "LEVEL_ZERO_LOADER_PATTERNS",
+    "NPU_LEVEL_ZERO_PATTERNS",
     "NPU_LIBRARY_PATTERNS",
     "PROBED_PACKAGES",
     "DeviceSnapshot",
@@ -61,11 +66,30 @@ __all__ = [
 #: Directory the Linux accel subsystem exposes the NPU through.
 ACCEL_DIRNAME: str = "accel"
 
-#: Glob patterns for the NPU compiler/plugin shared libraries.
-NPU_LIBRARY_PATTERNS: tuple[str, ...] = (
-    "libopenvino_intel_npu_compiler*.so*",
-    "libopenvino_intel_npu_plugin.so*",
+#: Glob patterns for the NPU compiler shared libraries (the compiler and the
+#: driver's loader for it). The plugin itself is not one: every openvino wheel
+#: carries it, so finding it says nothing about the compiler.
+NPU_LIBRARY_PATTERNS: tuple[str, ...] = ("libopenvino_intel_npu_compiler*.so*",)
+
+#: PCI vendor id of Intel, the only vendor OpenVINO's GPU and NPU plugins drive.
+INTEL_PCI_VENDOR: str = "0x8086"
+
+#: PCI class prefixes (``/sys/bus/pci/devices/*/class``) of the accelerators:
+#: display controllers (``0x03``) are GPUs, processing accelerators (``0x1200``)
+#: are the NPU.
+_PCI_CLASS_KINDS: tuple[tuple[str, DeviceKind], ...] = (
+    ("0x03", DeviceKind.GPU),
+    ("0x1200", DeviceKind.NPU),
 )
+
+#: Where OpenCL ICD loaders look for vendor drivers; Intel's names ``libigdrcl``.
+_OPENCL_VENDOR_DIRS: tuple[str, ...] = ("/etc/OpenCL/vendors",)
+_INTEL_OPENCL_MARKER = "libigdrcl"
+
+#: Glob patterns for the Level Zero loader and the Level Zero NPU driver
+#: (``libze_intel_vpu`` is the name before the 2024 rename).
+LEVEL_ZERO_LOADER_PATTERNS: tuple[str, ...] = ("libze_loader.so*",)
+NPU_LEVEL_ZERO_PATTERNS: tuple[str, ...] = ("libze_intel_npu.so*", "libze_intel_vpu.so*")
 
 #: System directories searched for those libraries, in order.
 _SYSTEM_LIBRARY_DIRS: tuple[str, ...] = (
@@ -327,6 +351,7 @@ class LinuxSystemProbe:
             distro_id=release.get("ID"),
             distro_version=release.get("VERSION_ID"),
             distro_pretty=release.get("PRETTY_NAME") or release.get("NAME"),
+            distro_like=release.get("ID_LIKE", "").split(),
             cpu_model=cpu_model,
             cpu_count=cpu_count,
         )
@@ -425,7 +450,7 @@ class LinuxSystemProbe:
 
     # --- NPU node ------------------------------------------------------
     def library_search_dirs(self) -> list[Path]:
-        """Directories searched for the NPU compiler and plugin libraries."""
+        """Directories searched for the NPU compiler libraries."""
         if self._library_dirs is not None:
             return list(self._library_dirs)
 
@@ -529,12 +554,16 @@ class LinuxSystemProbe:
         )
 
     def _find_npu_libraries(self) -> list[str]:
-        """Return the NPU compiler/plugin libraries found on this host."""
+        """Return the NPU compiler libraries found on this host."""
+        return self._find_libraries(NPU_LIBRARY_PATTERNS)
+
+    def _find_libraries(self, patterns: Sequence[str]) -> list[str]:
+        """Return the files matching ``patterns`` in the library search directories."""
         found: dict[str, None] = {}
         for directory in self.library_search_dirs():
             if not _is_dir(directory):
                 continue
-            for pattern in NPU_LIBRARY_PATTERNS:
+            for pattern in patterns:
                 try:
                     matches = sorted(directory.glob(pattern))
                 except OSError:  # pragma: no cover - unreadable directory
@@ -542,6 +571,65 @@ class LinuxSystemProbe:
                 for match in matches:
                     found.setdefault(str(match), None)
         return list(found)
+
+    # --- accelerators and their drivers ---------------------------------
+    def pci_accelerators(self, notes: list[str] | None = None) -> list[PciAccelerator] | None:
+        """Return the Intel GPUs and NPUs on the PCI bus, or ``None`` when it cannot be read.
+
+        This is the hardware, independent of OpenVINO: a GPU or an NPU listed
+        here but absent from ``available_devices`` is missing a driver, not
+        missing from the machine.
+        """
+        bus = self._under_root("sys", "bus", "pci", "devices")
+        if not _is_dir(bus):
+            if notes is not None:
+                notes.append(f"{bus} is not readable; PCI accelerators were not listed.")
+            return None
+        found: list[PciAccelerator] = []
+        try:
+            entries = sorted(bus.iterdir())
+        except OSError:  # pragma: no cover - unreadable sysfs
+            return None
+        for entry in entries:
+            vendor = (self._read_text(entry / "vendor") or "").strip().lower()
+            if vendor != INTEL_PCI_VENDOR:
+                continue
+            pci_class = (self._read_text(entry / "class") or "").strip().lower()
+            kind = next((k for prefix, k in _PCI_CLASS_KINDS if pci_class.startswith(prefix)), None)
+            if kind is None:
+                continue
+            driver: str | None = None
+            try:
+                driver = (entry / "driver").resolve(strict=True).name
+            except OSError:
+                driver = None
+            found.append(
+                PciAccelerator(
+                    kind=kind,
+                    address=entry.name,
+                    vendor_id=vendor,
+                    device_id=(self._read_text(entry / "device") or "").strip().lower(),
+                    kernel_driver=driver,
+                )
+            )
+        return found
+
+    def driver_libraries(self) -> DriverLibraries:
+        """Find the user-space GPU and NPU drivers OpenVINO's plugins load."""
+        opencl: list[str] = []
+        for entry in _OPENCL_VENDOR_DIRS:
+            directory = self._under_root(*entry.strip("/").split("/"))
+            if not _is_dir(directory):
+                continue
+            for icd in sorted(directory.glob("*.icd")):
+                library = (self._read_text(icd) or "").strip()
+                if _INTEL_OPENCL_MARKER in library:
+                    opencl.append(library)
+        return DriverLibraries(
+            gpu_opencl=opencl,
+            level_zero_loader=self._find_libraries(LEVEL_ZERO_LOADER_PATTERNS),
+            npu_level_zero=self._find_libraries(NPU_LEVEL_ZERO_PATTERNS),
+        )
 
     # --- filesystems ---------------------------------------------------
     def filesystems(self, *, full: bool = False) -> list[FilesystemInfo]:
@@ -670,6 +758,8 @@ class LinuxSystemProbe:
             else None
         )
         npu = self.npu_node(driver_version=driver_version, notes=notes)
+        accelerators = self.pci_accelerators(notes)
+        driver_libraries = self.driver_libraries()
 
         filesystems = self.filesystems(full=full)
         system_temp = filesystems[0] if filesystems else None
@@ -689,6 +779,8 @@ class LinuxSystemProbe:
             openvino_available=snapshot.available,
             openvino_import_error=snapshot.import_error,
             npu=npu,
+            accelerators=accelerators,
+            driver_libraries=driver_libraries,
             packages=packages,
             device_tags=tags,
             system_temp=system_temp,

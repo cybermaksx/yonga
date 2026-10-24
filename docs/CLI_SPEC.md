@@ -68,6 +68,14 @@ Devices
   GPU  ✓ Intel Arc Graphics
   NPU  ✓ Intel NPU
 
+Drivers
+  GPU kernel       ✓ xe  PCI 8086:64a0 at 0000:00:02.0
+  GPU runtime      ✓ compute-runtime
+  GPU in OpenVINO  ✓ listed
+  NPU kernel       ✓ intel_vpu
+  NPU runtime      ✓ level-zero
+  NPU in OpenVINO  ✓ listed
+
 NPU
   /dev/accel/accel0      ✓ accessible
   driver                 1.38...
@@ -81,6 +89,19 @@ Storage
 ```
 
 Warnings must have remediation text.
+
+The `Drivers` section lists every Intel GPU (PCI class `0x03`) and NPU (class `0x1200`) found in
+`/sys/bus/pci/devices`, whatever OpenVINO makes of them, and for each one checks three things: the
+kernel module bound to it (`i915` or `xe`, `intel_vpu`; `drivers.<kind>.kernel`), the user-space
+driver OpenVINO's plugin loads (`drivers.<kind>.runtime`: Intel's OpenCL driver named by an ICD
+file in `/etc/OpenCL/vendors` for a GPU, `libze_loader.so.1` and `libze_intel_npu.so` for an NPU),
+and whether OpenVINO lists the device (`drivers.<kind>.openvino`). A missing piece is a warning
+whose remediation names the package for the host's distribution family, from `ID` then `ID_LIKE`
+in `/etc/os-release`: Arch and its derivatives, Debian and Ubuntu, or Fedora; any other gets the
+upstream release page. With several GPUs the ids are `drivers.gpu0.*`, `drivers.gpu1.*`. A host
+with neither is one informational line; the section is left out when the PCI bus cannot be read.
+In the `NPU` section, a driver that reports compiler version 0 (`npu.compiler_version`, `missing`)
+has no compiler library, and the group line is informational when the node is accessible anyway.
 
 The `Install` line (`host.install`) says how yonga is running: an AppImage, with the image file's
 path, or a Python environment, with `sys.prefix`. It also says what the command `yonga` on `PATH`

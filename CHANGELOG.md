@@ -19,6 +19,26 @@ manifest may change in any minor release.
   into a provider you already have it writes only `npm`, `options.baseURL` and `options.apiKey`.
   `--remove ARTIFACT` takes back only the entries it wrote and keeps any you edited since;
   `yonga remove` points to it, with `--config` when the connection is in another file.
+- `yonga doctor` has a **Drivers** section: it finds the Intel GPUs and NPUs on the PCI bus,
+  whatever OpenVINO makes of them, and checks for each one the kernel driver, the user-space
+  driver OpenVINO's plugin loads (Intel's OpenCL compute runtime for a GPU, the Level Zero loader
+  and NPU driver for an NPU) and whether OpenVINO lists it. A missing driver comes with the
+  install command for the host's distribution family: Arch and derivatives such as CachyOS,
+  Debian and Ubuntu, or Fedora.
+- A known failure for an NPU driver without its compiler library
+  (`npu.compiler.driver_compiler_missing`), which Arch's `intel-npu-driver` package causes: every
+  NPU compile failed with `ZE_RESULT_ERROR_UNSUPPORTED_FEATURE`, reported as an unrecognised
+  failure.
+
+### Fixed
+
+- `doctor` reports an NPU driver that loaded no compiler (`NPU_COMPILER_VERSION` 0) as a warning
+  instead of a plain version line.
+- `doctor` no longer counts `libopenvino_intel_npu_plugin.so`, which every `openvino` wheel ships,
+  as an NPU compiler library, so the `compiler libraries` line can no longer pass without a
+  compiler.
+- `doctor` no longer tells the user to join the NPU node's group, with a `sudo usermod` command,
+  when the node is accessible to them anyway.
 
 ## [0.5.1] - 2026-10-11
 

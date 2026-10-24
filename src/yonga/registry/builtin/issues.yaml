@@ -221,6 +221,54 @@ issues:
           remediation was "Run `yonga doctor` to check the device and driver
           state".
 
+  # Below npu-compiler-pass-failed on purpose: a compiler that loaded and
+  # refused the graph says so with "[NPU_VCL] Compiler returned msg:", and that
+  # diagnosis is the more precise one when both match.
+  - id: npu-driver-compiler-missing
+    schema_version: 1
+    status: active
+    priority: 35
+    summary: The NPU driver has no compiler library to compile with
+    match:
+      device: npu
+      case_sensitive: true
+      exception_contains:
+        - "pfnCreate2 result: ZE_RESULT_ERROR_UNSUPPORTED_FEATURE"
+    classification:
+      code: npu.compiler.driver_compiler_missing
+      category: compiler_missing
+      environment_broken: true
+      retry_same_device: false
+    recommendation:
+      title: The NPU driver could not load its compiler
+      message: >-
+        The NPU driver refused to create the graph as an unsupported feature.
+        With no compiler message attached, this means the driver found no
+        compiler library: its NPU_COMPILER_VERSION is 0 and no model can be
+        compiled for the NPU until one is installed. The model is not at fault,
+        so yonga will not move the job to another device for you.
+      remediation:
+        - "Confirm with: yonga doctor (the NPU compiler line reads 'missing')"
+        - >-
+          Install the NPU compiler matching your NPU driver version:
+          intel-driver-compiler-npu on Ubuntu; where the driver package leaves
+          it out (Arch's intel-npu-driver), copy
+          libopenvino_intel_npu_compiler.so and
+          libopenvino_intel_npu_compiler_loader.so from the same release's
+          intel-driver-compiler-npu .deb
+          (https://github.com/intel/linux-npu-driver/releases) into /usr/lib.
+        - "Or prepare for another device: yonga prepare MODEL --device gpu"
+      fallback_devices: []
+    sources:
+      - kind: tested
+        note: >-
+          Reproduced on CachyOS with Arch's intel-npu-driver 1.38.0 (no compiler
+          in the package), OpenVINO 2026.4.1 and an Arrow Lake Core Ultra 7
+          255U, preparing Qwen3-4B for the NPU: "Compilation failed. Level0
+          pfnCreate2 result: ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, code
+          0x78000003". The driver log showed it failing to dlopen
+          /usr/lib/libopenvino_intel_npu_compiler_loader.so.
+
   - id: tokenizer-string-precision-read
     schema_version: 1
     status: active

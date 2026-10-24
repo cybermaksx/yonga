@@ -138,6 +138,7 @@ def test_host_info_reads_distribution_and_cpu(tmp_path):
     assert host.distro_id == "ubuntu"
     assert host.distro_version == "26.04"
     assert host.distro_pretty == "Ubuntu 26.04.1 LTS"
+    assert host.distro_like == ["debian"]
     assert host.cpu_model == "Intel(R) Core(TM) Ultra 7 268V"
     assert host.python_version == platform.python_version()
     assert host.kernel == platform.release()
@@ -237,8 +238,105 @@ def test_npu_node_reports_the_accel_device(tmp_path):
     assert sorted(Path(entry).name for entry in npu.compiler_libraries) == [
         "libopenvino_intel_npu_compiler.so",
         "libopenvino_intel_npu_compiler_loader.so",
-        "libopenvino_intel_npu_plugin.so",
     ]
+
+
+def pci_device(
+    root: Path, address: str, *, vendor: str, pci_class: str, device: str, driver: str | None
+) -> None:
+    """One ``/sys/bus/pci/devices`` entry, with its driver link when bound."""
+    entry = root / "sys" / "bus" / "pci" / "devices" / address
+    entry.mkdir(parents=True)
+    (entry / "vendor").write_text(f"{vendor}\n")
+    (entry / "class").write_text(f"{pci_class}\n")
+    (entry / "device").write_text(f"{device}\n")
+    if driver is not None:
+        target = root / "sys" / "bus" / "pci" / "drivers" / driver
+        target.mkdir(parents=True, exist_ok=True)
+        (entry / "driver").symlink_to(target)
+
+
+def test_pci_accelerators_lists_intel_gpus_and_npus_with_their_kernel_driver(tmp_path):
+    root = build_root(tmp_path)
+    # The Arrow Lake reference laptop: iGPU on i915, NPU on intel_vpu.
+    pci_device(
+        root, "0000:00:02.0", vendor="0x8086", pci_class="0x030000", device="0x7d41", driver="i915"
+    )
+    pci_device(
+        root,
+        "0000:00:0b.0",
+        vendor="0x8086",
+        pci_class="0x120000",
+        device="0x7d1d",
+        driver="intel_vpu",
+    )
+    # A discrete GPU without a driver, an NVIDIA GPU and an Intel USB controller.
+    pci_device(
+        root, "0000:03:00.0", vendor="0x8086", pci_class="0x030000", device="0xe20b", driver=None
+    )
+    pci_device(
+        root,
+        "0000:01:00.0",
+        vendor="0x10de",
+        pci_class="0x030000",
+        device="0x2684",
+        driver="nvidia",
+    )
+    pci_device(
+        root,
+        "0000:00:14.0",
+        vendor="0x8086",
+        pci_class="0x0c0330",
+        device="0x7e7d",
+        driver="xhci_hcd",
+    )
+    probe = LinuxSystemProbe(root=root, filesystem=StubFilesystem())
+
+    found = probe.pci_accelerators()
+
+    assert found is not None
+    assert [(a.address, a.kind, a.device_id, a.kernel_driver) for a in found] == [
+        ("0000:00:02.0", DeviceKind.GPU, "0x7d41", "i915"),
+        ("0000:00:0b.0", DeviceKind.NPU, "0x7d1d", "intel_vpu"),
+        ("0000:03:00.0", DeviceKind.GPU, "0xe20b", None),
+    ]
+
+
+def test_an_unreadable_pci_bus_is_none_and_a_note(tmp_path):
+    probe = LinuxSystemProbe(root=build_root(tmp_path), filesystem=StubFilesystem())
+    notes: list[str] = []
+
+    assert probe.pci_accelerators(notes) is None
+    assert any("PCI" in note for note in notes)
+
+
+def test_driver_libraries_finds_intels_opencl_icd_and_the_level_zero_libraries(tmp_path):
+    root = build_root(tmp_path)
+    vendors = root / "etc" / "OpenCL" / "vendors"
+    vendors.mkdir(parents=True)
+    (vendors / "intel.icd").write_text("/usr/lib/intel-opencl/libigdrcl.so\n")
+    (vendors / "rusticl.icd").write_text("libRusticlOpenCL.so.1\n")
+    libdir = tmp_path / "libs"
+    libdir.mkdir()
+    for name in ("libze_loader.so.1", "libze_intel_npu.so.1", "libze_intel_gpu.so.1"):
+        (libdir / name).write_bytes(b"")
+    probe = LinuxSystemProbe(root=root, filesystem=StubFilesystem(), library_dirs=[libdir])
+
+    libraries = probe.driver_libraries()
+
+    assert libraries.gpu_opencl == ["/usr/lib/intel-opencl/libigdrcl.so"]
+    assert [Path(p).name for p in libraries.level_zero_loader] == ["libze_loader.so.1"]
+    assert [Path(p).name for p in libraries.npu_level_zero] == ["libze_intel_npu.so.1"]
+
+
+def test_driver_libraries_are_empty_on_a_host_without_them(tmp_path):
+    probe = LinuxSystemProbe(
+        root=build_root(tmp_path), filesystem=StubFilesystem(), library_dirs=[]
+    )
+    libraries = probe.driver_libraries()
+    assert libraries.gpu_opencl == []
+    assert libraries.level_zero_loader == []
+    assert libraries.npu_level_zero == []
 
 
 def test_npu_node_without_dev_accel_is_a_note_not_a_crash(tmp_path):

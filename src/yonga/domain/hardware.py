@@ -151,6 +151,32 @@ class NPUNodeInfo(BaseModel):
         return self.node_exists and self.readable and self.writable
 
 
+class PciAccelerator(BaseModel):
+    """An Intel GPU or NPU found on the PCI bus, whatever OpenVINO makes of it."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    kind: DeviceKind
+    address: str
+    """PCI address, ``0000:00:02.0``."""
+    vendor_id: str
+    device_id: str
+    kernel_driver: str | None = None
+    """The kernel module bound to it (``i915``, ``xe``, ``intel_vpu``), if any."""
+
+
+class DriverLibraries(BaseModel):
+    """User-space driver libraries OpenVINO's GPU and NPU plugins load at run time."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    gpu_opencl: list[str] = Field(default_factory=list)
+    """Intel's OpenCL driver (compute-runtime), as named by an ICD file."""
+    level_zero_loader: list[str] = Field(default_factory=list)
+    npu_level_zero: list[str] = Field(default_factory=list)
+    """The Level Zero NPU driver, ``libze_intel_npu.so``."""
+
+
 class PackageInfo(BaseModel):
     """Installed-ness of a single Python distribution relevant to the stack."""
 
@@ -179,6 +205,8 @@ class HostInfo(BaseModel):
     distro_id: str | None = None
     distro_version: str | None = None
     distro_pretty: str | None = None
+    distro_like: list[str] = Field(default_factory=list)
+    """``ID_LIKE`` from ``/etc/os-release``: the distributions this one derives from."""
     cpu_model: str | None = None
     cpu_count: int | None = None
 
@@ -227,6 +255,9 @@ class HardwareInventory(BaseModel):
     openvino_available: bool = False
     openvino_import_error: str | None = None
     npu: NPUNodeInfo | None = None
+    accelerators: list[PciAccelerator] | None = None
+    """Intel GPUs and NPUs on the PCI bus; ``None`` when the bus was not read."""
+    driver_libraries: DriverLibraries | None = None
     packages: list[PackageInfo] = Field(default_factory=list)
     device_tags: list[str] = Field(default_factory=list)
     system_temp: FilesystemInfo | None = None
