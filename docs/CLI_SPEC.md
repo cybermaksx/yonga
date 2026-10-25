@@ -698,6 +698,117 @@ the user cannot write to; 30 for too little space; 60 when the confirmation is d
 be asked (a non-interactive session or `--json` without `--yes`); 70 when not running from an
 AppImage or when something other than an AppImage is in the way.
 
+## 12d. `connect`
+
+```bash
+yonga connect opencode ARTIFACT [--host 127.0.0.1] [--port 8000] [--device auto]
+                                [--context N] [--config PATH] [--yes] [--json]
+yonga connect opencode --remove ARTIFACT [--config PATH] [--yes] [--json]
+```
+
+Registers a prepared artifact with OpenCode as an OpenAI-compatible provider, so that
+`yonga serve ARTIFACT` can be used from `opencode` without hand-written configuration.
+`--host`, `--port` and `--device` default to what `serve` uses, and the device resolves as
+`serve` resolves it. `--config PATH` names the OpenCode file (`~` is expanded, a relative path is
+taken from the current directory); without it the target is `$XDG_CONFIG_HOME/opencode/opencode.json`,
+falling back to `~/.config/opencode/opencode.json`. `--context N` replaces the context limit read
+from the artifact. The command shows what it adds or changes and asks before writing (`--yes`
+skips the question), then prints the `yonga serve ARTIFACT --port P` command to run (with
+`--host` and `--device` when they are not the defaults). Only `--config`, `--yes` and `--json`
+combine with `--remove`; anything else is exit 70 (`connect.opencode.remove_options`).
+
+**Checks**, in this order, before the OpenCode file is read or written (the artifact is opened as
+a `ChatSession` but never loaded):
+
+1. The reference resolves through the artifact store; the store's own errors apply.
+2. The device resolves as for `serve`.
+3. Tools. OpenCode sends its twelve tools with every agent request, so an artifact `serve` would
+   refuse tools for cannot be used: exit 70 `connect.opencode.tools_unsupported`, with up to three
+   prepared artifacts that do take tools, or the families whose built-in chat profile declares
+   tool calling.
+4. Prompt length. A fixed `MAX_PROMPT_LEN` below `OPENCODE_MIN_PROMPT_TOKENS` (8192) is exit 70
+   `connect.opencode.prompt_too_short`, naming a prepared GPU or CPU artifact of the same source
+   model, else `yonga prepare MODEL --device gpu`. The constant is the first power of two above the
+   5261 tokens of OpenCode 2.1.2's first agent request in an empty `HOME` (8514 with skills and an
+   `AGENTS.md`), measured on the reference host with the Qwen3 chat template and tokenizer. Every
+   built-in NPU profile compiles with 1024, so none passes.
+
+**The entry.** One provider per host and port holds every artifact connected to that address:
+
+```json
+"yonga-8000": {
+  "npm": "@ai-sdk/openai-compatible",
+  "name": "yonga (127.0.0.1:8000)",
+  "options": { "baseURL": "http://127.0.0.1:8000/v1" },
+  "models": {
+    "073d5d7c8ea75283": {
+      "name": "Qwen/Qwen3-4B · GPU · gpu-int4-asym-g128-r08",
+      "tool_call": true,
+      "limit": { "context": 40960, "output": 4096 }
+    }
+  }
+}
+```
+
+The provider key is `yonga-<port>` for a loopback host and `yonga-<host>-<port>` otherwise
+(characters outside `[A-Za-z0-9_-]` become `-`). The model key is the artifact id, which `serve`
+answers to. `limit.context` is `max_position_embeddings` from the artifact's `config.json` (or its
+`text_config`), unless `--context` is given; with neither, exit 70
+`connect.opencode.context_unknown`. `limit.output` is the manifest's
+`recommended_runtime.max_new_tokens`, else the configured `max_new_tokens`. When the prompt length
+is fixed (and passed check 4), `limit.input` is `MAX_PROMPT_LEN` and `limit.context` defaults to
+that plus `limit.output`. When `YONGA_API_KEY` is set, `options.apiKey` is `{env:YONGA_API_KEY}`;
+the key itself is never written. Outcomes: `added`, `updated` (the difference is shown before the
+question), `already_connected` (nothing written, no question).
+
+**The file.** Parsed with the standard `json` module. JSONC (comments, trailing commas), a broken
+file, a root, `provider` or `provider.yonga-…`.`models` that is not an object is exit 70
+`connect.opencode.config_not_json`; the file is left alone. A directory given as `--config` is exit
+70 `connect.opencode.config_not_a_file`. A missing file is created with mode `0600` and
+`"$schema": "https://opencode.ai/config.json"` first, a missing directory is created. Other keys
+and their order are kept; output has two-space indentation and a trailing newline. The write goes
+to a temporary file in the same directory, is flushed with `fsync`, keeps the file's mode and is
+renamed over the target with `os.replace`; a symbolic link is resolved and its target edited. Just
+before the rename the bytes are compared with what was read, and a file that changed is exit 70
+`connect.opencode.config_changed` with nothing written. A file or directory the user cannot read
+(`config_not_readable`) or write (`config_not_writable`) is exit 10, a full disk is exit 30 with
+the code `config_not_writable`; sudo is never used. The file is never deleted.
+
+**The record**, `<data-dir>/opencode-connections.json` (`{"schema": 1, "connections": [...]}`),
+keeps per connection the resolved config path, provider key, artifact id, the model entry as
+written, whether yonga created the provider (and the provider fields it wrote), and the time. A
+record that cannot be written is a warning: the OpenCode file is already correct.
+
+**`--remove ARTIFACT`** takes the artifact id as recorded, so it works after `yonga remove`.
+A model entry identical to the recorded one is removed. One the user edited is kept: the command
+lists it with the reason in text and in the JSON `kept` list, and exits 70 after removing the rest
+(there is no separate code). The provider goes too when yonga created it, no models are left and
+its other fields are still what yonga wrote. Record entries are dropped for what was removed and
+for entries whose model is already gone. No record entry is `not_connected`, exit 0.
+`yonga remove ARTIFACT` does not touch OpenCode's configuration; when the record names the
+artifact it prints the `connect opencode --remove ID` command.
+
+`--json` for a connection: `action`, `config`, `created_config`, `provider`, `created_provider`,
+`model`, `base_url`, `limit`, `serve_command` and `exit_code`. For `--remove`: `action`
+(`removed`, `not_connected`), `config`, `removed` (`[{provider, model}]`), `kept`
+(`[{provider, model, reason}]`) and `exit_code`. Errors use the error document of section 15.
+
+| Code | Category | Exit | When |
+|---|---|---|---|
+| `connect.opencode.tools_unsupported` | `configuration_error` | 70 | The artifact takes no tools. |
+| `connect.opencode.prompt_too_short` | `configuration_error` | 70 | Fixed `MAX_PROMPT_LEN` under 8192. |
+| `connect.opencode.context_unknown` | `configuration_error` | 70 | No context length in the artifact; pass `--context`. |
+| `connect.opencode.config_not_json` | `configuration_error` | 70 | The file is not a plain JSON object of the expected shape. |
+| `connect.opencode.config_not_a_file` | `configuration_error` | 70 | `--config` names a directory. |
+| `connect.opencode.config_changed` | `configuration_error` | 70 | The file changed between reading and writing. |
+| `connect.opencode.remove_options` | `configuration_error` | 70 | `--remove` combined with `--host`, `--port`, `--device` or `--context`. |
+| `connect.opencode.config_not_readable`, `config_not_writable` | `permission_denied` | 10 | The OS refused reading or writing the file or its directory. |
+| `connect.opencode.config_not_writable` | `insufficient_disk` | 30 | The disk is full. |
+| `connect.opencode.declined` | `user_cancelled` | 60 | The question was declined, or cannot be asked (no terminal, or `--json` without `--yes`). |
+
+Exit codes: 0 for `added`, `updated`, `already_connected`, `removed`, `not_connected`; 10, 30, 60
+and 70 as in the table; 70 also when `--remove` kept an edited entry.
+
 ## 13. `logs`
 
 ```bash

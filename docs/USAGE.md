@@ -398,6 +398,34 @@ prompt hashes, and per-run metrics with warmups excluded from the aggregates.
 
 ---
 
+### Use it from OpenCode
+
+```bash
+yonga connect opencode 073d5d7c8ea75283 --port 8765     # writes the provider into OpenCode's config
+yonga serve 073d5d7c8ea75283 --port 8765                # then pick yonga-8765/073d5d7c8ea75283 in opencode
+```
+
+`connect opencode` adds the artifact to `~/.config/opencode/opencode.json` (`--config FILE` for
+another file), with the context and output limits read from the artifact, shows the change and asks
+first (`--yes` skips the question). It prints the `serve` command to run; it never starts the
+server. Re-running it changes nothing when the entry is already right.
+
+It refuses, writing nothing, what OpenCode cannot use. OpenCode sends 12 tools and a system prompt
+of about 5300 tokens with every request, so an artifact without tool calling is refused
+(`connect.opencode.tools_unsupported`), and so is one whose prompt length is fixed under 8192
+tokens (`connect.opencode.prompt_too_short`): that is every built-in NPU profile (1024). The
+message names a GPU or CPU artifact of the same model to use instead. A file with comments or
+trailing commas (JSONC) is not rewritten (`connect.opencode.config_not_json`); add the provider by
+hand from the JSON printed. `YONGA_API_KEY`, when set, is referenced as `{env:YONGA_API_KEY}`,
+never written.
+
+```bash
+yonga connect opencode --remove 073d5d7c8ea75283        # works after `yonga remove` too
+```
+
+`--remove` deletes only the entries yonga wrote. An entry you edited since is kept and listed, and
+the command then exits 70. The file is never deleted.
+
 ## 5. Ask the registry why
 
 ```bash

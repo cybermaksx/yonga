@@ -218,6 +218,29 @@ Every endpoint except `/health` then requires `Authorization: Bearer <key>`; a r
 !!! warning
     yonga serves plain HTTP. If you expose it beyond your own machine, keep it on a network you trust, or put it behind a reverse proxy that adds TLS.
 
+## Use it from OpenCode {#opencode}
+
+```bash
+yonga connect opencode 073d5d7c8ea75283 --port 8765
+yonga serve 073d5d7c8ea75283 --port 8765
+```
+
+The first command adds the artifact to OpenCode's config (`~/.config/opencode/opencode.json`, or the file you give with `--config`) as a provider, with the context and output limits read from the artifact. It shows the change and asks first; `--yes` skips the question. Then start the server with the command it prints and choose `yonga-8765/073d5d7c8ea75283` in `opencode`. Running it again changes nothing when the entry is already right.
+
+yonga refuses, and writes nothing, when OpenCode could not use the artifact. OpenCode sends 12 tools and a system prompt of about 5300 tokens with every request, so:
+
+- An artifact without tool calling is refused (`connect.opencode.tools_unsupported`).
+- An artifact whose prompt length is fixed under 8192 tokens is refused (`connect.opencode.prompt_too_short`). Every built-in NPU profile is fixed at 1024. Use a GPU or CPU artifact of the same model; the message names one.
+- A config file with comments or trailing commas (JSONC) is not rewritten (`connect.opencode.config_not_json`). Add the provider by hand from the JSON it prints.
+
+When `YONGA_API_KEY` is set, the entry refers to it as `{env:YONGA_API_KEY}`; the key itself is never written.
+
+```bash
+yonga connect opencode --remove 073d5d7c8ea75283
+```
+
+`--remove` deletes only the entries yonga wrote, also after `yonga remove` deleted the artifact. An entry you edited since is kept and listed, and the command exits 70. The config file is never deleted.
+
 ## Limits and refusals {#limits}
 
 yonga refuses what it cannot honour instead of silently answering a different request. Errors use OpenAI's shape, `{"error": {"message", "type", "param", "code"}}`, and `param` names the offending field.

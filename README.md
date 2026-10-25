@@ -69,7 +69,7 @@ on Python 3.14, and Python 3.11-3.13 are not affected. GGUF import is verified s
 
 ## What works today
 
-Seventeen commands; `registry` has seven subcommands, `env`, `cache` and `self` two each:
+Eighteen commands; `registry` has seven subcommands, `env`, `cache` and `self` two each, `connect` one:
 
 | Command | What it does |
 |---|---|
@@ -88,6 +88,7 @@ Seventeen commands; `registry` has seven subcommands, `env`, `cache` and `self` 
 | `yonga env list` / `env remove KEY` | The isolated environments `prepare` builds when a model's exporter needs package versions other than the installed ones, and the disk they use. |
 | `yonga cache list` / `cache prune` | The OpenVINO compile cache: each entry's size, last use, owning artifact and whether it is still used, orphaned, or built by another OpenVINO release; `prune` removes the dead ones (`--older-than DAYS`, `--unattributed`, `--all`, `--dry-run`). |
 | `yonga self install` / `self uninstall` | Copies the running AppImage to `~/.local/bin/yonga` (or `--bin-dir DIR`) so `yonga` works in any shell, and says what to do when that directory is not on `PATH`; `uninstall` removes the copy and keeps models and caches. AppImage only, never with sudo. |
+| `yonga connect opencode ARTIFACT` | Adds a prepared artifact to OpenCode's config as a `yonga serve` provider (context and output limits read from the artifact), after checking that OpenCode can use it: it refuses a model without tool calling and an NPU artifact whose fixed prompt length is under 8192 tokens. `--remove` takes back only what it wrote. Edits plain JSON only, never with sudo. |
 | `yonga logs [JOB_ID]` | Lists job logs, prints one as a table, or `--raw` for the JSON Lines file. |
 | `yonga registry validate` | Loads every registry layer and checks it is internally consistent; an installed remote bundle that no longer verifies is named, exit 2. |
 | `yonga registry profiles` | The conversion profiles `--profile` accepts, with device, weights, size band and priority. |

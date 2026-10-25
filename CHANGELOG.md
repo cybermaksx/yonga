@@ -9,6 +9,16 @@ manifest may change in any minor release.
 
 ## [Unreleased]
 
+### Added
+
+- **`yonga connect opencode ARTIFACT`** adds a prepared artifact to OpenCode's config as a
+  `yonga serve` provider, with the context and output limits read from the artifact, and prints the
+  `serve` command to run. It refuses an artifact OpenCode cannot use (no tool calling, or a fixed
+  prompt length under 8192 tokens, which every built-in NPU profile has) and says which artifact to
+  use instead. It edits plain JSON only, asks first, writes atomically and never deletes the file.
+  `--remove ARTIFACT` takes back only the entries it wrote and keeps any you edited since;
+  `yonga remove` points to it.
+
 ## [0.5.1] - 2026-10-11
 
 ### Changed

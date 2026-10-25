@@ -218,6 +218,29 @@ Bu durumda `/health` dışındaki her uç nokta `Authorization: Bearer <key>` ba
 !!! warning "Uyarı"
     yonga düz HTTP sunar. Sunucuyu kendi makinenizin dışına açarsanız güvendiğiniz bir ağda tutun ya da TLS ekleyen bir ters vekil sunucunun (reverse proxy) arkasına koyun.
 
+## OpenCode ile kullanın {#opencode}
+
+```bash
+yonga connect opencode 073d5d7c8ea75283 --port 8765
+yonga serve 073d5d7c8ea75283 --port 8765
+```
+
+İlk komut, yapıtı OpenCode'un yapılandırmasına (`~/.config/opencode/opencode.json` ya da `--config` ile verdiğiniz dosya) bir sağlayıcı olarak ekler; bağlam ve çıktı sınırlarını yapıtın kendisinden okur. Değişikliği gösterir ve yazmadan önce sorar; `--yes` soruyu atlar. Ardından yazdırdığı komutla sunucuyu başlatın ve `opencode` içinde `yonga-8765/073d5d7c8ea75283` modelini seçin. Kayıt zaten doğruysa komutu yeniden çalıştırmak hiçbir şeyi değiştirmez.
+
+OpenCode yapıtı kullanamayacaksa yonga reddeder ve hiçbir şey yazmaz. OpenCode her istekle 12 araç ve yaklaşık 5300 belirteçlik bir sistem istemi gönderir; bu yüzden:
+
+- Araç çağırmayan bir yapıt reddedilir (`connect.opencode.tools_unsupported`).
+- İstem uzunluğu 8192 belirtecin altında sabitlenmiş bir yapıt reddedilir (`connect.opencode.prompt_too_short`). Yerleşik NPU profillerinin hepsi 1024'te sabittir. Aynı modelin bir GPU ya da CPU yapıtını kullanın; ileti birini adıyla gösterir.
+- Yorum ya da sondaki virgül içeren (JSONC) bir yapılandırma dosyası yeniden yazılmaz (`connect.opencode.config_not_json`). Yazdırdığı JSON'dan sağlayıcıyı elle ekleyin.
+
+`YONGA_API_KEY` tanımlıysa kayıt ona `{env:YONGA_API_KEY}` olarak başvurur; anahtarın kendisi hiçbir zaman yazılmaz.
+
+```bash
+yonga connect opencode --remove 073d5d7c8ea75283
+```
+
+`--remove` yalnızca yonga'nın yazdığı kayıtları siler; `yonga remove` yapıtı sildikten sonra da çalışır. Sonradan elle değiştirdiğiniz bir kayıt bırakılır ve listelenir, komut 70 koduyla çıkar. Yapılandırma dosyası hiçbir zaman silinmez.
+
 ## Sınırlar ve reddedilen istekler {#limits}
 
 yonga, yerine getiremeyeceği bir isteğe sessizce farklı bir yanıt vermek yerine onu reddeder. Hatalar OpenAI'ın `{"error": {"message", "type", "param", "code"}}` biçimini kullanır ve `param` sorunlu alanı adlandırır.
