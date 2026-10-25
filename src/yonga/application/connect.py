@@ -43,6 +43,7 @@ from yonga.adapters.opencode_config import (
     read_config,
     render,
     with_model,
+    without_model,
     write_config,
 )
 from yonga.domain.artifacts import ArtifactManifest, ArtifactSummary
@@ -65,6 +66,8 @@ __all__ = [
     "ConnectionRecord",
     "ConnectionRecords",
     "Endpoint",
+    "RemoveAction",
+    "RemovePlan",
     "SessionView",
 ]
 
@@ -84,6 +87,7 @@ _SUGGESTIONS = 3
 _DEFAULT_HOST = "127.0.0.1"
 _DEFAULT_PORT = 8000
 _RECORD_SCHEMA = 1
+_EDITED = "edited since yonga wrote it"
 
 
 class ConnectAction(str, Enum):
@@ -246,6 +250,28 @@ class ConnectPlan:
     serve_command: str
 
 
+class RemoveAction(str, Enum):
+    """What :meth:`ConnectService.apply_remove` will do (or did)."""
+
+    REMOVED = "removed"
+    NOT_CONNECTED = "not_connected"
+
+
+@dataclass(frozen=True)
+class RemovePlan:
+    """What a removal would take out and what it leaves alone."""
+
+    action: RemoveAction
+    snapshot: ConfigSnapshot
+    document: dict[str, Any]
+    removed: list[tuple[str, str]]
+    """``(provider, model)`` entries to delete."""
+    kept: list[tuple[str, str, str]]
+    """``(provider, model, reason)`` entries left in place."""
+    stale: list[ConnectionRecord]
+    """Records whose entry is already gone from the file."""
+
+
 @dataclass(frozen=True)
 class ConnectResult:
     """What :meth:`ConnectService.apply` did."""
@@ -390,6 +416,93 @@ class ConnectService:
         records.append(record)
         return ConnectResult(created_config, self._records.save(records))
 
+    # --- removal -----------------------------------------------------
+
+    def plan_remove(self, artifact_id: str, *, config_path: Path) -> RemovePlan:
+        """Decide what to take out of the config; needs the record, never the artifact."""
+        snapshot = read_config(config_path)
+        config = str(snapshot.path)
+        records = self._records.load()
+        document = snapshot.document
+        removed: list[tuple[str, str]] = []
+        kept: list[tuple[str, str, str]] = []
+        stale: list[ConnectionRecord] = []
+        for record in records:
+            if record.config != config or record.artifact_id != artifact_id:
+                continue
+            current = _recorded_model(document, record.provider, artifact_id)
+            if current is None:
+                stale.append(record)
+            elif current != record.model:
+                kept.append((record.provider, artifact_id, _EDITED))
+            else:
+                removed.append((record.provider, artifact_id))
+                owner = next(
+                    (
+                        item
+                        for item in records
+                        if item.config == config
+                        and item.provider == record.provider
+                        and item.created_provider
+                        and item.provider_fields is not None
+                    ),
+                    None,
+                )
+                document = without_model(
+                    document,
+                    record.provider,
+                    artifact_id,
+                    drop_provider_when=owner.provider_fields if owner is not None else None,
+                )
+        return RemovePlan(
+            action=RemoveAction.REMOVED if removed else RemoveAction.NOT_CONNECTED,
+            snapshot=snapshot,
+            document=document,
+            removed=removed,
+            kept=kept,
+            stale=stale,
+        )
+
+    def apply_remove(self, plan: RemovePlan) -> bool:
+        """Write the config when something is removed, then forget the records.
+
+        Returns whether the record file was saved. Provider ownership travels with
+        the provider: when the record that created it goes while the provider stays,
+        it moves to a remaining record of that provider.
+        """
+        if plan.removed:
+            write_config(plan.snapshot, plan.document)
+        config = str(plan.snapshot.path)
+        gone = {(config, provider, model) for provider, model in plan.removed}
+        gone.update((item.config, item.provider, item.artifact_id) for item in plan.stale)
+        loaded = self._records.load()
+        remaining = [
+            item for item in loaded if (item.config, item.provider, item.artifact_id) not in gone
+        ]
+        providers = plan.document.get("provider")
+        for owner in loaded:
+            if (
+                (owner.config, owner.provider, owner.artifact_id) not in gone
+                or not owner.created_provider
+                or not isinstance(providers, Mapping)
+                or owner.provider not in providers
+            ):
+                continue
+            group = [
+                index
+                for index, item in enumerate(remaining)
+                if item.config == owner.config and item.provider == owner.provider
+            ]
+            if group and not any(remaining[index].created_provider for index in group):
+                remaining[group[0]] = remaining[group[0]].model_copy(
+                    update={"created_provider": True, "provider_fields": owner.provider_fields}
+                )
+        return self._records.save(remaining)
+
+    def is_connected(self, artifact_id: str) -> bool:
+        """True when the record file lists a connection for the artifact."""
+        return any(item.artifact_id == artifact_id for item in self._records.load())
+
     # --- the checks --------------------------------------------------
 
     def _require_tools(self, session: SessionView) -> None:
@@ -494,6 +607,17 @@ def _model_name(session: SessionView, manifest: ArtifactManifest | None, artifac
     if manifest is None:
         return f"{artifact_id} · {session.device}"
     return f"{manifest.requested_model.repo_id} · {session.device} · {manifest.export.profile}"
+
+
+def _recorded_model(
+    document: Mapping[str, Any], provider: str, model_id: str
+) -> Mapping[str, Any] | None:
+    """``provider[PROVIDER].models[MODEL_ID]`` when the document has it."""
+    providers = document.get("provider")
+    entry = providers.get(provider) if isinstance(providers, Mapping) else None
+    models = entry.get("models") if isinstance(entry, Mapping) else None
+    found = models.get(model_id) if isinstance(models, Mapping) else None
+    return found if isinstance(found, Mapping) else None
 
 
 def _context_from_config(path: Path) -> int | None:

@@ -435,3 +435,173 @@ def test_jsonc_config_refusal_carries_the_snippet(harness: Harness) -> None:
     assert f'"{ARTIFACT}"' in advice
     assert "@ai-sdk/openai-compatible" in advice
     assert harness.config_path.read_text(encoding="utf-8") == "{ // c\n}"
+
+
+# --- removal ---------------------------------------------------------------------------
+
+
+def connect(harness: Harness, reference: str = ARTIFACT, **kwargs: Any) -> ConnectService:
+    service = harness.service()
+    service.apply(harness.plan(service, reference=reference, **kwargs))
+    return service
+
+
+def read_file(harness: Harness) -> dict[str, Any]:
+    return json.loads(harness.config_path.read_text(encoding="utf-8"))  # type: ignore[no-any-return]
+
+
+def edit_file(harness: Harness, change: Any) -> None:
+    document = read_file(harness)
+    change(document)
+    harness.config_path.write_text(render(document), encoding="utf-8")
+
+
+def remove(harness: Harness, service: ConnectService, artifact_id: str = ARTIFACT) -> Any:
+    plan = service.plan_remove(artifact_id, config_path=harness.config_path)
+    service.apply_remove(plan)
+    return plan
+
+
+def test_remove_deletes_only_the_recorded_entry(harness: Harness) -> None:
+    service = connect(harness)
+    edit_file(
+        harness,
+        lambda d: d["provider"]["yonga-8000"]["models"].update({"other": {"name": "x"}}),
+    )
+    plan = remove(harness, service)
+    assert plan.action.value == "removed"
+    assert plan.removed == [("yonga-8000", ARTIFACT)]
+    models = read_file(harness)["provider"]["yonga-8000"]["models"]
+    assert models == {"other": {"name": "x"}}
+    assert harness.records.load() == []
+
+
+def test_remove_drops_provider_it_created_once_empty(harness: Harness) -> None:
+    service = connect(harness)
+    remove(harness, service)
+    assert "yonga-8000" not in read_file(harness).get("provider", {})
+
+
+def test_remove_keeps_provider_the_user_extended(harness: Harness) -> None:
+    service = connect(harness)
+    edit_file(harness, lambda d: d["provider"]["yonga-8000"].update({"headers": {"a": "b"}}))
+    remove(harness, service)
+    provider = read_file(harness)["provider"]["yonga-8000"]
+    assert provider["models"] == {}
+    assert provider["headers"] == {"a": "b"}
+
+
+def test_remove_keeps_an_edited_entry(harness: Harness) -> None:
+    service = connect(harness)
+    edit_file(
+        harness,
+        lambda d: d["provider"]["yonga-8000"]["models"][ARTIFACT]["limit"].update(context=1),
+    )
+    before = harness.config_path.read_bytes()
+    plan = remove(harness, service)
+    assert plan.action.value == "not_connected"
+    assert plan.kept == [("yonga-8000", ARTIFACT, "edited since yonga wrote it")]
+    assert harness.config_path.read_bytes() == before
+    assert len(harness.records.load()) == 1
+
+
+def test_remove_without_record_is_not_connected_and_writes_nothing(harness: Harness) -> None:
+    service = harness.service()
+    plan = service.plan_remove(ARTIFACT, config_path=harness.config_path)
+    assert plan.action.value == "not_connected"
+    assert plan.removed == [] and plan.kept == [] and plan.stale == []
+    service.apply_remove(plan)
+    assert not harness.config_path.exists()
+
+
+def test_remove_after_artifact_deleted_works(harness: Harness) -> None:
+    connect(harness)
+
+    def gone(reference: str, device: str | None) -> Any:
+        raise AssertionError("must not open a session")
+
+    def listing() -> Any:
+        raise AssertionError("must not list artifacts")
+
+    service = ConnectService(
+        open_session=gone,
+        artifacts=listing,
+        tool_families=[],
+        records=harness.records,
+        default_max_new_tokens=4096,
+        env={},
+    )
+    plan = remove(harness, service)
+    assert plan.removed == [("yonga-8000", ARTIFACT)]
+    assert "yonga-8000" not in read_file(harness).get("provider", {})
+
+
+def test_remove_both_ports(harness: Harness) -> None:
+    connect(harness)
+    connect(harness, endpoint=Endpoint(port=8001))
+    service = harness.service()
+    plan = remove(harness, service)
+    assert sorted(plan.removed) == [("yonga-8000", ARTIFACT), ("yonga-8001", ARTIFACT)]
+    assert read_file(harness).get("provider", {}) == {}
+    assert harness.records.load() == []
+
+
+def test_remove_clears_stale_records(harness: Harness) -> None:
+    service = connect(harness)
+    edit_file(harness, lambda d: d["provider"]["yonga-8000"]["models"].clear())
+    before = harness.config_path.read_bytes()
+    plan = service.plan_remove(ARTIFACT, config_path=harness.config_path)
+    assert plan.action.value == "not_connected"
+    assert len(plan.stale) == 1
+    service.apply_remove(plan)
+    assert harness.config_path.read_bytes() == before
+    assert harness.records.load() == []
+
+
+def test_is_connected(harness: Harness) -> None:
+    service = harness.service()
+    assert service.is_connected(ARTIFACT) is False
+    service = connect(harness)
+    assert service.is_connected(ARTIFACT) is True
+    assert service.is_connected("nope") is False
+    remove(harness, service)
+    assert service.is_connected(ARTIFACT) is False
+
+
+def two_artifacts(harness: Harness) -> ConnectService:
+    service = connect(harness)
+    harness.add_session("second")
+    connect(harness, "second")
+    return service
+
+
+def test_remove_creator_first_then_other_drops_provider(harness: Harness) -> None:
+    service = two_artifacts(harness)
+    remove(harness, service, ARTIFACT)
+    provider = read_file(harness)["provider"]["yonga-8000"]
+    assert set(provider["models"]) == {"second"}
+    (record,) = harness.records.load()
+    assert record.artifact_id == "second"
+    assert record.created_provider is True
+    assert record.provider_fields is not None
+    remove(harness, service, "second")
+    assert "yonga-8000" not in read_file(harness).get("provider", {})
+    assert harness.records.load() == []
+
+
+def test_remove_other_first_then_creator_drops_provider(harness: Harness) -> None:
+    service = two_artifacts(harness)
+    remove(harness, service, "second")
+    assert set(read_file(harness)["provider"]["yonga-8000"]["models"]) == {ARTIFACT}
+    remove(harness, service, ARTIFACT)
+    assert "yonga-8000" not in read_file(harness).get("provider", {})
+
+
+def test_remove_in_either_order_keeps_provider_the_user_extended(harness: Harness) -> None:
+    service = two_artifacts(harness)
+    edit_file(harness, lambda d: d["provider"]["yonga-8000"].update({"headers": {"a": "b"}}))
+    remove(harness, service, ARTIFACT)
+    remove(harness, service, "second")
+    provider = read_file(harness)["provider"]["yonga-8000"]
+    assert provider["models"] == {}
+    assert provider["headers"] == {"a": "b"}
