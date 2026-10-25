@@ -95,6 +95,7 @@ from yonga.ui import tables
 from yonga.ui.chat_tui import ChatCommandKind, ChatSessionInfo, ChatView, parse_command
 from yonga.ui.console import YongaConsole, fallback_command, human_bytes
 from yonga.ui.progress import RichProgressSink
+from yonga.util.net import is_loopback, url_host
 from yonga.util.redaction import redact_text
 
 __all__ = ["CliState", "app", "cli_state", "main"]
@@ -1578,7 +1579,7 @@ def _serve(
     _require_port(host, port)
     api_key = os.environ.get(API_KEY_ENV) or None
     console = state.console
-    if not _is_loopback(host):
+    if not is_loopback(host):
         warning = f"Binding {host} makes the model reachable from other machines."
         if api_key is None:
             warning += f" No {API_KEY_ENV} is set, so anyone who can reach it can use it."
@@ -1595,7 +1596,7 @@ def _serve(
     )
     try:
         server.load()
-        url = f"http://{_url_host(host)}:{port}/v1"
+        url = f"http://{url_host(host)}:{port}/v1"
         console.print(
             Text.assemble(
                 "Serving ",
@@ -1885,21 +1886,6 @@ def _run_http(app_instance: object, *, host: str, port: int, verbose: bool) -> N
         log_level="info" if verbose else "warning",
         access_log=verbose,
     )
-
-
-def _is_loopback(host: str) -> bool:
-    import ipaddress
-
-    if host.strip().lower() == "localhost":
-        return True
-    try:
-        return ipaddress.ip_address(host.strip("[]")).is_loopback
-    except ValueError:
-        return False
-
-
-def _url_host(host: str) -> str:
-    return f"[{host}]" if ":" in host and not host.startswith("[") else host
 
 
 def _require_port(host: str, port: int) -> None:

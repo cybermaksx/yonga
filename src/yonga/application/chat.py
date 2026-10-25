@@ -1427,6 +1427,11 @@ class ChatSession:
         return self._device
 
     @property
+    def runtime_properties(self) -> Mapping[str, str]:
+        """The OpenVINO properties the runtime is compiled with (a copy)."""
+        return dict(self._properties)
+
+    @property
     def pipeline(self) -> PipelineKind:
         """Whether this artifact is driven as an LLM or a VLM."""
         return self._pipeline

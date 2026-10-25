@@ -21,9 +21,10 @@ Nothing here prints, asks a question or touches ``sys.argv``.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import os
+from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, overload, runtime_checkable
 
 from yonga.adapters import (
     CommandRunner,
@@ -42,9 +43,15 @@ from yonga.application.artifact_refs import artifact_not_found
 from yonga.application.artifacts import ArtifactStore
 from yonga.application.benchmark import BenchmarkService
 from yonga.application.benchmark import RuntimeFactory as BenchmarkRuntimeFactory
-from yonga.application.chat import ChatService
+from yonga.application.chat import ChatOptions, ChatService
 from yonga.application.chat import RuntimeFactory as ChatRuntimeFactory
 from yonga.application.compile_cache import CompileCacheService
+from yonga.application.connect import (
+    RECORD_FILENAME,
+    ConnectionRecords,
+    ConnectService,
+    SessionView,
+)
 from yonga.application.doctor import DoctorService
 from yonga.application.inspect_model import InspectService
 from yonga.application.prepare import PrepareService, SmokeTester
@@ -71,7 +78,7 @@ from yonga.registry.resolver import RegistryResolver, installed_registry_version
 from yonga.registry.schema import Registry, RegistryDocument
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Mapping
 
     from yonga.adapters.system_linux import DeviceSnapshot
     from yonga.application.evaluation import EvaluationService
@@ -643,6 +650,28 @@ class Wiring:
             progress=progress,
         )
 
+    def connect_service(self) -> ConnectService:
+        """Build the ``yonga connect`` service; nothing is opened until it is used.
+
+        The session and the artifact list are lazy callables, and the tool-capable
+        families are read from the registry on first use, so a test's wiring that
+        never connects an artifact never loads the registry here.
+        """
+
+        def open_session(reference: str, device: str | None) -> SessionView:
+            return self.chat_service(command="serve").open_session(
+                reference, options=ChatOptions(device=device, command="serve")
+            )
+
+        return ConnectService(
+            open_session=open_session,
+            artifacts=lambda: self.artifact_store().list_artifacts(),
+            tool_families=_LazyFamilies(self.registry),
+            records=ConnectionRecords(self.paths.data_dir / RECORD_FILENAME),
+            default_max_new_tokens=self._settings.max_new_tokens,
+            env=os.environ,
+        )
+
     def benchmark_service(self) -> BenchmarkService:
         """Build the ``yonga bench`` service."""
         resolver = self.registry_resolver()
@@ -657,6 +686,36 @@ class Wiring:
             self._settings,
             classifier=classify,
         )
+
+
+class _LazyFamilies(Sequence[str]):
+    """The model types whose chat profile declares tool calling, read on first use."""
+
+    def __init__(self, registry: Callable[[], Registry]) -> None:
+        self._registry = registry
+        self._names: list[str] | None = None
+
+    def _load(self) -> list[str]:
+        if self._names is None:
+            self._names = sorted(
+                {
+                    name
+                    for rule in self._registry().chat
+                    if rule.tool_calling is not None
+                    for name in rule.match.model_types
+                }
+            )
+        return self._names
+
+    @overload
+    def __getitem__(self, index: int) -> str: ...
+    @overload
+    def __getitem__(self, index: slice) -> Sequence[str]: ...
+    def __getitem__(self, index: int | slice) -> str | Sequence[str]:
+        return self._load()[index]
+
+    def __len__(self) -> int:
+        return len(self._load())
 
 
 #: Builds an adapter graph from resolved settings. The CLI accepts one of these
