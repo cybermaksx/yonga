@@ -15,6 +15,8 @@ from yonga.adapters.opencode_config import (
     OPENCODE_SCHEMA_URL,
     check_provider,
     default_config_path,
+    merge_provider_fields,
+    provider_fields_in,
     read_config,
     render,
     with_model,
@@ -152,6 +154,47 @@ def test_with_model_replaces_entry_and_provider_fields() -> None:
     assert provider["options"]["baseURL"] == "http://127.0.0.1:9000/v1"
     assert provider["models"] == {"qwen": {"name": "New"}}
     assert first["provider"]["yonga-8000"]["models"]["qwen"] == ENTRY
+
+
+def test_with_model_merges_into_an_existing_provider_key_by_key() -> None:
+    original: dict[str, Any] = {
+        "provider": {
+            "yonga-8000": {
+                "npm": "@ai-sdk/openai-compatible",
+                "name": "My local",
+                "options": {
+                    "baseURL": "http://127.0.0.1:8000/v1",
+                    "timeout": 600000,
+                    "headers": {"X-A": "1"},
+                    "apiKey": "{env:YONGA_API_KEY}",
+                },
+                "models": {"mine": {"name": "x"}},
+            }
+        }
+    }
+    fields = {"npm": "@ai-sdk/openai-compatible", "options": {"baseURL": "http://h:1/v1"}}
+    provider = with_model(original, "yonga-8000", fields, "qwen", ENTRY)["provider"]["yonga-8000"]
+    assert provider["name"] == "My local"
+    assert provider["options"] == {
+        "baseURL": "http://h:1/v1",
+        "timeout": 600000,
+        "headers": {"X-A": "1"},
+        "apiKey": "{env:YONGA_API_KEY}",
+    }
+    assert list(provider["models"]) == ["mine", "qwen"]
+
+
+def test_merge_and_projection_of_provider_fields() -> None:
+    current: dict[str, Any] = {"npm": "x", "name": "n", "options": {"timeout": 1}}
+    fields = {"npm": "y", "options": {"baseURL": "u"}}
+    assert provider_fields_in(current, fields) == {"npm": "x", "options": {}}
+    assert merge_provider_fields(current, fields) == {
+        "npm": "y",
+        "name": "n",
+        "options": {"timeout": 1, "baseURL": "u"},
+    }
+    assert current == {"npm": "x", "name": "n", "options": {"timeout": 1}}
+    assert provider_fields_in({}, fields) == {}
 
 
 def test_without_model_keeps_provider_with_other_models() -> None:

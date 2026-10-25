@@ -50,6 +50,8 @@ __all__ = [
     "ConfigSnapshot",
     "check_provider",
     "default_config_path",
+    "merge_provider_fields",
+    "provider_fields_in",
     "read_config",
     "render",
     "with_model",
@@ -224,16 +226,55 @@ def with_model(
 
     ``$schema`` is added first only to an empty document. A missing provider is
     created with ``provider_fields`` first and ``models`` after them; an existing
-    one gets those fields updated in place. Existing key order is kept and new
-    keys are appended. The input must have passed :func:`check_provider`.
+    one has them merged in by :func:`merge_provider_fields`, so a key the user
+    added (``options.timeout``, ``headers``) stays. Existing key order is kept
+    and new keys are appended. The input must have passed :func:`check_provider`.
     """
     result: dict[str, Any] = copy.deepcopy(dict(document))
     if not result:
         result["$schema"] = OPENCODE_SCHEMA_URL
     providers = result.setdefault("provider", {})
-    provider = providers.setdefault(key, {})
-    provider.update(copy.deepcopy(dict(provider_fields)))
+    provider = merge_provider_fields(providers.get(key, {}), provider_fields)
     provider.setdefault("models", {})[model_id] = copy.deepcopy(dict(entry))
+    providers[key] = provider
+    return result
+
+
+def merge_provider_fields(provider: Mapping[str, Any], fields: Mapping[str, Any]) -> dict[str, Any]:
+    """A deep copy of ``provider`` with ``fields`` written over it, one level deep.
+
+    A field whose value is an object is merged key by key into the provider's
+    object of that name (``options.baseURL`` is set, ``options.timeout`` stays);
+    any other field replaces the provider's value. Nothing is ever removed.
+    """
+    result: dict[str, Any] = copy.deepcopy(dict(provider))
+    for name, value in fields.items():
+        current = result.get(name)
+        if isinstance(value, Mapping) and isinstance(current, dict):
+            current.update(copy.deepcopy(dict(value)))
+        else:
+            result[name] = copy.deepcopy(value)
+    return result
+
+
+def provider_fields_in(provider: Mapping[str, Any], fields: Mapping[str, Any]) -> dict[str, Any]:
+    """What ``provider`` holds now at the places ``fields`` would write.
+
+    The counterpart of :func:`merge_provider_fields`: comparing the result with
+    ``fields`` tells whether the merge would change anything, and the two are
+    the "before" and "after" shown to the user. Absent keys are left out.
+    """
+    result: dict[str, Any] = {}
+    for name, value in fields.items():
+        if name not in provider:
+            continue
+        current = provider[name]
+        if isinstance(value, Mapping) and isinstance(current, Mapping):
+            result[name] = {
+                inner: copy.deepcopy(current[inner]) for inner in value if inner in current
+            }
+        else:
+            result[name] = copy.deepcopy(current)
     return result
 
 

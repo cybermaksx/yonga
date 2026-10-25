@@ -3134,14 +3134,20 @@ def _connect_opencode(
         console.print(f"{plan.artifact_id} is already connected in {path}.")
     else:
         console.print(f"Target  {path}")
-        if plan.action is ConnectAction.ADDED:
-            if plan.created_provider:
-                console.print(f"  + provider.{key} → {endpoint.base_url}")
+        if plan.created_provider:
+            console.print(f"  + provider.{key} → {endpoint.base_url}")
+        elif plan.provider_changed:
+            console.print(f"  ~ provider.{key}")
+            console.print(
+                f"    before {json.dumps(plan.previous_provider_fields, ensure_ascii=False)}"
+            )
+            console.print(f"    after  {json.dumps(plan.provider_fields, ensure_ascii=False)}")
+        if plan.previous_entry is None:
             parts = [f"context {limit['context']}", f"output {limit['output']}"]
             if "input" in limit:
                 parts.append(f"input {limit['input']}")
             console.print(f"  + model {plan.artifact_id} ({', '.join(parts)})")
-        else:
+        elif plan.previous_entry != plan.entry:
             console.print(f"  ~ model {plan.artifact_id}")
             console.print(f"    before {json.dumps(plan.previous_entry, ensure_ascii=False)}")
             console.print(f"    after  {json.dumps(plan.entry, ensure_ascii=False)}")

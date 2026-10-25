@@ -758,8 +758,13 @@ answers to. `limit.context` is `max_position_embeddings` from the artifact's `co
 `recommended_runtime.max_new_tokens`, else the configured `max_new_tokens`. When the prompt length
 is fixed (and passed check 4), `limit.input` is `MAX_PROMPT_LEN` and `limit.context` defaults to
 that plus `limit.output`. When `YONGA_API_KEY` is set, `options.apiKey` is `{env:YONGA_API_KEY}`;
-the key itself is never written. Outcomes: `added`, `updated` (the difference is shown before the
-question), `already_connected` (nothing written, no question).
+the key itself is never written. A provider that already exists is merged into key by key: yonga
+sets `npm`, `options.baseURL` and, when `YONGA_API_KEY` is set, `options.apiKey`; the provider's
+`name`, an `options.apiKey` already there and every other key stay as they are (`name` is written
+only into a provider yonga creates). Outcomes: `added`, `updated` (the model entry or one of the
+provider fields yonga writes differs; each difference is shown as before and after lines before the
+question, also for `added` into an existing provider), `already_connected` (nothing yonga writes
+would change; nothing written, no question).
 
 **The file.** Parsed with the standard `json` module. JSONC (comments, trailing commas), a broken
 file, a root, `provider` or `provider.yonga-…`.`models` that is not an object is exit 70

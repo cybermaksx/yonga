@@ -40,6 +40,8 @@ from pydantic import BaseModel, ValidationError
 from yonga.adapters.opencode_config import (
     ConfigSnapshot,
     check_provider,
+    merge_provider_fields,
+    provider_fields_in,
     read_config,
     render,
     with_model,
@@ -245,9 +247,20 @@ class ConnectPlan:
     entry: dict[str, Any]
     previous_entry: dict[str, Any] | None
     provider_fields: dict[str, Any]
+    """The provider fields this connection writes (``name`` only into a new provider)."""
+    previous_provider_fields: dict[str, Any] | None
+    """What the existing provider held at those places; ``None`` for a new provider."""
     document: dict[str, Any]
     created_provider: bool
     serve_command: str
+
+    @property
+    def provider_changed(self) -> bool:
+        """True when writing changes a field of an existing provider."""
+        return (
+            self.previous_provider_fields is not None
+            and self.previous_provider_fields != self.provider_fields
+        )
 
 
 class RemoveAction(str, Enum):
@@ -340,20 +353,20 @@ class ConnectService:
             "tool_call": True,
             "limit": limit,
         }
+        key = endpoint.provider_key
         options: dict[str, Any] = {"baseURL": endpoint.base_url}
         if self._env.get(_API_KEY_ENV):
             options["apiKey"] = "{env:" + _API_KEY_ENV + "}"
-        provider_fields: dict[str, Any] = {
+        new_provider: dict[str, Any] = {
             "npm": _PROVIDER_NPM,
             "name": f"yonga ({endpoint.label})",
             "options": options,
         }
-        key = endpoint.provider_key
         try:
             snapshot = read_config(config_path)
             check_provider(snapshot.document, key)
         except ConfigurationError as error:
-            extended = _with_snippet(error, key, provider_fields, artifact_id, entry)
+            extended = _with_snippet(error, key, new_provider, artifact_id, entry)
             if extended is error:
                 raise
             raise extended from error
@@ -362,12 +375,18 @@ class ConnectService:
         models = provider.get("models") if isinstance(provider, Mapping) else None
         previous = models.get(artifact_id) if isinstance(models, Mapping) else None
         previous_entry = dict(previous) if isinstance(previous, Mapping) else None
+        if isinstance(provider, Mapping):
+            # An existing provider keeps its name and every key yonga does not write.
+            provider_fields = {
+                field: value for field, value in new_provider.items() if field != "name"
+            }
+            previous_fields: dict[str, Any] | None = provider_fields_in(provider, provider_fields)
+        else:
+            provider_fields, previous_fields = new_provider, None
+        provider_changed = previous_fields is not None and previous_fields != provider_fields
         if previous is None:
             action = ConnectAction.ADDED
-        elif previous == entry and all(
-            isinstance(provider, Mapping) and provider.get(name) == value
-            for name, value in provider_fields.items()
-        ):
+        elif previous == entry and not provider_changed:
             action = ConnectAction.ALREADY_CONNECTED
         else:
             action = ConnectAction.UPDATED
@@ -379,6 +398,7 @@ class ConnectService:
             entry=entry,
             previous_entry=previous_entry,
             provider_fields=provider_fields,
+            previous_provider_fields=previous_fields,
             document=with_model(snapshot.document, key, provider_fields, artifact_id, entry),
             created_provider=provider is None,
             serve_command=_serve_command(artifact_id, endpoint, device),
@@ -406,11 +426,13 @@ class ConnectService:
                 records.append(item)
             elif item.created_provider:
                 # A re-run replaces the record but not the fact that yonga made the
-                # provider; the fields are those just written.
+                # provider; the fields are those it wrote then, with today's on top.
                 record = record.model_copy(
                     update={
                         "created_provider": True,
-                        "provider_fields": dict(plan.provider_fields),
+                        "provider_fields": merge_provider_fields(
+                            item.provider_fields or {}, plan.provider_fields
+                        ),
                     }
                 )
         records.append(record)

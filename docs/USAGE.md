@@ -417,7 +417,8 @@ tokens (`connect.opencode.prompt_too_short`): that is every built-in NPU profile
 message names a GPU or CPU artifact of the same model to use instead. A file with comments or
 trailing commas (JSONC) is not rewritten (`connect.opencode.config_not_json`); add the provider by
 hand from the JSON printed. `YONGA_API_KEY`, when set, is referenced as `{env:YONGA_API_KEY}`,
-never written.
+never written. Into a provider you already have, yonga writes only `npm`, `options.baseURL` and
+`options.apiKey`; its name and your other options stay.
 
 ```bash
 yonga connect opencode --remove 073d5d7c8ea75283        # works after `yonga remove` too

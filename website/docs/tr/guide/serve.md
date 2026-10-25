@@ -233,7 +233,7 @@ OpenCode yapıtı kullanamayacaksa yonga reddeder ve hiçbir şey yazmaz. OpenCo
 - İstem uzunluğu 8192 belirtecin altında sabitlenmiş bir yapıt reddedilir (`connect.opencode.prompt_too_short`). Yerleşik NPU profillerinin hepsi 1024'te sabittir. Aynı modelin bir GPU ya da CPU yapıtını kullanın; ileti birini adıyla gösterir.
 - Yorum ya da sondaki virgül içeren (JSONC) bir yapılandırma dosyası yeniden yazılmaz (`connect.opencode.config_not_json`). Yazdırdığı JSON'dan sağlayıcıyı elle ekleyin.
 
-`YONGA_API_KEY` tanımlıysa kayıt ona `{env:YONGA_API_KEY}` olarak başvurur; anahtarın kendisi hiçbir zaman yazılmaz.
+`YONGA_API_KEY` tanımlıysa kayıt ona `{env:YONGA_API_KEY}` olarak başvurur; anahtarın kendisi hiçbir zaman yazılmaz. Zaten var olan bir sağlayıcıya yonga yalnızca `npm`, `options.baseURL` ve `options.apiKey` alanlarını yazar; sağlayıcının adı ve sizin eklediğiniz diğer seçenekler olduğu gibi kalır.
 
 ```bash
 yonga connect opencode --remove 073d5d7c8ea75283

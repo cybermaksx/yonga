@@ -363,6 +363,86 @@ def test_rerun_that_changes_provider_fields_keeps_ownership(harness: Harness) ->
     assert record.provider_fields["options"]["apiKey"] == "{env:YONGA_API_KEY}"
 
 
+def write_config(harness: Harness, document: dict[str, Any]) -> None:
+    harness.config_path.parent.mkdir(parents=True, exist_ok=True)
+    harness.config_path.write_text(render(document), encoding="utf-8")
+
+
+def test_connect_into_existing_provider_keeps_user_options_and_name(harness: Harness) -> None:
+    write_config(
+        harness,
+        {
+            "provider": {
+                "yonga-8000": {
+                    "npm": "@ai-sdk/openai-compatible",
+                    "name": "My local",
+                    "options": {
+                        "baseURL": "http://127.0.0.1:8000/v1",
+                        "timeout": 600000,
+                        "headers": {"X-A": "1"},
+                    },
+                    "models": {"mine": {"name": "x"}},
+                }
+            }
+        },
+    )
+    service = harness.service()
+    plan = harness.plan(service)
+    assert plan.action is ConnectAction.ADDED
+    assert plan.created_provider is False
+    assert "name" not in plan.provider_fields
+    assert plan.previous_provider_fields == plan.provider_fields
+    service.apply(plan)
+    provider = json.loads(harness.config_path.read_text())["provider"]["yonga-8000"]
+    assert provider["name"] == "My local"
+    assert provider["options"] == {
+        "baseURL": "http://127.0.0.1:8000/v1",
+        "timeout": 600000,
+        "headers": {"X-A": "1"},
+    }
+    assert set(provider["models"]) == {"mine", ARTIFACT}
+
+
+def test_connect_without_api_key_keeps_an_existing_api_key(harness: Harness) -> None:
+    keyed = harness.service(env={"YONGA_API_KEY": "s"})
+    keyed.apply(harness.plan(keyed))
+    harness.add_session("second")
+    plain = harness.service()
+    plan = harness.plan(plain, reference="second")
+    assert plan.action is ConnectAction.ADDED
+    plain.apply(plan)
+    options = json.loads(harness.config_path.read_text())["provider"]["yonga-8000"]["options"]
+    assert options["apiKey"] == "{env:YONGA_API_KEY}"
+
+
+def test_rerun_without_api_key_after_one_is_already_connected(harness: Harness) -> None:
+    keyed = harness.service(env={"YONGA_API_KEY": "s"})
+    keyed.apply(harness.plan(keyed))
+    assert harness.plan().action is ConnectAction.ALREADY_CONNECTED
+
+
+def test_api_key_newly_set_is_updated_with_the_provider_change(harness: Harness) -> None:
+    connect(harness)
+    plan = harness.plan(harness.service(env={"YONGA_API_KEY": "s"}))
+    assert plan.action is ConnectAction.UPDATED
+    assert plan.previous_entry == plan.entry
+    assert plan.previous_provider_fields == {
+        "npm": "@ai-sdk/openai-compatible",
+        "options": {"baseURL": "http://127.0.0.1:8000/v1"},
+    }
+    assert plan.provider_fields == {
+        "npm": "@ai-sdk/openai-compatible",
+        "options": {"baseURL": "http://127.0.0.1:8000/v1", "apiKey": "{env:YONGA_API_KEY}"},
+    }
+    assert plan.provider_changed is True
+
+
+def test_new_provider_has_no_previous_fields(harness: Harness) -> None:
+    plan = harness.plan()
+    assert plan.previous_provider_fields is None
+    assert plan.provider_changed is False
+
+
 def test_gpu_artifact_is_found_by_resolved_source(harness: Harness) -> None:
     session = harness.sessions[ARTIFACT]
     session.device = "NPU"

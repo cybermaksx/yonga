@@ -47,6 +47,11 @@ def session_in(tmp_path: Path, artifact_id: str = ARTIFACT, **fields: Any) -> Fa
     return FakeSession(directory, **fields)
 
 
+def squeeze(text: str) -> str:
+    """``text`` without any whitespace: rich wraps long paths mid-word."""
+    return "".join(text.split())
+
+
 @pytest.fixture
 def runner() -> CliRunner:
     return CliRunner()
@@ -178,6 +183,44 @@ def test_connect_updated_shows_before_and_after(
     assert "after" in result.stdout
     models = json.loads(config.read_text(encoding="utf-8"))["provider"][PROVIDER]["models"]
     assert models[ARTIFACT]["limit"]["context"] == 9999
+
+
+def test_connect_into_a_changed_provider_shows_the_provider_change(
+    runner: CliRunner, home: Path, tmp_path: Path, config: Path
+) -> None:
+    config.parent.mkdir(parents=True)
+    provider = {"npm": "other", "name": "Mine", "options": {"timeout": 5}, "models": {}}
+    config.write_text(json.dumps({"provider": {PROVIDER: provider}}), encoding="utf-8")
+    result = connect(runner, home, tmp_path, config, "--yes")
+    assert result.exit_code == 0, result.output
+    out = squeeze(result.stdout)
+    assert squeeze(f"~ provider.{PROVIDER}") in out
+    assert squeeze('before {"npm": "other", "options": {}}') in out
+    assert squeeze(f"+ model {ARTIFACT}") in out
+    written = json.loads(config.read_text(encoding="utf-8"))["provider"][PROVIDER]
+    assert written["name"] == "Mine"
+    assert written["options"] == {"timeout": 5, "baseURL": "http://127.0.0.1:8000/v1"}
+
+
+def test_connect_updated_provider_only_shows_no_model_change(
+    runner: CliRunner, home: Path, tmp_path: Path, config: Path
+) -> None:
+    assert connect(runner, home, tmp_path, config, "--yes").exit_code == 0
+    document = json.loads(config.read_text(encoding="utf-8"))
+    document["provider"][PROVIDER]["npm"] = "other"
+    config.write_text(json.dumps(document), encoding="utf-8")
+    result = connect(runner, home, tmp_path, config, "--yes", "--json")
+    assert one_document(result)["action"] == "updated"
+    result = connect(runner, home, tmp_path, config, "--yes")
+    assert "already connected" in result.stdout
+    config.write_text(json.dumps(document), encoding="utf-8")
+    result = connect(runner, home, tmp_path, config, "--yes")
+    out = squeeze(result.stdout)
+    assert squeeze(f"~ provider.{PROVIDER}") in out
+    assert "~ model" not in result.stdout
+    assert json.loads(config.read_text(encoding="utf-8"))["provider"][PROVIDER]["npm"] == (
+        "@ai-sdk/openai-compatible"
+    )
 
 
 def test_connect_tool_less_exits_seventy_with_suggestion(

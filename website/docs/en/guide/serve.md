@@ -233,7 +233,7 @@ yonga refuses, and writes nothing, when OpenCode could not use the artifact. Ope
 - An artifact whose prompt length is fixed under 8192 tokens is refused (`connect.opencode.prompt_too_short`). Every built-in NPU profile is fixed at 1024. Use a GPU or CPU artifact of the same model; the message names one.
 - A config file with comments or trailing commas (JSONC) is not rewritten (`connect.opencode.config_not_json`). Add the provider by hand from the JSON it prints.
 
-When `YONGA_API_KEY` is set, the entry refers to it as `{env:YONGA_API_KEY}`; the key itself is never written.
+When `YONGA_API_KEY` is set, the entry refers to it as `{env:YONGA_API_KEY}`; the key itself is never written. Into a provider you already have, yonga writes only `npm`, `options.baseURL` and `options.apiKey`; the provider's name and your other options stay.
 
 ```bash
 yonga connect opencode --remove 073d5d7c8ea75283
