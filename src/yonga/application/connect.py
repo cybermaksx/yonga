@@ -374,7 +374,19 @@ class ConnectService:
             provider_fields=dict(plan.provider_fields) if plan.created_provider else None,
             written_at=datetime.now(UTC),
         )
-        records = [item for item in self._records.load() if not item.same_connection(record)]
+        records = []
+        for item in self._records.load():
+            if not item.same_connection(record):
+                records.append(item)
+            elif item.created_provider:
+                # A re-run replaces the record but not the fact that yonga made the
+                # provider; the fields are those just written.
+                record = record.model_copy(
+                    update={
+                        "created_provider": True,
+                        "provider_fields": dict(plan.provider_fields),
+                    }
+                )
         records.append(record)
         return ConnectResult(created_config, self._records.save(records))
 
@@ -439,6 +451,7 @@ class ConnectService:
         if length >= OPENCODE_MIN_PROMPT_TOKENS:
             return length
         repo_id = manifest.requested_model.repo_id if manifest is not None else ""
+        source_id = manifest.resolved_source.repo_id if manifest is not None else ""
         raise ConfigurationError(
             diagnostic(
                 "connect.opencode.prompt_too_short",
@@ -448,16 +461,16 @@ class ConnectService:
                 f"tokens. OpenCode's first request is {OPENCODE_MIN_PROMPT_TOKENS} tokens or "
                 "close to it (5261 measured with OpenCode 2.1.2 in an empty home, 8514 with "
                 f"skills and an AGENTS.md), so it needs at least {OPENCODE_MIN_PROMPT_TOKENS}.",
-                remediation=[self._longer_prompt_advice(repo_id)],
+                remediation=[self._longer_prompt_advice(repo_id, source_id)],
             )
         )
 
-    def _longer_prompt_advice(self, repo_id: str) -> str:
+    def _longer_prompt_advice(self, repo_id: str, source_id: str) -> str:
         """Name a prepared GPU or CPU artifact of the same model, else how to prepare one."""
         for summary in self._artifacts():
             if (
                 summary.ready
-                and summary.repo_id == repo_id
+                and summary.repo_id == source_id
                 and (summary.recommended_device or "").upper() in {"GPU", "CPU"}
             ):
                 return f"Use the {summary.recommended_device} artifact: " + (

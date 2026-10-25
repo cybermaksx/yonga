@@ -346,6 +346,37 @@ def test_changed_limits_are_updated_with_previous_entry(harness: Harness) -> Non
     service.apply(second)
     (record,) = harness.records.load()
     assert record.model["limit"]["context"] == 8192
+    assert record.created_provider is True
+    assert record.provider_fields == first.provider_fields
+
+
+def test_rerun_that_changes_provider_fields_keeps_ownership(harness: Harness) -> None:
+    first = harness.plan()
+    harness.service().apply(first)
+    keyed = harness.service(env={"YONGA_API_KEY": "k"})
+    second = harness.plan(keyed)
+    assert second.action is ConnectAction.UPDATED
+    keyed.apply(second)
+    (record,) = harness.records.load()
+    assert record.created_provider is True
+    assert record.provider_fields is not None
+    assert record.provider_fields["options"]["apiKey"] == "{env:YONGA_API_KEY}"
+
+
+def test_gpu_artifact_is_found_by_resolved_source(harness: Harness) -> None:
+    session = harness.sessions[ARTIFACT]
+    session.device = "NPU"
+    session.runtime_properties = {"MAX_PROMPT_LEN": "1024"}
+    manifest = make_manifest()
+    session.manifest = manifest.model_copy(
+        update={
+            "requested_model": ManifestModelRef(repo_id="user/derived", resolved_revision="a" * 40)
+        }
+    )
+    harness.add_session("gpuid")
+    harness.listing = [summary("gpuid")]
+    error = refusal(harness)
+    assert "yonga connect opencode gpuid" in " ".join(error.diagnostic.remediation)
 
 
 def test_second_artifact_in_provider_keeps_provider_untouched(harness: Harness) -> None:
