@@ -239,7 +239,7 @@ OpenCode yapıtı kullanamayacaksa yonga reddeder ve hiçbir şey yazmaz. OpenCo
 yonga connect opencode --remove 073d5d7c8ea75283
 ```
 
-`--remove` yalnızca yonga'nın yazdığı kayıtları siler; `yonga remove` yapıtı sildikten sonra da çalışır. Sonradan elle değiştirdiğiniz bir kayıt bırakılır ve listelenir, komut 70 koduyla çıkar. Yapılandırma dosyası hiçbir zaman silinmez.
+`--remove` yalnızca yonga'nın yazdığı kayıtları siler; `yonga remove` yapıtı sildikten sonra da çalışır. Sonradan elle değiştirdiğiniz bir kayıt bırakılır ve listelenir, komut 70 koduyla çıkar. Yapılandırma dosyası hiçbir zaman silinmez. `--config FILE` ile yapılan bir bağlantı aynı `--config FILE` ile kaldırılır; verilmezse `--remove` bağlantının bulunduğu dosyayı adıyla gösterir, `yonga remove` da komutun tamamını yazdırır.
 
 ## Sınırlar ve reddedilen istekler {#limits}
 

@@ -579,7 +579,7 @@ def test_remove_keeps_an_edited_entry(harness: Harness) -> None:
     )
     before = harness.config_path.read_bytes()
     plan = remove(harness, service)
-    assert plan.action.value == "not_connected"
+    assert plan.action.value == "kept"
     assert plan.kept == [("yonga-8000", ARTIFACT, "edited since yonga wrote it")]
     assert harness.config_path.read_bytes() == before
     assert len(harness.records.load()) == 1
@@ -819,3 +819,43 @@ def test_a_second_bad_record_file_replaces_the_older_backup(tmp_path: Path) -> N
     assert update.written is True
     assert (tmp_path / "records.json.bak").read_text(encoding="utf-8") == "two"
     assert records.save([]).set_aside is None
+
+
+# --- removal without a matching record ---------------------------------------------------
+
+
+def test_remove_without_a_record_does_not_read_the_config(harness: Harness) -> None:
+    harness.config_path.parent.mkdir(parents=True)
+    harness.config_path.write_text("{ // not json", encoding="utf-8")
+    plan = harness.service().plan_remove(ARTIFACT, config_path=harness.config_path)
+    assert plan.action.value == "not_connected"
+    assert plan.snapshot is None
+    assert plan.config == harness.config_path.resolve()
+
+
+def test_remove_names_the_other_configs_that_record_the_artifact(harness: Harness) -> None:
+    connect(harness)
+    elsewhere = harness.tmp_path / "elsewhere.json"
+    plan = harness.service().plan_remove(ARTIFACT, config_path=elsewhere)
+    assert plan.action.value == "not_connected"
+    assert plan.elsewhere == [str(harness.config_path.resolve())]
+    assert not elsewhere.exists()
+
+
+def test_remove_from_a_jsonc_file_says_to_remove_the_entry_by_hand(harness: Harness) -> None:
+    connect(harness)
+    text = "// mine\n" + harness.config_path.read_text(encoding="utf-8")
+    harness.config_path.write_text(text, encoding="utf-8")
+    with pytest.raises(ConfigurationError) as caught:
+        harness.service().plan_remove(ARTIFACT, config_path=harness.config_path)
+    advice = " ".join(caught.value.diagnostic.remediation)
+    assert caught.value.diagnostic.code == "connect.opencode.config_not_json"
+    assert f"provider.yonga-8000.models.{ARTIFACT}" in advice
+    assert "Add the provider" not in advice
+    assert harness.config_path.read_text(encoding="utf-8") == text
+
+
+def test_connected_configs(harness: Harness) -> None:
+    service = connect(harness)
+    assert service.connected_configs(ARTIFACT) == [str(harness.config_path.resolve())]
+    assert service.connected_configs("nope") == []

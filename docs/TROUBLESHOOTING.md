@@ -579,7 +579,7 @@ contract. Every refusal below leaves the OpenCode file exactly as it was.
 | `connect.opencode.tools_unsupported` | `configuration_error` | 70 | OpenCode sends its tools with every request and this artifact's chat profile takes none. | Connect an artifact that does take tools (the message lists some). |
 | `connect.opencode.prompt_too_short` | `configuration_error` | 70 | The artifact's fixed prompt length (every built-in NPU profile: 1024) is under the 8192 tokens OpenCode needs. | Connect a GPU or CPU artifact of the same model, or `yonga prepare MODEL --device gpu`. |
 | `connect.opencode.context_unknown` | `configuration_error` | 70 | The artifact has no `max_position_embeddings`; yonga does not invent a limit. | Pass `--context N`. |
-| `connect.opencode.config_not_json` | `configuration_error` | 70 | The file has comments, trailing commas or a broken body, or `provider` is not an object. | Add the provider by hand (the JSON is printed) or use another file with `--config`. |
+| `connect.opencode.config_not_json` | `configuration_error` | 70 | The file has comments, trailing commas or a broken body, or `provider` is not an object. | Add the provider by hand (the JSON is printed) or use another file with `--config`; for `--remove`, delete the model entry it names by hand. |
 | `connect.opencode.config_not_a_file` | `configuration_error` | 70 | `--config` names a directory. | Pass the file itself. |
 | `connect.opencode.config_changed` | `configuration_error` | 70 | Something else edited the file between reading and writing; nothing was written. | Run the command again. |
 | `connect.opencode.remove_options` | `configuration_error` | 70 | `--remove` was combined with `--host`, `--port`, `--device` or `--context`. | Give only `--config`, `--yes` and `--json` with `--remove`. |
@@ -587,7 +587,9 @@ contract. Every refusal below leaves the OpenCode file exactly as it was.
 | `connect.opencode.declined` | `user_cancelled` | 60 | The question was declined, or could not be asked (no terminal, or `--json` without `--yes`). | Re-run with `--yes`. |
 
 `connect opencode --remove` exiting **70** without a code is not a failure to remove: an entry you
-edited after yonga wrote it is kept, listed with its reason, and the rest is removed.
+edited after yonga wrote it is kept, listed with its reason, and the rest is removed (`--json`
+says `kept` when nothing was removed). `not_connected` for a connection you made means it was made
+in another file: the output names that file and the `--remove ... --config PATH` command.
 
 ## 6. Reading a job log
 

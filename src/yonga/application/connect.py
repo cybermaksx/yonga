@@ -303,6 +303,8 @@ class RemoveAction(str, Enum):
     """What :meth:`ConnectService.apply_remove` will do (or did)."""
 
     REMOVED = "removed"
+    KEPT = "kept"
+    """Recorded entries exist, but every one was edited since and is kept."""
     NOT_CONNECTED = "not_connected"
 
 
@@ -311,7 +313,10 @@ class RemovePlan:
     """What a removal would take out and what it leaves alone."""
 
     action: RemoveAction
-    snapshot: ConfigSnapshot
+    config: Path
+    """The config file, with symbolic links resolved."""
+    snapshot: ConfigSnapshot | None
+    """The file as read; ``None`` when no record named it, so it was not read."""
     document: dict[str, Any]
     removed: list[tuple[str, str]]
     """``(provider, model)`` entries to delete."""
@@ -319,6 +324,8 @@ class RemovePlan:
     """``(provider, model, reason)`` entries left in place."""
     stale: list[ConnectionRecord]
     """Records whose entry is already gone from the file."""
+    elsewhere: list[str]
+    """Other config files the record connects the artifact in."""
 
 
 @dataclass(frozen=True)
@@ -475,17 +482,40 @@ class ConnectService:
     # --- removal -----------------------------------------------------
 
     def plan_remove(self, artifact_id: str, *, config_path: Path) -> RemovePlan:
-        """Decide what to take out of the config; needs the record, never the artifact."""
-        snapshot = read_config(config_path)
-        config = str(snapshot.path)
+        """Decide what to take out of the config; needs the record, never the artifact.
+
+        The record is read first: when it names no connection of the artifact in
+        this file, the answer is ``not_connected`` and the file is not read at all.
+        """
+        config_file = config_path.resolve()
+        config = str(config_file)
         records = self._records.load()
+        mine = [
+            item for item in records if item.config == config and item.artifact_id == artifact_id
+        ]
+        elsewhere = list(
+            dict.fromkeys(
+                item.config
+                for item in records
+                if item.artifact_id == artifact_id and item.config != config
+            )
+        )
+        if not mine:
+            return RemovePlan(
+                RemoveAction.NOT_CONNECTED, config_file, None, {}, [], [], [], elsewhere
+            )
+        try:
+            snapshot = read_config(config_path)
+        except ConfigurationError as error:
+            extended = _for_removal(error, mine)
+            if extended is error:
+                raise
+            raise extended from error
         document = snapshot.document
         removed: list[tuple[str, str]] = []
         kept: list[tuple[str, str, str]] = []
         stale: list[ConnectionRecord] = []
-        for record in records:
-            if record.config != config or record.artifact_id != artifact_id:
-                continue
+        for record in mine:
             current = _recorded_model(document, record.provider, artifact_id)
             if current is None:
                 stale.append(record)
@@ -500,13 +530,14 @@ class ConnectService:
                     artifact_id,
                     drop_provider_when=owner.provider_fields if owner is not None else None,
                 )
+        if removed:
+            action = RemoveAction.REMOVED
+        elif kept:
+            action = RemoveAction.KEPT
+        else:
+            action = RemoveAction.NOT_CONNECTED
         return RemovePlan(
-            action=RemoveAction.REMOVED if removed else RemoveAction.NOT_CONNECTED,
-            snapshot=snapshot,
-            document=document,
-            removed=removed,
-            kept=kept,
-            stale=stale,
+            action, snapshot.path, snapshot, document, removed, kept, stale, elsewhere
         )
 
     def apply_remove(self, plan: RemovePlan) -> RecordUpdate:
@@ -516,9 +547,9 @@ class ConnectService:
         the provider: when the record that created it goes while the provider stays,
         it moves to a remaining record of that provider.
         """
-        if plan.removed:
+        if plan.removed and plan.snapshot is not None:
             write_config(plan.snapshot, plan.document)
-        config = str(plan.snapshot.path)
+        config = str(plan.config)
         gone = {(config, provider, model) for provider, model in plan.removed}
         gone.update((item.config, item.provider, item.artifact_id) for item in plan.stale)
         loaded = self._records.load()
@@ -547,7 +578,15 @@ class ConnectService:
 
     def is_connected(self, artifact_id: str) -> bool:
         """True when the record file lists a connection for the artifact."""
-        return any(item.artifact_id == artifact_id for item in self._records.load())
+        return bool(self.connected_configs(artifact_id))
+
+    def connected_configs(self, artifact_id: str) -> list[str]:
+        """The config files the record connects the artifact in, each once."""
+        return list(
+            dict.fromkeys(
+                item.config for item in self._records.load() if item.artifact_id == artifact_id
+            )
+        )
 
     # --- the checks --------------------------------------------------
 
@@ -769,6 +808,25 @@ def _serve_command(artifact_id: str, endpoint: Endpoint, device: str | None) -> 
     if device is not None:
         parts += ["--device", device]
     return " ".join(parts)
+
+
+def _for_removal(
+    error: ConfigurationError, records: Sequence[ConnectionRecord]
+) -> ConfigurationError:
+    """Say which entries to delete by hand from a file yonga cannot rewrite."""
+    original = error.diagnostic
+    if original.code != "connect.opencode.config_not_json":
+        return error
+    entries = ", ".join(f"`provider.{item.provider}.models.{item.artifact_id}`" for item in records)
+    extended = original.model_copy(
+        update={
+            "remediation": [
+                "Comments and trailing commas (JSONC) cannot be rewritten without losing them.",
+                f"Remove {entries} from the file by hand.",
+            ]
+        }
+    )
+    return ConfigurationError(extended, cause=error.cause)
 
 
 def _with_snippet(

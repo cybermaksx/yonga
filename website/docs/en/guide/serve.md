@@ -239,7 +239,7 @@ When `YONGA_API_KEY` is set, the entry refers to it as `{env:YONGA_API_KEY}`; th
 yonga connect opencode --remove 073d5d7c8ea75283
 ```
 
-`--remove` deletes only the entries yonga wrote, also after `yonga remove` deleted the artifact. An entry you edited since is kept and listed, and the command exits 70. The config file is never deleted.
+`--remove` deletes only the entries yonga wrote, also after `yonga remove` deleted the artifact. An entry you edited since is kept and listed, and the command exits 70. The config file is never deleted. A connection made with `--config FILE` is removed with the same `--config FILE`; without it, `--remove` names the file the connection is in, and `yonga remove` prints the full command.
 
 ## Limits and refusals {#limits}
 

@@ -31,6 +31,7 @@ from __future__ import annotations
 import functools
 import json
 import os
+import shlex
 import sys
 import threading
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -1268,22 +1269,34 @@ def _remove(state: CliState, artifact: str, *, yes: bool) -> ExitCode:
         )
     else:
         console.print(f"Removed {report.artifact_dir} ({human_bytes(report.freed_bytes)} freed).")
-        if _listed_in_opencode(state, report.artifact_id):
+        configs = _opencode_configs(state, report.artifact_id)
+        if report.artifact_id and configs:
             console.print(
                 "This artifact is still listed in OpenCode; remove it there with: "
-                + state.hint(f"yonga connect opencode --remove {report.artifact_id}")
+                + "; ".join(
+                    state.hint(_opencode_remove_command(report.artifact_id, config))
+                    for config in configs
+                )
             )
     return ExitCode.SUCCESS
 
 
-def _listed_in_opencode(state: CliState, artifact_id: str | None) -> bool:
-    """Whether the connection record names the artifact; a record that cannot be read says no."""
+def _opencode_configs(state: CliState, artifact_id: str | None) -> list[str]:
+    """The OpenCode files the connection record names the artifact in; none when unreadable."""
     if not artifact_id:
-        return False
+        return []
     try:
-        return state.graph.connect_service().is_connected(artifact_id)
+        return state.graph.connect_service().connected_configs(artifact_id)
     except Exception:  # a note must never fail the removal it follows
-        return False
+        return []
+
+
+def _opencode_remove_command(artifact_id: str, config: str) -> str:
+    """``yonga connect opencode --remove ID``, with ``--config`` unless it is the default file."""
+    command = f"yonga connect opencode --remove {artifact_id}"
+    if Path(config) != default_config_path(os.environ).resolve():
+        command += f" --config {shlex.quote(config)}"
+    return command
 
 
 # ======================================================================
@@ -3174,7 +3187,7 @@ def _connect_opencode(
         state.emit(
             {
                 "action": plan.action.value,
-                "config": str(path),
+                "config": str(plan.snapshot.path),
                 "created_config": result.created_config,
                 "provider": key,
                 "created_provider": written and plan.created_provider,
@@ -3252,7 +3265,7 @@ def _disconnect_opencode(
         state.emit(
             {
                 "action": plan.action.value,
-                "config": str(path),
+                "config": str(plan.config),
                 "removed": [{"provider": p, "model": m} for p, m in plan.removed],
                 "kept": [{"provider": p, "model": m, "reason": r} for p, m, r in plan.kept],
                 "record_written": recorded.written,
@@ -3260,8 +3273,13 @@ def _disconnect_opencode(
             }
         )
         return code
-    if plan.action is RemoveAction.NOT_CONNECTED and not plan.kept:
+    if plan.action is RemoveAction.NOT_CONNECTED:
         console.print(f"{artifact} is not connected in {path}.")
+        for other in plan.elsewhere:
+            console.print(
+                f"It is connected in {other}; remove it there with: "
+                + state.hint(_opencode_remove_command(artifact, other))
+            )
     for provider, model in plan.removed:
         console.print(f"Removed {model} from {provider} in {path}.")
     for provider, model, reason in plan.kept:

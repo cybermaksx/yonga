@@ -425,7 +425,9 @@ yonga connect opencode --remove 073d5d7c8ea75283        # works after `yonga rem
 ```
 
 `--remove` deletes only the entries yonga wrote. An entry you edited since is kept and listed, and
-the command then exits 70. The file is never deleted.
+the command then exits 70. The file is never deleted. A connection made with `--config FILE` is
+removed with the same `--config FILE`; without it, `--remove` names the file the connection is in,
+and `yonga remove` prints the full command.
 
 ## 5. Ask the registry why
 

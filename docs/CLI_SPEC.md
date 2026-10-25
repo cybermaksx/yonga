@@ -795,13 +795,19 @@ A model entry identical to the recorded one is removed. One the user edited is k
 lists it with the reason in text and in the JSON `kept` list, and exits 70 after removing the rest
 (there is no separate code). The provider goes too when yonga created it, no models are left and
 its other fields are still what yonga wrote. Record entries are dropped for what was removed and
-for entries whose model is already gone. No record entry is `not_connected`, exit 0.
-`yonga remove ARTIFACT` does not touch OpenCode's configuration; when the record names the
-artifact it prints the `connect opencode --remove ID` command.
+for entries whose model is already gone. When every recorded entry was kept the action is `kept`
+(exit 70). The record is read before the file: no record entry for this file is `not_connected`,
+exit 0, without reading the file, and when the record connects the artifact in other files the
+output names each with its `connect opencode --remove ID --config PATH` command. A file that is not
+plain JSON is `connect.opencode.config_not_json`, naming the `provider.KEY.models.ID` entries to
+remove by hand. `yonga remove ARTIFACT` does not touch OpenCode's configuration; when the record
+names the artifact it prints the `connect opencode --remove ID` command, with `--config PATH` when
+the recorded file is not the default one.
 
 `--json` for a connection: `action`, `config`, `created_config`, `provider`, `created_provider`,
-`model`, `base_url`, `limit`, `serve_command`, `record_written` and `exit_code`. For `--remove`:
-`action` (`removed`, `not_connected`), `config`, `removed` (`[{provider, model}]`), `kept`
+`model`, `base_url`, `limit`, `serve_command`, `record_written` and `exit_code`; `config` is the
+resolved file (symbolic links followed), as the record holds it. For `--remove`:
+`action` (`removed`, `kept`, `not_connected`), `config`, `removed` (`[{provider, model}]`), `kept`
 (`[{provider, model, reason}]`), `record_written` and `exit_code`. Errors use the error document of section 15.
 
 | Code | Category | Exit | When |
@@ -818,7 +824,8 @@ artifact it prints the `connect opencode --remove ID` command.
 | `connect.opencode.declined` | `user_cancelled` | 60 | The question was declined, or cannot be asked (no terminal, or `--json` without `--yes`). |
 
 Exit codes: 0 for `added`, `updated`, `already_connected`, `removed`, `not_connected`; 10, 30, 60
-and 70 as in the table; 70 also when `--remove` kept an edited entry.
+and 70 as in the table; 70 also when `--remove` kept an edited entry (action `removed` when it
+removed others, `kept` when it removed nothing).
 
 ## 13. `logs`
 

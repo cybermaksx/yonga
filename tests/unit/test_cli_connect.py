@@ -309,6 +309,7 @@ def test_remove_kept_entry_exits_seventy(
     result = connect(runner, home, tmp_path, config, "--remove", "--yes", "--json")
     assert result.exit_code == int(ExitCode.REGISTRY)
     payload = one_document(result)
+    assert payload["action"] == "kept"
     assert payload["exit_code"] == int(ExitCode.REGISTRY)
     assert payload["removed"] == []
     assert payload["kept"] == [
@@ -356,7 +357,9 @@ def test_artifact_remove_prints_the_opencode_note(
     removed = invoke(runner, home, ["remove", str(artifact), "--yes"], factory=connected)
     assert removed.exit_code == 0, removed.output
     assert "still listed in OpenCode" in removed.stdout
-    assert f"connect opencode --remove {artifact_id}" in " ".join(removed.stdout.split())
+    assert squeeze(f"connect opencode --remove {artifact_id} --config {config}") in squeeze(
+        removed.stdout
+    )
 
 
 def test_artifact_remove_without_a_connection_prints_no_note(
@@ -419,3 +422,75 @@ def test_a_broken_record_is_set_aside_and_the_move_is_reported(
     assert backup.read_text(encoding="utf-8") == "{ broken"
     assert squeeze(str(backup)) in squeeze(result.stderr)
     assert json.loads(path.read_text(encoding="utf-8"))["connections"]
+
+
+def test_artifact_remove_note_has_no_config_for_the_default_file(
+    runner: CliRunner, home: Path, tmp_path: Path
+) -> None:
+    def factory(settings: Settings) -> Wiring:
+        return ConnectWiring(settings, {}, hub=hub_with(tmp_path=tmp_path))
+
+    prepared = invoke(
+        runner,
+        home,
+        [
+            "prepare",
+            "nDimensional/Qwen3.5-9B-Uncensored-Safetensors",
+            "--device",
+            "cpu",
+            "--yes",
+            "--json",
+        ],
+        factory=factory,
+    )
+    document = one_document(prepared)
+    artifact_id = str(document["artifact_id"])
+    sessions = {artifact_id: session_in(tmp_path, artifact_id)}
+
+    def connected(settings: Settings) -> Wiring:
+        return ConnectWiring(settings, sessions, hub=hub_with(tmp_path=tmp_path))
+
+    env = {"XDG_CONFIG_HOME": str(tmp_path / "xdg")}
+    done = invoke(
+        runner, home, ["connect", "opencode", artifact_id, "--yes"], factory=connected, env=env
+    )
+    assert done.exit_code == 0, done.output
+    assert (tmp_path / "xdg" / "opencode" / "opencode.json").exists()
+    removed = invoke(
+        runner,
+        home,
+        ["remove", str(document["artifact_dir"]), "--yes"],
+        factory=connected,
+        env=env,
+    )
+    assert removed.exit_code == 0, removed.output
+    assert squeeze(f"connect opencode --remove {artifact_id}") in squeeze(removed.stdout)
+    assert "--config" not in removed.stdout
+
+
+def test_remove_from_another_file_names_the_recorded_one(
+    runner: CliRunner, home: Path, tmp_path: Path, config: Path
+) -> None:
+    assert connect(runner, home, tmp_path, config, "--yes").exit_code == 0
+    other = tmp_path / "other.json"
+    result = connect(runner, home, tmp_path, other, "--remove", "--yes")
+    assert result.exit_code == 0, result.output
+    out = squeeze(result.stdout)
+    assert squeeze("is not connected in") in out
+    assert squeeze(f"connect opencode --remove {ARTIFACT} --config {config}") in out
+    assert not other.exists()
+
+
+def test_json_config_is_the_resolved_file(runner: CliRunner, home: Path, tmp_path: Path) -> None:
+    real = tmp_path / "real"
+    real.mkdir()
+    (tmp_path / "link").symlink_to(real)
+    env = {"XDG_CONFIG_HOME": str(tmp_path / "link")}
+    factory = wiring_with(tmp_path)
+    command = ["connect", "opencode", ARTIFACT, "--yes", "--json"]
+    added = one_document(invoke(runner, home, command, factory=factory, env=env))
+    target = str(real / "opencode" / "opencode.json")
+    assert added["config"] == target
+    removed = one_document(invoke(runner, home, [*command, "--remove"], factory=factory, env=env))
+    assert removed["action"] == "removed"
+    assert removed["config"] == target
