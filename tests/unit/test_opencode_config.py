@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import stat
@@ -253,3 +254,44 @@ def test_default_config_path_honours_xdg_config_home() -> None:
 
 def test_default_config_path_falls_back_to_home() -> None:
     assert default_config_path({"HOME": "/h"}) == Path("/h/.config/opencode/opencode.json")
+
+
+# --- operating system failures -----------------------------------------
+def test_directory_as_config_path_is_not_a_file(tmp_path: Path) -> None:
+    with pytest.raises(ConfigurationError) as caught:
+        read_config(tmp_path)
+    assert caught.value.diagnostic.code == "connect.opencode.config_not_a_file"
+
+
+def test_read_only_filesystem_on_write_exits_ten(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    snapshot = read_config(tmp_path / "opencode.json")
+
+    def refuse(*_args: object, **_kwargs: object) -> None:
+        raise OSError(errno.EROFS, "Read-only file system")
+
+    monkeypatch.setattr(os, "replace", refuse)
+    monkeypatch.setattr(Path, "replace", refuse)
+    with pytest.raises(YongaError) as caught:
+        write_config(snapshot, {"theme": "x"})
+    diagnostic = caught.value.diagnostic
+    assert diagnostic.code == "connect.opencode.config_not_writable"
+    assert diagnostic.exit_code() == ExitCode.ENVIRONMENT_UNUSABLE
+    assert "Read-only file system" in diagnostic.message
+    assert not (tmp_path / "opencode.json").exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_full_disk_on_write_is_reported(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    snapshot = read_config(tmp_path / "opencode.json")
+
+    def full(*_args: object, **_kwargs: object) -> int:
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(os, "fsync", full)
+    with pytest.raises(YongaError) as caught:
+        write_config(snapshot, {"theme": "x"})
+    assert caught.value.diagnostic.code == "connect.opencode.config_not_writable"
+    assert "No space left on device" in caught.value.diagnostic.message
+    assert list(tmp_path.iterdir()) == []

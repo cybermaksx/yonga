@@ -26,6 +26,7 @@ here are narrow on purpose:
 from __future__ import annotations
 
 import copy
+import errno
 import json
 import os
 import tempfile
@@ -115,8 +116,10 @@ def read_config(path: Path) -> ConfigSnapshot:
         raw = resolved.read_bytes()
     except FileNotFoundError:
         return ConfigSnapshot(resolved, None, {}, None)
-    except PermissionError as error:
-        raise _not_readable(resolved, error) from error
+    except IsADirectoryError:
+        raise _not_a_file(resolved) from None
+    except OSError as error:
+        raise _io_failure("read", resolved, error) from error
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError:
@@ -137,16 +140,42 @@ def _mode_of(st_mode: int) -> int:
     return st_mode & 0o7777
 
 
-def _not_readable(path: Path, error: OSError) -> YongaError:
-    """The refusal for a config the user cannot read."""
+def _not_a_file(path: Path) -> ConfigurationError:
+    """The refusal for a config path that names a directory."""
+    return ConfigurationError(
+        diagnostic(
+            "connect.opencode.config_not_a_file",
+            FailureCategory.CONFIGURATION_ERROR,
+            "OpenCode's config is not a file",
+            f"{path} is a directory, not a config file.",
+            remediation=["Pass the config file itself with --config FILE."],
+            context={"config": str(path)},
+        )
+    )
+
+
+def _io_failure(action: str, path: Path, error: OSError) -> YongaError:
+    """Turn an ``OSError`` into a typed failure with the right exit code.
+
+    Permission and read-only-filesystem errors, and every other error the
+    operating system reports, are PERMISSION_DENIED (exit 10) except a full
+    disk, which is INSUFFICIENT_DISK. All name the path and the system's text.
+    """
+    if error.errno in (errno.ENOSPC, errno.EDQUOT):
+        category = FailureCategory.INSUFFICIENT_DISK
+        advice = "Free some space, or choose another location with --config FILE."
+    else:
+        category = FailureCategory.PERMISSION_DENIED
+        advice = "Choose a location you can use with --config FILE."
     return YongaError(
         diagnostic(
-            "connect.opencode.config_not_readable",
-            FailureCategory.PERMISSION_DENIED,
-            "Cannot read OpenCode's config",
-            f"Could not read {path}: {error.strerror or error}. yonga never uses sudo.",
-            remediation=["Fix the file's permissions, or choose another file with --config FILE."],
+            f"connect.opencode.config_not_{'readable' if action == 'read' else 'writable'}",
+            category,
+            f"Cannot {action} OpenCode's config",
+            f"Could not {action} {path}: {error.strerror or error}.",
+            remediation=[advice, "yonga never uses sudo for this, and it is not needed."],
             context={"config": str(path)},
+            raw_excerpt=f"{type(error).__name__}: {error}",
         ),
         cause=error,
     )
@@ -268,8 +297,8 @@ def write_config(snapshot: ConfigSnapshot, document: Mapping[str, Any]) -> bool:
         _recheck(snapshot)
         Path(temporary).replace(path)
         temporary = None
-    except PermissionError as error:
-        raise _not_writable(path, error) from error
+    except OSError as error:
+        raise _io_failure("write", path, error) from error
     finally:
         if temporary is not None:
             with suppress(OSError):
@@ -295,24 +324,6 @@ def _recheck(snapshot: ConfigSnapshot) -> None:
             remediation=[f"Run the command again: {RERUN_PLACEHOLDER}"],
             context={"config": str(snapshot.path)},
         )
-    )
-
-
-def _not_writable(path: Path, error: OSError) -> YongaError:
-    """The refusal for a config location the user cannot write to."""
-    return YongaError(
-        diagnostic(
-            "connect.opencode.config_not_writable",
-            FailureCategory.PERMISSION_DENIED,
-            "Cannot write OpenCode's config",
-            f"Could not write {path}: {error.strerror or error}.",
-            remediation=[
-                "Choose a location you can write with --config FILE.",
-                "yonga never uses sudo for this, and it is not needed.",
-            ],
-            context={"config": str(path)},
-        ),
-        cause=error,
     )
 
 
