@@ -68,6 +68,7 @@ __all__ = [
     "ConnectionRecord",
     "ConnectionRecords",
     "Endpoint",
+    "RecordUpdate",
     "RemoveAction",
     "RemovePlan",
     "SessionView",
@@ -187,6 +188,16 @@ class ConnectionRecord(BaseModel):
         )
 
 
+@dataclass(frozen=True)
+class RecordUpdate:
+    """What saving the record file did."""
+
+    written: bool
+    """Whether the record file now holds what was saved."""
+    set_aside: Path | None = None
+    """Where a record file that did not parse was moved before it was replaced."""
+
+
 class ConnectionRecords:
     """The record file: ``{"schema": 1, "connections": [...]}``."""
 
@@ -194,16 +205,37 @@ class ConnectionRecords:
         """Bind to the record file; nothing is read until :meth:`load`."""
         self._path = path
 
+    @property
+    def backup_path(self) -> Path:
+        """Where :meth:`save` moves a record file that does not parse."""
+        return self._path.with_name(self._path.name + ".bak")
+
     def load(self) -> list[ConnectionRecord]:
         """Every recorded connection; a missing or unreadable file reads as ``[]``."""
+        return self._read() or []
+
+    def _read(self) -> list[ConnectionRecord] | None:
+        """The connections, ``[]`` for a missing file, ``None`` for one that does not parse."""
         try:
             payload = json.loads(self._path.read_text(encoding="utf-8"))
-            return [ConnectionRecord.model_validate(item) for item in payload["connections"]]
-        except (OSError, ValueError, KeyError, TypeError, ValidationError):
+        except FileNotFoundError:
             return []
+        except (OSError, ValueError):
+            return None
+        try:
+            if payload["schema"] != _RECORD_SCHEMA:
+                return None
+            return [ConnectionRecord.model_validate(item) for item in payload["connections"]]
+        except (KeyError, TypeError, ValidationError):
+            return None
 
-    def save(self, records: Sequence[ConnectionRecord]) -> bool:
-        """Atomically replace the file; ``False`` instead of raising on an I/O error."""
+    def save(self, records: Sequence[ConnectionRecord]) -> RecordUpdate:
+        """Atomically replace the file, never over one that did not parse.
+
+        Such a file (broken, or written by another schema) is first moved to
+        :attr:`backup_path`, replacing an older backup, so the newest bad copy
+        survives. An I/O error is reported in the result, not raised.
+        """
         text = json.dumps(
             {
                 "schema": _RECORD_SCHEMA,
@@ -213,6 +245,7 @@ class ConnectionRecords:
             ensure_ascii=False,
         )
         temporary: str | None = None
+        set_aside: Path | None = None
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             descriptor, temporary = tempfile.mkstemp(
@@ -222,11 +255,14 @@ class ConnectionRecords:
                 output.write(text + "\n")
                 output.flush()
                 os.fsync(output.fileno())
+            if self._read() is None:
+                self._path.replace(self.backup_path)
+                set_aside = self.backup_path
             Path(temporary).replace(self._path)
             temporary = None
-            return True
+            return RecordUpdate(True, set_aside)
         except OSError:
-            return False
+            return RecordUpdate(False, set_aside)
         finally:
             if temporary is not None:
                 with contextlib.suppress(OSError):
@@ -291,6 +327,9 @@ class ConnectResult:
 
     created_config: bool
     record_written: bool
+    """Whether the record names this connection afterwards."""
+    record_set_aside: Path | None = None
+    """Where a record file that did not parse was moved."""
 
 
 # ======================================================================
@@ -407,10 +446,15 @@ class ConnectService:
     # --- applying ----------------------------------------------------
 
     def apply(self, plan: ConnectPlan) -> ConnectResult:
-        """Write the config and remember the connection; do nothing when connected."""
-        if plan.action is ConnectAction.ALREADY_CONNECTED:
-            return ConnectResult(False, True)
-        created_config = write_config(plan.snapshot, plan.document)
+        """Write the config unless already connected, then bring the record up to date.
+
+        An already connected entry writes nothing to the config, and the record
+        only when it has no entry for this connection (it was lost or never
+        written), so that ``--remove`` can find it.
+        """
+        created_config = False
+        if plan.action is not ConnectAction.ALREADY_CONNECTED:
+            created_config = write_config(plan.snapshot, plan.document)
         record = ConnectionRecord(
             config=str(plan.snapshot.path),
             provider=plan.endpoint.provider_key,
@@ -420,23 +464,13 @@ class ConnectService:
             provider_fields=dict(plan.provider_fields) if plan.created_provider else None,
             written_at=datetime.now(UTC),
         )
-        records = []
-        for item in self._records.load():
-            if not item.same_connection(record):
-                records.append(item)
-            elif item.created_provider:
-                # A re-run replaces the record but not the fact that yonga made the
-                # provider; the fields are those it wrote then, with today's on top.
-                record = record.model_copy(
-                    update={
-                        "created_provider": True,
-                        "provider_fields": merge_provider_fields(
-                            item.provider_fields or {}, plan.provider_fields
-                        ),
-                    }
-                )
-        records.append(record)
-        return ConnectResult(created_config, self._records.save(records))
+        loaded = self._records.load()
+        if plan.action is ConnectAction.ALREADY_CONNECTED and any(
+            item.same_connection(record) and item.model == record.model for item in loaded
+        ):
+            return ConnectResult(created_config, True)
+        update = self._records.save(_recorded(loaded, record, plan.provider_fields))
+        return ConnectResult(created_config, update.written, update.set_aside)
 
     # --- removal -----------------------------------------------------
 
@@ -459,17 +493,7 @@ class ConnectService:
                 kept.append((record.provider, artifact_id, _EDITED))
             else:
                 removed.append((record.provider, artifact_id))
-                owner = next(
-                    (
-                        item
-                        for item in records
-                        if item.config == config
-                        and item.provider == record.provider
-                        and item.created_provider
-                        and item.provider_fields is not None
-                    ),
-                    None,
-                )
+                owner = _owner(records, config, record.provider)
                 document = without_model(
                     document,
                     record.provider,
@@ -485,10 +509,10 @@ class ConnectService:
             stale=stale,
         )
 
-    def apply_remove(self, plan: RemovePlan) -> bool:
+    def apply_remove(self, plan: RemovePlan) -> RecordUpdate:
         """Write the config when something is removed, then forget the records.
 
-        Returns whether the record file was saved. Provider ownership travels with
+        Returns what saving the record file did. Provider ownership travels with
         the provider: when the record that created it goes while the provider stays,
         it moves to a remaining record of that provider.
         """
@@ -629,6 +653,65 @@ def _model_name(session: SessionView, manifest: ArtifactManifest | None, artifac
     if manifest is None:
         return f"{artifact_id} · {session.device}"
     return f"{manifest.requested_model.repo_id} · {session.device} · {manifest.export.profile}"
+
+
+def _owner(
+    records: Sequence[ConnectionRecord], config: str, provider: str
+) -> ConnectionRecord | None:
+    """The newest record that says yonga created ``provider`` in ``config``."""
+    owners = [
+        item
+        for item in records
+        if item.config == config
+        and item.provider == provider
+        and item.created_provider
+        and item.provider_fields is not None
+    ]
+    return max(owners, key=lambda item: item.written_at, default=None)
+
+
+def _recorded(
+    loaded: Sequence[ConnectionRecord],
+    record: ConnectionRecord,
+    written: Mapping[str, Any],
+) -> list[ConnectionRecord]:
+    """The record list after ``record`` was written with provider fields ``written``.
+
+    ``record`` replaces the entry for the same connection. Exactly one record
+    keeps owning the provider, with the fields yonga last wrote merged into what
+    it wrote before, so that removing the last model drops the provider while
+    those fields are still unchanged:
+
+    * a provider ``record`` created (it was missing) is owned by ``record``;
+      older owners of that provider lost what they owned and give it up;
+    * otherwise the owner stays the owner: ``record`` itself when its earlier
+      entry was, else the newest owner among the others.
+    """
+    previous = next((item for item in loaded if item.same_connection(record)), None)
+    others = [item for item in loaded if not item.same_connection(record)]
+    same_provider = [
+        index
+        for index, item in enumerate(others)
+        if item.config == record.config and item.provider == record.provider
+    ]
+    if record.created_provider:
+        for index in same_provider:
+            if others[index].created_provider:
+                others[index] = others[index].model_copy(
+                    update={"created_provider": False, "provider_fields": None}
+                )
+        return [*others, record]
+    if previous is not None and previous.created_provider:
+        fields = merge_provider_fields(previous.provider_fields or {}, written)
+        record = record.model_copy(update={"created_provider": True, "provider_fields": fields})
+        return [*others, record]
+    owner = _owner([others[index] for index in same_provider], record.config, record.provider)
+    if owner is not None:
+        index = others.index(owner)
+        others[index] = owner.model_copy(
+            update={"provider_fields": merge_provider_fields(owner.provider_fields or {}, written)}
+        )
+    return [*others, record]
 
 
 def _recorded_model(

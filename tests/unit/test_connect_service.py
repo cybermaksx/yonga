@@ -489,7 +489,7 @@ def test_record_write_failure_is_reported_not_raised(harness: Harness, tmp_path:
         if os.access(locked, os.W_OK):
             pytest.skip("directory permissions are not enforced for this user")
         records = ConnectionRecords(locked / "sub" / "opencode-connections.json")
-        assert records.save([]) is False
+        assert records.save([]).written is False
         harness.records = records
         service = harness.service()
         result = service.apply(harness.plan(service))
@@ -685,3 +685,137 @@ def test_remove_in_either_order_keeps_provider_the_user_extended(harness: Harnes
     provider = read_file(harness)["provider"]["yonga-8000"]
     assert provider["models"] == {}
     assert provider["headers"] == {"a": "b"}
+
+
+# --- provider ownership ----------------------------------------------------------------
+
+
+def owners(harness: Harness) -> list[tuple[str, dict[str, Any] | None]]:
+    return [
+        (item.artifact_id, item.provider_fields)
+        for item in harness.records.load()
+        if item.created_provider
+    ]
+
+
+def test_owner_record_follows_fields_a_later_connect_writes(harness: Harness) -> None:
+    service = connect(harness)
+    harness.add_session("second")
+    keyed = harness.service(env={"YONGA_API_KEY": "s"})
+    keyed.apply(harness.plan(keyed, reference="second"))
+    ((owner, fields),) = owners(harness)
+    assert owner == ARTIFACT
+    assert fields is not None
+    assert fields["options"]["apiKey"] == "{env:YONGA_API_KEY}"
+    assert fields["name"] == "yonga (127.0.0.1:8000)"
+    remove(harness, service, ARTIFACT)
+    remove(harness, service, "second")
+    assert "yonga-8000" not in read_file(harness).get("provider", {})
+
+
+def test_api_key_from_the_first_connect_only_still_drops_the_provider(harness: Harness) -> None:
+    keyed = harness.service(env={"YONGA_API_KEY": "s"})
+    keyed.apply(harness.plan(keyed))
+    harness.add_session("bbbb")
+    connect(harness, "bbbb")
+    service = harness.service()
+    remove(harness, service, ARTIFACT)
+    remove(harness, service, "bbbb")
+    assert read_file(harness).get("provider", {}) == {}
+    assert harness.records.load() == []
+
+
+def test_recreated_provider_is_owned_by_the_new_record(harness: Harness) -> None:
+    connect(harness, endpoint=Endpoint("::1", 8000))
+    edit_file(harness, lambda d: d["provider"].pop("yonga-8000"))
+    harness.add_session("bbbb")
+    service = connect(harness, "bbbb")
+    assert [owner for owner, _ in owners(harness)] == ["bbbb"]
+    remove(harness, service, "bbbb")
+    assert "yonga-8000" not in read_file(harness).get("provider", {})
+
+
+def test_stale_owner_hands_the_provider_to_the_remaining_model(harness: Harness) -> None:
+    service = two_artifacts(harness)
+    edit_file(harness, lambda d: d["provider"]["yonga-8000"]["models"].pop(ARTIFACT))
+    plan = remove(harness, service, ARTIFACT)
+    assert len(plan.stale) == 1
+    assert [owner for owner, _ in owners(harness)] == ["second"]
+    remove(harness, service, "second")
+    assert "yonga-8000" not in read_file(harness).get("provider", {})
+
+
+def test_ownership_moves_to_a_kept_model(harness: Harness) -> None:
+    service = two_artifacts(harness)
+    edit_file(
+        harness,
+        lambda d: d["provider"]["yonga-8000"]["models"]["second"].update(name="mine"),
+    )
+    remove(harness, service, ARTIFACT)
+    ((owner, fields),) = owners(harness)
+    assert owner == "second"
+    assert fields == {
+        "npm": "@ai-sdk/openai-compatible",
+        "name": "yonga (127.0.0.1:8000)",
+        "options": {"baseURL": "http://127.0.0.1:8000/v1"},
+    }
+    plan = remove(harness, service, "second")
+    assert plan.kept == [("yonga-8000", "second", "edited since yonga wrote it")]
+    assert "second" in read_file(harness)["provider"]["yonga-8000"]["models"]
+
+
+# --- a lost or broken record -----------------------------------------------------------
+
+
+def test_already_connected_without_a_record_writes_one(harness: Harness) -> None:
+    connect(harness)
+    harness.records._path.unlink()
+    service = harness.service()
+    plan = harness.plan(service)
+    assert plan.action is ConnectAction.ALREADY_CONNECTED
+    before = harness.config_path.read_bytes()
+    result = service.apply(plan)
+    assert result.record_written is True
+    assert harness.config_path.read_bytes() == before
+    (record,) = harness.records.load()
+    assert record.created_provider is False
+    assert record.model == plan.entry
+    assert remove(harness, service).removed == [("yonga-8000", ARTIFACT)]
+
+
+def test_already_connected_with_its_record_saves_nothing(harness: Harness) -> None:
+    connect(harness)
+    path = harness.records._path
+    before = path.stat().st_mtime_ns
+    service = harness.service()
+    assert service.apply(harness.plan(service)).record_written is True
+    assert path.stat().st_mtime_ns == before
+
+
+@pytest.mark.parametrize(
+    "text",
+    ['{"schema": 1, "connections": [', '{"schema": 2, "connections": []}', '{"schema": 1}'],
+)
+def test_a_record_file_that_does_not_parse_is_set_aside(harness: Harness, text: str) -> None:
+    path = harness.records._path
+    path.parent.mkdir(parents=True)
+    path.write_text(text, encoding="utf-8")
+    service = harness.service()
+    result = service.apply(harness.plan(service))
+    backup = path.with_name(path.name + ".bak")
+    assert result.record_written is True
+    assert result.record_set_aside == backup
+    assert backup.read_text(encoding="utf-8") == text
+    assert [item.artifact_id for item in harness.records.load()] == [ARTIFACT]
+
+
+def test_a_second_bad_record_file_replaces_the_older_backup(tmp_path: Path) -> None:
+    path = tmp_path / "records.json"
+    records = ConnectionRecords(path)
+    path.write_text("one", encoding="utf-8")
+    assert records.save([]).set_aside == tmp_path / "records.json.bak"
+    path.write_text("two", encoding="utf-8")
+    update = records.save([])
+    assert update.written is True
+    assert (tmp_path / "records.json.bak").read_text(encoding="utf-8") == "two"
+    assert records.save([]).set_aside is None

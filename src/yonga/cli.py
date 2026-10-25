@@ -50,7 +50,13 @@ from yonga.application.artifact_refs import newest_choice_note
 from yonga.application.artifacts import ArtifactStore
 from yonga.application.benchmark import DEFAULT_SUITE, benchmark_result_path
 from yonga.application.chat import ChatOptions, ChatService, ChatSession, ChatTurn
-from yonga.application.connect import RECORD_FILENAME, ConnectAction, Endpoint, RemoveAction
+from yonga.application.connect import (
+    RECORD_FILENAME,
+    ConnectAction,
+    Endpoint,
+    RecordUpdate,
+    RemoveAction,
+)
 from yonga.application.inspect_model import InspectReport
 from yonga.application.jobs import (
     JobContext,
@@ -3129,8 +3135,8 @@ def _connect_opencode(
     console = state.console
     key = endpoint.provider_key
     limit = plan.entry["limit"]
-    result = None
-    if plan.action is ConnectAction.ALREADY_CONNECTED:
+    written = plan.action is not ConnectAction.ALREADY_CONNECTED
+    if not written:
         console.print(f"{plan.artifact_id} is already connected in {path}.")
     else:
         console.print(f"Target  {path}")
@@ -3163,32 +3169,48 @@ def _connect_opencode(
                     ],
                 )
             )
-        result = service.apply(plan)
+    result = service.apply(plan)
     if state.json_mode:
         state.emit(
             {
                 "action": plan.action.value,
                 "config": str(path),
-                "created_config": result.created_config if result is not None else False,
+                "created_config": result.created_config,
                 "provider": key,
-                "created_provider": result is not None and plan.created_provider,
+                "created_provider": written and plan.created_provider,
                 "model": plan.artifact_id,
                 "base_url": endpoint.base_url,
                 "limit": limit,
                 "serve_command": plan.serve_command,
+                "record_written": result.record_written,
                 "exit_code": int(ExitCode.SUCCESS),
             }
         )
         return ExitCode.SUCCESS
-    if result is not None:
+    if written:
         console.print(f"Connected {plan.artifact_id} to OpenCode as {key}/{plan.artifact_id}.")
     console.print(f"Start the server with: {plan.serve_command}")
-    if result is not None and not result.record_written:
-        console.detail(
-            f"Could not update {state.graph.paths.data_dir / RECORD_FILENAME}; "
-            "'--remove' will not find this connection."
-        )
+    _warn_about_record(
+        state,
+        RecordUpdate(result.record_written, result.record_set_aside),
+        consequence="'--remove' will not find this connection",
+    )
     return ExitCode.SUCCESS
+
+
+def _warn_about_record(state: CliState, update: RecordUpdate, *, consequence: str) -> None:
+    """Say on stderr, always, when the connection record was set aside or not saved."""
+    path = state.graph.paths.data_dir / RECORD_FILENAME
+    if update.set_aside is not None:
+        state.console.print_error(
+            f"warning: {path} could not be read; it was moved to {update.set_aside} "
+            "and a new record was started.",
+            style="yellow",
+        )
+    if not update.written:
+        state.console.print_error(
+            f"warning: could not update {path}; {consequence}.", style="yellow"
+        )
 
 
 def _disconnect_opencode(
@@ -3224,7 +3246,7 @@ def _disconnect_opencode(
                     ],
                 )
             )
-    recorded = service.apply_remove(plan) if plan.removed or plan.stale else True
+    recorded = service.apply_remove(plan) if plan.removed or plan.stale else RecordUpdate(True)
     code = ExitCode.REGISTRY if plan.kept else ExitCode.SUCCESS
     if state.json_mode:
         state.emit(
@@ -3233,6 +3255,7 @@ def _disconnect_opencode(
                 "config": str(path),
                 "removed": [{"provider": p, "model": m} for p, m in plan.removed],
                 "kept": [{"provider": p, "model": m, "reason": r} for p, m, r in plan.kept],
+                "record_written": recorded.written,
                 "exit_code": int(code),
             }
         )
@@ -3243,8 +3266,7 @@ def _disconnect_opencode(
         console.print(f"Removed {model} from {provider} in {path}.")
     for provider, model, reason in plan.kept:
         console.print(f"Kept {provider}/{model}: {reason}.")
-    if not recorded:
-        console.detail(f"Could not update {state.graph.paths.data_dir / RECORD_FILENAME}.")
+    _warn_about_record(state, recorded, consequence="it may still list what was removed here")
     return code
 
 

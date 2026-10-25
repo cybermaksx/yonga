@@ -12,7 +12,7 @@ from typer.testing import CliRunner
 
 from tests.unit.test_cli import FakeWiring, as_tty, hub_with, invoke, one_document
 from tests.unit.test_connect_service import ARTIFACT, FakeSession, make_manifest, summary
-from yonga.application.connect import ConnectionRecords, ConnectService
+from yonga.application.connect import ConnectionRecords, ConnectService, RecordUpdate
 from yonga.application.wiring import Wiring
 from yonga.config.settings import Settings
 from yonga.domain.diagnostics import ExitCode
@@ -149,9 +149,11 @@ def test_connect_json_with_yes_emits_one_document(
         "base_url",
         "limit",
         "serve_command",
+        "record_written",
         "exit_code",
     }
     assert payload["action"] == "added"
+    assert payload["record_written"] is True
     assert payload["config"] == str(config)
     assert payload["created_config"] is True
     assert payload["provider"] == PROVIDER
@@ -263,7 +265,16 @@ def test_connect_remove_round_trip(
     result = connect(runner, home, tmp_path, config, "--remove", "--yes", "--json")
     assert result.exit_code == 0, result.output
     payload = one_document(result)
-    assert set(payload) == {"ok", "action", "config", "removed", "kept", "exit_code"}
+    assert set(payload) == {
+        "ok",
+        "action",
+        "config",
+        "removed",
+        "kept",
+        "record_written",
+        "exit_code",
+    }
+    assert payload["record_written"] is True
     assert payload["removed"] == [{"provider": PROVIDER, "model": ARTIFACT}]
     assert payload["kept"] == []
     document = json.loads(config.read_text(encoding="utf-8"))
@@ -371,3 +382,40 @@ def test_artifact_remove_without_a_connection_prints_no_note(
     removed = invoke(runner, home, ["remove", str(artifact), "--yes"], factory=factory)
     assert removed.exit_code == 0
     assert "OpenCode" not in removed.stdout
+
+
+def records_file(home: Path) -> Path:
+    found = list(home.rglob("opencode-connections.json"))
+    assert len(found) == 1, found
+    return found[0]
+
+
+def test_a_record_that_cannot_be_saved_is_warned_about_without_verbose(
+    runner: CliRunner,
+    home: Path,
+    tmp_path: Path,
+    config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(ConnectionRecords, "save", lambda self, records: RecordUpdate(False))
+    result = connect(runner, home, tmp_path, config, "--yes")
+    assert result.exit_code == 0, result.output
+    assert "'--remove' will not find this connection" in " ".join(result.stderr.split())
+    payload = one_document(connect(runner, home, tmp_path, config, "--yes", "--json"))
+    assert payload["action"] == "already_connected"
+    assert payload["record_written"] is False
+
+
+def test_a_broken_record_is_set_aside_and_the_move_is_reported(
+    runner: CliRunner, home: Path, tmp_path: Path, config: Path
+) -> None:
+    assert connect(runner, home, tmp_path, config, "--yes").exit_code == 0
+    path = records_file(home)
+    path.write_text("{ broken", encoding="utf-8")
+    config.unlink()
+    result = connect(runner, home, tmp_path, config, "--yes")
+    assert result.exit_code == 0, result.output
+    backup = path.with_name(path.name + ".bak")
+    assert backup.read_text(encoding="utf-8") == "{ broken"
+    assert squeeze(str(backup)) in squeeze(result.stderr)
+    assert json.loads(path.read_text(encoding="utf-8"))["connections"]

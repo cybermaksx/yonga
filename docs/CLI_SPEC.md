@@ -781,8 +781,14 @@ the code `config_not_writable`; sudo is never used. The file is never deleted.
 
 **The record**, `<data-dir>/opencode-connections.json` (`{"schema": 1, "connections": [...]}`),
 keeps per connection the resolved config path, provider key, artifact id, the model entry as
-written, whether yonga created the provider (and the provider fields it wrote), and the time. A
-record that cannot be written is a warning: the OpenCode file is already correct.
+written, whether yonga created the provider (and the provider fields it wrote), and the time.
+One record owns each provider yonga created; every later connect to that provider merges the fields
+it wrote into the owner's, and a connect that re-creates a provider the user deleted takes the
+ownership over. `already_connected` adds a record entry when there is none, so `--remove` finds the
+connection. A record that cannot be written is a warning on stderr (`record_written` is `false` in
+`--json`): the OpenCode file is already correct. A record file that exists but does not parse
+(broken, or another schema) is never written over: it is moved to `opencode-connections.json.bak`,
+replacing an older backup, a new record is started, and a warning names both files.
 
 **`--remove ARTIFACT`** takes the artifact id as recorded, so it works after `yonga remove`.
 A model entry identical to the recorded one is removed. One the user edited is kept: the command
@@ -794,9 +800,9 @@ for entries whose model is already gone. No record entry is `not_connected`, exi
 artifact it prints the `connect opencode --remove ID` command.
 
 `--json` for a connection: `action`, `config`, `created_config`, `provider`, `created_provider`,
-`model`, `base_url`, `limit`, `serve_command` and `exit_code`. For `--remove`: `action`
-(`removed`, `not_connected`), `config`, `removed` (`[{provider, model}]`), `kept`
-(`[{provider, model, reason}]`) and `exit_code`. Errors use the error document of section 15.
+`model`, `base_url`, `limit`, `serve_command`, `record_written` and `exit_code`. For `--remove`:
+`action` (`removed`, `not_connected`), `config`, `removed` (`[{provider, model}]`), `kept`
+(`[{provider, model, reason}]`), `record_written` and `exit_code`. Errors use the error document of section 15.
 
 | Code | Category | Exit | When |
 |---|---|---|---|
