@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 from typer.testing import CliRunner
 
+from tests.support import plain_text
 from tests.unit.test_cli import FakeWiring, as_tty, hub_with, invoke, one_document
 from tests.unit.test_connect_service import ARTIFACT, FakeSession, make_manifest, summary
 from yonga.application.connect import ConnectionRecords, ConnectService, RecordUpdate
@@ -169,7 +170,7 @@ def test_connect_already_connected_asks_nothing(
     before = config.read_text(encoding="utf-8")
     result = connect(runner, home, tmp_path, config)
     assert result.exit_code == 0, result.output
-    assert f"{ARTIFACT} is already connected in {config}." in result.stdout
+    assert squeeze(f"{ARTIFACT} is already connected in {config}.") in squeeze(result.stdout)
     assert "Write this to" not in result.stdout
     assert config.read_text(encoding="utf-8") == before
 
@@ -494,3 +495,9 @@ def test_json_config_is_the_resolved_file(runner: CliRunner, home: Path, tmp_pat
     removed = one_document(invoke(runner, home, [*command, "--remove"], factory=factory, env=env))
     assert removed["action"] == "removed"
     assert removed["config"] == target
+
+
+def test_config_help_names_the_xdg_default(runner: CliRunner, home: Path) -> None:
+    result = invoke(runner, home, ["connect", "opencode", "--help"])
+    assert result.exit_code == 0
+    assert "$XDG_CONFIG_HOME/opencode/opencode.json" in plain_text(result.stdout)

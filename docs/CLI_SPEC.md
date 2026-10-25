@@ -808,7 +808,7 @@ the recorded file is not the default one.
 `model`, `base_url`, `limit`, `serve_command`, `record_written` and `exit_code`; `config` is the
 resolved file (symbolic links followed), as the record holds it. For `--remove`:
 `action` (`removed`, `kept`, `not_connected`), `config`, `removed` (`[{provider, model}]`), `kept`
-(`[{provider, model, reason}]`), `record_written` and `exit_code`. Errors use the error document of section 15.
+(`[{provider, model, reason}]`), `record_written` and `exit_code`. Errors use the usual `--json` failure document and exit code (section 15).
 
 | Code | Category | Exit | When |
 |---|---|---|---|

@@ -410,11 +410,13 @@ another file), with the context and output limits read from the artifact, shows 
 first (`--yes` skips the question). It prints the `serve` command to run; it never starts the
 server. Re-running it changes nothing when the entry is already right.
 
-It refuses, writing nothing, what OpenCode cannot use. OpenCode sends 12 tools and a system prompt
-of about 5300 tokens with every request, so an artifact without tool calling is refused
+It refuses, writing nothing, what OpenCode cannot use. OpenCode sends its 12 tools with every
+request, and its first request is about 5300 tokens (system prompt plus the 12 tool definitions),
+more with skills or an `AGENTS.md`. So an artifact without tool calling is refused
 (`connect.opencode.tools_unsupported`), and so is one whose prompt length is fixed under 8192
 tokens (`connect.opencode.prompt_too_short`): that is every built-in NPU profile (1024). The
-message names a GPU or CPU artifact of the same model to use instead. A file with comments or
+message names a prepared GPU or CPU artifact of the same model to use instead, or gives the
+`yonga prepare MODEL --device gpu` command. A file with comments or
 trailing commas (JSONC) is not rewritten (`connect.opencode.config_not_json`); add the provider by
 hand from the JSON printed. `YONGA_API_KEY`, when set, is referenced as `{env:YONGA_API_KEY}`,
 never written. Into a provider you already have, yonga writes only `npm`, `options.baseURL` and

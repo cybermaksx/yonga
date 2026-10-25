@@ -656,9 +656,9 @@ class ConnectService:
                 FailureCategory.CONFIGURATION_ERROR,
                 "This artifact's prompt length is too short for OpenCode",
                 f"The artifact on {session.device} is compiled for prompts of at most {length} "
-                f"tokens. OpenCode's first request is {OPENCODE_MIN_PROMPT_TOKENS} tokens or "
-                "close to it (5261 measured with OpenCode 2.1.2 in an empty home, 8514 with "
-                f"skills and an AGENTS.md), so it needs at least {OPENCODE_MIN_PROMPT_TOKENS}.",
+                "tokens. OpenCode's first request measured 5261 tokens in an empty home and 8514 "
+                "with skills and an AGENTS.md (OpenCode 2.1.2), so yonga requires at least "
+                f"{OPENCODE_MIN_PROMPT_TOKENS}.",
                 remediation=[self._longer_prompt_advice(repo_id, source_id)],
             )
         )

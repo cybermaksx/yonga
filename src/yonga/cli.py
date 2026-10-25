@@ -3077,7 +3077,10 @@ _CONNECT_HOST_HELP = "Address 'yonga serve' listens on (default: 127.0.0.1)."
 _CONNECT_PORT_HELP = "Port 'yonga serve' listens on (default: 8000)."
 _CONNECT_DEVICE_HELP = "auto, npu, gpu or cpu (default: auto, as 'serve' resolves it)."
 _CONNECT_CONTEXT_HELP = "Context limit to write, instead of the one read from the artifact."
-_CONNECT_CONFIG_HELP = "The OpenCode file to edit (default: ~/.config/opencode/opencode.json)."
+_CONNECT_CONFIG_HELP = (
+    "The OpenCode file to edit (default: $XDG_CONFIG_HOME/opencode/opencode.json, "
+    "else ~/.config/opencode/opencode.json)."
+)
 
 
 @connect_app.command("opencode")

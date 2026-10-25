@@ -197,6 +197,8 @@ def test_npu_prompt_of_1024_is_refused_with_the_gpu_artifact(harness: Harness) -
     assert error.diagnostic.code == "connect.opencode.prompt_too_short"
     assert "1024" in error.diagnostic.message
     assert "8192" in error.diagnostic.message
+    assert "5261 tokens in an empty home and 8514" in error.diagnostic.message
+    assert "close to it" not in error.diagnostic.message
     assert "yonga connect opencode gpuid" in " ".join(error.diagnostic.remediation)
 
 

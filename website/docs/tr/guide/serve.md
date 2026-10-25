@@ -227,10 +227,10 @@ yonga serve 073d5d7c8ea75283 --port 8765
 
 İlk komut, yapıtı OpenCode'un yapılandırmasına (`~/.config/opencode/opencode.json` ya da `--config` ile verdiğiniz dosya) bir sağlayıcı olarak ekler; bağlam ve çıktı sınırlarını yapıtın kendisinden okur. Değişikliği gösterir ve yazmadan önce sorar; `--yes` soruyu atlar. Ardından yazdırdığı komutla sunucuyu başlatın ve `opencode` içinde `yonga-8765/073d5d7c8ea75283` modelini seçin. Kayıt zaten doğruysa komutu yeniden çalıştırmak hiçbir şeyi değiştirmez.
 
-OpenCode yapıtı kullanamayacaksa yonga reddeder ve hiçbir şey yazmaz. OpenCode her istekle 12 araç ve yaklaşık 5300 belirteçlik bir sistem istemi gönderir; bu yüzden:
+OpenCode yapıtı kullanamayacaksa yonga reddeder ve hiçbir şey yazmaz. OpenCode 12 aracını her istekle gönderir ve ilk isteği yaklaşık 5300 belirteçtir (sistem istemi ile 12 araç tanımı); beceriler (skills) ya da bir `AGENTS.md` varsa daha uzundur. Bu yüzden:
 
 - Araç çağırmayan bir yapıt reddedilir (`connect.opencode.tools_unsupported`).
-- İstem uzunluğu 8192 belirtecin altında sabitlenmiş bir yapıt reddedilir (`connect.opencode.prompt_too_short`). Yerleşik NPU profillerinin hepsi 1024'te sabittir. Aynı modelin bir GPU ya da CPU yapıtını kullanın; ileti birini adıyla gösterir.
+- İstem uzunluğu 8192 belirtecin altında sabitlenmiş bir yapıt reddedilir (`connect.opencode.prompt_too_short`). Yerleşik NPU profillerinin hepsi 1024'te sabittir. İleti, bunun yerine kullanılacak, aynı modelden hazırlanmış bir GPU ya da CPU yapıtını adıyla gösterir ya da `yonga prepare MODEL --device gpu` komutunu verir.
 - Yorum ya da sondaki virgül içeren (JSONC) bir yapılandırma dosyası yeniden yazılmaz (`connect.opencode.config_not_json`). Yazdırdığı JSON'dan sağlayıcıyı elle ekleyin.
 
 `YONGA_API_KEY` tanımlıysa kayıt ona `{env:YONGA_API_KEY}` olarak başvurur; anahtarın kendisi hiçbir zaman yazılmaz. Zaten var olan bir sağlayıcıya yonga yalnızca `npm`, `options.baseURL` ve `options.apiKey` alanlarını yazar; sağlayıcının adı ve sizin eklediğiniz diğer seçenekler olduğu gibi kalır.
