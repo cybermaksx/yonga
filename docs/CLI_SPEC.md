@@ -759,7 +759,8 @@ answers to. `limit.context` is `max_position_embeddings` from the artifact's `co
 `connect.opencode.context_unknown`. `limit.output` is the manifest's
 `recommended_runtime.max_new_tokens`, else the configured `max_new_tokens`. When the prompt length
 is fixed (and passed check 4), `limit.input` is `MAX_PROMPT_LEN` and `limit.context` defaults to
-that plus `limit.output`. When `YONGA_API_KEY` is set, `options.apiKey` is `{env:YONGA_API_KEY}`;
+that plus `limit.output`; a `--context` below that sum is exit 70
+`connect.opencode.context_too_small`, naming both numbers. When `YONGA_API_KEY` is set, `options.apiKey` is `{env:YONGA_API_KEY}`;
 the key itself is never written. A provider that already exists is merged into key by key: yonga
 sets `npm`, `options.baseURL` and, when `YONGA_API_KEY` is set, `options.apiKey`; the provider's
 `name`, an `options.apiKey` already there and every other key stay as they are (`name` is written
@@ -820,6 +821,7 @@ resolved file (symbolic links followed), as the record holds it. For `--remove`:
 |---|---|---|---|
 | `connect.opencode.tools_unsupported` | `configuration_error` | 70 | The artifact takes no tools. |
 | `connect.opencode.prompt_too_short` | `configuration_error` | 70 | Fixed `MAX_PROMPT_LEN` under 8192. |
+| `connect.opencode.context_too_small` | `configuration_error` | 70 | `--context` is below the fixed prompt length plus the output limit. |
 | `connect.opencode.context_unknown` | `configuration_error` | 70 | No context length in the artifact; pass `--context`. |
 | `connect.opencode.config_not_json` | `configuration_error` | 70 | The file is not a plain JSON object of the expected shape. |
 | `connect.opencode.config_not_a_file` | `configuration_error` | 70 | `--config` names a directory. |

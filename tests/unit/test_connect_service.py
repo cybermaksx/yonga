@@ -1011,3 +1011,14 @@ def test_prompt_advice_compares_devices_normalised(harness: Harness) -> None:
     harness.add_session("indexed")
     harness.listing = [summary(ARTIFACT, device="NPU"), summary("indexed", device="gpu.0")]
     assert "yonga connect opencode indexed" in " ".join(refusal(harness).diagnostic.remediation)
+
+
+def test_context_below_prompt_plus_output_is_refused(harness: Harness) -> None:
+    session = harness.sessions[ARTIFACT]
+    session.device = "NPU"
+    session.runtime_properties = {"MAX_PROMPT_LEN": "8192"}
+    error = refusal(harness, context=4096)
+    assert error.diagnostic.code == "connect.opencode.context_too_small"
+    assert "4096" in error.diagnostic.message
+    assert str(8192 + 4096) in error.diagnostic.message
+    assert harness.plan(context=8192 + 4096).entry["limit"]["context"] == 8192 + 4096

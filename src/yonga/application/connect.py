@@ -404,6 +404,8 @@ class ConnectService:
             )
         if window is None:
             raise _context_unknown(artifact_id)
+        if fixed_prompt is not None and window < fixed_prompt + output:
+            raise _context_too_small(artifact_id, window, fixed_prompt, output)
         limit: dict[str, int] = {"context": window}
         if fixed_prompt is not None:
             limit["input"] = fixed_prompt
@@ -827,6 +829,26 @@ def _context_unknown(artifact_id: str) -> ConfigurationError:
             remediation=[
                 f"Give the context length yourself: yonga connect opencode {artifact_id} "
                 "--context N"
+            ],
+        )
+    )
+
+
+def _context_too_small(
+    artifact_id: str, window: int, fixed_prompt: int, output: int
+) -> ConfigurationError:
+    """The refusal for a ``--context`` that cannot hold the fixed prompt and the reply."""
+    needed = fixed_prompt + output
+    return ConfigurationError(
+        diagnostic(
+            "connect.opencode.context_too_small",
+            FailureCategory.CONFIGURATION_ERROR,
+            "The context limit is smaller than the prompt and the reply",
+            f"--context {window} is below {needed}: the artifact {artifact_id} takes prompts of "
+            f"{fixed_prompt} tokens and answers with up to {output}, and OpenCode would "
+            "otherwise be told the input alone exceeds the context.",
+            remediation=[
+                f"Use --context {needed} or more, or leave --context out to use {needed}."
             ],
         )
     )

@@ -578,6 +578,7 @@ contract. Every refusal below leaves the OpenCode file exactly as it was.
 |---|---|---|---|---|
 | `connect.opencode.tools_unsupported` | `configuration_error` | 70 | OpenCode sends its tools with every request and this artifact's chat profile takes none. | Connect an artifact that does take tools (the message lists some). |
 | `connect.opencode.prompt_too_short` | `configuration_error` | 70 | The artifact's fixed prompt length (every built-in NPU profile: 1024) is under the 8192 tokens OpenCode needs. | Drop a forced `--device npu` from a GPU or CPU artifact; or connect another GPU or CPU artifact of the same model, or `yonga prepare MODEL --device gpu`. |
+| `connect.opencode.context_too_small` | `configuration_error` | 70 | `--context` is below the fixed prompt length plus the output limit (for example 8192 + 4096 on an NPU artifact). | Pass `--context` of at least that sum, or leave it out. |
 | `connect.opencode.context_unknown` | `configuration_error` | 70 | The artifact has no `max_position_embeddings`; yonga does not invent a limit. | Pass `--context N`. |
 | `connect.opencode.config_not_json` | `configuration_error` | 70 | The file has comments, trailing commas or a broken body, or `provider` is not an object. | Add the provider by hand (the JSON is printed) or use another file with `--config`; for `--remove`, delete the model entry it names by hand. |
 | `connect.opencode.config_not_a_file` | `configuration_error` | 70 | `--config` names a directory. | Pass the file itself. |
