@@ -761,8 +761,10 @@ that plus `limit.output`. When `YONGA_API_KEY` is set, `options.apiKey` is `{env
 the key itself is never written. A provider that already exists is merged into key by key: yonga
 sets `npm`, `options.baseURL` and, when `YONGA_API_KEY` is set, `options.apiKey`; the provider's
 `name`, an `options.apiKey` already there and every other key stay as they are (`name` is written
-only into a provider yonga creates). Outcomes: `added`, `updated` (the model entry or one of the
-provider fields yonga writes differs; each difference is shown as before and after lines before the
+only into a provider yonga creates). The model entry is merged the same way: yonga sets `name`,
+`tool_call` and `limit` (replaced as a whole), and any other key the user added to it
+(`reasoning`, `options`) stays. Outcomes: `added`, `updated` (the model entry's keys yonga writes, or one of the
+provider fields yonga writes, differ; each difference is shown as before and after lines before the
 question, also for `added` into an existing provider), `already_connected` (nothing yonga writes
 would change; nothing written, no question).
 
@@ -791,7 +793,8 @@ connection. A record that cannot be written is a warning on stderr (`record_writ
 replacing an older backup, a new record is started, and a warning names both files.
 
 **`--remove ARTIFACT`** takes the artifact id as recorded, so it works after `yonga remove`.
-A model entry identical to the recorded one is removed. One the user edited is kept: the command
+A model entry whose keys yonga wrote are identical to the recorded ones is removed, with any key
+the user added. One whose yonga keys the user edited is kept: the command
 lists it with the reason in text and in the JSON `kept` list, and exits 70 after removing the rest
 (there is no separate code). The provider goes too when yonga created it, no models are left and
 its other fields are still what yonga wrote. Record entries are dropped for what was removed and

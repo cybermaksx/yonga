@@ -338,3 +338,32 @@ def test_full_disk_on_write_is_reported(tmp_path: Path, monkeypatch: pytest.Monk
     assert caught.value.diagnostic.code == "connect.opencode.config_not_writable"
     assert "No space left on device" in caught.value.diagnostic.message
     assert list(tmp_path.iterdir()) == []
+
+
+def test_with_model_merges_into_an_existing_model_entry() -> None:
+    original: dict[str, Any] = {
+        "provider": {
+            "yonga-8000": {
+                "models": {
+                    "qwen": {
+                        "name": "old",
+                        "reasoning": True,
+                        "options": {"temperature": 0.2},
+                        "limit": {"context": 1, "extra": 2},
+                    }
+                }
+            }
+        }
+    }
+    entry = {"name": "New", "tool_call": True, "limit": {"context": 9, "output": 3}}
+    model = with_model(original, "yonga-8000", FIELDS, "qwen", entry)["provider"]["yonga-8000"][
+        "models"
+    ]["qwen"]
+    assert model == {
+        "name": "New",
+        "reasoning": True,
+        "options": {"temperature": 0.2},
+        "limit": {"context": 9, "output": 3},
+        "tool_call": True,
+    }
+    assert list(model)[:3] == ["name", "reasoning", "options"]

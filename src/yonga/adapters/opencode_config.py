@@ -50,7 +50,9 @@ __all__ = [
     "ConfigSnapshot",
     "check_provider",
     "default_config_path",
+    "merge_model_entry",
     "merge_provider_fields",
+    "model_entry_in",
     "provider_fields_in",
     "read_config",
     "render",
@@ -222,7 +224,10 @@ def with_model(
     model_id: str,
     entry: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """A deep copy of ``document`` with ``provider[KEY].models[MODEL_ID] = entry``.
+    """A deep copy of ``document`` with ``entry`` written into ``provider[KEY].models[MODEL_ID]``.
+
+    An existing model entry is merged by :func:`merge_model_entry`, so a key the
+    user added (``reasoning``, ``options``) stays.
 
     ``$schema`` is added first only to an empty document. A missing provider is
     created with ``provider_fields`` first and ``models`` after them; an existing
@@ -235,9 +240,32 @@ def with_model(
         result["$schema"] = OPENCODE_SCHEMA_URL
     providers = result.setdefault("provider", {})
     provider = merge_provider_fields(providers.get(key, {}), provider_fields)
-    provider.setdefault("models", {})[model_id] = copy.deepcopy(dict(entry))
+    models = provider.setdefault("models", {})
+    existing = models.get(model_id)
+    models[model_id] = merge_model_entry(existing if isinstance(existing, Mapping) else {}, entry)
     providers[key] = provider
     return result
+
+
+def merge_model_entry(existing: Mapping[str, Any], entry: Mapping[str, Any]) -> dict[str, Any]:
+    """A deep copy of ``existing`` with every key of ``entry`` set over it.
+
+    ``limit`` is yonga's whole, so it is replaced rather than merged; every key
+    ``entry`` does not name is kept, in its place.
+    """
+    result: dict[str, Any] = copy.deepcopy(dict(existing))
+    for name, value in entry.items():
+        result[name] = copy.deepcopy(value)
+    return result
+
+
+def model_entry_in(existing: Mapping[str, Any], entry: Mapping[str, Any]) -> dict[str, Any]:
+    """What ``existing`` holds at the keys ``entry`` writes; absent keys are left out.
+
+    The counterpart of :func:`merge_model_entry`: it equals ``entry`` exactly
+    when merging would change nothing yonga owns.
+    """
+    return {name: copy.deepcopy(existing[name]) for name in entry if name in existing}
 
 
 def merge_provider_fields(provider: Mapping[str, Any], fields: Mapping[str, Any]) -> dict[str, Any]:

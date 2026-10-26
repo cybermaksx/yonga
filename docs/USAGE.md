@@ -420,13 +420,14 @@ message names a prepared GPU or CPU artifact of the same model to use instead, o
 trailing commas (JSONC) is not rewritten (`connect.opencode.config_not_json`); add the provider by
 hand from the JSON printed. `YONGA_API_KEY`, when set, is referenced as `{env:YONGA_API_KEY}`,
 never written. Into a provider you already have, yonga writes only `npm`, `options.baseURL` and
-`options.apiKey`; its name and your other options stay.
+`options.apiKey`; its name and your other options stay. Likewise a model entry keeps the keys you
+added to it (`reasoning`, `options`); yonga sets `name`, `tool_call` and `limit`.
 
 ```bash
 yonga connect opencode --remove 073d5d7c8ea75283        # works after `yonga remove` too
 ```
 
-`--remove` deletes only the entries yonga wrote. An entry you edited since is kept and listed, and
+`--remove` deletes only the entries yonga wrote. An entry whose yonga-written keys you edited since is kept and listed, and
 the command then exits 70. The file is never deleted. A connection made with `--config FILE` is
 removed with the same `--config FILE`; without it, `--remove` names the file the connection is in,
 and `yonga remove` prints the full command.

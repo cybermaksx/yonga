@@ -233,13 +233,13 @@ OpenCode yapıtı kullanamayacaksa yonga reddeder ve hiçbir şey yazmaz. OpenCo
 - İstem uzunluğu 8192 belirtecin altında sabitlenmiş bir yapıt reddedilir (`connect.opencode.prompt_too_short`). Yerleşik NPU profillerinin hepsi 1024'te sabittir. İleti, bunun yerine kullanılacak, aynı modelden hazırlanmış bir GPU ya da CPU yapıtını adıyla gösterir ya da `yonga prepare MODEL --device gpu` komutunu verir.
 - Yorum ya da sondaki virgül içeren (JSONC) bir yapılandırma dosyası yeniden yazılmaz (`connect.opencode.config_not_json`). Yazdırdığı JSON'dan sağlayıcıyı elle ekleyin.
 
-`YONGA_API_KEY` tanımlıysa kayıt ona `{env:YONGA_API_KEY}` olarak başvurur; anahtarın kendisi hiçbir zaman yazılmaz. Zaten var olan bir sağlayıcıya yonga yalnızca `npm`, `options.baseURL` ve `options.apiKey` alanlarını yazar; sağlayıcının adı ve sizin eklediğiniz diğer seçenekler olduğu gibi kalır.
+`YONGA_API_KEY` tanımlıysa kayıt ona `{env:YONGA_API_KEY}` olarak başvurur; anahtarın kendisi hiçbir zaman yazılmaz. Zaten var olan bir sağlayıcıya yonga yalnızca `npm`, `options.baseURL` ve `options.apiKey` alanlarını yazar; sağlayıcının adı ve sizin eklediğiniz diğer seçenekler olduğu gibi kalır. Model kaydı da aynı şekilde korunur: sizin eklediğiniz anahtarlar (`reasoning`, `options`) kalır; yonga yalnızca `name`, `tool_call` ve `limit` alanlarını yazar.
 
 ```bash
 yonga connect opencode --remove 073d5d7c8ea75283
 ```
 
-`--remove` yalnızca yonga'nın yazdığı kayıtları siler; `yonga remove` yapıtı sildikten sonra da çalışır. Sonradan elle değiştirdiğiniz bir kayıt bırakılır ve listelenir, komut 70 koduyla çıkar. Yapılandırma dosyası hiçbir zaman silinmez. `--config FILE` ile yapılan bir bağlantı aynı `--config FILE` ile kaldırılır; verilmezse `--remove` bağlantının bulunduğu dosyayı adıyla gösterir, `yonga remove` da komutun tamamını yazdırır.
+`--remove` yalnızca yonga'nın yazdığı kayıtları siler; `yonga remove` yapıtı sildikten sonra da çalışır. yonga'nın yazdığı anahtarları sonradan elle değiştirdiğiniz bir kayıt bırakılır ve listelenir, komut 70 koduyla çıkar. Yapılandırma dosyası hiçbir zaman silinmez. `--config FILE` ile yapılan bir bağlantı aynı `--config FILE` ile kaldırılır; verilmezse `--remove` bağlantının bulunduğu dosyayı adıyla gösterir, `yonga remove` da komutun tamamını yazdırır.
 
 ## Sınırlar ve reddedilen istekler {#limits}
 

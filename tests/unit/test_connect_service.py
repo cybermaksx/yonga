@@ -885,3 +885,52 @@ def test_connected_configs(harness: Harness) -> None:
     service = connect(harness)
     assert service.connected_configs(ARTIFACT) == [str(harness.config_path.resolve())]
     assert service.connected_configs("nope") == []
+
+
+# --- keys the user added to the model entry --------------------------------------------
+
+
+def with_user_model_key(harness: Harness) -> None:
+    edit_file(
+        harness,
+        lambda d: d["provider"]["yonga-8000"]["models"][ARTIFACT].update(
+            reasoning=True, options={"temperature": 0.2}
+        ),
+    )
+
+
+def test_user_model_keys_survive_an_updated_rerun(harness: Harness) -> None:
+    service = connect(harness)
+    with_user_model_key(harness)
+    harness.write_model_config({"max_position_embeddings": 8192})
+    plan = harness.plan(service)
+    assert plan.action is ConnectAction.UPDATED
+    assert plan.previous_entry is not None and "reasoning" not in plan.previous_entry
+    service.apply(plan)
+    model = read_file(harness)["provider"]["yonga-8000"]["models"][ARTIFACT]
+    assert model["reasoning"] is True
+    assert model["options"] == {"temperature": 0.2}
+    assert model["limit"]["context"] == 8192
+    (record,) = harness.records.load()
+    assert record.model == plan.entry
+
+
+def test_a_user_model_key_alone_is_already_connected(harness: Harness) -> None:
+    service = connect(harness)
+    with_user_model_key(harness)
+    before = harness.config_path.read_bytes()
+    plan = harness.plan(service)
+    assert plan.action is ConnectAction.ALREADY_CONNECTED
+    service.apply(plan)
+    assert harness.config_path.read_bytes() == before
+
+
+def test_remove_deletes_an_entry_with_an_extra_user_key(harness: Harness) -> None:
+    service = connect(harness)
+    with_user_model_key(harness)
+    plan = remove(harness, service)
+    assert plan.action.value == "removed"
+    assert ARTIFACT not in read_file(harness).get("provider", {}).get("yonga-8000", {}).get(
+        "models", {}
+    )
+    assert harness.records.load() == []

@@ -42,6 +42,7 @@ from yonga.adapters.opencode_config import (
     ConfigSnapshot,
     check_provider,
     merge_provider_fields,
+    model_entry_in,
     provider_fields_in,
     read_config,
     render,
@@ -423,7 +424,8 @@ class ConnectService:
         provider = providers.get(key) if isinstance(providers, Mapping) else None
         models = provider.get("models") if isinstance(provider, Mapping) else None
         previous = models.get(artifact_id) if isinstance(models, Mapping) else None
-        previous_entry = dict(previous) if isinstance(previous, Mapping) else None
+        # Only the keys yonga writes count; ones the user added to the entry do not.
+        previous_entry = model_entry_in(previous, entry) if isinstance(previous, Mapping) else None
         if isinstance(provider, Mapping):
             # An existing provider keeps its name and every key yonga does not write.
             provider_fields = {
@@ -435,7 +437,7 @@ class ConnectService:
         provider_changed = previous_fields is not None and previous_fields != provider_fields
         if previous is None:
             action = ConnectAction.ADDED
-        elif previous == entry and not provider_changed:
+        elif previous_entry == entry and not provider_changed:
             action = ConnectAction.ALREADY_CONNECTED
         else:
             action = ConnectAction.UPDATED
@@ -524,7 +526,7 @@ class ConnectService:
             current = _recorded_model(document, record.provider, artifact_id)
             if current is None:
                 stale.append(record)
-            elif current != record.model:
+            elif model_entry_in(current, record.model) != record.model:
                 kept.append((record.provider, artifact_id, _EDITED))
             else:
                 removed.append((record.provider, artifact_id))
