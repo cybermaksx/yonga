@@ -56,6 +56,7 @@ from yonga.domain.diagnostics import (
     FailureCategory,
     diagnostic,
 )
+from yonga.domain.hardware import normalise_device
 from yonga.domain.models import PipelineKind
 from yonga.util.net import is_loopback, url_host
 
@@ -88,6 +89,7 @@ _PROVIDER_NPM = "@ai-sdk/openai-compatible"
 _API_KEY_ENV = "YONGA_API_KEY"
 _FIXED_PROMPT_PROPERTY = "MAX_PROMPT_LEN"
 _SUGGESTIONS = 3
+_LONG_PROMPT_DEVICES = frozenset({"GPU", "CPU"})
 _DEFAULT_HOST = "127.0.0.1"
 _DEFAULT_PORT = 8000
 _RECORD_SCHEMA = 1
@@ -391,7 +393,7 @@ class ConnectService:
         # artifact without a manifest is keyed by the reference itself.
         artifact_id = manifest.artifact_id if manifest is not None else reference
         self._require_tools(session)
-        fixed_prompt = self._require_prompt_length(session, manifest)
+        fixed_prompt = self._require_prompt_length(session, manifest, artifact_id)
         output = self._output_limit(manifest)
         window = context
         if window is None:
@@ -651,7 +653,7 @@ class ConnectService:
         return found
 
     def _require_prompt_length(
-        self, session: SessionView, manifest: ArtifactManifest | None
+        self, session: SessionView, manifest: ArtifactManifest | None, artifact_id: str
     ) -> int | None:
         """Return the fixed prompt length, refusing one OpenCode's first request exceeds."""
         raw = session.runtime_properties.get(_FIXED_PROMPT_PROPERTY)
@@ -674,17 +676,34 @@ class ConnectService:
                 "tokens. OpenCode's first request measured 5261 tokens in an empty home and 8514 "
                 "with skills and an AGENTS.md (OpenCode 2.1.2), so yonga requires at least "
                 f"{OPENCODE_MIN_PROMPT_TOKENS}.",
-                remediation=[self._longer_prompt_advice(repo_id, source_id)],
+                remediation=[self._longer_prompt_advice(session, artifact_id, repo_id, source_id)],
             )
         )
 
-    def _longer_prompt_advice(self, repo_id: str, source_id: str) -> str:
-        """Name a prepared GPU or CPU artifact of the same model, else how to prepare one."""
-        for summary in self._artifacts():
+    def _longer_prompt_advice(
+        self, session: SessionView, artifact_id: str, repo_id: str, source_id: str
+    ) -> str:
+        """How to get a long enough prompt: drop ``--device``, use a sibling, or prepare one.
+
+        When the refused artifact is itself recommended for the GPU or CPU, the
+        refusal comes from a forced ``--device npu``. Otherwise a prepared GPU or
+        CPU artifact of the same source model is named (never the refused one),
+        else how to prepare one.
+        """
+        listing = list(self._artifacts())
+        own = next((item for item in listing if item.artifact_id == artifact_id), None)
+        own_device = normalise_device(own.recommended_device or "") if own is not None else ""
+        if own_device in _LONG_PROMPT_DEVICES:
+            return (
+                f"This artifact is recommended for the {own_device}: drop "
+                f"`--device {session.device.lower()}` (or use `--device {own_device.lower()}`)."
+            )
+        for summary in listing:
             if (
                 summary.ready
+                and summary.artifact_id != artifact_id
                 and summary.repo_id == source_id
-                and (summary.recommended_device or "").upper() in {"GPU", "CPU"}
+                and normalise_device(summary.recommended_device or "") in _LONG_PROMPT_DEVICES
             ):
                 return f"Use the {summary.recommended_device} artifact: " + (
                     f"yonga connect opencode {summary.artifact_id}"

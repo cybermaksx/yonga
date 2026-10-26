@@ -727,7 +727,9 @@ a `ChatSession` but never loaded):
    prepared artifacts that do take tools, or the families whose built-in chat profile declares
    tool calling.
 4. Prompt length. A fixed `MAX_PROMPT_LEN` below `OPENCODE_MIN_PROMPT_TOKENS` (8192) is exit 70
-   `connect.opencode.prompt_too_short`, naming a prepared GPU or CPU artifact of the same source
+   `connect.opencode.prompt_too_short`. When the artifact itself is recommended for the GPU or CPU
+   (a forced `--device npu`), the advice is to drop `--device npu`; otherwise it names another
+   prepared GPU or CPU artifact of the same source
    model, else `yonga prepare MODEL --device gpu`. The constant is the first power of two above the
    5261 tokens of OpenCode 2.1.2's first agent request in an empty `HOME` (8514 with skills and an
    `AGENTS.md`), measured on the reference host with the Qwen3 chat template and tokenizer. Every

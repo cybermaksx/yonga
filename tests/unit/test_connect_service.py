@@ -979,3 +979,35 @@ def test_a_sibling_that_fails_to_open_is_skipped_in_the_suggestions(harness: Har
     advice = " ".join(error.diagnostic.remediation)
     assert "yonga connect opencode good" in advice
     assert "broken" not in advice
+
+
+def test_prompt_advice_never_suggests_the_refused_artifact(harness: Harness) -> None:
+    session = harness.sessions[ARTIFACT]
+    session.device = "NPU"
+    session.runtime_properties = {"MAX_PROMPT_LEN": "1024"}
+    harness.listing = [summary(ARTIFACT, device="NPU")]
+    advice = " ".join(refusal(harness).diagnostic.remediation)
+    assert "yonga connect opencode " + ARTIFACT not in advice
+
+
+def test_prompt_advice_for_a_gpu_artifact_forced_onto_the_npu_drops_the_device(
+    harness: Harness,
+) -> None:
+    session = harness.sessions[ARTIFACT]
+    session.device = "NPU"
+    session.runtime_properties = {"MAX_PROMPT_LEN": "1024"}
+    harness.listing = [summary(ARTIFACT, device="GPU")]
+    advice = " ".join(refusal(harness, device="npu").diagnostic.remediation)
+    assert "drop `--device npu`" in advice
+    assert "--device gpu" in advice
+    assert "yonga connect opencode " + ARTIFACT not in advice
+    assert "yonga prepare" not in advice
+
+
+def test_prompt_advice_compares_devices_normalised(harness: Harness) -> None:
+    session = harness.sessions[ARTIFACT]
+    session.device = "NPU"
+    session.runtime_properties = {"MAX_PROMPT_LEN": "1024"}
+    harness.add_session("indexed")
+    harness.listing = [summary(ARTIFACT, device="NPU"), summary("indexed", device="gpu.0")]
+    assert "yonga connect opencode indexed" in " ".join(refusal(harness).diagnostic.remediation)
