@@ -790,7 +790,7 @@ ownership over. `already_connected` adds a record entry when there is none, so `
 connection. A record that cannot be written is a warning on stderr (`record_written` is `false` in
 `--json`): the OpenCode file is already correct. A record file that exists but does not parse
 (broken, or another schema) is never written over: it is moved to `opencode-connections.json.bak`,
-replacing an older backup, a new record is started, and a warning names both files.
+replacing an older backup, a new record is started, and a warning names both files. A record file that cannot be read (permissions) is left as it is and counts as not written.
 
 **`--remove ARTIFACT`** takes the artifact id as recorded, so it works after `yonga remove`.
 A model entry whose keys yonga wrote are identical to the recorded ones is removed, with any key

@@ -213,16 +213,24 @@ class ConnectionRecords:
         return self._path.with_name(self._path.name + ".bak")
 
     def load(self) -> list[ConnectionRecord]:
-        """Every recorded connection; a missing or unreadable file reads as ``[]``."""
-        return self._read() or []
+        """Every recorded connection; a missing, unreadable or corrupt file reads as ``[]``."""
+        try:
+            return self._read() or []
+        except OSError:
+            return []
 
     def _read(self) -> list[ConnectionRecord] | None:
-        """The connections, ``[]`` for a missing file, ``None`` for one that does not parse."""
+        """The connections, ``[]`` for a missing file, ``None`` for content that is corrupt.
+
+        Only content that does not parse or validate is corrupt. A file that
+        cannot be read at all raises its ``OSError``: it may be perfectly good,
+        so :meth:`save` must neither set it aside nor replace it.
+        """
         try:
             payload = json.loads(self._path.read_text(encoding="utf-8"))
         except FileNotFoundError:
             return []
-        except (OSError, ValueError):
+        except ValueError:
             return None
         try:
             if payload["schema"] != _RECORD_SCHEMA:
@@ -236,7 +244,8 @@ class ConnectionRecords:
 
         Such a file (broken, or written by another schema) is first moved to
         :attr:`backup_path`, replacing an older backup, so the newest bad copy
-        survives. An I/O error is reported in the result, not raised.
+        survives. An I/O error, also reading the existing file, is reported in the
+        result, not raised, and leaves that file as it is.
         """
         text = json.dumps(
             {

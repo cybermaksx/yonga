@@ -934,3 +934,22 @@ def test_remove_deletes_an_entry_with_an_extra_user_key(harness: Harness) -> Non
         "models", {}
     )
     assert harness.records.load() == []
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file permissions")
+def test_an_unreadable_record_file_is_not_set_aside_or_overwritten(harness: Harness) -> None:
+    service = connect(harness)
+    path = harness.records._path
+    before = path.read_bytes()
+    harness.add_session("second")
+    path.chmod(0o000)
+    try:
+        assert harness.records.load() == []
+        result = service.apply(harness.plan(service, reference="second"))
+    finally:
+        path.chmod(0o600)
+    assert result.record_written is False
+    assert result.record_set_aside is None
+    assert path.read_bytes() == before
+    assert not harness.records.backup_path.exists()
+    assert "second" in read_file(harness)["provider"]["yonga-8000"]["models"]
