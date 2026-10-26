@@ -588,6 +588,7 @@ def test_help_lists_every_documented_command(runner: CliRunner) -> None:
         "eval",
         "cache",
         "self",
+        "connect",
     ):
         assert command in result.stdout
 

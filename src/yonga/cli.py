@@ -31,6 +31,7 @@ from __future__ import annotations
 import functools
 import json
 import os
+import shlex
 import sys
 import threading
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -45,10 +46,18 @@ from rich.text import Text
 from typer.core import TyperGroup
 
 from yonga import APP_NAME, __version__
+from yonga.adapters.opencode_config import default_config_path
 from yonga.application.artifact_refs import newest_choice_note
 from yonga.application.artifacts import ArtifactStore
 from yonga.application.benchmark import DEFAULT_SUITE, benchmark_result_path
 from yonga.application.chat import ChatOptions, ChatService, ChatSession, ChatTurn
+from yonga.application.connect import (
+    RECORD_FILENAME,
+    ConnectAction,
+    Endpoint,
+    RecordUpdate,
+    RemoveAction,
+)
 from yonga.application.inspect_model import InspectReport
 from yonga.application.jobs import (
     JobContext,
@@ -95,6 +104,7 @@ from yonga.ui import tables
 from yonga.ui.chat_tui import ChatCommandKind, ChatSessionInfo, ChatView, parse_command
 from yonga.ui.console import YongaConsole, fallback_command, human_bytes
 from yonga.ui.progress import RichProgressSink
+from yonga.util.net import is_loopback, url_host
 from yonga.util.redaction import redact_text
 
 __all__ = ["CliState", "app", "cli_state", "main"]
@@ -695,6 +705,13 @@ self_app = typer.Typer(
     add_completion=False,
 )
 app.add_typer(self_app, name="self")
+connect_app = typer.Typer(
+    name="connect",
+    help="Register a prepared artifact with a client that talks to 'yonga serve'.",
+    no_args_is_help=True,
+    add_completion=False,
+)
+app.add_typer(connect_app, name="connect")
 
 
 def _version_callback(value: bool) -> None:
@@ -1252,7 +1269,34 @@ def _remove(state: CliState, artifact: str, *, yes: bool) -> ExitCode:
         )
     else:
         console.print(f"Removed {report.artifact_dir} ({human_bytes(report.freed_bytes)} freed).")
+        configs = _opencode_configs(state, report.artifact_id)
+        if report.artifact_id and configs:
+            console.print(
+                "This artifact is still listed in OpenCode; remove it there with: "
+                + "; ".join(
+                    state.hint(_opencode_remove_command(report.artifact_id, config))
+                    for config in configs
+                )
+            )
     return ExitCode.SUCCESS
+
+
+def _opencode_configs(state: CliState, artifact_id: str | None) -> list[str]:
+    """The OpenCode files the connection record names the artifact in; none when unreadable."""
+    if not artifact_id:
+        return []
+    try:
+        return state.graph.connect_service().connected_configs(artifact_id)
+    except Exception:  # a note must never fail the removal it follows
+        return []
+
+
+def _opencode_remove_command(artifact_id: str, config: str) -> str:
+    """``yonga connect opencode --remove ID``, with ``--config`` unless it is the default file."""
+    command = f"yonga connect opencode --remove {artifact_id}"
+    if Path(config) != default_config_path(os.environ).resolve():
+        command += f" --config {shlex.quote(config)}"
+    return command
 
 
 # ======================================================================
@@ -1578,7 +1622,7 @@ def _serve(
     _require_port(host, port)
     api_key = os.environ.get(API_KEY_ENV) or None
     console = state.console
-    if not _is_loopback(host):
+    if not is_loopback(host):
         warning = f"Binding {host} makes the model reachable from other machines."
         if api_key is None:
             warning += f" No {API_KEY_ENV} is set, so anyone who can reach it can use it."
@@ -1595,7 +1639,7 @@ def _serve(
     )
     try:
         server.load()
-        url = f"http://{_url_host(host)}:{port}/v1"
+        url = f"http://{url_host(host)}:{port}/v1"
         console.print(
             Text.assemble(
                 "Serving ",
@@ -1885,21 +1929,6 @@ def _run_http(app_instance: object, *, host: str, port: int, verbose: bool) -> N
         log_level="info" if verbose else "warning",
         access_log=verbose,
     )
-
-
-def _is_loopback(host: str) -> bool:
-    import ipaddress
-
-    if host.strip().lower() == "localhost":
-        return True
-    try:
-        return ipaddress.ip_address(host.strip("[]")).is_loopback
-    except ValueError:
-        return False
-
-
-def _url_host(host: str) -> str:
-    return f"[{host}]" if ":" in host and not host.startswith("[") else host
 
 
 def _require_port(host: str, port: int) -> None:
@@ -3039,6 +3068,227 @@ def registry_reset(
         return ExitCode.SUCCESS
 
     _dispatch(state, run)
+
+
+# ======================================================================
+# connect
+# ======================================================================
+_CONNECT_HOST_HELP = "Address 'yonga serve' listens on (default: 127.0.0.1)."
+_CONNECT_PORT_HELP = "Port 'yonga serve' listens on (default: 8000)."
+_CONNECT_DEVICE_HELP = "auto, npu, gpu or cpu (default: auto, as 'serve' resolves it)."
+_CONNECT_CONTEXT_HELP = "Context limit to write, instead of the one read from the artifact."
+_CONNECT_CONFIG_HELP = (
+    "The OpenCode file to edit (default: $XDG_CONFIG_HOME/opencode/opencode.json, "
+    "else ~/.config/opencode/opencode.json)."
+)
+
+
+@connect_app.command("opencode")
+def connect_opencode(
+    ctx: typer.Context,
+    artifact: str = typer.Argument(..., metavar="ARTIFACT", help="Artifact id, repo id or path."),
+    remove: bool = typer.Option(
+        False, "--remove", help="Take the connection back out; ARTIFACT is the recorded id."
+    ),
+    host: str | None = typer.Option(None, "--host", help=_CONNECT_HOST_HELP),
+    port: int | None = typer.Option(None, "--port", min=1, max=65535, help=_CONNECT_PORT_HELP),
+    device: str | None = typer.Option(None, "--device", help=_CONNECT_DEVICE_HELP),
+    context: int | None = typer.Option(None, "--context", min=1, help=_CONNECT_CONTEXT_HELP),
+    config: Path | None = typer.Option(None, "--config", metavar="PATH", help=_CONNECT_CONFIG_HELP),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Do not ask before writing."),
+    json_output: bool = typer.Option(False, "--json", help="Emit the outcome as JSON."),
+) -> None:
+    """Add a prepared artifact to OpenCode's config as a 'yonga serve' provider."""
+    state = cli_state(ctx, json_output=json_output)
+    path = config.expanduser().resolve() if config is not None else default_config_path(os.environ)
+    if remove:
+        given = [
+            name
+            for name, value in (
+                ("--host", host),
+                ("--port", port),
+                ("--device", device),
+                ("--context", context),
+            )
+            if value is not None
+        ]
+        _dispatch(state, lambda: _disconnect_opencode(state, artifact, path, yes=yes, given=given))
+        return
+    _dispatch(
+        state,
+        lambda: _connect_opencode(
+            state,
+            artifact,
+            path,
+            endpoint=Endpoint(host=host or "127.0.0.1", port=port if port is not None else 8000),
+            device=device,
+            context=context,
+            yes=yes,
+        ),
+    )
+
+
+def _connect_opencode(
+    state: CliState,
+    artifact: str,
+    path: Path,
+    *,
+    endpoint: Endpoint,
+    device: str | None,
+    context: int | None,
+    yes: bool,
+) -> ExitCode:
+    """Check the artifact, show the change, ask, then write it (spec sections 3 and 7)."""
+    resolved = _device(device)
+    service = state.graph.connect_service()
+    plan = service.plan_connect(
+        artifact,
+        endpoint=endpoint,
+        device=None if resolved == "auto" else resolved,
+        context=context,
+        config_path=path,
+    )
+    console = state.console
+    key = endpoint.provider_key
+    limit = plan.entry["limit"]
+    written = plan.action is not ConnectAction.ALREADY_CONNECTED
+    if not written:
+        console.print(f"{plan.artifact_id} is already connected in {path}.")
+    else:
+        console.print(f"Target  {path}")
+        if plan.created_provider:
+            console.print(f"  + provider.{key} → {endpoint.base_url}")
+        elif plan.provider_changed:
+            console.print(f"  ~ provider.{key}")
+            console.print(
+                f"    before {json.dumps(plan.previous_provider_fields, ensure_ascii=False)}"
+            )
+            console.print(f"    after  {json.dumps(plan.provider_fields, ensure_ascii=False)}")
+        if plan.previous_entry is None:
+            parts = [f"context {limit['context']}", f"output {limit['output']}"]
+            if "input" in limit:
+                parts.append(f"input {limit['input']}")
+            console.print(f"  + model {plan.artifact_id} ({', '.join(parts)})")
+        elif plan.previous_entry != plan.entry:
+            console.print(f"  ~ model {plan.artifact_id}")
+            console.print(f"    before {json.dumps(plan.previous_entry, ensure_ascii=False)}")
+            console.print(f"    after  {json.dumps(plan.entry, ensure_ascii=False)}")
+        if not console.confirm(f"Write this to {path}?", default=False, assume_yes=yes):
+            raise CancelledError(
+                diagnostic(
+                    "connect.opencode.declined",
+                    FailureCategory.USER_CANCELLED,
+                    "Nothing was written",
+                    f"{path} was left as it was.",
+                    remediation=[
+                        f"Re-run with --yes to write it without a prompt: {state.rerun('--yes')}"
+                    ],
+                )
+            )
+    result = service.apply(plan)
+    if state.json_mode:
+        state.emit(
+            {
+                "action": plan.action.value,
+                "config": str(plan.snapshot.path),
+                "created_config": result.created_config,
+                "provider": key,
+                "created_provider": written and plan.created_provider,
+                "model": plan.artifact_id,
+                "base_url": endpoint.base_url,
+                "limit": limit,
+                "serve_command": plan.serve_command,
+                "record_written": result.record_written,
+                "exit_code": int(ExitCode.SUCCESS),
+            }
+        )
+        return ExitCode.SUCCESS
+    if written:
+        console.print(f"Connected {plan.artifact_id} to OpenCode as {key}/{plan.artifact_id}.")
+    console.print(f"Start the server with: {plan.serve_command}")
+    _warn_about_record(
+        state,
+        RecordUpdate(result.record_written, result.record_set_aside),
+        consequence="'--remove' will not find this connection",
+    )
+    return ExitCode.SUCCESS
+
+
+def _warn_about_record(state: CliState, update: RecordUpdate, *, consequence: str) -> None:
+    """Say on stderr, always, when the connection record was set aside or not saved."""
+    path = state.graph.paths.data_dir / RECORD_FILENAME
+    if update.set_aside is not None:
+        state.console.print_error(
+            f"warning: {path} could not be read; it was moved to {update.set_aside} "
+            "and a new record was started.",
+            style="yellow",
+        )
+    if not update.written:
+        state.console.print_error(
+            f"warning: could not update {path}; {consequence}.", style="yellow"
+        )
+
+
+def _disconnect_opencode(
+    state: CliState, artifact: str, path: Path, *, yes: bool, given: Sequence[str]
+) -> ExitCode:
+    """Take out only the entries yonga recorded, after asking (spec section 6)."""
+    if given:
+        raise ConfigurationError(
+            diagnostic(
+                "connect.opencode.remove_options",
+                FailureCategory.CONFIGURATION_ERROR,
+                "These options do not combine with --remove",
+                f"{', '.join(given)} describe a connection to add; --remove takes one out.",
+                remediation=["Only --config, --yes and --json combine with --remove."],
+            )
+        )
+    service = state.graph.connect_service()
+    plan = service.plan_remove(artifact, config_path=path)
+    console = state.console
+    if plan.removed:
+        console.print(f"Target  {path}")
+        for provider, model in plan.removed:
+            console.print(f"  - model {model} from provider.{provider}")
+        if not console.confirm(f"Remove this from {path}?", default=False, assume_yes=yes):
+            raise CancelledError(
+                diagnostic(
+                    "connect.opencode.declined",
+                    FailureCategory.USER_CANCELLED,
+                    "Nothing was removed",
+                    f"{path} was left as it was.",
+                    remediation=[
+                        f"Re-run with --yes to remove it without a prompt: {state.rerun('--yes')}"
+                    ],
+                )
+            )
+    recorded = service.apply_remove(plan) if plan.removed or plan.stale else RecordUpdate(True)
+    code = ExitCode.REGISTRY if plan.kept else ExitCode.SUCCESS
+    if state.json_mode:
+        state.emit(
+            {
+                "action": plan.action.value,
+                "config": str(plan.config),
+                "removed": [{"provider": p, "model": m} for p, m in plan.removed],
+                "kept": [{"provider": p, "model": m, "reason": r} for p, m, r in plan.kept],
+                "record_written": recorded.written,
+                "exit_code": int(code),
+            }
+        )
+        return code
+    if plan.action is RemoveAction.NOT_CONNECTED:
+        console.print(f"{artifact} is not connected in {path}.")
+        for other in plan.elsewhere:
+            console.print(
+                f"It is connected in {other}; remove it there with: "
+                + state.hint(_opencode_remove_command(artifact, other))
+            )
+    for provider, model in plan.removed:
+        console.print(f"Removed {model} from {provider} in {path}.")
+    for provider, model, reason in plan.kept:
+        console.print(f"Kept {provider}/{model}: {reason}.")
+    _warn_about_record(state, recorded, consequence="it may still list what was removed here")
+    return code
 
 
 # ======================================================================

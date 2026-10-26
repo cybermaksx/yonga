@@ -398,6 +398,40 @@ prompt hashes, and per-run metrics with warmups excluded from the aggregates.
 
 ---
 
+### Use it from OpenCode
+
+```bash
+yonga connect opencode 073d5d7c8ea75283 --port 8765     # writes the provider into OpenCode's config
+yonga serve 073d5d7c8ea75283 --port 8765                # then pick yonga-8765/073d5d7c8ea75283 in opencode
+```
+
+`connect opencode` adds the artifact to `~/.config/opencode/opencode.json` (`--config FILE` for
+another file), with the context and output limits read from the artifact, shows the change and asks
+first (`--yes` skips the question). It prints the `serve` command to run; it never starts the
+server. Re-running it changes nothing when the entry is already right.
+
+It refuses, writing nothing, what OpenCode cannot use. OpenCode sends its 12 tools with every
+request, and its first request is about 5300 tokens (system prompt plus the 12 tool definitions),
+more with skills or an `AGENTS.md`. So an artifact without tool calling is refused
+(`connect.opencode.tools_unsupported`), and so is one whose prompt length is fixed under 8192
+tokens (`connect.opencode.prompt_too_short`): that is every built-in NPU profile (1024). The
+message names a prepared GPU or CPU artifact of the same model to use instead, or gives the
+`yonga prepare MODEL --device gpu` command. A file with comments or
+trailing commas (JSONC) is not rewritten (`connect.opencode.config_not_json`); add the provider by
+hand from the JSON printed. `YONGA_API_KEY`, when set, is referenced as `{env:YONGA_API_KEY}`,
+never written. Into a provider you already have, yonga writes only `npm`, `options.baseURL` and
+`options.apiKey`; its name and your other options stay. Likewise a model entry keeps the keys you
+added to it (`reasoning`, `options`); yonga sets `name`, `tool_call` and `limit`.
+
+```bash
+yonga connect opencode --remove 073d5d7c8ea75283        # works after `yonga remove` too
+```
+
+`--remove` deletes only the entries yonga wrote. An entry whose yonga-written keys you edited since is kept and listed, and
+the command then exits 70. The file is never deleted. A connection made with `--config FILE` is
+removed with the same `--config FILE`; without it, `--remove` names the file the connection is in,
+and `yonga remove` prints the full command.
+
 ## 5. Ask the registry why
 
 ```bash

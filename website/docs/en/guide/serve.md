@@ -218,6 +218,29 @@ Every endpoint except `/health` then requires `Authorization: Bearer <key>`; a r
 !!! warning
     yonga serves plain HTTP. If you expose it beyond your own machine, keep it on a network you trust, or put it behind a reverse proxy that adds TLS.
 
+## Use it from OpenCode {#opencode}
+
+```bash
+yonga connect opencode 073d5d7c8ea75283 --port 8765
+yonga serve 073d5d7c8ea75283 --port 8765
+```
+
+The first command adds the artifact to OpenCode's config (`~/.config/opencode/opencode.json`, or the file you give with `--config`) as a provider, with the context and output limits read from the artifact. It shows the change and asks first; `--yes` skips the question. Then start the server with the command it prints and choose `yonga-8765/073d5d7c8ea75283` in `opencode`. Running it again changes nothing when the entry is already right.
+
+yonga refuses, and writes nothing, when OpenCode could not use the artifact. OpenCode sends its 12 tools with every request, and its first request is about 5300 tokens (system prompt plus the 12 tool definitions), more with skills or an `AGENTS.md`, so:
+
+- An artifact without tool calling is refused (`connect.opencode.tools_unsupported`).
+- An artifact whose prompt length is fixed under 8192 tokens is refused (`connect.opencode.prompt_too_short`). Every built-in NPU profile is fixed at 1024. The message names a prepared GPU or CPU artifact of the same model to use instead, or gives the `yonga prepare MODEL --device gpu` command.
+- A config file with comments or trailing commas (JSONC) is not rewritten (`connect.opencode.config_not_json`). Add the provider by hand from the JSON it prints.
+
+When `YONGA_API_KEY` is set, the entry refers to it as `{env:YONGA_API_KEY}`; the key itself is never written. Into a provider you already have, yonga writes only `npm`, `options.baseURL` and `options.apiKey`; the provider's name and your other options stay. A model entry likewise keeps the keys you added to it (`reasoning`, `options`); yonga sets `name`, `tool_call` and `limit`.
+
+```bash
+yonga connect opencode --remove 073d5d7c8ea75283
+```
+
+`--remove` deletes only the entries yonga wrote, also after `yonga remove` deleted the artifact. An entry whose yonga-written keys you edited since is kept and listed, and the command exits 70. The config file is never deleted. A connection made with `--config FILE` is removed with the same `--config FILE`; without it, `--remove` names the file the connection is in, and `yonga remove` prints the full command.
+
 ## Limits and refusals {#limits}
 
 yonga refuses what it cannot honour instead of silently answering a different request. Errors use OpenAI's shape, `{"error": {"message", "type", "param", "code"}}`, and `param` names the offending field.
