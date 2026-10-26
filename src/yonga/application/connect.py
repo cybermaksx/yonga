@@ -27,6 +27,7 @@ import contextlib
 import json
 import os
 import re
+import shlex
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -377,7 +378,9 @@ class ConnectService:
         """Run the checks in order, then read the config and decide the outcome."""
         session = self._open_session(reference, device)
         manifest = session.manifest
-        artifact_id = manifest.artifact_id if manifest is not None else session.artifact_dir.name
+        # `serve` answers to the reference as typed plus the manifest's ids, so an
+        # artifact without a manifest is keyed by the reference itself.
+        artifact_id = manifest.artifact_id if manifest is not None else reference
         self._require_tools(session)
         fixed_prompt = self._require_prompt_length(session, manifest)
         output = self._output_limit(manifest)
@@ -447,7 +450,9 @@ class ConnectService:
             previous_provider_fields=previous_fields,
             document=with_model(snapshot.document, key, provider_fields, artifact_id, entry),
             created_provider=provider is None,
-            serve_command=_serve_command(artifact_id, endpoint, device),
+            serve_command=_serve_command(
+                reference if _is_path(reference) else artifact_id, endpoint, device
+            ),
         )
 
     # --- applying ----------------------------------------------------
@@ -798,9 +803,18 @@ def _context_unknown(artifact_id: str) -> ConfigurationError:
     )
 
 
-def _serve_command(artifact_id: str, endpoint: Endpoint, device: str | None) -> str:
-    """The ``yonga serve`` command that answers the entry just planned."""
-    parts = ["yonga", "serve", artifact_id]
+def _is_path(reference: str) -> bool:
+    """True when ``reference`` names an artifact directory rather than an id."""
+    return os.sep in reference or "/" in reference or Path(reference).is_dir()
+
+
+def _serve_command(target: str, endpoint: Endpoint, device: str | None) -> str:
+    """The ``yonga serve`` command that answers the entry just planned.
+
+    ``target`` is the artifact id, or the path as the user passed it (``serve``
+    resolves ids only inside the store).
+    """
+    parts = ["yonga", "serve", shlex.quote(target)]
     if endpoint.port != _DEFAULT_PORT:
         parts += ["--port", str(endpoint.port)]
     if endpoint.host != _DEFAULT_HOST:

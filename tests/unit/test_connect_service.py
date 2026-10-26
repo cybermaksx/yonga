@@ -285,6 +285,30 @@ def test_serve_command(harness: Harness) -> None:
     assert harness.opened[-1] == (ARTIFACT, "gpu")
 
 
+def test_artifact_without_a_manifest_is_keyed_by_the_reference_as_passed(
+    harness: Harness,
+) -> None:
+    reference = str(harness.tmp_path / "somewhere" / "my-artifact")
+    harness.sessions[reference] = FakeSession(harness.model_dir, manifest=None)
+    plan = harness.plan(reference=reference)
+    assert plan.artifact_id == reference
+    assert list(plan.document["provider"]["yonga-8000"]["models"]) == [reference]
+    assert plan.serve_command == f"yonga serve {reference}"
+
+
+def test_serve_command_uses_a_path_reference_as_passed(harness: Harness) -> None:
+    reference = "./store/" + ARTIFACT
+    harness.sessions[reference] = FakeSession(harness.model_dir)
+    plan = harness.plan(reference=reference)
+    assert plan.artifact_id == ARTIFACT
+    assert plan.serve_command == f"yonga serve {reference}"
+
+
+def test_serve_command_uses_the_id_for_a_prefix_reference(harness: Harness) -> None:
+    harness.sessions["073d"] = FakeSession(harness.model_dir)
+    assert harness.plan(reference="073d").serve_command == f"yonga serve {ARTIFACT}"
+
+
 def test_ambiguous_reference_error_passes_through(harness: Harness) -> None:
     problem = ConfigurationError("More than one artifact matches 'abc'.")
 
