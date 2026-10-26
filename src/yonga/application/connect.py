@@ -54,7 +54,6 @@ from yonga.domain.artifacts import ArtifactManifest, ArtifactSummary
 from yonga.domain.diagnostics import (
     ConfigurationError,
     FailureCategory,
-    YongaError,
     diagnostic,
 )
 from yonga.domain.models import PipelineKind
@@ -645,7 +644,7 @@ class ConnectService:
                 continue
             try:
                 other = self._open_session(summary.artifact_id, None)
-            except YongaError:
+            except Exception:  # a sibling that cannot be opened is no suggestion
                 continue
             if other.tool_calling is not None:
                 found.append(summary.artifact_id)

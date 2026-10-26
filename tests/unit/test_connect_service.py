@@ -953,3 +953,29 @@ def test_an_unreadable_record_file_is_not_set_aside_or_overwritten(harness: Harn
     assert path.read_bytes() == before
     assert not harness.records.backup_path.exists()
     assert "second" in read_file(harness)["provider"]["yonga-8000"]["models"]
+
+
+def test_a_sibling_that_fails_to_open_is_skipped_in_the_suggestions(harness: Harness) -> None:
+    harness.sessions[ARTIFACT].tool_calling = None
+    harness.add_session("good")
+    harness.listing = [summary(ARTIFACT), summary("broken"), summary("good")]
+    opened = harness.open_session
+
+    def flaky(reference: str, device: str | None) -> FakeSession:
+        if reference == "broken":
+            raise ValueError("unexpected manifest shape")
+        return opened(reference, device)
+
+    service = ConnectService(
+        open_session=flaky,
+        artifacts=lambda: harness.listing,
+        tool_families=["qwen3"],
+        records=harness.records,
+        default_max_new_tokens=4096,
+        env={},
+    )
+    error = refusal(harness, service=service)
+    assert error.diagnostic.code == "connect.opencode.tools_unsupported"
+    advice = " ".join(error.diagnostic.remediation)
+    assert "yonga connect opencode good" in advice
+    assert "broken" not in advice
