@@ -367,3 +367,19 @@ def test_with_model_merges_into_an_existing_model_entry() -> None:
         "tool_call": True,
     }
     assert list(model)[:3] == ["name", "reasoning", "options"]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file permissions")
+def test_write_refuses_a_read_only_file(tmp_path: Path) -> None:
+    path = _write(tmp_path / "opencode.json", "{}")
+    path.chmod(0o444)
+    snapshot = read_config(path)
+    with pytest.raises(YongaError) as caught:
+        write_config(snapshot, {"theme": "x"})
+    diagnostic = caught.value.diagnostic
+    assert diagnostic.code == "connect.opencode.config_not_writable"
+    assert diagnostic.exit_code() == ExitCode.ENVIRONMENT_UNUSABLE
+    assert "read-only" in " ".join(diagnostic.remediation)
+    assert path.read_text(encoding="utf-8") == "{}"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o444
+    assert list(tmp_path.iterdir()) == [path]

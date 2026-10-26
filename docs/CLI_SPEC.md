@@ -778,7 +778,8 @@ to a temporary file in the same directory, is flushed with `fsync`, keeps the fi
 renamed over the target with `os.replace`; a symbolic link is resolved and its target edited. Just
 before the rename the bytes are compared with what was read, and a file that changed is exit 70
 `connect.opencode.config_changed` with nothing written. A file or directory the user cannot read
-(`config_not_readable`) or write (`config_not_writable`) is exit 10, a full disk is exit 30 with
+(`config_not_readable`) or write (`config_not_writable`) is exit 10, as is an existing file that is read-only for the user (`config_not_writable`, refused
+before anything is written, its mode never overridden); a full disk is exit 30 with
 the code `config_not_writable`; sudo is never used. The file is never deleted.
 
 **The record**, `<data-dir>/opencode-connections.json` (`{"schema": 1, "connections": [...]}`),
@@ -822,7 +823,7 @@ resolved file (symbolic links followed), as the record holds it. For `--remove`:
 | `connect.opencode.config_not_a_file` | `configuration_error` | 70 | `--config` names a directory. |
 | `connect.opencode.config_changed` | `configuration_error` | 70 | The file changed between reading and writing. |
 | `connect.opencode.remove_options` | `configuration_error` | 70 | `--remove` combined with `--host`, `--port`, `--device` or `--context`. |
-| `connect.opencode.config_not_readable`, `config_not_writable` | `permission_denied` | 10 | The OS refused reading or writing the file or its directory. |
+| `connect.opencode.config_not_readable`, `config_not_writable` | `permission_denied` | 10 | The OS refused reading or writing the file or its directory, or the file is read-only. |
 | `connect.opencode.config_not_writable` | `insufficient_disk` | 30 | The disk is full. |
 | `connect.opencode.declined` | `user_cancelled` | 60 | The question was declined, or cannot be asked (no terminal, or `--json` without `--yes`). |
 

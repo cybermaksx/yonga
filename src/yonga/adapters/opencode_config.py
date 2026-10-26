@@ -19,6 +19,8 @@ here are narrow on purpose:
 * **Compare before replace.** The bytes read earlier are remembered; right
   before the rename the target is read again, and a difference (OpenCode or the
   user saved in between) aborts the write instead of discarding their change.
+* **A read-only file stays read-only.** One the user has no write permission
+  on is refused, not replaced through the writable directory.
 * **Nothing else happens.** The file is never deleted, and there is no sudo: an
   unwritable location is reported with how to choose another one.
 """
@@ -348,9 +350,12 @@ def write_config(snapshot: ConfigSnapshot, document: Mapping[str, Any]) -> bool:
     Parent directories are created. The new text is written to a temporary file
     beside the target, flushed, given ``snapshot.mode`` (``0600`` when the file
     is new) and renamed over the target after the target is read once more and
-    found byte-for-byte equal to ``snapshot.raw``.
+    found byte-for-byte equal to ``snapshot.raw``. An existing file the user
+    cannot write is refused first (``config_not_writable``), not replaced.
     """
     path = snapshot.path
+    if snapshot.raw is not None and not os.access(path, os.W_OK):
+        raise _read_only(path)
     data = render(document).encode("utf-8")
     temporary: str | None = None
     try:
@@ -374,6 +379,28 @@ def write_config(snapshot: ConfigSnapshot, document: Mapping[str, Any]) -> bool:
                 Path(temporary).unlink()
     _fsync_directory(path.parent)
     return snapshot.raw is None
+
+
+def _read_only(path: Path) -> YongaError:
+    """The refusal for an existing config the user has no write permission on.
+
+    Renaming over it would work (the directory is writable) and would also copy
+    its mode, silently overriding a protection the user set on purpose.
+    """
+    return YongaError(
+        diagnostic(
+            "connect.opencode.config_not_writable",
+            FailureCategory.PERMISSION_DENIED,
+            "Cannot write OpenCode's config",
+            f"{path} is read-only for you, so yonga left it untouched.",
+            remediation=[
+                "The file is read-only: make it writable (chmod u+w), or choose another file with "
+                "--config FILE.",
+                "yonga never uses sudo for this, and it is not needed.",
+            ],
+            context={"config": str(path)},
+        )
+    )
 
 
 def _recheck(snapshot: ConfigSnapshot) -> None:

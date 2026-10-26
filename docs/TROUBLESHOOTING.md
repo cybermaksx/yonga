@@ -583,7 +583,7 @@ contract. Every refusal below leaves the OpenCode file exactly as it was.
 | `connect.opencode.config_not_a_file` | `configuration_error` | 70 | `--config` names a directory. | Pass the file itself. |
 | `connect.opencode.config_changed` | `configuration_error` | 70 | Something else edited the file between reading and writing; nothing was written. | Run the command again. |
 | `connect.opencode.remove_options` | `configuration_error` | 70 | `--remove` was combined with `--host`, `--port`, `--device` or `--context`. | Give only `--config`, `--yes` and `--json` with `--remove`. |
-| `connect.opencode.config_not_readable`, `connect.opencode.config_not_writable` | `permission_denied`, or `insufficient_disk` (exit 30) for `config_not_writable` on a full disk | 10 or 30 | The OS refused reading or writing the file or its directory, or the disk is full. yonga never uses sudo. | Choose a location you own with `--config FILE`, or free space. |
+| `connect.opencode.config_not_readable`, `connect.opencode.config_not_writable` | `permission_denied`, or `insufficient_disk` (exit 30) for `config_not_writable` on a full disk | 10 or 30 | The OS refused reading or writing the file or its directory, the file is read-only, or the disk is full. yonga never uses sudo. | Make a read-only file writable, choose a location you own with `--config FILE`, or free space. |
 | `connect.opencode.declined` | `user_cancelled` | 60 | The question was declined, or could not be asked (no terminal, or `--json` without `--yes`). | Re-run with `--yes`. |
 
 `connect opencode --remove` exiting **70** without a code is not a failure to remove: an entry you
