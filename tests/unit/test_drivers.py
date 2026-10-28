@@ -86,6 +86,16 @@ def test_a_claimed_device_is_told_to_release_it_not_to_load_a_module():
         ("0x7d41", False),  # Arrow Lake-U (the CachyOS laptop)
         ("0x64a0", False),  # Lunar Lake
         ("0xE20B", False),  # Battlemage, upper case
+        ("0x4e55", True),  # Jasper Lake
+        ("0x4571", True),  # Elkhart Lake
+        ("0x3E9B", True),  # Coffee Lake, upper case
+        # Ids that share a prefix with a legacy family but are not in the kernel's list.
+        ("0x4e00", False),
+        ("0x45ff", False),
+        ("0x3eff", False),
+        ("0x8a00", False),
+        ("", False),
+        ("not-an-id", False),
     ],
 )
 def test_gpu_generations_before_gen12_are_recognised(device_id, legacy):
